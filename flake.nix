@@ -23,6 +23,64 @@
 
       version = "0.1.0";
 
+      # package.json pins `packageManager: pnpm@12.4.1`; nixpkgs' pnpm_12 is
+      # 12.3.4. That mismatch is not a warning — pnpm honours the pin and tries
+      # to *download and signature-verify* 12.4.1 at first run, which fails in
+      # the sandbox:
+      #
+      #   Error: ERR_PNPM_PNPM_ENGINE_IDENTITY_UNVERIFIABLE
+      #   Refusing to run pnpm@12.4.1: its npm registry signature could not be
+      #   verified (@pnpm/exe.linux-x64@12.4.1: … error sending request)
+      #
+      # (npmjs has no @pnpm/exe-linux-x64 12.4.1 tarball at all, so there is no
+      # registry artefact to verify even with network access.)
+      #
+      # Neither `manage-package-manager-versions=false` nor COREPACK settings
+      # stop it — verified against pnpm 12.3.4 directly. The upstream standalone
+      # release binary is used instead: it is a self-contained musl executable
+      # that is simply 12.4.1, so there is nothing to provision and nothing to
+      # verify.
+      pnpmPinned =
+        { pkgs, muslArch }:
+        pkgs.stdenvNoCC.mkDerivation {
+          pname = "pnpm";
+          version = "12.4.1";
+
+          src = pkgs.fetchurl {
+            url =
+              if muslArch == "x86_64" then
+                "https://github.com/pnpm/pnpm/releases/download/v12.4.1/pnpm-linux-x64-musl.tar.gz"
+              else
+                "https://github.com/pnpm/pnpm/releases/download/v12.4.1/pnpm-linux-arm64-musl.tar.gz";
+            hash =
+              if muslArch == "x86_64" then
+                "sha256-tyz8IUDi8zgOJlVaR0+OCRpEMTdPrOYwpQsA5NuZLds="
+              else
+                lib.fakeHash;
+          };
+
+          dontUnpack = true;
+          dontConfigure = true;
+          dontBuild = true;
+
+          installPhase = ''
+            runHook preInstall
+            mkdir -p "$out/bin"
+            # No --strip-components: this archive holds `pnpm` at its root
+            # (alongside dist/), so stripping a component would strip the name
+            # itself and install nothing. The binary is self-contained.
+            tar xzf "$src" -C "$out/bin" pnpm
+            runHook postInstall
+          '';
+
+          meta = {
+            description = "pnpm 12.4.1 (matches package.json's packageManager pin)";
+            homepage = "https://pnpm.io";
+            license = lib.licenses.mit;
+            platforms = lib.platforms.linux;
+          };
+        };
+
       # scripts/build-wasm.mjs aborts unless `wasm-bindgen --version` equals the
       # wasm-bindgen in Cargo.lock — 0.2.128. nixpkgs 26.11 ships 0.2.127, so the
       # upstream release build is used rather than editing the lockfile or
@@ -68,7 +126,49 @@
       # ---------------------------------------------------------------------
       webBuild =
         { pkgs, src, muslArch }:
-        pkgs.stdenvNoCC.mkDerivation {
+        let
+          # The wasm build is a real cargo invocation, so it needs the five git
+          # repositories Cargo.lock pins, vendored — the sandbox has no network.
+          # importCargoLock fetches them as fixed-output derivations.
+          #
+          # A `let` binding, not a derivation attribute: `${cargoGitDeps}` in
+          # buildPhase resolves the variable in scope, and a sibling attribute of
+          # a non-recursive set is not in scope.
+          cargoGitDeps = pkgs.rustPlatform.importCargoLock {
+            lockFile = ./Cargo.lock;
+            outputHashes = {
+              # matrix-rust-sdk 0.19.1, rev bc2502ee….
+              "matrix-sdk-base-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
+              "matrix-sdk-common-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
+              "matrix-sdk-qrcode-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
+              "matrix-sdk-sqlite-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
+              "matrix-sdk-store-encryption-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
+              "matrix-sdk-test-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
+              "matrix-sdk-test-macros-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
+              "matrix-sdk-test-utils-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
+              "matrix-sdk-ui-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
+
+              # tauri-plugin-notifications 0.5.0, SableClient fork (UnifiedPush/VAPID).
+              "tauri-plugin-notifications-0.5.0" = "sha256-IRjkPyK7F5I5LlPprTp1qjVvtaFPsBoArT8mLxjPN+Q=";
+
+              # tauri-plugin-app-icon 0.1.0. android/ios only; not compiled here.
+              "tauri-plugin-app-icon-0.1.0" = "sha256-yC835kEOJZje7kZ6H/DAbLUPjipu4NQqqJ6SimQthBM=";
+
+              # tauri-runtime-cef 0.1.0. Behind the non-default `cef` feature,
+              # which pulls a CEF download, so the default build never touches it.
+              "tauri-runtime-cef-0.1.0" = "sha256-d+m6Bh6PMj82qOtHWGmjUai0aApBiIkndUhK+vp/p6w=";
+
+              # tauri-plugin-livekit-mobile 0.2.0, android/ios only. Its
+              # Cargo.toml asks for rev ca97b1ec… but the locked commit is
+              # 92ddc076…, so the hash is for that tree.
+              "tauri-plugin-livekit-mobile-0.2.0" = "sha256-5QB7wu2js4JLkJWiJ6YgR7QpLzuVpm49PmKnO9tNm94=";
+            };
+          };
+        in
+        # stdenv, not stdenvNoCC: cargo compiles *build scripts* for the host,
+        # and each one is a real link, so a C linker has to be on PATH even
+        # though no C of ours is compiled.
+        pkgs.stdenv.mkDerivation {
           pname = "sable-next-web-build";
           inherit version;
 
@@ -76,7 +176,11 @@
 
           nativeBuildInputs = with pkgs; [
             nodejs_24
-            pnpm_12
+
+            # The pinned pnpm, not pkgs.pnpm_12 — see pnpmPinned above.
+            (pnpmPinned {
+              inherit pkgs muslArch;
+            })
             pnpmConfigHook
             binaryen
 
@@ -85,6 +189,13 @@
             # spawn error ("status null"), not a useful message.
             cargo
             rustc
+
+            # nixpkgs' rustc rewrites the hardcoded "rust-lld" to "lld"
+            # (pkgs/development/compilers/rust/rustc.nix, postPatch) because
+            # Nixpkgs ships no bundled rust-lld. build-wasm.mjs invokes plain
+            # `cargo`, not the nix wrapper, so nothing else puts a linker on
+            # PATH and the wasm32 link dies with "linker `lld` not found".
+            lld
 
             (wasmBindgenCli {
               inherit pkgs muslArch;
@@ -116,45 +227,17 @@
           # the build never reaches out.
           SENTRY_AUTH_TOKEN = "";
 
-          dontConfigure = true;
+          # NOT dontConfigure: pnpmConfigHook registers itself in
+          # postConfigureHooks, so skipping the configure phase skips the hook,
+          # node_modules is never installed from the vendored store, and the
+          # first `pnpm exec vite build` tries to download the tree from
+          # registry.npmjs.org — which the sandbox forbids. configurePhase is
+          # otherwise a no-op for stdenv on a source tree with no autotools.
 
-          # The wasm build is a real cargo invocation, so it needs the five git
-          # repositories Cargo.lock pins, vendored — the sandbox has no network.
-          # importCargoLock fetches them as fixed-output derivations.
-          cargoGitDeps = pkgs.importCargoLock {
-            lockFile = ./Cargo.lock;
-            gitDir = "cargo-vendor";
-            outputHashes = {
-              # matrix-rust-sdk 0.19.1, rev bc2502ee….
-              "matrix-sdk-base-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-common-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-qrcode-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-sqlite-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-store-encryption-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-test-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-test-macros-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-test-utils-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-ui-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-
-              # tauri-plugin-notifications 0.5.0, SableClient fork (UnifiedPush/VAPID).
-              "tauri-plugin-notifications-0.5.0" = "sha256-IRjkPyK7F5I5LlPprTp1qjVvtaFPsBoArT8mLxjPN+Q=";
-
-              # tauri-plugin-app-icon 0.1.0. android/ios only; not compiled here.
-              "tauri-plugin-app-icon-0.1.0" = "sha256-yC835kEOJZje7kZ6H/DAbLUPjipu4NQqqJ6SimQthBM=";
-
-              # tauri-runtime-cef 0.1.0. Behind the non-default `cef` feature,
-              # which pulls a CEF download, so the default build never touches it.
-              "tauri-runtime-cef-0.1.0" = "sha256-d+m6Bh6PMj82qOtHWGmjUai0aApBiIkndUhK+vp/p6w=";
-
-              # tauri-plugin-livekit-mobile 0.2.0, android/ios only. Its
-              # Cargo.toml asks for rev ca97b1ec… but the locked commit is
-              # 92ddc076…, so the hash is for that tree.
-              "tauri-plugin-livekit-mobile-0.2.0" = "sha256-5QB7wu2js4JLkJWiJ6YgR7QpLzuVpm49PmKnO9tNm94=";
-            };
-          };
-
-          # Not actually needed: the vendor directory is referenced by absolute
-          # store path from the cargo config below, not injected as a dependency.
+          # Not actually needed: the vendor/ directory is not injected as a
+          # dependency. The [patch] entries in the root Cargo.toml point into it,
+          # and sable-wasm is the only crate the wasm build compiles, so it never
+          # reaches the Tauri-only tree.
 
           buildPhase = ''
             runHook preBuild
@@ -162,49 +245,25 @@
             export CARGO_HOME="$NIX_BUILD_TOP/cargo-home"
             mkdir -p "$CARGO_HOME"
 
-            # Vendor the five git dependencies and rewrite cargo's source config
-            # so the wasm build resolves them from disk. Revs below are the ones
-            # Cargo.lock pins; they must match the [source."git+…"] keys exactly
-            # or cargo ignores the replacement and tries the network.
-            mkdir -p .cargo
-            {
-              echo '[source.crates-io]'
-              echo 'replace-with = "vendored-sources"'
-              echo
-
-              echo '[source."git+https://github.com/matrix-org/matrix-rust-sdk?rev=bc2502ee3d3ba1dc687740df5be0f8635032399e"]'
-              echo 'git = "https://github.com/matrix-org/matrix-rust-sdk"'
-              echo 'rev = "bc2502ee3d3ba1dc687740df5be0f8635032399e"'
-              echo 'replace-with = "vendored-sources"'
-              echo
-
-              echo '[source."git+https://github.com/SableClient/tauri-plugin-notifications.git?rev=f230395e47f326cc09bcf644f7952d57cab518f7"]'
-              echo 'git = "https://github.com/SableClient/tauri-plugin-notifications.git"'
-              echo 'rev = "f230395e47f326cc09bcf644f7952d57cab518f7"'
-              echo 'replace-with = "vendored-sources"'
-              echo
-
-              echo '[source."git+https://github.com/SableClient/tauri-plugin-app-icon?rev=bab80ae17f6d018702e472c539d0f02eba480c21"]'
-              echo 'git = "https://github.com/SableClient/tauri-plugin-app-icon"'
-              echo 'rev = "bab80ae17f6d018702e472c539d0f02eba480c21"'
-              echo 'replace-with = "vendored-sources"'
-              echo
-
-              echo '[source."git+https://github.com/SableClient/tauri-plugin-livekit-mobile.git?rev=ca97b1ecd6fae4fc8faa3fe0b3e67661a98f7fe9"]'
-              echo 'git = "https://github.com/SableClient/tauri-plugin-livekit-mobile.git"'
-              echo 'rev = "ca97b1ecd6fae4fc8faa3fe0b3e67661a98f7fe9"'
-              echo 'replace-with = "vendored-sources"'
-              echo
-
-              echo '[source."git+https://github.com/SableClient/tauri-runtime-cef?rev=6568170ae5fb27b38dae1e367f0bb3a09a040152"]'
-              echo 'git = "https://github.com/SableClient/tauri-runtime-cef"'
-              echo 'rev = "6568170ae5fb27b38dae1e367f0bb3a09a040152"'
-              echo 'replace-with = "vendored-sources"'
-              echo
-
-              echo '[source.vendored-sources]'
-              echo "directory = \"${cargoGitDeps}\""
-            } > .cargo/config.toml
+            # Point cargo's source replacement at the vendored crates without
+            # touching .cargo/config.toml.
+            #
+            # importCargoLock already writes its own .cargo/config.toml holding
+            # the [source."git+…#<sha>"] keys Cargo.lock actually uses — with the
+            # fragment suffix. Overwriting that file with keys lacking the suffix
+            # makes cargo fall through to the network.
+            #
+            # And the repo's own .cargo/config.toml must survive untouched:
+            # scripts/build-wasm.mjs parses it for the wasm32 rustflags
+            # (getrandom_backend="wasm_js") and refuses to build without them.
+            # CARGO_HOME/config.toml is read *in addition* to the tree-local one,
+            # so this layers on top instead of replacing anything.
+            cp "${cargoGitDeps}/.cargo/config.toml" \
+              "$CARGO_HOME/config.toml"
+            # The vendored config points at a relative "cargo-vendor-dir"; make
+            # that absolute now that the file lives somewhere else entirely.
+            sed -i "s|directory = \"cargo-vendor-dir\"|directory = \"${cargoGitDeps}\"|" \
+              "$CARGO_HOME/config.toml"
 
             export CARGO_NET_OFFLINE=true
 
@@ -295,7 +354,9 @@
           installPhase = ''
             runHook preInstall
             mkdir -p "$out/bin"
-            install -Dm755 sable-web-view "$out/bin/sable-web-view"
+            # Named `sable`, not `sable-web-view`: this is the program the
+            # package presents, and the symlinkJoin wraps $out/bin/sable.
+            install -Dm755 sable-web-view "$out/bin/sable"
             runHook postInstall
           '';
 
@@ -321,7 +382,7 @@
             homepage = "https://sable.moe";
             license = lib.licenses.agpl3Plus;
             platforms = lib.platforms.linux;
-            mainProgram = "sable-web-view";
+            mainProgram = "sable";
           };
         };
 
@@ -343,14 +404,37 @@
           ];
           nativeBuildInputs = [ pkgs.makeWrapper ];
           postBuild = ''
-            wrapProgram $out/bin/sable-web-view \
+            wrapProgram $out/bin/sable \
               --prefix SABLE_DIST : ${dist}/share/sable/dist
+
+            # A desktop entry, so the app shows up in a launcher rather than
+            # only as a bare binary.
+            mkdir -p $out/share/applications
+            cat > $out/share/applications/sable.desktop <<EOF
+            [Desktop Entry]
+            Name=Sable Next
+            Comment=Matrix client
+            Exec=sable
+            Icon=sable
+            Terminal=false
+            Type=Application
+            Categories=Network;InstantMessaging;
+            EOF
+          '';
+          # The icon is one the frontend already ships — static/icons/logo.svg,
+          # referenced by its own web manifest. symlinkJoin would otherwise
+          # collide on share/ between the two inputs.
+          preBuild = ''
+            mkdir -p $out/share/icons/hicolor/scalable/apps
+            ln -s ${dist}/share/sable/dist/icons/logo.svg \
+              $out/share/icons/hicolor/scalable/apps/sable.svg
           '';
           meta =
             view.meta
             // {
               name = "sable-next-${version}";
               inherit version;
+              mainProgram = "sable";
             };
         };
 
@@ -415,6 +499,38 @@
             };
           };
 
+          # sable-core is a pure rlib — it produces no binary, no cdylib and no
+          # .so. cargoInstallHook only copies executables and
+          # .so/.a/.dylib, so with it in place this derivation "succeeds" into
+          # an empty store path and `nix build .#lib` looks like it worked while
+          # installing nothing at all.
+          #
+          # Skip it and install the rlib ourselves, from the same place the hook
+          # would have looked. `dontCargoInstall` has to be set because the hook
+          # self-installs in default.nix (`if [ -z "${dontCargoInstall-}" ] …
+          # then installPhase=cargoInstallHook`), and we want our installPhase.
+          dontCargoInstall = true;
+
+          installPhase = ''
+            runHook preInstall
+
+            mkdir -p "$out/lib"
+            # cargoBuildHook passes --target, so artefacts land in
+            # target/<triple>/release/, not target/release/. Ask rustc for the
+            # triple rather than relying on substituteAll, which does not apply
+            # to phases set here.
+            host_triple=$(rustc --print host-tuple)
+            rlib="target/$host_triple/release/libsable_core.rlib"
+            if [ ! -f "$rlib" ]; then
+              echo "install: $rlib is missing" >&2
+              find target -maxdepth 3 -name 'libsable_core*' >&2 || true
+              exit 1
+            fi
+            install -Dm644 "$rlib" "$out/lib/libsable_core.rlib"
+
+            runHook postInstall
+          '';
+
           # Keep the store path free of the checkout's own noise. vendor/ stays:
           # the [patch] entries in the root Cargo.toml point into it, and
           # vendor/tauri-plugin-edge-to-edge is on the workspace exclude list
@@ -468,6 +584,18 @@
           web-build = webBuild {
             inherit pkgs src muslArch;
           };
+
+          # The upstream Tauri desktop shell. CI-ONLY, and deliberately not
+          # `default`: it pulls ~1036 crates and takes hours on a small machine.
+          # Kept so the real desktop artefact stays reachable, and so a failure
+          # there is visible as this attribute rather than as a missing one.
+          # See BUILD-NIX.md.
+          #
+          # flake.tauri.nix is a separate flake, so it cannot be imported as a function
+          # (a flake is a set). The package logic lives in tauri-packages.nix,
+          # which is an ordinary function — so both flakes get the same
+          # derivation with no getFlake/purity problem on a dirty tree.
+          tauri = (import ./tauri-packages.nix nixpkgs).packages.${system}.default;
         }
       );
 
@@ -477,40 +605,59 @@
           pkgs = import nixpkgs {
             inherit system;
           };
+          muslArch = if system == "x86_64-linux" then "x86_64" else "aarch64";
         in
         {
           default = pkgs.mkShell {
-            packages = with pkgs; [
+            packages = [
               # frontend
-              nodejs_24
-              pnpm_12
-              binaryen
-              lefthook
+              pkgs.nodejs_24
 
-              # rust, including the wasm32 target rust-toolchain.toml pins
-              cargo
-              rustc
-              rustfmt
-              clippy
-              rust-analyzer
+              # The pinned pnpm, not pkgs.pnpm_12 — the same pin the package
+              # build uses. `nix develop` must be able to run
+              # `pnpm wasm:build`, and pnpm 12.3.4 refuses to honour
+              # packageManager: pnpm@12.4.1 without network access.
+              (pnpmPinned {
+                inherit pkgs muslArch;
+              })
+              pkgs.binaryen
+              pkgs.lefthook
+
+              # rust, including the wasm32 target rust-toolchain.toml pins.
+              # nixpkgs' rustc substitutes "rust-lld" for "lld", so lld has to be
+              # on PATH here too or the wasm32 link fails.
+              pkgs.cargo
+              pkgs.rustc
+              pkgs.rustfmt
+              pkgs.clippy
+              pkgs.rust-analyzer
+              pkgs.lld
+
+              # wasm-bindgen-cli, at the version Cargo.lock pins (0.2.128).
+              # build-wasm.mjs refuses to run on a mismatch, and nixpkgs ships
+              # 0.2.127.
+              (wasmBindgenCli {
+                inherit pkgs muslArch;
+              })
 
               # native: webkit2gtk_4_1 headers for the wrapper, plus gtk3,
               # which is what webkitgtk_4_1 links against in nixpkgs
-              pkg-config
-              glib
-              gtk3
-              libsoup_3
-              webkitgtk_4_1
-              openssl
-              sqlite
-            ] ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+              pkgs.pkg-config
+              pkgs.glib
+              pkgs.gtk3
+              pkgs.libsoup_3
+              pkgs.webkitgtk_4_1
+              pkgs.openssl
+              pkgs.sqlite
+            ]
+            ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux (with pkgs; [
               # Tauri-iteration extras; not needed for the web build
               cmake
               perl
               pipewire
               librsvg
               xdotool
-            ];
+            ]);
           };
         }
       );

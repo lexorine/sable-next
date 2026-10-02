@@ -108,7 +108,11 @@ static void on_uri_request(WebKitURISchemeRequest *request, gpointer user_data) 
   }
 
   gsize length = 0;
-  g_autofree gchar *contents = NULL;
+  /* Deliberately not g_autofree: g_memory_input_stream_new_from_data takes
+   * ownership of the buffer, so g_autofree here would free it a second time on
+   * scope exit — an observable double free ("free(): invalid size") once the
+   * request is serviced. */
+  gchar *contents = NULL;
   g_autoptr(GError) error = NULL;
   if (!g_file_get_contents(file, &contents, &length, &error)) {
     webkit_uri_scheme_request_finish_error(request, error);
@@ -116,7 +120,7 @@ static void on_uri_request(WebKitURISchemeRequest *request, gpointer user_data) 
   }
 
   g_autofree gchar *mime = g_content_type_guess(file, NULL, 0, NULL);
-  /* The stream takes ownership of contents, so do not free it separately. */
+  /* NULL destroy notify: the stream frees `contents` when it is disposed. */
   g_autoptr(GInputStream) stream =
       g_memory_input_stream_new_from_data(contents, length, NULL);
   webkit_uri_scheme_request_finish(request, stream, (gint64)length, mime);
@@ -140,11 +144,46 @@ static gboolean on_load_failed(WebKitWebView *view, WebKitLoadEvent event,
 static void on_notify_title(GObject *object, GParamSpec *pspec, gpointer data) {
   (void)pspec;
   (void)data;
-  g_autofree const gchar *title = webkit_web_view_get_title(WEBKIT_WEB_VIEW(object));
+
+  /*
+   * transfer-none, and NOT g_autofree. The getter returns a string owned by
+   * the WebKitWebView; freeing it corrupts GLib's heap. This is not theoretical
+   * — it aborts the process on the first title change of a real page:
+   *
+   *   PageLoadStateObserver::didChangeTitle()
+   *     -> notify::title -> this handler -> g_free -> malloc_printerr
+   *        "free(): invalid size" / SIGABRT
+   *
+   * gtk_window_set_title copies the string, so nothing leaks by not freeing.
+   */
+  const gchar *title = webkit_web_view_get_title(WEBKIT_WEB_VIEW(object));
   if (title != NULL && title[0] != '\0') {
     gtk_window_set_title(GTK_WINDOW(gtk_widget_get_toplevel(GTK_WIDGET(object))),
                           title);
   }
+}
+
+/*
+ * PNG, not the SVG the frontend also ships: gdk-pixbuf decodes PNG natively,
+ * whereas SVG needs an external loader (librsvg) that a bare
+ * webkit2gtk+gtk3 runtime does not necessarily have. If it is missing the icon
+ * silently does not appear, so the safest portable choice is the PNG.
+ */
+static void set_window_icon(GtkWindow *window, const char *dist) {
+  g_autofree char *icon =
+      g_build_filename(dist, "icons", "logo-512x512.png", NULL);
+  if (!g_file_test(icon, G_FILE_TEST_EXISTS)) return;
+
+  g_autoptr(GError) error = NULL;
+  GdkPixbuf *pixbuf =
+      gdk_pixbuf_new_from_file_at_scale(icon, 128, 128, TRUE, &error);
+  if (pixbuf == NULL) {
+    g_printerr("sable-web-view: cannot load %s: %s\n", icon, error->message);
+    return;
+  }
+
+  gtk_window_set_icon(window, pixbuf);
+  g_object_unref(pixbuf);
 }
 
 int main(int argc, char **argv) {
@@ -165,6 +204,7 @@ int main(int argc, char **argv) {
 
   GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
   gtk_window_set_default_size(GTK_WINDOW(window), 1280, 900);
+  set_window_icon(GTK_WINDOW(window), dist);
 
   /* webkit_web_view_new_with_context returns GtkWidget* in this ABI. */
   GtkWidget *webview = GTK_WIDGET(webkit_web_view_new_with_context(context));
@@ -173,6 +213,9 @@ int main(int argc, char **argv) {
 
   gtk_container_add(GTK_CONTAINER(window), webview);
   g_signal_connect(window, "destroy", G_CALLBACK(on_destroy), NULL);
+  /* Set a title before the load completes, so the window is never nameless
+   * while WebKit parses the document. */
+  gtk_window_set_title(GTK_WINDOW(window), "Sable Next");
   gtk_widget_show_all(window);
 
   g_autofree char *uri = g_strdup_printf("%s://index.html", SABLE_SCHEME);
