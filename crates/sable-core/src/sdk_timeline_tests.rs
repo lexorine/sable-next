@@ -3659,16 +3659,22 @@ async fn redacted_content_core(
     // `power_level` is compared against the room's `redact` level, which the
     // factory leaves at the spec default of 50, so a caller passing 50 is at
     // the boundary rather than comfortably past it.
+    // `power_levels_or_default` reads from storage, and `power_levels` returns
+    // `InsufficientData` unless the room also has its `m.room.create` event, so
+    // a fixture without one silently falls back to the spec defaults — which is
+    // what made a user placed at 50 read back as 0.
     let mut users = std::collections::BTreeMap::new();
     users.insert(own_user_id.clone(), Int::from(power_level));
 
     let room = server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id.as_ref()).add_state_bulk([
-                factory.member(&own_user_id).into_raw(),
-                factory.power_levels(&mut users).into_raw(),
-            ]),
+            JoinedRoomBuilder::new(room_id.as_ref())
+                .add_timeline_state_bulk([
+                    factory.member(&own_user_id).into_raw(),
+                    factory.power_levels(&mut users).into_raw(),
+                ])
+                .add_state_event(factory.create(&own_user_id, "10".try_into().unwrap()).into_raw()),
         )
         .await;
     server.mock_room_state_encryption().plain().mount().await;
@@ -3864,6 +3870,12 @@ async fn a_refusal_from_the_server_is_reported_as_a_refusal() {
         })))
         .mount(server.server())
         .await;
+    // The SDK fetched and cached `/versions` while the mock client was being
+    // built, so advertising the feature after that has no effect unless the
+    // cache is dropped. Without this every 403 reads as "homeserver without
+    // support" and the refusal is never distinguishable.
+    client.reset_supported_versions().await.expect("a cache to drop");
+
     Mock::given(method("GET"))
         .and(path(format!(
             "/_matrix/client/v3/rooms/{room_id}/event/{event_id}"
@@ -3905,6 +3917,12 @@ async fn erased_content_is_final_rather_than_retryable() {
         })))
         .mount(server.server())
         .await;
+    // The SDK fetched and cached `/versions` while the mock client was being
+    // built, so advertising the feature after that has no effect unless the
+    // cache is dropped. Without this every 403 reads as "homeserver without
+    // support" and the refusal is never distinguishable.
+    client.reset_supported_versions().await.expect("a cache to drop");
+
     Mock::given(method("GET"))
         .and(path(format!(
             "/_matrix/client/v3/rooms/{room_id}/event/{event_id}"
@@ -3949,6 +3967,12 @@ async fn a_server_without_the_feature_hides_the_affordance_for_good() {
         })))
         .mount(server.server())
         .await;
+    // The SDK fetched and cached `/versions` while the mock client was being
+    // built, so advertising the feature after that has no effect unless the
+    // cache is dropped. Without this every 403 reads as "homeserver without
+    // support" and the refusal is never distinguishable.
+    client.reset_supported_versions().await.expect("a cache to drop");
+
     Mock::given(method("GET"))
         .and(path(format!(
             "/_matrix/client/v3/rooms/{room_id}/event/{event_id}"
@@ -3990,6 +4014,12 @@ async fn a_server_fault_stays_retryable() {
         })))
         .mount(server.server())
         .await;
+    // The SDK fetched and cached `/versions` while the mock client was being
+    // built, so advertising the feature after that has no effect unless the
+    // cache is dropped. Without this every 403 reads as "homeserver without
+    // support" and the refusal is never distinguishable.
+    client.reset_supported_versions().await.expect("a cache to drop");
+
     Mock::given(method("GET"))
         .and(path(format!(
             "/_matrix/client/v3/rooms/{room_id}/event/{event_id}"
