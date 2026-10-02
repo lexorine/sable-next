@@ -3674,7 +3674,11 @@ async fn redacted_content_core(
                     factory.member(&own_user_id).into_raw(),
                     factory.power_levels(&mut users).into_raw(),
                 ])
-                .add_state_event(factory.create(&own_user_id, "10".try_into().unwrap()).into_raw()),
+                .add_state_event(
+                    factory
+                        .create(&own_user_id, "10".try_into().unwrap())
+                        .into_raw(),
+                ),
         )
         .await;
     server.mock_room_state_encryption().plain().mount().await;
@@ -3874,7 +3878,10 @@ async fn a_refusal_from_the_server_is_reported_as_a_refusal() {
     // built, so advertising the feature after that has no effect unless the
     // cache is dropped. Without this every 403 reads as "homeserver without
     // support" and the refusal is never distinguishable.
-    client.reset_supported_versions().await.expect("a cache to drop");
+    client
+        .reset_supported_versions()
+        .await
+        .expect("a cache to drop");
 
     Mock::given(method("GET"))
         .and(path(format!(
@@ -3921,7 +3928,10 @@ async fn erased_content_is_final_rather_than_retryable() {
     // built, so advertising the feature after that has no effect unless the
     // cache is dropped. Without this every 403 reads as "homeserver without
     // support" and the refusal is never distinguishable.
-    client.reset_supported_versions().await.expect("a cache to drop");
+    client
+        .reset_supported_versions()
+        .await
+        .expect("a cache to drop");
 
     Mock::given(method("GET"))
         .and(path(format!(
@@ -3971,7 +3981,10 @@ async fn a_server_without_the_feature_hides_the_affordance_for_good() {
     // built, so advertising the feature after that has no effect unless the
     // cache is dropped. Without this every 403 reads as "homeserver without
     // support" and the refusal is never distinguishable.
-    client.reset_supported_versions().await.expect("a cache to drop");
+    client
+        .reset_supported_versions()
+        .await
+        .expect("a cache to drop");
 
     Mock::given(method("GET"))
         .and(path(format!(
@@ -4018,7 +4031,10 @@ async fn a_server_fault_stays_retryable() {
     // built, so advertising the feature after that has no effect unless the
     // cache is dropped. Without this every 403 reads as "homeserver without
     // support" and the refusal is never distinguishable.
-    client.reset_supported_versions().await.expect("a cache to drop");
+    client
+        .reset_supported_versions()
+        .await
+        .expect("a cache to drop");
 
     Mock::given(method("GET"))
         .and(path(format!(
