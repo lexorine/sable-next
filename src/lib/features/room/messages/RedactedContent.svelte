@@ -77,6 +77,11 @@
     switch (code) {
       case 'denied':
         return { message: $i18n.t('timeline.redactedDenied'), retryable: false };
+      case 'unsupported':
+        // `unsupported` covers the three permanent answers: no such endpoint, no
+        // such event, or a retention window that has already erased the copy.
+        // None of them can turn into content on a retry.
+        return { message: $i18n.t('timeline.redactedUnsupported'), retryable: false };
       case 'unavailable':
         return { message: $i18n.t('timeline.redactedUnavailable'), retryable: true };
       default:
@@ -109,13 +114,15 @@
 {#if phase.kind === 'shown'}
   <div class="unredacted">
     <span class="unredacted-label">{$i18n.t('timeline.redactedShown')}</span>
-    <MessageBody
-      item={phase.item}
-      canRedactOthers={false}
-      {senderTimezone}
-      {onMatrixLink}
-    />
+    <MessageBody item={phase.item} canRedactOthers={false} {senderTimezone} {onMatrixLink} />
   </div>
+{:else if phase.kind === 'failed' && !phase.retryable}
+  <!--
+    A permanent refusal is not an action, so it is no longer a button: a control
+    labelled with the reason would still be focusable and clickable, and a
+    click would send a request that cannot succeed.
+  -->
+  <span class="unredacted-failed">{phase.message}</span>
 {:else}
   <Button
     class="unredacted-reveal"
@@ -128,8 +135,6 @@
   >
     {#if phase.kind === 'loading'}
       {$i18n.t('timeline.redactedLoading')}
-    {:else if phase.kind === 'failed' && !phase.retryable}
-      {phase.message}
     {:else}
       {$i18n.t('timeline.viewRedacted')}
     {/if}

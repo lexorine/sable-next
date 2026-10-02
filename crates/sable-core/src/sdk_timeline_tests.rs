@@ -3,8 +3,7 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use futures_util::{StreamExt, pin_mut};
 use matrix_sdk::{
     ruma::{
-        OwnedEventId, OwnedRoomId, OwnedUserId,
-        event_id,
+        OwnedEventId, OwnedRoomId, OwnedUserId, event_id,
         events::{
             key::verification::done::KeyVerificationDoneEventContent,
             receipt::{ReceiptThread, ReceiptType},
@@ -3639,17 +3638,27 @@ async fn an_emptied_state_event_is_a_state_event_not_a_deleted_message() {
 ///
 /// `power_level` is the user's level, compared against the room's `redact`
 /// level, which the factory leaves at the spec default of 50.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 async fn redacted_content_core(
     server: &MatrixMockServer,
     client: matrix_sdk::Client,
     room_id: &OwnedRoomId,
     power_level: u32,
 ) -> (std::sync::Arc<Core>, OwnedUserId) {
+    use crate::redacted::may_view_redacted;
     use matrix_sdk::ruma::Int;
 
     let own_user_id = client.user_id().expect("a logged-in user").to_owned();
-    let factory = EventFactory::new().room(room_id.as_ref()).sender(*ALICE);
+    // The state events must come from the account that owns the client: the
+    // SDK drops state it considers unauthorised, and a silently dropped
+    // power-levels event reads as `redact 50` against a user of 0.
+    let factory = EventFactory::new()
+        .room(room_id.as_ref())
+        .sender(own_user_id.as_ref());
 
+    // `power_level` is compared against the room's `redact` level, which the
+    // factory leaves at the spec default of 50, so a caller passing 50 is at
+    // the boundary rather than comfortably past it.
     let mut users = std::collections::BTreeMap::new();
     users.insert(own_user_id.clone(), Int::from(power_level));
 
@@ -3663,7 +3672,26 @@ async fn redacted_content_core(
         )
         .await;
     server.mock_room_state_encryption().plain().mount().await;
-    assert_eq!(room.room_id(), room_id.as_ref() as &matrix_sdk::ruma::RoomId);
+    assert_eq!(
+        room.room_id(),
+        room_id.as_ref() as &matrix_sdk::ruma::RoomId
+    );
+
+    // The gate reads the room's own state, so a mismatch between what the mock
+    // was given and what the SDK ended up with would otherwise surface only as
+    // a bare `Denied` much later in the test. Asserted only for the privileged
+    // caller: the point of the unprivileged test is that it lands below.
+    let seen = room.power_levels_or_default().await;
+    if power_level >= 50 {
+        assert!(
+            may_view_redacted(&seen, &own_user_id),
+            "a caller at the redact level must pass the gate: fixture put {own_user_id} at {power_level}, \
+             but the room reports {:?} for {own_user_id:?} against redact {:?} (users map {:?})",
+            seen.for_user(&own_user_id),
+            seen.redact,
+            seen.users,
+        );
+    }
 
     let sync_service = Arc::new(SyncService::builder(client.clone()).build().await.unwrap());
     let (core, _events) = Core::new("test", Box::new(MemorySessionStore::default()));

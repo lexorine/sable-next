@@ -103,6 +103,12 @@
   {#if canRedactOthers && item.event_id && roomId}
     <RedactedContent {roomId} {item} {senderTimezone} {onMatrixLink} />
   {/if}
+{:else if item.content.kind === 'message'}
+  {#if item.content.html}
+    <FormattedBody html={item.content.html} {senderTimezone} {onMatrixLink} />
+  {:else}
+    <p class="body">{item.content.body}</p>
+  {/if}
 {:else if item.content.kind === 'sticker'}
   <MediaImage
     class="sticker privacy-media"
@@ -258,7 +264,7 @@
 
   /* The recovered content sits under the tombstone, not in place of it. */
   :global(.unredacted) {
-    border-inline-start: var(--space-100) solid var(--surface-var-outline-variant);
+    border-inline-start: var(--border-width) solid var(--primary-main);
     display: flex;
     flex-direction: column;
     gap: var(--space-100);
@@ -268,6 +274,12 @@
 
   :global(.unredacted-label) {
     color: var(--surface-var-on-container);
+    font-size: var(--font-size-small);
+  }
+
+  :global(.unredacted-failed) {
+    color: var(--surface-var-on-container);
+    display: block;
     font-size: var(--font-size-small);
   }
 
