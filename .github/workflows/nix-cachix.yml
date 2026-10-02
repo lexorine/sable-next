@@ -49,7 +49,7 @@ jobs:
       # a stock ubuntu-24.04 runner (~14G free) fills up mid-build. Reclaim ~30G
       # by dropping the preinstalled toolchains we never touch.
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@v6
+        uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true
           android: true
