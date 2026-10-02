@@ -839,7 +839,7 @@
             style:--receipt-reserve={inlineReceipts ? `${String(receiptWidth)}px` : undefined}
             {@attach inlineReceipts ? receiptReserve : undefined}
           >
-            <MessageBody {item} {canRedactOthers} />
+            <MessageBody {item} {roomId} {canRedactOthers} {senderTimezone} {onMatrixLink} />
             {#if inlineReceipts}
               <span class="receipt-space" aria-hidden="true"></span>
               {@render receiptSlot()}
@@ -849,6 +849,7 @@
           <div class:content-bubble={layout === 'bubble' && nonTextContent}>
             <MessageBody
               {item}
+              {roomId}
               {senderTimezone}
               {members}
               {canRedactOthers}

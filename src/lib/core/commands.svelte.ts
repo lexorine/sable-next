@@ -47,6 +47,7 @@ import type {
   PusherView,
   PushFetchView,
   ReactionShortcodeView,
+  RedactedContentView,
   RegisteredPusherView,
   RelationsView,
   RegistrationResultView,
@@ -487,6 +488,25 @@ export function createCommands(transport: () => Transport) {
         room_id: roomId,
       });
       return response;
+    },
+
+    /**
+     * MSC2815: reads a redacted event's original content.
+     *
+     * `content` is null when the homeserver answered but had nothing to give —
+     * it ignored the query parameter, or the event is a state event. That is not
+     * an error, so it is reported as an empty answer rather than a rejection.
+     */
+    async redactedContent(
+      roomId: string,
+      eventId: string
+    ): Promise<RedactedContentView> {
+      const response = await transport().send({
+        type: 'redacted_content',
+        room_id: roomId,
+        event_id: eventId,
+      });
+      return response.content;
     },
 
     async timestampToEvent(

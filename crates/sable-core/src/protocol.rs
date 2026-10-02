@@ -385,6 +385,17 @@ pub enum Command {
         event_types: Vec<String>,
         reason: Option<String>,
     },
+    /// MSC2815: read a redacted event's original content.
+    ///
+    /// Refused with [`CommandErr::Denied`] for anyone below the room's `redact`
+    /// level, and with [`CommandErr::Unsupported`] when the homeserver does not
+    /// implement MSC2815 at all.
+    RedactedContent {
+        #[cfg_attr(feature = "typegen", specta(type = String))]
+        room_id: OwnedRoomId,
+        #[cfg_attr(feature = "typegen", specta(type = String))]
+        event_id: OwnedEventId,
+    },
     PinnedEvents {
         #[cfg_attr(feature = "typegen", specta(type = String))]
         room_id: OwnedRoomId,
@@ -1576,6 +1587,10 @@ pub enum CommandOk {
     DeleteThread,
     BulkRedact {
         redacted: u32,
+    },
+    /// MSC2815.
+    RedactedContent {
+        content: RedactedContentView,
     },
     PinnedEvents {
         #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
@@ -3454,6 +3469,30 @@ pub struct EditVersionView {
     pub timestamp: u64,
     pub body: String,
     pub html: String,
+}
+
+/// MSC2815: what a redacted event originally said.
+///
+/// `content` is `None` when the server answered but had nothing to give — an
+/// event that was never redacted, a state event, or a homeserver that ignored
+/// the query parameter. The UI reads that as "nothing to show" rather than as
+/// an error, because the request itself succeeded.
+#[derive(Debug, Clone, Default, Serialize)]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+pub struct RedactedContentView {
+    /// The original message, rendered exactly as the timeline renders a live
+    /// one: same variants, same sanitised HTML.
+    pub content: Option<TimelineItemContentView>,
+    /// The sender's per-message profile, which for a redacted message only
+    /// survives inside the event the server returned.
+    pub per_message_profile: Option<PerMessageProfileView>,
+}
+
+impl RedactedContentView {
+    /// The empty answer, for a response with nothing in it.
+    pub fn empty() -> Self {
+        Self::default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

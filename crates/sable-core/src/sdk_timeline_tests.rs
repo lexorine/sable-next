@@ -3,6 +3,7 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use futures_util::{StreamExt, pin_mut};
 use matrix_sdk::{
     ruma::{
+        OwnedEventId, OwnedRoomId, OwnedUserId,
         event_id,
         events::{
             key::verification::done::KeyVerificationDoneEventContent,
@@ -23,7 +24,7 @@ use matrix_sdk_ui::sync_service::{State as SyncState, SyncService};
 use serde_json::json;
 use wiremock::{
     Mock, ResponseTemplate,
-    matchers::{body_partial_json, method, path, path_regex},
+    matchers::{body_partial_json, method, path, path_regex, query_param},
 };
 
 use super::{
@@ -3829,4 +3830,357 @@ async fn an_emptied_state_event_is_a_state_event_not_a_deleted_message() {
         }
         other => panic!("expected a state event, got {other:?}"),
     }
+}
+
+/// MSC2815: builds a core whose session holds `client`, joined to `room_id`.
+///
+/// `power_level` is the user's level, compared against the room's `redact`
+/// level, which the factory leaves at the spec default of 50.
+async fn redacted_content_core(
+    server: &MatrixMockServer,
+    client: matrix_sdk::Client,
+    room_id: &OwnedRoomId,
+    power_level: u32,
+) -> (std::sync::Arc<Core>, OwnedUserId) {
+    use matrix_sdk::ruma::Int;
+
+    let own_user_id = client.user_id().expect("a logged-in user").to_owned();
+    let factory = EventFactory::new().room(room_id.as_ref()).sender(*ALICE);
+
+    let mut users = std::collections::BTreeMap::new();
+    users.insert(own_user_id.clone(), Int::from(power_level));
+
+    let room = server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id.as_ref()).add_state_bulk([
+                factory.member(&own_user_id).into_raw(),
+                factory.power_levels(&mut users).into_raw(),
+            ]),
+        )
+        .await;
+    server.mock_room_state_encryption().plain().mount().await;
+    assert_eq!(room.room_id(), room_id.as_ref() as &matrix_sdk::ruma::RoomId);
+
+    let sync_service = Arc::new(SyncService::builder(client.clone()).build().await.unwrap());
+    let (core, _events) = Core::new("test", Box::new(MemorySessionStore::default()));
+    *core.session.write().await = Some(Session {
+        account_id: "test".to_owned(),
+        client,
+        sync_service,
+        homeserver: server.server().uri(),
+        oauth: false,
+    });
+
+    (core, own_user_id)
+}
+
+/// Mounts `GET /rooms/{roomId}/event/{eventId}` so that only a request carrying
+/// the MSC2815 parameter answers, and a request without it gets a 403 the way a
+/// homeserver with the feature off behaves.
+async fn mock_unredacted_read(
+    server: &MatrixMockServer,
+    room_id: &OwnedRoomId,
+    event_id: &OwnedEventId,
+    body: serde_json::Value,
+) {
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/_matrix/client/v3/rooms/{room_id}/event/{event_id}"
+        )))
+        .and(query_param(
+            "fi.mau.msc2815.include_unredacted_content",
+            "true",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(server.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/_matrix/client/v3/rooms/{room_id}/event/{event_id}"
+        )))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "errcode": "M_FORBIDDEN",
+            "error": "the query parameter is not supported",
+        })))
+        .mount(server.server())
+        .await;
+}
+
+#[tokio::test]
+async fn a_moderator_reads_the_original_content_of_a_redacted_event() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room_id = OwnedRoomId::try_from("!msc2815:example.org").unwrap();
+    let event_id = OwnedEventId::try_from("$redacted").unwrap();
+
+    mock_unredacted_read(
+        &server,
+        &room_id,
+        &event_id,
+        json!({
+            "type": "m.room.message",
+            "event_id": "$redacted",
+            "sender": ALICE.to_string(),
+            "origin_server_ts": 1,
+            "room_id": "!msc2815:example.org",
+            "content": { "msgtype": "m.text", "body": "the secret" },
+        }),
+    )
+    .await;
+    let (core, _) = redacted_content_core(&server, client, &room_id, 50).await;
+
+    let response = core
+        .dispatch(Command::RedactedContent {
+            room_id: room_id.clone(),
+            event_id: event_id.clone(),
+        })
+        .await
+        .expect("a moderator may read it");
+
+    match response {
+        CommandOk::RedactedContent { content } => match content.content {
+            Some(crate::protocol::TimelineItemContentView::Message { body, .. }) => {
+                assert_eq!(body, "the secret");
+            }
+            other => panic!("expected the unredacted message, got {other:?}"),
+        },
+        other => panic!("expected redacted content, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_user_below_the_redact_level_never_reaches_the_endpoint() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room_id = OwnedRoomId::try_from("!msc2815:example.org").unwrap();
+    let event_id = OwnedEventId::try_from("$redacted").unwrap();
+
+    // No mock for the endpoint: reaching it at all is the failure this guards.
+    let (core, _) = redacted_content_core(&server, client, &room_id, 0).await;
+
+    let error = core
+        .dispatch(Command::RedactedContent {
+            room_id,
+            event_id: event_id.clone(),
+        })
+        .await
+        .expect_err("below the redact level");
+
+    assert!(
+        matches!(error, CommandErr::Denied),
+        "expected a refusal, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_server_that_ignored_the_parameter_reads_as_empty_not_broken() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room_id = OwnedRoomId::try_from("!msc2815:example.org").unwrap();
+    let event_id = OwnedEventId::try_from("$redacted").unwrap();
+
+    // A homeserver without the feature answers 200 with the event still
+    // redacted, so the UI has to be able to tell that from real content.
+    mock_unredacted_read(
+        &server,
+        &room_id,
+        &event_id,
+        json!({
+            "type": "m.room.message",
+            "event_id": "$redacted",
+            "sender": ALICE.to_string(),
+            "origin_server_ts": 1,
+            "room_id": "!msc2815:example.org",
+            "content": {},
+            "unsigned": { "redacted_because": { "content": { "reason": "spam" } } },
+        }),
+    )
+    .await;
+    let (core, _) = redacted_content_core(&server, client, &room_id, 50).await;
+
+    let response = core
+        .dispatch(Command::RedactedContent {
+            room_id,
+            event_id: event_id.clone(),
+        })
+        .await
+        .expect("the request itself succeeded");
+
+    match response {
+        CommandOk::RedactedContent { content } => assert!(
+            content.content.is_none(),
+            "a still-redacted event must not read as content"
+        ),
+        other => panic!("expected redacted content, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_from_the_server_is_reported_as_a_refusal() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room_id = OwnedRoomId::try_from("!msc2815:example.org").unwrap();
+    let event_id = OwnedEventId::try_from("$redacted").unwrap();
+
+    // Advertises the feature, then refuses: the power levels changed underneath
+    // the client between rendering and clicking.
+    Mock::given(method("GET"))
+        .and(path("/_matrix/client/versions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "versions": ["v1.11"],
+            "unstable_features": { "fi.mau.msc2815": true },
+        })))
+        .mount(server.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/_matrix/client/v3/rooms/{room_id}/event/{event_id}"
+        )))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "errcode": "M_FORBIDDEN",
+            "error": "You don't have permission to view redacted events in this room.",
+        })))
+        .mount(server.server())
+        .await;
+    let (core, _) = redacted_content_core(&server, client, &room_id, 50).await;
+
+    let error = core
+        .dispatch(Command::RedactedContent {
+            room_id,
+            event_id: event_id.clone(),
+        })
+        .await
+        .expect_err("the server refused");
+
+    assert!(
+        matches!(error, CommandErr::Denied),
+        "expected a refusal, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn erased_content_is_final_rather_than_retryable() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room_id = OwnedRoomId::try_from("!msc2815:example.org").unwrap();
+    let event_id = OwnedEventId::try_from("$redacted").unwrap();
+
+    Mock::given(method("GET"))
+        .and(path("/_matrix/client/versions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "versions": ["v1.11"],
+            "unstable_features": { "fi.mau.msc2815": true },
+        })))
+        .mount(server.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/_matrix/client/v3/rooms/{room_id}/event/{event_id}"
+        )))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "errcode": "FI.MAU.MSC2815_UNREDACTED_CONTENT_DELETED",
+            "error": "The content for that event has already been erased from the database",
+            "fi.mau.msc2815.content_keep_ms": 604_800_000u64,
+        })))
+        .mount(server.server())
+        .await;
+    let (core, _) = redacted_content_core(&server, client, &room_id, 50).await;
+
+    let error = core
+        .dispatch(Command::RedactedContent {
+            room_id,
+            event_id: event_id.clone(),
+        })
+        .await
+        .expect_err("the content is gone");
+
+    assert!(
+        matches!(error, CommandErr::Unsupported),
+        "erased content is as final as an unsupported server, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_server_without_the_feature_hides_the_affordance_for_good() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room_id = OwnedRoomId::try_from("!msc2815:example.org").unwrap();
+    let event_id = OwnedEventId::try_from("$redacted").unwrap();
+
+    // Advertises nothing and answers 403, which is what Synapse does when the
+    // experimental flag is off.
+    Mock::given(method("GET"))
+        .and(path("/_matrix/client/versions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "versions": ["v1.11"],
+            "unstable_features": {},
+        })))
+        .mount(server.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/_matrix/client/v3/rooms/{room_id}/event/{event_id}"
+        )))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "errcode": "M_FORBIDDEN",
+            "error": "You don't have permission to view redacted events in this room.",
+        })))
+        .mount(server.server())
+        .await;
+    let (core, _) = redacted_content_core(&server, client, &room_id, 50).await;
+
+    let error = core
+        .dispatch(Command::RedactedContent {
+            room_id,
+            event_id: event_id.clone(),
+        })
+        .await
+        .expect_err("no such endpoint");
+
+    assert!(
+        matches!(error, CommandErr::Unsupported),
+        "an unsupported server is distinguishable from a refusal, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_server_fault_stays_retryable() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room_id = OwnedRoomId::try_from("!msc2815:example.org").unwrap();
+    let event_id = OwnedEventId::try_from("$redacted").unwrap();
+
+    Mock::given(method("GET"))
+        .and(path("/_matrix/client/versions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "versions": ["v1.11"],
+            "unstable_features": { "fi.mau.msc2815": true },
+        })))
+        .mount(server.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/_matrix/client/v3/rooms/{room_id}/event/{event_id}"
+        )))
+        .respond_with(ResponseTemplate::new(502).set_body_json(json!({
+            "errcode": "M_UNKNOWN",
+            "error": "the homeserver is unwell",
+        })))
+        .mount(server.server())
+        .await;
+    let (core, _) = redacted_content_core(&server, client, &room_id, 50).await;
+
+    let error = core
+        .dispatch(Command::RedactedContent {
+            room_id,
+            event_id: event_id.clone(),
+        })
+        .await
+        .expect_err("the homeserver is unwell");
+
+    assert!(
+        matches!(error, CommandErr::Unavailable),
+        "a server fault must keep the UI alive for a retry, got {error:?}"
+    );
 }

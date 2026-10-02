@@ -1,0 +1,296 @@
+{
+  description = "sable-next — native Nix packages";
+
+  inputs = {
+    # nixpkgs 26.11pre ships rustc 1.98.1, the exact version
+    # rust-toolchain.toml pins, and its rustc already includes the
+    # wasm32-unknown-unknown std.
+    nixpkgs.url = "github:NixOS/nixpkgs/c59305bab2065cfecc4944690d9eedbb56f3a9fa";
+  };
+
+  outputs =
+    {
+      self,
+      nixpkgs,
+    }:
+    let
+      inherit (nixpkgs) lib;
+
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
+      forAllSystems = lib.genAttrs systems;
+
+      # Cargo.lock resolves 13 crates out of five git repositories.
+      # importCargoLock keys its `outputHashes` on *name-version*, not on the
+      # commit, and every entry it is given must correspond to a git dependency
+      # or evaluation fails ("a hash was specified … but there is no
+      # corresponding git dependency"). Hashes below were produced by running
+      # fetchgit with lib.fakeHash, one per repository; several keys share a
+      # repository's hash, which is what importCargoLock expects.
+      gitOutputHashes = {
+        # matrix-rust-sdk 0.19.1, rev bc2502ee…. The root Cargo.toml also
+        # carries [patch] entries pointing matrix-sdk, -crypto and -indexeddb at
+        # the vendor/ tree, and vendor/ is on the workspace exclude list. Those
+        # three resolve from the checkout; the crates below are not patched and
+        # still come from git, so the fetch remains necessary.
+        "matrix-sdk-base-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
+        "matrix-sdk-common-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
+        "matrix-sdk-qrcode-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
+        "matrix-sdk-sqlite-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
+        "matrix-sdk-store-encryption-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
+        "matrix-sdk-test-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
+        "matrix-sdk-test-macros-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
+        "matrix-sdk-test-utils-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
+        "matrix-sdk-ui-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
+
+        # tauri-plugin-notifications 0.5.0, SableClient fork (UnifiedPush/VAPID).
+        "tauri-plugin-notifications-0.5.0" = "sha256-IRjkPyK7F5I5LlPprTp1qjVvtaFPsBoArT8mLxjPN+Q=";
+
+        # tauri-plugin-app-icon 0.1.0. android/ios only; not compiled here.
+        "tauri-plugin-app-icon-0.1.0" = "sha256-yC835kEOJZje7kZ6H/DAbLUPjipu4NQqqJ6SimQthBM=";
+
+        # tauri-runtime-cef 0.1.0. Behind the non-default `cef` feature, which
+        # pulls a CEF download, so the default `wry` build never touches it.
+        "tauri-runtime-cef-0.1.0" = "sha256-d+m6Bh6PMj82qOtHWGmjUai0aApBiIkndUhK+vp/p6w=";
+
+        # tauri-plugin-livekit-mobile 0.2.0, android/ios only. Its Cargo.toml
+        # asks for rev ca97b1ec… but the locked commit is 92ddc076…, so the hash
+        # is for that tree.
+        "tauri-plugin-livekit-mobile-0.2.0" = "sha256-5QB7wu2js4JLkJWiJ6YgR7QpLzuVpm49PmKnO9tNm94=";
+      };
+    in
+    {
+      packages = forAllSystems (
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          inherit (pkgs) lib;
+
+          muslArch = if system == "x86_64-linux" then "x86_64" else "aarch64";
+
+          # scripts/build-wasm.mjs aborts unless `wasm-bindgen --version` equals
+          # the wasm-bindgen in Cargo.lock — 0.2.128. nixpkgs 26.11 ships
+          # wasm-bindgen-cli 0.2.127, so the upstream release tarball is used
+          # rather than editing the lockfile or bypassing the assertion.
+          wasm-bindgen-cli-0-2-128 = pkgs.stdenvNoCC.mkDerivation {
+            pname = "wasm-bindgen-cli";
+            version = "0.2.128";
+            src = pkgs.fetchurl {
+              url = "https://github.com/rustwasm/wasm-bindgen/releases/download/0.2.128/wasm-bindgen-0.2.128-${muslArch}-unknown-linux-musl.tar.gz";
+              hash =
+                if muslArch == "x86_64" then
+                  "sha256-tR8CCP3/g1FaeHvYq5rFhl7YTau2bQxwmVe7WXk8ZF8="
+                else
+                  "sha256-B5cx3RvHeYwe+k8I/MRRMIJ8vMn/YKC0xgR9ZPxv0lw=";
+            };
+            dontUnpack = true;
+            dontConfigure = true;
+            dontBuild = true;
+            installPhase = ''
+              runHook preInstall
+              mkdir -p "$out/bin"
+              tar xzf "$src" -C "$out/bin" --strip-components=1
+              runHook postInstall
+            '';
+            meta = {
+              description = "wasm-bindgen CLI 0.2.128 (matches Cargo.lock)";
+              license = lib.licenses.mit;
+              platforms = lib.platforms.linux;
+            };
+          };
+
+          # sha256 values are the ones scripts/fetch-deepfilternet.mjs asserts,
+          # base64-encoded so Nix accepts them.
+          deepfilternet-wasm = pkgs.fetchurl {
+            url = "https://cdn.mezon.ai/AI/models/datas/noise_suppression/deepfilternet3/v3/pkg/df_bg.wasm";
+            hash = "sha256-RAtdErbqfZUAhzb4RCIdeHTuFd5csQ0wFQAkcP26BDI=";
+          };
+
+          deepfilternet-onnx = pkgs.fetchurl {
+            url = "https://github.com/Rikorose/DeepFilterNet/raw/84d57ec2c08fe08e68a13fb32a58cd7092060a0f/models/DeepFilterNet3_onnx.tar.gz";
+            hash = "sha256-yU2R9wkRAByUbg+rtKqa3DcEX0WgO1YAjLDIJEy2NhY=";
+          };
+
+          # The Tauri desktop shell. sable-wasm is deliberately absent: it only
+          # compiles for wasm32-unknown-unknown (its session store holds JS
+          # functions, so it is not Send) and is produced as a wasm32 artefact in
+          # preBuild, never as a native library.
+          sable = pkgs.rustPlatform.buildRustPackage (
+            finalAttrs:
+            {
+              pname = "sable-next";
+              version = "0.1.0";
+
+              src = ./.;
+
+              # The binary crate is `app`; the library target is `app_lib`.
+              cargoBuildFlags = [
+                "-p"
+                "app"
+                "--bin"
+                "app"
+              ];
+
+              cargoLock = {
+                lockFile = ./Cargo.lock;
+                outputHashes = gitOutputHashes;
+              };
+
+              # Keep the store path free of the checkout's own noise. The vendor/ tree
+              # stays: the [patch] entries in the root Cargo.toml point at it,
+              # and vendor/tauri-plugin-edge-to-edge is excluded from the
+              # workspace exactly as upstream does. This has to be prePatch —
+              # overriding `postPatch` and calling runHook postPatch from it
+              # re-enters cargo's own postPatch hook (cargoSetupPostPatchHook)
+              # forever and the builder dies on a stack overflow.
+              prePatch = ''
+                rm -rf .git node_modules result .svelte-kit dist
+              '';
+
+              nativeBuildInputs =
+                [
+                  pkgs.cargo
+                  wasm-bindgen-cli-0-2-128
+                  pkgs.binaryen
+                  pkgs.nodejs_24
+                  pkgs.pnpm_12
+                  pkgs.pnpmConfigHook
+                  pkgs.pkg-config
+                  pkgs.makeWrapper
+                ]
+                ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+                  pkgs.perl
+
+                  # nixpkgs' rustc substitutes the hardcoded "rust-lld" for
+                  # "lld" (pkgs/development/compilers/rust/rustc.nix, postPatch),
+                  # because Nixpkgs has no bundled rust-lld. The wasm32 build in
+                  # scripts/build-wasm.mjs invokes plain `cargo` rather than the
+                  # nix wrapper, so nothing else puts a linker on PATH and the
+                  # build dies with "linker `lld` not found".
+                  pkgs.lld
+                ];
+
+              buildInputs =
+                (with pkgs; [
+                  glib
+                  gtk3
+                  libsoup_3
+                  librsvg
+                  openssl
+                  pango
+                  pipewire
+                  webkitgtk_4_1
+                  xdotool
+                ])
+                ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux (
+                  with pkgs; [ libayatana-appindicator ]
+                );
+
+              env = {
+                pnpmDeps = pkgs.fetchPnpmDeps {
+                  pname = "sable-next";
+                  version = finalAttrs.version;
+                  src = finalAttrs.src;
+                  pnpm = pkgs.pnpm_12;
+                  fetcherVersion = 4;
+                  hash = "sha256-c8KPyvK0m78O9ih0U+U0ts9jHEiLTcIO5uu3YtdotlI=";
+                };
+
+                # fetch-deepfilternet.mjs would pull these from the network at
+                # vite's buildStart; planting them first keeps the derivation
+                # hermetic (and the script verifies the checksums anyway).
+                SABLE_DEEPFILTERNET_WASM = deepfilternet-wasm;
+                SABLE_DEEPFILTERNET_ONNX = deepfilternet-onnx;
+
+                # No Sentry credentials in a Nix build, so the frontend must not
+                # attempt a source-map upload.
+                SENTRY_AUTH_TOKEN = "";
+              };
+
+              # `app` embeds ../dist and the wasm bindings, and tauri-build panics
+              # when `frontendDist` is absent — so both are built first, in the
+              # repo's own order: wasm bindings, then vite.
+              #
+              # No runHook here: nixpkgs appends a `preBuild` attribute to
+              # preBuildHooks, which cargoBuildHook already calls once, so
+              # calling runHook from inside it recurses until the builder dies.
+              preBuild = ''
+                # scripts/build-wasm.mjs shells out to cargo and reads CARGO_HOME
+                # for its --remap-path-prefix set.
+                export CARGO_HOME="$NIX_BUILD_TOP/cargo-home"
+                mkdir -p "$CARGO_HOME"
+
+                export SABLE_WASM_OUTPUT=src/generated/wasm
+                node scripts/build-wasm.mjs --release
+
+                # DeepFilterNet payloads; fetch-deepfilternet.mjs checksums them.
+                mkdir -p static/deepfilternet3/v3/pkg static/deepfilternet3/v3/models
+                cp "$SABLE_DEEPFILTERNET_WASM" static/deepfilternet3/v3/pkg/df_bg.wasm
+                cp "$SABLE_DEEPFILTERNET_ONNX" static/deepfilternet3/v3/models/DeepFilterNet3_onnx.tar.gz
+
+                # `vite build`, not `pnpm build`: the npm prebuild hook would
+                # rebuild the bindings compiled a moment ago.
+                pnpm exec vite build
+              '';
+
+              installPhase = ''
+                runHook preInstall
+
+                mkdir -p "$out/bin"
+                install -Dm755 "target/release/app" "$out/bin/sable"
+
+                runHook postInstall
+              '';
+
+              meta = {
+                description = "Sable Next — a Matrix client (Tauri desktop shell)";
+                homepage = "https://sable.moe";
+                license = lib.licenses.agpl3Plus;
+                mainProgram = "sable";
+                platforms = lib.platforms.linux;
+              };
+            }
+          );
+        in
+        {
+          inherit sable;
+          default = sable;
+        }
+      );
+
+      devShells = forAllSystems (
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+        in
+        {
+          default = pkgs.mkShell {
+            packages = with pkgs; [
+              binaryen
+              cargo
+              cmake
+              glib
+              gtk3
+              libayatana-appindicator
+              libsoup_3
+              librsvg
+              nodejs_24
+              openssl
+              pango
+              perl
+              pipewire
+              pkg-config
+              pnpm_12
+              rustc
+              rustfmt
+              clippy
+              webkitgtk_4_1
+              xdotool
+            ];
+          };
+        }
+      );
+    };
+}

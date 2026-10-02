@@ -14,6 +14,7 @@
   import { previewableLinks } from '../media/link-preview.js';
   import FormattedBody from './FormattedBody.svelte';
   import LinkEmbed from '../media/embeds/LinkEmbed.svelte';
+  import RedactedContent from './RedactedContent.svelte';
   import TimelineGallery from '../timeline/TimelineGallery.svelte';
   import { galleryItemId } from '../media/media-items.js';
   import TimelineLocation from '../timeline/TimelineLocation.svelte';
@@ -30,6 +31,7 @@
   interface Props {
     item: TimelineItemView;
     canRedactOthers: boolean;
+    roomId?: string;
     encrypted?: boolean | null;
     senderTimezone?: string | null;
     members?: readonly MemberView[];
@@ -43,6 +45,7 @@
   let {
     item,
     canRedactOthers,
+    roomId = '',
     encrypted = null,
     senderTimezone = null,
     members = [],
@@ -92,6 +95,14 @@
       ? $i18n.t('timeline.redactedWithReason', { reason: item.content.reason })
       : $i18n.t('timeline.redacted')}
   </p>
+  <!--
+    MSC2815. `canRedactOthers` is the room's `redact` level applied to someone
+    else's event, which is exactly the gate the server enforces for reading a
+    redacted event, so it doubles as the permission for this affordance.
+  -->
+  {#if canRedactOthers && item.event_id && roomId}
+    <RedactedContent {roomId} {item} {senderTimezone} {onMatrixLink} />
+  {/if}
 {:else if item.content.kind === 'sticker'}
   <MediaImage
     class="sticker privacy-media"
@@ -243,6 +254,21 @@
     font-size: var(--font-size-small);
     gap: var(--space-100);
     margin: 0;
+  }
+
+  /* The recovered content sits under the tombstone, not in place of it. */
+  :global(.unredacted) {
+    border-inline-start: var(--space-100) solid var(--surface-var-outline-variant);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-100);
+    margin-block-start: var(--space-100);
+    padding-inline-start: var(--space-200);
+  }
+
+  :global(.unredacted-label) {
+    color: var(--surface-var-on-container);
+    font-size: var(--font-size-small);
   }
 
   :global(.image) {
