@@ -596,6 +596,11 @@
           # which is an ordinary function — so both flakes get the same
           # derivation with no getFlake/purity problem on a dirty tree.
           tauri = (import ./tauri-packages.nix nixpkgs).packages.${system}.default;
+
+          # The Tauri shell is the deliverable, so it is what a bare `nix build`
+          # and the Cachix workflow's `.#packages.<system>.default` both mean.
+          # `sable-web` stays reachable by name for the browser-only artefact.
+          default = (import ./tauri-packages.nix nixpkgs).packages.${system}.default;
         }
       );
 
