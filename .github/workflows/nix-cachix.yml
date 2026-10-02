@@ -1,12 +1,12 @@
 # Builds the Nix flake package for linux x86_64 on GitHub workers and pushes
-# every built store path to the `sable-next` Cachix cache (currently empty).
+# every built store path to the `sable-cachix` Cachix cache.
 #
 # Pushes happen through cachix/cachix-action's post-build hook, so the only
 # build step is `nix build`; anything that derivation builds lands in the cache.
 #
-# Required repo secret: CACHIX_AUTH_TOKEN (a write token for the sable-next
-# cache, e.g. `CACHIX_AUTH_TOKEN` from ~/.env). No public key needed here;
-# consumers add the substituter on their own NixOS side.
+# Required repo secret: CACHIX_AUTH_TOKEN (a write token for the sable-cachix
+# cache). No public key needed here; consumers add the substituter on their
+# own NixOS side.
 #
 # NOTE: this workflow needs flake.nix + flake.lock present on main. They are
 # currently staged locally but not yet pushed.
@@ -34,7 +34,7 @@ concurrency:
 
 jobs:
   build-x86_64:
-    name: Build x86_64-linux, push to sable-next
+    name: Build x86_64-linux, push to sable-cachix
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
@@ -48,10 +48,10 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v25
 
-      - name: Set up Cachix (sable-next)
+      - name: Set up Cachix (sable-cachix)
         uses: cachix/cachix-action@v16
         with:
-          name: sable-next
+          name: sable-cachix
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Build default package (x86_64-linux)
