@@ -31,8 +31,8 @@ use matrix_sdk::ruma::{
 };
 use tracing::warn;
 
-use crate::protocol::{CommandErr, RedactedContentView};
 use crate::Core;
+use crate::protocol::{CommandErr, RedactedContentView};
 
 /// The unstable feature a homeserver advertises in `/versions`.
 ///
@@ -90,7 +90,7 @@ impl RedactedContentError {
     /// `ContentDeleted` and `EventNotFound` also become `Unsupported` — both are
     /// permanent, and neither would ever produce content on a retry.
     #[must_use]
-    pub fn into_command_err(self) -> CommandErr {
+    pub const fn into_command_err(self) -> CommandErr {
         match self {
             Self::NotPermitted => CommandErr::Denied,
             Self::Unsupported | Self::ContentDeleted | Self::EventNotFound => {
@@ -106,13 +106,13 @@ impl RedactedContentError {
     /// erased content, and a power level or a feature flag does not appear
     /// mid-session. Retrying the others just spends another request.
     #[must_use]
-    pub fn is_terminal(self) -> bool {
+    pub const fn is_terminal(self) -> bool {
         !matches!(self, Self::Unavailable)
     }
 
     /// The wire name, so the error is greppable in a bug report.
     #[must_use]
-    pub fn code(self) -> &'static str {
+    pub const fn code(self) -> &'static str {
         match self {
             Self::NotPermitted => "not_permitted",
             Self::ContentDeleted => "content_deleted",
@@ -149,7 +149,7 @@ pub(crate) async fn fetch(
             event_id: event_id.clone(),
         })
         .await
-        .map_err(|error| classify(error, advertised))?;
+        .map_err(|error| classify(&error, advertised))?;
 
     // A server without the feature answers 200 with the event still redacted,
     // which arrives here as an empty view rather than as an error.
@@ -158,16 +158,15 @@ pub(crate) async fn fetch(
 
 /// Turns the bare event into a view, logging rather than failing when it cannot.
 async fn into_view(room: &matrix_sdk::Room, event: RedactedEvent) -> RedactedContentView {
-    match crate::view::redacted_content_view(room, &event.event).await {
-        Some(view) => view,
-        None => {
+    crate::view::redacted_content_view(room, &event.event)
+        .await
+        .unwrap_or_else(|| {
             warn!(
                 "the homeserver answered an unredacted read with nothing to show: either it \
-                 ignored the query parameter or the event carries no message content"
+ignored the query parameter or the event carries no message content"
             );
             RedactedContentView::empty()
-        }
-    }
+        })
 }
 
 impl Core {
@@ -208,24 +207,20 @@ impl Core {
 }
 
 /// Classifies a failed request into the sentence the UI shows.
-fn classify(error: matrix_sdk::HttpError, advertised: bool) -> RedactedContentError {
+fn classify(error: &matrix_sdk::HttpError, advertised: bool) -> RedactedContentError {
     let status = error
         .as_client_api_error()
         .map_or(0, |api_error| api_error.status_code.as_u16());
-    let errcode = error
-        .as_client_api_error()
-        .and_then(|api_error| {
-            let kind = api_error.error_kind()?;
-            let code = kind.errcode();
-            Some(code.as_str().to_owned())
-        });
+    let errcode = error.as_client_api_error().and_then(|api_error| {
+        let kind = api_error.error_kind()?;
+        let code = kind.errcode();
+        Some(code.as_str().to_owned())
+    });
 
     match status {
         403 if !advertised => RedactedContentError::Unsupported,
         403 => RedactedContentError::NotPermitted,
-        404 if errcode.as_deref() == Some(CONTENT_DELETED) => {
-            RedactedContentError::ContentDeleted
-        }
+        404 if errcode.as_deref() == Some(CONTENT_DELETED) => RedactedContentError::ContentDeleted,
         404 => RedactedContentError::EventNotFound,
         // A server that does not know the path answers 400/405/501 rather than
         // 403, depending on its router.
@@ -314,15 +309,14 @@ mod tests {
     use std::collections::BTreeSet;
 
     use matrix_sdk::ruma::api::{
-        MatrixVersion as Version, OutgoingRequestExt, SupportedVersions, auth_scheme::SendAccessToken,
+        MatrixVersion as Version, OutgoingRequestExt, SupportedVersions,
+        auth_scheme::SendAccessToken,
     };
     use matrix_sdk::ruma::events::room::power_levels::{
         RoomPowerLevelsEventContent, UserPowerLevel,
     };
     use matrix_sdk::ruma::room_version_rules::AuthorizationRules;
-    use matrix_sdk::ruma::{
-        Int, OwnedUserId, owned_event_id, owned_room_id, owned_user_id,
-    };
+    use matrix_sdk::ruma::{Int, OwnedUserId, owned_event_id, owned_room_id, owned_user_id};
     use serde_json::json;
 
     use super::*;
@@ -417,7 +411,7 @@ mod tests {
 
     fn power_levels(users: &[(&str, u32)], redact: u32) -> RoomPowerLevels {
         let mut content = RoomPowerLevelsEventContent::new(&AuthorizationRules::V1);
-        content.redact = Int::from(redact).into();
+        content.redact = Int::from(redact);
         for (user, level) in users {
             content
                 .users
@@ -432,10 +426,7 @@ mod tests {
 
     #[test]
     fn only_the_redact_level_may_read_unredacted_content() {
-        let levels = power_levels(
-            &[("@mod:example.org", 50), ("@plain:example.org", 0)],
-            50,
-        );
+        let levels = power_levels(&[("@mod:example.org", 50), ("@plain:example.org", 0)], 50);
 
         assert!(may_view_redacted(
             &levels,
@@ -522,7 +513,7 @@ mod tests {
             .send(request())
             .await
             .expect_err("the mock refuses every request");
-        classify(error, advertised)
+        classify(&error, advertised)
     }
 
     #[tokio::test]

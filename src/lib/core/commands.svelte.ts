@@ -497,10 +497,7 @@ export function createCommands(transport: () => Transport) {
      * it ignored the query parameter, or the event is a state event. That is not
      * an error, so it is reported as an empty answer rather than a rejection.
      */
-    async redactedContent(
-      roomId: string,
-      eventId: string
-    ): Promise<RedactedContentView> {
+    async redactedContent(roomId: string, eventId: string): Promise<RedactedContentView> {
       const response = await transport().send({
         type: 'redacted_content',
         room_id: roomId,

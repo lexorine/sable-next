@@ -1532,10 +1532,7 @@ impl Core {
                 Ok(CommandOk::BulkRedact { redacted })
             }
 
-            Command::RedactedContent {
-                room_id,
-                event_id,
-            } => {
+            Command::RedactedContent { room_id, event_id } => {
                 let content = self.redacted_content(&room_id, &event_id).await?;
                 Ok(CommandOk::RedactedContent { content })
             }

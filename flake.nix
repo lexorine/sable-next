@@ -133,6 +133,12 @@
                 "app"
               ];
 
+              # The repo has no `cargo test` suite wired into the build; the
+              # release build already type-checks every crate. Without this,
+              # cargoCheckHook recompiles the whole 1036-crate dependency tree a
+              # second time, doubling build time for no additional coverage.
+              doCheck = false;
+
               cargoLock = {
                 lockFile = ./Cargo.lock;
                 outputHashes = gitOutputHashes;
@@ -162,6 +168,13 @@
                 ]
                 ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [
                   pkgs.perl
+
+                  # libspa-sys (via pipewire) runs bindgen. This is the hook nixpkgs
+                  # provides for that: it points LIBCLANG_PATH at clang's lib
+                  # output and fills BINDGEN_EXTRA_CLANG_ARGS. Adding plain
+                  # `clang` to the inputs is not enough — libclang.so.* lives
+                  # in clang's `lib` output, and bindgen dlopens it by path.
+                  pkgs.rustPlatform.bindgenHook
 
                   # nixpkgs' rustc substitutes the hardcoded "rust-lld" for
                   # "lld" (pkgs/development/compilers/rust/rustc.nix, postPatch),
@@ -226,9 +239,13 @@
                 node scripts/build-wasm.mjs --release
 
                 # DeepFilterNet payloads; fetch-deepfilternet.mjs checksums them.
-                mkdir -p static/deepfilternet3/v3/pkg static/deepfilternet3/v3/models
-                cp "$SABLE_DEEPFILTERNET_WASM" static/deepfilternet3/v3/pkg/df_bg.wasm
-                cp "$SABLE_DEEPFILTERNET_ONNX" static/deepfilternet3/v3/models/DeepFilterNet3_onnx.tar.gz
+                # install(1), not cp: the fetched files are read-only in the
+                # store, and vite's prepare-out-dir copies static/ verbatim,
+                # so a read-only source turns into EACCES there.
+                install -Dm644 "$SABLE_DEEPFILTERNET_WASM" \
+                  static/deepfilternet3/v3/pkg/df_bg.wasm
+                install -Dm644 "$SABLE_DEEPFILTERNET_ONNX" \
+                  static/deepfilternet3/v3/models/DeepFilterNet3_onnx.tar.gz
 
                 # `vite build`, not `pnpm build`: the npm prebuild hook would
                 # rebuild the bindings compiled a moment ago.

@@ -3490,6 +3490,7 @@ pub struct RedactedContentView {
 
 impl RedactedContentView {
     /// The empty answer, for a response with nothing in it.
+    #[must_use]
     pub fn empty() -> Self {
         Self::default()
     }

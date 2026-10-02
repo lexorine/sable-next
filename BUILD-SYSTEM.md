@@ -14,17 +14,17 @@ not transcripts of runs.
 
 ## 1. Layout
 
-| Path | What it is |
-| --- | --- |
-| `crates/sable-core` | Matrix protocol core (also holds `generate-types` example, feature `typegen`) |
-| `crates/sable-hdr` | header/preview helper crate |
-| `crates/sable-push` | push gateway client |
-| `crates/sable-wasm` | WASM bindings — **wasm32-only** (session store holds JS fns, not `Send`) |
-| `src-tauri` | Tauri shell, package name `app`, lib name `app_lib` |
-| `vendor/` | patched-in `matrix-sdk`, `matrix-sdk-crypto`, `matrix-sdk-indexeddb` (0.19.1, rev `bc2502ee3d3ba1dc687740df5be0f8635032399e`), `tauri-plugin-edge-to-edge` |
-| `src/` | SvelteKit app (`src/generated/wasm` = bindings, `src/generated/protocol.ts` = Specta output) |
-| `tests/e2e` | Playwright; `tests/e2e/fixtures/continuwuity.ts` is a testcontainers homeserver |
-| `scripts/` | helper scripts: `build-wasm.mjs`, `install-git-hooks.mjs`, `scripts/ci/*` (release/CI), `scripts/cef/*`; `mise.toml [task_config] includes = ["scripts"]` also points mise's task-file search here (currently no task files in it) |
+| Path                | What it is                                                                                                                                                                                                                         |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/sable-core` | Matrix protocol core (also holds `generate-types` example, feature `typegen`)                                                                                                                                                      |
+| `crates/sable-hdr`  | header/preview helper crate                                                                                                                                                                                                        |
+| `crates/sable-push` | push gateway client                                                                                                                                                                                                                |
+| `crates/sable-wasm` | WASM bindings — **wasm32-only** (session store holds JS fns, not `Send`)                                                                                                                                                           |
+| `src-tauri`         | Tauri shell, package name `app`, lib name `app_lib`                                                                                                                                                                                |
+| `vendor/`           | patched-in `matrix-sdk`, `matrix-sdk-crypto`, `matrix-sdk-indexeddb` (0.19.1, rev `bc2502ee3d3ba1dc687740df5be0f8635032399e`), `tauri-plugin-edge-to-edge`                                                                         |
+| `src/`              | SvelteKit app (`src/generated/wasm` = bindings, `src/generated/protocol.ts` = Specta output)                                                                                                                                       |
+| `tests/e2e`         | Playwright; `tests/e2e/fixtures/continuwuity.ts` is a testcontainers homeserver                                                                                                                                                    |
+| `scripts/`          | helper scripts: `build-wasm.mjs`, `install-git-hooks.mjs`, `scripts/ci/*` (release/CI), `scripts/cef/*`; `mise.toml [task_config] includes = ["scripts"]` also points mise's task-file search here (currently no task files in it) |
 
 Root `Cargo.toml`: `members = ["crates/*", "src-tauri"]`,
 `default-members = ["crates/sable-core", "src-tauri"]`, `resolver = "3"`.
@@ -33,21 +33,21 @@ Profiles: `wasm-release` (opt-z, lto, cgu 1), `wasm-dev` (opt 1, no debug),
 
 ## 2. Exact toolchain pins
 
-| Tool | Version | Where pinned |
-| --- | --- | --- |
-| mise | min `2026.7.11` (CI installs `2026.9.7`) | `mise.toml:2`, `.forgejo/actions/*/action.yml` |
-| Node | `24.21.0` | `mise.toml [tools]`, `.forgejo/actions/setup/action.yml` |
-| pnpm | `12.4.1` (aqua backend) | `package.json packageManager`, `mise.lock` |
-| Rust | `1.98.1`, components `clippy,rustfmt`, target `wasm32-unknown-unknown` (backend `core:rust` = rustup) | `rust-toolchain.toml`, `mise.lock` |
-| wasm-bindgen CLI | `0.2.128` — **must equal the `wasm-bindgen` version in `Cargo.lock`**, `build-wasm.mjs` aborts otherwise | `mise.toml [tools]`, `mise.lock` |
-| binaryen (wasm-opt) | `132` | `mise.toml` |
-| watchexec | `2.7.2` | `mise.toml` |
-| lefthook | `2.1.14` | `mise.toml` |
-| cargo-machete | `0.9.2` | `mise.toml [tasks.check].tools` |
-| cargo-deny | `0.20.2` | `mise.toml [tasks.check].tools` |
-| cargo-nextest | `0.9.146` (`cargo-nextest-` prefix) | `mise.toml [tasks.test].tools` |
-| OpenTofu | `1.12.6` | `mise.toml [tasks.opentofu].tools` |
-| Tauri env (opt.) | Java `temurin-21`, `android-sdk 22.0`, `ANDROID_NDK_VERSION=29.0.14206865` | `mise.tauri.toml`, `mise.toml [env]` |
+| Tool                | Version                                                                                                  | Where pinned                                             |
+| ------------------- | -------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| mise                | min `2026.7.11` (CI installs `2026.9.7`)                                                                 | `mise.toml:2`, `.forgejo/actions/*/action.yml`           |
+| Node                | `24.21.0`                                                                                                | `mise.toml [tools]`, `.forgejo/actions/setup/action.yml` |
+| pnpm                | `12.4.1` (aqua backend)                                                                                  | `package.json packageManager`, `mise.lock`               |
+| Rust                | `1.98.1`, components `clippy,rustfmt`, target `wasm32-unknown-unknown` (backend `core:rust` = rustup)    | `rust-toolchain.toml`, `mise.lock`                       |
+| wasm-bindgen CLI    | `0.2.128` — **must equal the `wasm-bindgen` version in `Cargo.lock`**, `build-wasm.mjs` aborts otherwise | `mise.toml [tools]`, `mise.lock`                         |
+| binaryen (wasm-opt) | `132`                                                                                                    | `mise.toml`                                              |
+| watchexec           | `2.7.2`                                                                                                  | `mise.toml`                                              |
+| lefthook            | `2.1.14`                                                                                                 | `mise.toml`                                              |
+| cargo-machete       | `0.9.2`                                                                                                  | `mise.toml [tasks.check].tools`                          |
+| cargo-deny          | `0.20.2`                                                                                                 | `mise.toml [tasks.check].tools`                          |
+| cargo-nextest       | `0.9.146` (`cargo-nextest-` prefix)                                                                      | `mise.toml [tasks.test].tools`                           |
+| OpenTofu            | `1.12.6`                                                                                                 | `mise.toml [tasks.opentofu].tools`                       |
+| Tauri env (opt.)    | Java `temurin-21`, `android-sdk 22.0`, `ANDROID_NDK_VERSION=29.0.14206865`                               | `mise.tauri.toml`, `mise.toml [env]`                     |
 
 mise settings: `lockfile = true`, `minimum_release_age = "1d"`,
 `experimental = true`, `idiomatic_version_file_enable_tools = ["pnpm","rust"]`,
@@ -156,22 +156,22 @@ mirrors `codeql.yml`, `tauri-build.yml`, `zizmor.yml`.
 
 `.forgejo/workflows/quality-checks.yml` (ubuntu-latest, on PR + push to main)
 
-| job | runs | notes |
-| --- | --- | --- |
-| `build` | setup(action, `build: 'true'`) → wasm + `pnpm exec vite build` | uploads artifacts `.svelte-kit/output`, `dist`, `src/generated/wasm`; Sentry creds withheld on purpose |
-| `format` | `pnpm fmt:check`, `pnpm stylelint` | |
-| `checks` | `pnpm lint`, `pnpm check`, `pnpm test:coverage` + coverage upload | restores ESLint cache |
-| `e2e` | `pnpm exec playwright install chromium webkit` + `install-deps`, `pnpm test:e2e` | `runs-on: docker` (needs a daemon), env `SABLE_E2E_PREBUILT=1`, points testcontainers at the docker host, uploads `playwright-report` |
+| job      | runs                                                                             | notes                                                                                                                                 |
+| -------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `build`  | setup(action, `build: 'true'`) → wasm + `pnpm exec vite build`                   | uploads artifacts `.svelte-kit/output`, `dist`, `src/generated/wasm`; Sentry creds withheld on purpose                                |
+| `format` | `pnpm fmt:check`, `pnpm stylelint`                                               |                                                                                                                                       |
+| `checks` | `pnpm lint`, `pnpm check`, `pnpm test:coverage` + coverage upload                | restores ESLint cache                                                                                                                 |
+| `e2e`    | `pnpm exec playwright install chromium webkit` + `install-deps`, `pnpm test:e2e` | `runs-on: docker` (needs a daemon), env `SABLE_E2E_PREBUILT=1`, points testcontainers at the docker host, uploads `playwright-report` |
 
 `.forgejo/workflows/rust-quality.yml` (path-filtered on `crates/**`,
 `src-tauri/**`, `Cargo.*`, `rust-toolchain.toml`, `deny.toml`, …)
 
-| job | runs |
-| --- | --- |
-| `workspace` | clippy (workspace excl. app), `cargo nextest run --locked --workspace --exclude app --all-features`, `generate-types -- --check` |
-| `app` | clippy `-p app`, `cargo nextest run -p app` |
-| `wasm` | clippy `-p sable-wasm --target wasm32-unknown-unknown`, installs google-chrome-stable + matching chromedriver, `cargo test -p sable-wasm --target wasm32-unknown-unknown --profile wasm-test` with `CHROMEDRIVER` + `WASM_BINDGEN_TEST_WEBDRIVER_JSON=.forgejo/webdriver.json` |
-| `policy` | rustfmt only toolchain + `cargo deny check` (needs `cargo metadata`, compiles nothing) |
+| job         | runs                                                                                                                                                                                                                                                                           |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `workspace` | clippy (workspace excl. app), `cargo nextest run --locked --workspace --exclude app --all-features`, `generate-types -- --check`                                                                                                                                               |
+| `app`       | clippy `-p app`, `cargo nextest run -p app`                                                                                                                                                                                                                                    |
+| `wasm`      | clippy `-p sable-wasm --target wasm32-unknown-unknown`, installs google-chrome-stable + matching chromedriver, `cargo test -p sable-wasm --target wasm32-unknown-unknown --profile wasm-test` with `CHROMEDRIVER` + `WASM_BINDGEN_TEST_WEBDRIVER_JSON=.forgejo/webdriver.json` |
+| `policy`    | rustfmt only toolchain + `cargo deny check` (needs `cargo metadata`, compiles nothing)                                                                                                                                                                                         |
 
 Other Forgejo workflows: `tauri-build.yml` (release bundles: Linux/macOS/
 Windows/iOS/Android), `docker-publish.yml`, `cloudflare-web{,-preview}.yml`,
@@ -183,7 +183,7 @@ Composite actions:
   with pnpm cache → mise 2026.9.7 (`cache: true`, `env: false`) →
   `mise settings set trusted_config_paths "$GITHUB_WORKSPACE"` → WASM binding
   cache keyed on `hashFiles(crates/**, Cargo.toml, Cargo.lock,
-  rust-toolchain.toml, .cargo/config.toml, mise.toml, scripts/build-wasm.mjs)`
+rust-toolchain.toml, .cargo/config.toml, mise.toml, scripts/build-wasm.mjs)`
   → optional rust 1.98.1 + `wasm32-unknown-unknown` + sccache 0.18.0 +
   Swatinem/rust-cache → `pnpm install --frozen-lockfile` → `pnpm wasm:build`
   on cache miss → Sentry source-map guard → `pnpm exec vite build` (not

@@ -852,7 +852,9 @@ pub async fn redacted_content_view(
     room: &Room,
     event: &Raw<AnySyncTimelineEvent>,
 ) -> Option<RedactedContentView> {
-    let raw = event.deserialize_as_unchecked::<RawFields>().unwrap_or_default();
+    let raw = event
+        .deserialize_as_unchecked::<RawFields>()
+        .unwrap_or_default();
     let item_content =
         TimelineItemContent::from_event(room, TimelineEvent::from_plaintext(event.clone())).await?;
 
