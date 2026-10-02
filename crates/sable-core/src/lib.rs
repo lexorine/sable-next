@@ -35,6 +35,8 @@ pub mod push_check;
 pub mod push_rules;
 mod qr_login;
 mod reactions;
+/// MSC2815: reading the original content of a redacted event.
+pub mod redacted;
 mod registration;
 mod room_keys;
 mod rooms;

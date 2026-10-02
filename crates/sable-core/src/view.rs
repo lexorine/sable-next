@@ -27,6 +27,7 @@ use matrix_sdk::ruma::push::Action;
 use matrix_sdk::ruma::room::{
     JoinRuleKind, JoinRuleSummary, RoomSummary as RumaRoomSummary, RoomType,
 };
+use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::ruma::{
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedTransactionId,
     OwnedUserId, TransactionId, UserId,
@@ -62,11 +63,11 @@ use crate::protocol::{
     AudioMetadataView, AvatarChangeView, DisplayNameChangeView, ForwardedView, GalleryItemView,
     LatestEventView, MemberView, MembershipChangeView, MembershipView, MentionView,
     PerMessageProfileView, PollAnswerView, PollView, PredecessorRoomView, PublicRoomView,
-    ReactionGroup, ReplyView, RoomJoinRuleView, RoomPermissionsView, RoomPowerLevelsView,
-    RoomPreviewView, RoomStateView, RoomSummary, RoomTag, SearchContextView, SearchHitView,
-    SendBlockView, SendStateView, SpaceChildEdge, SpaceHierarchyRoomView, StateChangeView,
-    ThreadSummaryView, TimelineItemContentView, TimelineItemView, UploadProgressView,
-    UrlPreviewView, UtdCauseView, VectorDiff,
+    ReactionGroup, RedactedContentView, ReplyView, RoomJoinRuleView, RoomPermissionsView,
+    RoomPowerLevelsView, RoomPreviewView, RoomStateView, RoomSummary, RoomTag, SearchContextView,
+    SearchHitView, SendBlockView, SendStateView, SpaceChildEdge, SpaceHierarchyRoomView,
+    StateChangeView, ThreadSummaryView, TimelineItemContentView, TimelineItemView,
+    UploadProgressView, UrlPreviewView, UtdCauseView, VectorDiff,
 };
 
 // These are independent room capabilities, not a state machine.
@@ -813,6 +814,41 @@ pub fn aggregation_item(
         mention: MentionView::None,
         forwarded: None,
     }
+}
+
+/// MSC2815: renders an event the server returned unredacted.
+///
+/// Returns `None` when the response is not something a moderator wants to see:
+/// an event the server sent still redacted (it ignored the query parameter), a
+/// state event, or an event type this client cannot render. The caller reads
+/// that as "the server had nothing to give" rather than as a failure, because
+/// the request itself succeeded.
+pub async fn redacted_content_view(
+    room: &Room,
+    event: &Raw<AnySyncTimelineEvent>,
+) -> Option<RedactedContentView> {
+    let raw = event.deserialize_as_unchecked::<RawFields>().unwrap_or_default();
+    let item_content =
+        TimelineItemContent::from_event(room, TimelineEvent::from_plaintext(event.clone())).await?;
+
+    // A server without the feature answers 200 with the redacted event, so the
+    // redaction is the only tell that the parameter did nothing.
+    if item_content.is_redacted() {
+        return None;
+    }
+    // Only a message has a body to show; a state event's type survives
+    // redaction but its content does not.
+    if !matches!(item_content, TimelineItemContent::MsgLike(_)) {
+        return None;
+    }
+
+    let profile = per_message_profile(raw.content.as_ref());
+    let content = content(&item_content, profile.as_ref(), &raw, None);
+
+    Some(RedactedContentView {
+        content: Some(content),
+        per_message_profile: profile,
+    })
 }
 
 pub async fn standalone_item(
