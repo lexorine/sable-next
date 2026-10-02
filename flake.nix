@@ -256,7 +256,23 @@
                 runHook preInstall
 
                 mkdir -p "$out/bin"
-                install -Dm755 "target/release/app" "$out/bin/sable"
+                # cargoBuildHook passes `--target $rustcTargetSpec`, so cargo
+                # writes to target/<triple>/<profile>/app, not target/<profile>/app.
+                # Ask rustc for the triple rather than relying on Nix's
+                # substituteAll, which does not apply to phases set here.
+                host_triple=$(rustc --print host-tuple)
+                app_bin="target/$host_triple/release/app"
+                if [ ! -f "$app_bin" ]; then
+                  # Fallback for any layout where the triple is absent.
+                  app_bin=$(find target -type f -name app ! -name '*.d' \
+                    -path '*/release/*' -perm -u+x | head -1)
+                fi
+                if [ -z "$app_bin" ] || [ ! -f "$app_bin" ]; then
+                  echo "install: no built app binary under target/" >&2
+                  find target -maxdepth 3 -type d >&2
+                  exit 1
+                fi
+                install -Dm755 "$app_bin" "$out/bin/sable"
 
                 runHook postInstall
               '';
