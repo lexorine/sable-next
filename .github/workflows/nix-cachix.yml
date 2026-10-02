@@ -45,6 +45,20 @@ jobs:
         with:
           persist-credentials: false
 
+      # The Tauri build pulls 400+ npm packages then compiles 1000+ Rust crates;
+      # a stock ubuntu-24.04 runner (~14G free) fills up mid-build. Reclaim ~30G
+      # by dropping the preinstalled toolchains we never touch.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v6
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+
       - name: Install Nix
         uses: cachix/install-nix-action@v25
 
