@@ -1,6 +1,13 @@
 {
   description = "Sable Next — the static web build, wrapped in a minimal WebKitGTK window";
 
+  nixConfig = {
+    extra-substituters = [ "https://sable-cachix.cachix.org" ];
+    extra-trusted-public-keys = [
+      "sable-cachix.cachix.org-1:XXaZaHCKVrE9XOLfi1yG74+COyIrpjU0jeZ7SxVAz2U="
+    ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/c59305bab2065cfecc4944690d9eedbb56f3a9fa";
   };
