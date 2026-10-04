@@ -404,10 +404,22 @@ fn setup(app: &mut tauri::App<BrowserEngine>) -> Result<(), Box<dyn std::error::
 
     // Linux never registers schemes at install time, and a Windows dev
     // build skips the installer, so claim it at runtime.
+    //
+    // Registration shells out to `update-desktop-database` (desktop-file-utils)
+    // to refresh the XDG MIME cache. That tool is frequently absent from a
+    // minimal desktop, and propagating the failure aborts setup and takes the
+    // whole app down before the window opens — a hard crash for a feature that
+    // is optional and recoverable at runtime. Degrade to a warning instead: the
+    // app launches, and deep links keep working for anything already
+    // registered. Only this platform's registration is affected.
     #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
     {
         use tauri_plugin_deep_link::DeepLinkExt;
-        app.deep_link().register_all()?;
+        if let Err(error) = app.deep_link().register_all() {
+            log::warn!(
+                "deep-link scheme registration failed; incoming sable:// links may not launch the app: {error}"
+            );
+        }
     }
 
     #[cfg(all(feature = "cef", target_os = "linux"))]
