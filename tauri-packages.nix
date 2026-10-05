@@ -180,6 +180,15 @@ nixpkgs:
 
               buildInputs =
                 (with pkgs; [
+                  # tauri-plugin-deep-link shells out to
+                  # `update-desktop-database` in its setup hook to refresh the
+                  # XDG MIME cache, and the app calls `register_all()` during
+                  # startup. Declared here so makeWrapper puts it on the
+                  # wrapper's PATH: the tool is usually present in a user's
+                  # shell but is NOT in the derivation's closure, so without
+                  # this the wrapped app cannot find it and registration fails.
+                  desktop-file-utils
+
                   glib
                   gtk3
                   libsoup_3
