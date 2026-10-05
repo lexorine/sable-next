@@ -8,14 +8,17 @@ import { readJson, writeJson } from '#lib/platform/local-json.js';
 import { customTitleBarDefault } from '#lib/platform/window-decorations.js';
 import type { BadgeNotificationMode } from '#lib/rooms/unread.js';
 import { readV1Preferences } from '#lib/migrations/v1/preferences.js';
+import { migrateSettings, SETTINGS_SCHEMA } from './migrations.js';
 
 export type { BadgeNotificationMode };
 
 export type ThreadPresentation = 'timeline' | 'panel';
 export type TimelineLayout = 'modern' | 'compact' | 'bubble';
 export type MessageSpacing = 'compact' | 'cozy' | 'roomy';
+export type MediaAutoLoad = 'on' | 'private' | 'off';
 export type TimelineEmoteSize = 'default' | '20' | '24' | '32' | '48' | '64';
 export type DateFormat = 'auto' | 'dmy' | 'mdy' | 'ymd';
+export type WeekStart = 'sunday' | 'monday' | 'saturday';
 export type ThemeMode = 'system' | 'dark' | 'light';
 export type ShowRoomIcon = 'always' | 'sometimes' | 'collapsed' | 'never';
 export type SearchIndexLimit = '128' | '256' | '512' | '1024' | '2048' | '4096';
@@ -55,12 +58,111 @@ export type ReplyPreviewStyle = 'connected' | 'compact' | 'expanded';
 export type CaptionPosition = 'above' | 'below' | 'inline' | 'hidden';
 export type UsernameClick = 'mention' | 'profile';
 export type CallRingtoneVolume = 'quiet' | 'normal' | 'loud';
-export type ComposerButton = 'gif' | 'sticker' | 'emoticon' | 'separator' | 'persona' | 'format';
+export const CALL_VIDEO_RESOLUTIONS = [
+  'auto',
+  '360',
+  '480',
+  '720',
+  '1080',
+  '1440',
+  '2160',
+] as const;
+export const CALL_VIDEO_BITRATES = [
+  'auto',
+  '250',
+  '500',
+  '1000',
+  '2000',
+  '4000',
+  '8000',
+  '16000',
+] as const;
+export const CALL_VIDEO_CODECS = ['auto', 'vp8', 'h264', 'vp9', 'av1'] as const;
+export type CallVideoResolution = (typeof CALL_VIDEO_RESOLUTIONS)[number];
+export type CallVideoBitrate = (typeof CALL_VIDEO_BITRATES)[number];
+export type CallVideoCodec = (typeof CALL_VIDEO_CODECS)[number];
+export type ComposerForm = 'short' | 'adaptive' | 'tall';
+export type EnterKey = 'adaptive' | 'newline' | 'send';
+export const COMPOSER_ACTIONS = ['gif', 'sticker', 'emoticon', 'persona', 'format'] as const;
+export type ComposerAction = (typeof COMPOSER_ACTIONS)[number];
+
+export const COMPOSER_SEPARATOR_MAX = 9;
+export type ComposerSeparatorId = `separator:${number}`;
+
+export type ComposerButton = ComposerAction | 'separator' | ComposerSeparatorId;
+
+export function isComposerSeparator(id: string): id is 'separator' | ComposerSeparatorId {
+  return id === 'separator' || /^separator:\d+$/.test(id);
+}
+
+export function composerSeparatorId(index: number): ComposerSeparatorId {
+  return `separator:${index}`;
+}
+
+export function composerSeparatorCount(order: readonly ComposerButton[]): number {
+  return order.filter(isComposerSeparator).length;
+}
+
+function normalizeComposerOrder(order: readonly unknown[]): ComposerButton[] {
+  const result: ComposerButton[] = [];
+  for (const entry of order) {
+    if (typeof entry !== 'string') continue;
+    const id = entry === 'separator' ? 'separator:0' : entry;
+    if (result.includes(id as ComposerButton)) continue;
+    if ((COMPOSER_ACTIONS as readonly string[]).includes(id)) result.push(id as ComposerAction);
+    else if (isComposerSeparator(id)) {
+      const index = Number(id.slice('separator:'.length));
+      if (
+        Number.isInteger(index) &&
+        index >= 0 &&
+        index < COMPOSER_SEPARATOR_MAX &&
+        composerSeparatorCount(result) < COMPOSER_SEPARATOR_MAX
+      )
+        result.push(id);
+    }
+  }
+  for (const action of COMPOSER_ACTIONS) if (!result.includes(action)) result.push(action);
+  return result;
+}
+
+export function withComposerSeparatorCount(
+  order: readonly ComposerButton[],
+  count: number
+): ComposerButton[] {
+  const wanted = Math.min(
+    COMPOSER_SEPARATOR_MAX,
+    Math.max(0, Math.floor(Number.isFinite(count) ? count : 0))
+  );
+  const result = normalizeComposerOrder(order);
+  const current = composerSeparatorCount(result);
+  if (current > wanted) {
+    let remaining = wanted;
+    return result.filter((id) => !isComposerSeparator(id) || remaining-- > 0);
+  }
+  const added = Array.from({ length: COMPOSER_SEPARATOR_MAX }, (_, index) =>
+    composerSeparatorId(index)
+  )
+    .filter((id) => !result.includes(id))
+    .slice(0, wanted - current);
+  let insertAt = result.length;
+  while (insertAt > 0 && !isComposerSeparator(result[insertAt - 1])) insertAt--;
+  if (insertAt === 0) {
+    insertAt = result.length;
+    while (
+      insertAt > 0 &&
+      (result[insertAt - 1] === 'persona' || result[insertAt - 1] === 'format')
+    )
+      insertAt -= 1;
+  }
+  result.splice(insertAt, 0, ...added);
+  return result;
+}
+
 export const COMPOSER_BUTTONS = [
   'gif',
   'sticker',
   'emoticon',
-  'separator',
+  'separator:0',
   'persona',
   'format',
 ] as const satisfies readonly ComposerButton[];
@@ -105,9 +207,12 @@ export interface Preferences {
   showPingCounts: boolean;
   showUnreadDots: boolean;
   uniformIcons: boolean;
+  tintRoomIcons: boolean;
+  showSpaceEvents: boolean;
 
   hour24Clock: boolean;
   dateFormat: DateFormat;
+  weekStart: WeekStart;
 
   hideMembershipEvents: boolean;
   hideProfileChanges: boolean;
@@ -119,6 +224,7 @@ export interface Preferences {
   captionPosition: CaptionPosition;
   usernameClick: UsernameClick;
   doubleTapReact: boolean;
+  showRoleTooltip: boolean;
   doubleTapReaction: string;
   hideTypingIndicators: boolean;
   memberSort: MemberSort;
@@ -129,7 +235,8 @@ export interface Preferences {
   pronounPillLimit: PronounPillLimit;
   pronounPillLength: PronounPillLength;
 
-  enterForNewline: boolean;
+  composerForm: ComposerForm;
+  enterForNewline: EnterKey;
   mentionInReplies: boolean;
   formattingToolbar: boolean;
   composerFormatButton: boolean;
@@ -158,7 +265,7 @@ export interface Preferences {
   presenceStatusMessage: string;
   loadingAnimal: string;
 
-  mediaAutoLoad: boolean;
+  mediaAutoLoad: MediaAutoLoad;
   autoplayGifs: boolean;
   pauseAnimationsWhenInactive: boolean;
   autoplayStickers: boolean;
@@ -169,6 +276,8 @@ export interface Preferences {
   clientEmbeds: boolean;
   encryptedClientEmbeds: boolean;
   youtubeEmbeds: boolean;
+  tiktokEmbeds: boolean;
+  instagramEmbeds: boolean;
 
   systemNotifications: boolean;
   badgeDefaultDirect: BadgeNotificationMode;
@@ -197,6 +306,13 @@ export interface Preferences {
   audioInputDevice: string;
   audioOutputDevice: string;
   videoInputDevice: string;
+  callCameraResolution: CallVideoResolution;
+  callCameraBitrate: CallVideoBitrate;
+  callCameraCodec: CallVideoCodec;
+  callScreenResolution: CallVideoResolution;
+  callScreenBitrate: CallVideoBitrate;
+  callScreenCodec: CallVideoCodec;
+  callSimulcast: boolean;
 
   /** Empty falls back to `config.json`; see `hasCompleteOverride`. */
   pushGatewayUrl: string;
@@ -250,6 +366,7 @@ type EnumPreference = Exclude<
 >;
 
 const ENUMS = {
+  mediaAutoLoad: ['on', 'private', 'off'],
   language: languageValues,
   layout: ['modern', 'compact', 'bubble'],
   threadPresentation: ['timeline', 'panel'],
@@ -257,6 +374,9 @@ const ENUMS = {
   timelineEmoteSize: ['default', '20', '24', '32', '48', '64'],
   theme: ['system', 'dark', 'light'],
   dateFormat: ['auto', 'dmy', 'mdy', 'ymd'],
+  enterForNewline: ['adaptive', 'newline', 'send'],
+  composerForm: ['short', 'adaptive', 'tall'],
+  weekStart: ['sunday', 'monday', 'saturday'],
   gifProvider: ['default', 'klipy', 'tenor', 'giphy'],
   showRoomIcon: ['always', 'sometimes', 'collapsed', 'never'],
   subspaceHierarchyLimit: SUBSPACE_DEPTHS,
@@ -276,8 +396,14 @@ const ENUMS = {
   captionPosition: ['above', 'below', 'inline', 'hidden'],
   usernameClick: ['mention', 'profile'],
   callRingtoneVolume: ['quiet', 'normal', 'loud'],
-  badgeDefaultDirect: ['all', 'mentions'],
-  badgeDefaultGroup: ['all', 'mentions'],
+  callCameraResolution: CALL_VIDEO_RESOLUTIONS,
+  callCameraBitrate: CALL_VIDEO_BITRATES,
+  callCameraCodec: CALL_VIDEO_CODECS,
+  callScreenResolution: CALL_VIDEO_RESOLUTIONS,
+  callScreenBitrate: CALL_VIDEO_BITRATES,
+  callScreenCodec: CALL_VIDEO_CODECS,
+  badgeDefaultDirect: ['all', 'mentions', 'quiet'],
+  badgeDefaultGroup: ['all', 'mentions', 'quiet'],
   memberSort: ['name-asc', 'name-desc', 'newest', 'oldest'],
   personaLatching: ['off', 'room', 'account'],
   presence: ['online', 'unavailable', 'offline'],
@@ -337,9 +463,9 @@ const DEFAULTS: Preferences = {
   searchCrawlPause: '3',
   searchTricklePause: '10',
   searchFlushInterval: '60',
-  searchBatchSize: '100',
+  searchBatchSize: '50',
   searchBaseEvents: '20000',
-  searchMaxEvents: '200000',
+  searchMaxEvents: '50000',
   searchCrawler: true,
   searchUnmeteredOnly: true,
   serverSearch: true,
@@ -350,9 +476,12 @@ const DEFAULTS: Preferences = {
   showPingCounts: true,
   showUnreadDots: true,
   uniformIcons: false,
+  tintRoomIcons: false,
+  showSpaceEvents: true,
 
   hour24Clock: false,
   dateFormat: 'auto',
+  weekStart: 'sunday',
 
   hideMembershipEvents: false,
   hideProfileChanges: true,
@@ -364,6 +493,7 @@ const DEFAULTS: Preferences = {
   captionPosition: 'below',
   usernameClick: 'mention',
   doubleTapReact: true,
+  showRoleTooltip: false,
   doubleTapReaction: '❤️',
   hideTypingIndicators: false,
   memberSort: 'name-asc',
@@ -374,7 +504,8 @@ const DEFAULTS: Preferences = {
   pronounPillLimit: '3',
   pronounPillLength: 'all',
 
-  enterForNewline: false,
+  composerForm: 'tall',
+  enterForNewline: 'adaptive',
   mentionInReplies: true,
   formattingToolbar: false,
   composerFormatButton: true,
@@ -403,7 +534,7 @@ const DEFAULTS: Preferences = {
   presenceStatusMessage: '',
   loadingAnimal: '',
 
-  mediaAutoLoad: true,
+  mediaAutoLoad: 'on',
   autoplayGifs: true,
   pauseAnimationsWhenInactive: false,
   autoplayStickers: true,
@@ -414,6 +545,8 @@ const DEFAULTS: Preferences = {
   clientEmbeds: false,
   encryptedClientEmbeds: false,
   youtubeEmbeds: false,
+  tiktokEmbeds: false,
+  instagramEmbeds: false,
 
   systemNotifications: true,
   badgeDefaultDirect: 'all',
@@ -442,6 +575,13 @@ const DEFAULTS: Preferences = {
   audioInputDevice: '',
   audioOutputDevice: '',
   videoInputDevice: '',
+  callCameraResolution: 'auto',
+  callCameraBitrate: 'auto',
+  callCameraCodec: 'auto',
+  callScreenResolution: 'auto',
+  callScreenBitrate: 'auto',
+  callScreenCodec: 'auto',
+  callSimulcast: true,
 
   pushGatewayUrl: '',
   pushVapidKey: '',
@@ -483,10 +623,15 @@ function read(key: string): Record<string, unknown> | null {
 
 export const PREFERENCE_KEYS = Object.keys(DEFAULTS) as (keyof Preferences)[];
 
+function legacyEnterKey(value: unknown): unknown {
+  return typeof value === 'boolean' ? (value ? 'newline' : 'adaptive') : value;
+}
+
 export function sanitize(stored: Record<string, unknown>, base: Preferences): Preferences {
   const next = { ...base };
   for (const key of PREFERENCE_KEYS) {
-    const value = stored[key];
+    let value = key === 'enterForNewline' ? legacyEnterKey(stored[key]) : stored[key];
+    if (key === 'mediaAutoLoad' && typeof value === 'boolean') value = value ? 'on' : 'off';
     const allowed: readonly string[] | undefined =
       key in ENUMS ? ENUMS[key as keyof typeof ENUMS] : undefined;
     if (allowed) {
@@ -495,15 +640,7 @@ export function sanitize(stored: Record<string, unknown>, base: Preferences): Pr
       }
     } else if (key === 'composerButtonOrder') {
       if (Array.isArray(value)) {
-        const order = value.filter(
-          (entry): entry is ComposerButton =>
-            typeof entry === 'string' && COMPOSER_BUTTONS.includes(entry as ComposerButton)
-        );
-        const unique = order.filter((entry, index) => order.indexOf(entry) === index);
-        (next as Record<string, unknown>)[key] = [
-          ...unique,
-          ...COMPOSER_BUTTONS.filter((entry) => !unique.includes(entry)),
-        ];
+        next.composerButtonOrder = normalizeComposerOrder(value);
       }
     } else if (key in PREFERENCE_RANGES) {
       if (typeof value === 'number' && Number.isFinite(value)) {
@@ -519,25 +656,6 @@ export function sanitize(stored: Record<string, unknown>, base: Preferences): Pr
   return next;
 }
 
-function mergeNotificationSwitch(stored: Record<string, unknown>, next: Preferences): Preferences {
-  if (stored.desktopNotifications === false) next.systemNotifications = false;
-  return next;
-}
-
-const LEGACY_FONT_SCALES: Record<string, number> = {
-  smallest: 0.75,
-  small: 0.9375,
-  large: 1.125,
-  largest: 1.25,
-  huge: 1.5,
-};
-
-function mergeFontScale(stored: Record<string, unknown>, next: Preferences): Preferences {
-  if (stored.pageZoom !== undefined || typeof stored.fontScale !== 'string') return next;
-  next.pageZoom = LEGACY_FONT_SCALES[stored.fontScale] ?? next.pageZoom;
-  return next;
-}
-
 const explicit = new SvelteSet<keyof Preferences>();
 
 function load(): Preferences {
@@ -545,18 +663,20 @@ function load(): Preferences {
 
   const current = read(STORAGE_KEY) ?? read(LEGACY_STORAGE_KEY);
   const migrated = current === null ? readV1Preferences() : null;
-  const stored = current ?? migrated;
-  if (!stored) return { ...DEFAULTS };
+  const raw = current ?? migrated;
+  if (!raw) return { ...DEFAULTS };
 
-  const loaded = mergeFontScale(
-    stored,
-    mergeNotificationSwitch(stored, sanitize(stored, DEFAULTS))
-  );
+  const stored = migrateSettings(raw, raw.schema);
+  const loaded = sanitize(stored, DEFAULTS);
   for (const key of PREFERENCE_KEYS) {
     if (key in stored || loaded[key] !== DEFAULTS[key]) explicit.add(key);
   }
   if (migrated !== null) {
-    writeJson(STORAGE_KEY, stored, '[sable settings] migrated preferences not persisted');
+    writeJson(
+      STORAGE_KEY,
+      { ...stored, schema: SETTINGS_SCHEMA },
+      '[sable settings] migrated preferences not persisted'
+    );
   }
   return loaded;
 }
@@ -599,7 +719,7 @@ export function applyDeploymentDefaults(raw: Record<string, unknown>): void {
 
 function persist(): void {
   untrack(() => {
-    const stored: Partial<Record<keyof Preferences, unknown>> = {};
+    const stored: Record<string, unknown> = { schema: SETTINGS_SCHEMA };
     for (const key of explicit) stored[key] = preferences[key];
     writeJson(STORAGE_KEY, stored, '[sable settings] preferences not persisted');
   });

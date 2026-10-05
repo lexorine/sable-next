@@ -241,6 +241,40 @@ export function unreadCountAfter(items: readonly TimelineItemView[], index: numb
   return count;
 }
 
+export function withReadMarkerBefore(
+  items: readonly TimelineItemView[],
+  eventId: string
+): TimelineItemView[] {
+  const rest = items.filter((item) => item.content.kind !== 'read_marker');
+  const index = rest.findIndex((item) => item.event_id === eventId);
+  if (index < 0) return rest;
+  const marker = items.find((item) => item.content.kind === 'read_marker') ?? {
+    id: 'unread-marker',
+    event_id: null,
+    transaction_id: null,
+    send_state: null,
+    sender: null,
+    sender_name: null,
+    sender_avatar: null,
+    timestamp: 0,
+    content: { kind: 'read_marker' },
+    in_reply_to: null,
+    thread_root: null,
+    thread_summary: null,
+    reactions: [],
+    is_own: false,
+    read_by: [],
+    read_timestamps: {},
+    per_message_profile: null,
+    bundled_link_previews: [],
+    link_previews_removed: null,
+    mention: 'none',
+    forwarded: null,
+    forum_title: null,
+  };
+  return [...rest.slice(0, index), marker, ...rest.slice(index)];
+}
+
 export type PersonaLookup = (eventId: string | null | undefined) => PerMessageProfileView | null;
 
 export function personaLookup(
@@ -314,6 +348,30 @@ export function latestEventId(items: readonly TimelineItemView[]): string | null
     if (eventId) return eventId;
   }
   return null;
+}
+
+/** Preserve the latest receipt's time, including when it has no timestamp. */
+export function cumulativeReadTimestamps(
+  items: readonly TimelineItemView[]
+): Map<string, Readonly<Record<string, number>>> {
+  const timestamps = new Map<string, Readonly<Record<string, number>>>();
+  const seen = new Set<string>();
+  let cumulative: Record<string, number> = {};
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    const fresh = item.read_by.filter((userId) => !seen.has(userId));
+    if (fresh.length > 0) {
+      cumulative = { ...cumulative };
+      for (const userId of fresh) {
+        seen.add(userId);
+        if (Object.hasOwn(item.read_timestamps, userId)) {
+          cumulative[userId] = item.read_timestamps[userId];
+        }
+      }
+    }
+    timestamps.set(item.id, cumulative);
+  }
+  return timestamps;
 }
 
 export type ReplyDirection = 'older' | 'newer';

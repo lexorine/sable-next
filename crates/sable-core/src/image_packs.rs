@@ -447,14 +447,17 @@ impl Core {
         let mut packs = Vec::new();
         let mut complete = true;
         let mut seen: BTreeSet<OwnedRoomId> = BTreeSet::from([room_id.to_owned()]);
-        let mut frontier = parents;
+        let listing = crate::view::listing_spaces(client, room_id).await;
+        let mut frontier = if listing.is_empty() { parents } else { listing };
 
         for _ in 0..MAX_SPACE_CHAIN {
             let spaces: Vec<matrix_sdk::Room> = frontier
                 .into_iter()
                 .filter(|parent_id| seen.insert(parent_id.clone()))
                 .filter_map(|parent_id| client.get_room(&parent_id))
-                .filter(|space| space.state() == matrix_sdk::RoomState::Joined)
+                .filter(|space| {
+                    space.state() == matrix_sdk::RoomState::Joined && !space.is_tombstoned()
+                })
                 .collect();
             if spaces.is_empty() {
                 break;
@@ -464,18 +467,23 @@ impl Core {
                     let found = self
                         .room_packs(client, &space, ImagePackOriginView::Space, None, network)
                         .await;
-                    (space.room_id().to_owned(), found)
+                    let listed_in = crate::view::listing_spaces(client, space.room_id()).await;
+                    (space.room_id().to_owned(), found, listed_in)
                 })
                 .buffered(STATE_FETCH_CONCURRENCY)
                 .collect()
                 .await;
             let mut next = Vec::new();
-            for (space_id, found) in found {
+            for (space_id, found, listed_in) in found {
+                let listed = !listed_in.is_empty();
+                next.extend(listed_in);
                 match found {
                     Ok(found) => {
                         complete &= found.complete;
                         packs.extend(found.packs);
-                        next.extend(found.canonical_parents);
+                        if !listed {
+                            next.extend(found.canonical_parents);
+                        }
                     }
                     Err(error) => {
                         complete = false;
@@ -527,6 +535,56 @@ impl Core {
         }
 
         Ok(CommandOk::AllImagePacks { packs })
+    }
+
+    pub(crate) async fn copy_room_packs(
+        &self,
+        client: &matrix_sdk::Client,
+        from: &RoomId,
+        to: &RoomId,
+    ) {
+        let events = match client
+            .send(get_state_events::v3::Request::new(from.to_owned()))
+            .await
+        {
+            Ok(response) => response.room_state,
+            Err(error) => {
+                tracing::warn!(room = %from, %error, "image packs not copied to the upgraded room");
+                return;
+            }
+        };
+        for event in events {
+            let Ok(value) = event.deserialize_as_unchecked::<serde_json::Value>() else {
+                continue;
+            };
+            let event_type = value
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or_default();
+            let Some(content) = value.get("content").filter(|content| {
+                [ROOM_EMOTES, ROOM_IMAGE_PACK].contains(&event_type)
+                    && content.as_object().is_some_and(|map| !map.is_empty())
+            }) else {
+                continue;
+            };
+            let state_key = value
+                .get("state_key")
+                .and_then(|k| k.as_str())
+                .unwrap_or_default();
+            let Ok(body) = Raw::new(content).map(Raw::cast_unchecked) else {
+                continue;
+            };
+            let request =
+                matrix_sdk::ruma::api::client::state::send_state_event::v3::Request::new_raw(
+                    to.to_owned(),
+                    StateEventType::from(event_type),
+                    state_key.to_owned(),
+                    body,
+                );
+            if let Err(error) = client.send(request).await {
+                tracing::warn!(room = %to, event_type, %error, "image pack not copied to the upgraded room");
+            }
+        }
     }
 
     async fn room_pack_state(
@@ -882,7 +940,7 @@ mod server_tests {
     use std::sync::Arc;
 
     use matrix_sdk::ruma::serde::Raw;
-    use matrix_sdk::ruma::{OwnedRoomId, room_id};
+    use matrix_sdk::ruma::{OwnedRoomId, RoomId, room_id};
     use matrix_sdk::test_utils::mocks::MatrixMockServer;
     use matrix_sdk_test::JoinedRoomBuilder;
     use serde_json::json;
@@ -978,6 +1036,81 @@ mod server_tests {
                 ("selected", ImagePackOriginView::Global),
                 ("local", ImagePackOriginView::Room)
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replaced_space_does_not_offer_its_packs() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!room:example.org");
+        let live = room_id!("!live:example.org");
+        let old = room_id!("!old:example.org");
+        let state = |event_type: &str, key: &str, content: serde_json::Value| {
+            Raw::new(&json!({
+                "type": event_type, "state_key": key, "event_id": format!("${event_type}{key}"),
+                "sender": "@alice:example.org", "origin_server_ts": 1, "content": content
+            }))
+            .unwrap()
+            .cast_unchecked()
+        };
+        let space = |id: &RoomId, key: &str, tombstoned: bool| {
+            let mut events = vec![
+                state(
+                    "m.room.create",
+                    "",
+                    json!({"type": "m.space", "room_version": "11"}),
+                ),
+                state(
+                    "m.space.child",
+                    room_id.as_str(),
+                    json!({"via": ["example.org"]}),
+                ),
+                state(
+                    "m.room.image_pack",
+                    key,
+                    json!({"images": {"wave": {"url": "mxc://example.org/wave"}}}),
+                ),
+            ];
+            if tombstoned {
+                events.push(state(
+                    "m.room.tombstone",
+                    "",
+                    json!({"body": "", "replacement_room": "!new:example.org"}),
+                ));
+            }
+            JoinedRoomBuilder::new(id).add_state_bulk(events)
+        };
+        server
+            .sync_room(&client, JoinedRoomBuilder::new(room_id))
+            .await;
+        server.sync_room(&client, space(live, "live", false)).await;
+        server.sync_room(&client, space(old, "old", true)).await;
+        let core = core();
+        let service = Arc::new(
+            matrix_sdk_ui::sync_service::SyncService::builder(client.clone())
+                .build()
+                .await
+                .unwrap(),
+        );
+        *core.session.write().await = Some(crate::session::Session {
+            account_id: "a1".to_owned(),
+            client,
+            sync_service: service,
+            homeserver: server.server().uri(),
+            oauth: false,
+        });
+        let crate::protocol::CommandOk::ImagePacks { packs, .. } =
+            core.image_packs(room_id.to_owned(), true).await.unwrap()
+        else {
+            panic!("unexpected response")
+        };
+        assert_eq!(
+            packs
+                .iter()
+                .map(|pack| (pack.id.as_str(), pack.origin))
+                .collect::<Vec<_>>(),
+            [("live", ImagePackOriginView::Space)]
         );
     }
 

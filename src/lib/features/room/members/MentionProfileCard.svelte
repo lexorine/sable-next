@@ -1,5 +1,8 @@
 <script lang="ts">
   import PronounPill from '#lib/ui/primitives/PronounPill.svelte';
+  import UserSupporterBadge from '#lib/supporter/UserSupporterBadge.svelte';
+  import { profileSupporterAppearance } from '#lib/supporter/variants.js';
+  import { SUPPORTER_BADGE_FIELD } from '#lib/profile/fields.js';
   import type {
     MemberView,
     ProfileView,
@@ -151,8 +154,13 @@
     }
   });
 
-  let realName = $derived(roomMember?.display_name ?? currentProfile?.display_name ?? userId);
-  let realAvatar = $derived(roomMember?.avatar_url ?? currentProfile?.avatar_url ?? null);
+  let ownIdentity = $derived({
+    name: roomMember?.display_name ?? currentProfile?.display_name ?? null,
+    avatar: roomMember?.avatar_url ?? currentProfile?.avatar_url ?? null,
+  });
+  let shownIdentity = $derived(roomCosmetics?.identity(userId, ownIdentity) ?? ownIdentity);
+  let realName = $derived(shownIdentity.name ?? userId);
+  let realAvatar = $derived(shownIdentity.avatar);
   let displayName = $derived(profileOverrides.name(userId, realName));
   let avatarUrl = $derived(profileOverrides.avatar(userId, realAvatar));
   let overrideColors = $derived(profileOverrides.colors(userId));
@@ -199,7 +207,9 @@
 
     return $i18n.t('timeline.animalNeed', { identity, need: animal.animal_need });
   });
-  let extra = $derived(currentProfile?.extra ?? []);
+  let extra = $derived(
+    (currentProfile?.extra ?? []).filter((field) => field.key !== SUPPORTER_BADGE_FIELD)
+  );
   let showFailure = $derived(failed && !currentProfile && roomMember === null);
   let profileLoading = $derived(!currentProfile && !failed);
   let isSelf = $derived(core.session?.user_id === userId);
@@ -392,6 +402,16 @@
 {#snippet pronounRow()}
   {#if pronouns.length > 0}
     <PronounPill class="profile-pronoun-pill" {pronouns} />
+  {/if}
+  {#if currentProfile?.supporter_awards}
+    <UserSupporterBadge
+      {userId}
+      awards={currentProfile.supporter_awards}
+      name={displayName}
+      isOwnBadge={isSelf}
+      class="profile-supporter-badge"
+      {...profileSupporterAppearance(currentProfile.extra)}
+    />
   {/if}
 {/snippet}
 {#snippet metaRow()}
@@ -741,7 +761,7 @@
   footer={extra.length > 0 ? miscData : undefined}
   headerAction={variant === 'popover' && canMessage ? messageAction : undefined}
   composer={variant === 'sheet' && canMessage ? composer : undefined}
-  insetBody={variant === 'popover'}
+  insetBody
   {variant}
 />
 
@@ -821,8 +841,14 @@
     white-space: nowrap;
   }
 
+  :global(.profile-supporter-badge) {
+    align-self: center;
+    margin-inline: auto calc(-1 * var(--space-100));
+    order: 1;
+  }
+
   :global(.profile-pronoun-pill) {
-    --pronoun-pill-ground: var(--profile-panel-ground);
+    --pronoun-pill-ground: var(--profile-pronoun-ground, var(--profile-panel-ground));
 
     color: var(--profile-text-muted);
   }

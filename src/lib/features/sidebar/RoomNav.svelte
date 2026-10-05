@@ -71,11 +71,14 @@
   import { bannerChanges, readRoomBanner } from '#lib/features/room/room-banner.svelte.js';
   import { goToPage, scopedSearchPath } from '#lib/features/room/room-navigation.js';
   import { CALENDAR_ROOM_TYPE } from '#lib/features/calendar/calendar-events.js';
+  import CalendarRowEvent from '#lib/features/calendar/CalendarRowEvent.svelte';
+  import SpaceEvents from '#lib/features/calendar/SpaceEvents.svelte';
 
   import type { CallVoiceState } from '#lib/features/call/call-session.svelte.js';
   import CallVolumePopover from '#lib/features/call/CallVolumePopover.svelte';
   import MentionProfile from '#lib/features/room/members/MentionProfile.svelte';
-  import { participantKeys } from '#lib/features/call/participant-keys.js';
+  import { numberedName, participantKeys } from '#lib/features/call/participant-keys.js';
+  import ReplacedRooms from './ReplacedRooms.svelte';
   import RoomInvites from './RoomInvites.svelte';
   import RoomOptionsMenu from './RoomOptionsMenu.svelte';
   import ChecksIcon from 'phosphor-svelte/lib/ChecksIcon';
@@ -115,6 +118,8 @@
   }
 
   interface Props {
+    pathname?: string;
+    spaceId?: string;
     onNavigate?: (href: string) => void;
     width?: number;
     collapsed?: boolean;
@@ -124,6 +129,8 @@
   }
 
   let {
+    pathname = page.url.pathname,
+    spaceId = page.params.spaceId,
     onNavigate,
     width,
     collapsed = false,
@@ -176,13 +183,11 @@
   let leaveRoomId = $state<string | null>(null);
   let spacePermissions = $state<RoomPermissionsView | null>(null);
 
-  let directSection = $derived(page.url.pathname.startsWith('/direct'));
-  let unspacedSection = $derived(page.url.pathname.startsWith('/rooms'));
+  let directSection = $derived(pathname.startsWith('/direct'));
+  let unspacedSection = $derived(pathname.startsWith('/rooms'));
 
   let activeSpace = $derived(
-    page.url.pathname.startsWith('/space')
-      ? (findRoomByPathId(roomList.rooms, page.params.spaceId) ?? null)
-      : null
+    pathname.startsWith('/space') ? (findRoomByPathId(roomList.rooms, spaceId) ?? null) : null
   );
 
   // The id, not the summary: a room list diff hands back a fresh object for the
@@ -276,22 +281,22 @@
     home: HouseIcon,
   };
 
-  let section = $derived(navSectionKind(page.url.pathname));
+  let section = $derived(navSectionKind(pathname));
   let labels = $derived(navSectionLabels(section));
   let listLabel = $derived($i18n.t(labels.list));
   let listEmpty = $derived($i18n.t(labels.empty));
   let title = $derived.by(() => {
     if (section !== 'space') return $i18n.t(labels.title);
 
-    const space = findRoomByPathId(roomList.rooms, page.params.spaceId);
+    const space = findRoomByPathId(roomList.rooms, spaceId);
 
     return space?.name ?? $i18n.t(labels.title);
   });
   let TitleIcon = $derived(SECTION_ICONS[section]);
   let spaceTree = $derived.by<SpaceTreeNode[]>(() => {
-    if (!page.url.pathname.startsWith('/space')) return [];
+    if (!pathname.startsWith('/space')) return [];
 
-    const space = findRoomByPathId(roomList.rooms, page.params.spaceId);
+    const space = findRoomByPathId(roomList.rooms, spaceId);
     if (!space?.is_space) return [];
 
     const roomsById = new Map(
@@ -312,7 +317,7 @@
         .sort(byRecency);
     }
 
-    if (page.url.pathname.startsWith('/space')) {
+    if (pathname.startsWith('/space')) {
       return spaceTree.filter((item): item is SpaceTreeRoom => item.kind === 'room');
     }
 
@@ -333,7 +338,7 @@
   });
   let favourites = $derived.by<RoomNavRow[]>(() => {
     if (!groupFavourites) return [];
-    const rows = page.url.pathname.startsWith('/space') ? treeRows(spaceTree) : listedRooms;
+    const rows = pathname.startsWith('/space') ? treeRows(spaceTree) : listedRooms;
     return rows
       .filter(
         (row, index) =>
@@ -358,7 +363,7 @@
       return pending.filter((room) => room.is_direct);
     }
 
-    if (page.url.pathname.startsWith('/space')) {
+    if (pathname.startsWith('/space')) {
       const children = new Set(activeSpace?.space_children.map((child) => child.room_id) ?? []);
       return pending.filter((room) => children.has(room.room_id));
     }
@@ -374,6 +379,12 @@
   $effect(() => {
     publishVisibleRoomOrder(sectionRooms.map((row) => row.roomId));
   });
+  let calendarRooms = $derived(
+    spaceTree
+      .filter((item): item is SpaceTreeRoom => item.kind === 'room')
+      .map((item) => item.room)
+      .filter((room) => room.room_type === CALENDAR_ROOM_TYPE)
+  );
   let subspaces = $derived(spaceRootItems.filter((item) => item.kind !== 'room'));
   let visibleSubspaces = $derived<RoomNavItem[]>(
     flattenSpaceTree(subspaces, {
@@ -394,7 +405,7 @@
   function stillShownRow(item: RoomNavRow): boolean {
     const room = item.room;
     if (room === undefined) return false;
-    if (page.url.pathname === roomHref(item)) return true;
+    if (pathname === roomHref(item)) return true;
     return hasUnread(roomList.badgeUnreadFor(room));
   }
 
@@ -696,7 +707,7 @@
     {@const name = room ? roomLabel(room) : item.roomId}
     {@const avatarUrl = room ? roomAvatarUrl(room) : null}
     {@const href = roomHref(item)}
-    {@const active = page.url.pathname === href}
+    {@const active = pathname === href}
     {@const counts = room ? roomList.badgeUnreadFor(room) : NO_UNREAD}
     {@const mentions = counts.highlight}
     {@const unread = counts.unread}
@@ -711,7 +722,7 @@
       unread === 0 &&
       !marked}
     {@const peerId = room?.is_direct ? dmPeerId(room) : null}
-    {@const peerPresence = peerId ? presenceStore.get(peerId) : null}
+    {@const peerPresence = peerId ? presenceStore.peek(peerId) : null}
     {@const peerStatus = peerId ? resolveUserStatus(peerProfiles.get(peerId), peerPresence) : null}
     <div class="room-row-wrap">
       {@render threadLines(item.threads)}
@@ -749,6 +760,7 @@
                 src={avatarUrl}
                 size="small"
                 uniform
+                recolor={!room?.is_direct}
               >
                 <RoomIcon
                   isCalendar={room?.room_type === CALENDAR_ROOM_TYPE}
@@ -790,6 +802,8 @@
                   >{#if peerStatus.emoji}<span class="room-status-emoji">{peerStatus.emoji}</span
                     >{/if}{peerStatus.text}</span
                 >
+              {:else if room?.room_type === CALENDAR_ROOM_TYPE && preferences.showSpaceEvents}
+                <CalendarRowEvent roomId={room.room_id} />
               {/if}
             </span>
             {#if room && live > 0}
@@ -839,6 +853,18 @@
                 </span>
               {/if}
             </span>
+          {:else if !typing}
+            <UnreadBadge
+              class="room-collapsed-badge"
+              {counts}
+              dm={room?.is_direct ?? false}
+              role="img"
+              aria-label={mentions > 0
+                ? $i18n.t('nav.unreadMentions', { count: mentions })
+                : unread > 0
+                  ? $i18n.t('nav.unreadMessages', { count: unread })
+                  : $i18n.t('nav.markedUnread')}
+            />
           {/if}
         </a>
       {/snippet}
@@ -883,7 +909,10 @@
           {@const profile = peerProfiles.get(userId)}
           {@const voice =
             room.room_id === callRoomId ? callVoiceStates.get(rowKeys[index] ?? userId) : undefined}
-          {@const displayName = profile?.display_name ?? userId}
+          {@const displayName = numberedName(
+            profile?.display_name ?? userId,
+            rowKeys[index] ?? userId
+          )}
           <li
             class:speaking={voice?.speaking && !voice.muted}
             oncontextmenu={voice && userId !== core.session?.user_id
@@ -908,7 +937,7 @@
                 alt={collapsed ? (profile?.display_name ?? userId) : undefined}
               />
               {#if !collapsed}
-                <span>{profile?.display_name ?? userId}</span>
+                <span>{displayName}</span>
                 {#if voice && (voice.muted || voice.deafened || voice.camera || voice.screen)}
                   <span class="voice-badges">
                     {#if voice.screen}
@@ -945,7 +974,7 @@
     {@const room = item.room}
     {@const name = roomLabel(room)}
     {@const href = resolve('/(app)/space/[spaceId]/lobby', { spaceId: roomPathParam(room) })}
-    {@const active = page.url.pathname === href}
+    {@const active = pathname === href}
     <div class="room-row-wrap">
       {@render threadLines(item.threads)}
       {#snippet linkTrigger({ props }: { props: Record<string, unknown> })}
@@ -1011,7 +1040,7 @@
     <div class="room-nav-actions" class:collapsed>
       {#snippet action(href: string, label: string, icon: Component)}
         {@const Icon = icon}
-        {@const active = page.url.pathname === href}
+        {@const active = pathname === href}
         <a
           class="nav-action selection-current selection-layer"
           {href}
@@ -1071,6 +1100,10 @@
         {@render action(searchHref, $i18n.t('nav.messageSearch'), MagnifyingGlassIcon)}
       {/if}
     </div>
+
+    {#if !collapsed && activeSpace && preferences.showSpaceEvents && calendarRooms.length > 0}
+      <SpaceEvents spaceId={roomPathParam(activeSpace)} rooms={calendarRooms} {onNavigate} />
+    {/if}
 
     {#if favourites.length > 0}
       {#if !collapsed}
@@ -1180,6 +1213,7 @@
         </div>
       {/if}
     </div>
+    {#if unspacedSection}<ReplacedRooms {collapsed} />{/if}
   </div>
 </section>
 
@@ -1445,7 +1479,8 @@
     padding: var(--space-100) 0;
   }
 
-  .room-nav-actions.collapsed a {
+  .room-nav-actions.collapsed a,
+  .room-nav-actions.collapsed :global(.room-nav-trigger) {
     justify-content: center;
     padding: 0;
     width: var(--control-height-medium);
@@ -1501,7 +1536,7 @@
     background: var(--bg-container-hover);
   }
 
-  @media (hover: hover) and (pointer: fine) {
+  @media (any-hover: hover) and (any-pointer: fine) {
     .rooms-heading:hover {
       background: var(--bg-container-hover);
     }
@@ -1549,6 +1584,9 @@
     flex: none;
     gap: var(--space-100);
     justify-content: center;
+  }
+
+  .room-status:has(> *) {
     min-width: 1.5rem;
   }
 
@@ -1558,7 +1596,15 @@
     width: var(--space-600);
   }
 
-  @media (hover: hover) and (pointer: fine) {
+  @media (any-hover: hover) and (any-pointer: fine) {
+    .room-row-wrap:not(:has(.room-status > *, .voice-live)):is(:hover, :focus-within) .room-row,
+    .room-row-wrap:not(:has(.room-status > *, .voice-live)):has(
+        :global(.room-options-trigger[data-state='open'])
+      )
+      .room-row {
+      padding-right: calc(var(--space-100) + var(--space-600));
+    }
+
     .room-options-slot {
       margin-right: var(--space-100);
       pointer-events: none;
@@ -1582,8 +1628,11 @@
     }
 
     .room-row-wrap:hover .room-status,
+    .room-row-wrap:hover .voice-live,
     .room-row-wrap:focus-within .room-status,
-    .room-row-wrap:has(:global(.room-options-trigger[data-state='open'])) .room-status {
+    .room-row-wrap:focus-within .voice-live,
+    .room-row-wrap:has(:global(.room-options-trigger[data-state='open'])) .room-status,
+    .room-row-wrap:has(:global(.room-options-trigger[data-state='open'])) .voice-live {
       opacity: 0;
       pointer-events: none;
     }
@@ -1595,7 +1644,7 @@
     background: var(--bg-container-hover);
   }
 
-  @media (hover: hover) and (pointer: fine) {
+  @media (any-hover: hover) and (any-pointer: fine) {
     .room-row-wrap:hover {
       --room-icon-plate: var(--bg-container-hover);
 
@@ -1740,12 +1789,19 @@
     opacity: var(--opacity-p300);
   }
 
+  :global(.room-avatar-icon) :global(.media-image-tint) {
+    color: var(--sec-on-container);
+    opacity: var(--opacity-p300);
+  }
+
   :global(.room-avatar-icon.glyph .avatar-fallback) {
     background: none;
   }
 
   .room-row.unread :global(.room-avatar-icon.glyph),
-  .room-row[aria-current='page'] :global(.room-avatar-icon.glyph) {
+  .room-row[aria-current='page'] :global(.room-avatar-icon.glyph),
+  .room-row.unread :global(.room-avatar-icon .media-image-tint),
+  .room-row[aria-current='page'] :global(.room-avatar-icon .media-image-tint) {
     opacity: var(--opacity-p500);
   }
 
@@ -1989,7 +2045,14 @@
     flex: none;
     justify-content: center;
     padding: 0;
+    position: relative;
     width: var(--avatar-size-small);
+  }
+
+  .room-list.collapsed .room-row :global(.room-collapsed-badge) {
+    position: absolute;
+    right: -0.25rem;
+    top: -0.125rem;
   }
 
   .room-list.collapsed .room-category {

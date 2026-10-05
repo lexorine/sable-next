@@ -27,11 +27,13 @@ function item(overrides: Partial<TimelineItemView> & { id: string }): TimelineIt
     reactions: [],
     is_own: false,
     read_by: [],
+    read_timestamps: {},
     per_message_profile: null,
     bundled_link_previews: [],
     link_previews_removed: null,
     mention: 'none',
     forwarded: null,
+    forum_title: null,
     ...overrides,
   };
 }
@@ -132,6 +134,7 @@ test('a thread is unread when the latest activity has no receipt from the curren
     sender: '@bob:example.org',
     thread_summary: { num_replies: 0, latest_event_id: null, latest_body: null },
     read_by: [],
+    read_timestamps: {},
   });
 
   expect(collectForumThreads([root], '@alice:example.org')[0]?.unread).toBe(true);
@@ -156,6 +159,7 @@ test('a thread you authored yourself is never unread', () => {
     sender: '@alice:example.org',
     thread_summary: { num_replies: 0, latest_event_id: null, latest_body: null },
     read_by: [],
+    read_timestamps: {},
   });
 
   expect(collectForumThreads([root], '@alice:example.org')[0]?.unread).toBe(false);
@@ -184,4 +188,14 @@ test('keeps the root details needed for its own forum actions', () => {
     html: '<strong>Original</strong>',
     mediaCaption: false,
   });
+});
+
+test('carries the post title onto the thread', () => {
+  const titled = item({ id: 'titled', forum_title: 'Rules' });
+  const plain = item({ id: 'plain' });
+
+  const threads = collectForumThreads([titled, plain], null);
+
+  expect(threads.find((thread) => thread.eventId === '$titled')?.title).toBe('Rules');
+  expect(threads.find((thread) => thread.eventId === '$plain')?.title).toBeNull();
 });

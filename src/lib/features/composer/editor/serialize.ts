@@ -59,6 +59,17 @@ function cellLine(row: ProseMirrorNode): string {
   return `| ${cells.join(' | ')} |`;
 }
 
+function renderContent(state: MarkdownSerializerState, node: ProseMirrorNode): void {
+  state.renderContent(node);
+}
+
+function boldBlock(state: MarkdownSerializerState, node: ProseMirrorNode): void {
+  state.write('**');
+  state.renderInline(node);
+  state.write('**');
+  state.closeBlock(node);
+}
+
 const markdown = new MarkdownSerializer(
   {
     ...defaultMarkdownSerializer.nodes,
@@ -88,15 +99,11 @@ const markdown = new MarkdownSerializer(
       state.renderInline(node, false);
       state.closeBlock(node);
     },
-    details: (state, node) => {
-      state.renderContent(node);
-    },
-    summary: (state, node) => {
-      state.write('**');
-      state.renderInline(node);
-      state.write('**');
-      state.closeBlock(node);
-    },
+    details: renderContent,
+    summary: boldBlock,
+    description_list: renderContent,
+    description_term: boldBlock,
+    description_details: renderContent,
     table: (state, node) => {
       node.forEach((row, _offset, index) => {
         state.write(cellLine(row));
@@ -281,7 +288,7 @@ function expandMfm(node: ProseMirrorNode): ProseMirrorNode {
 function html(doc: ProseMirrorNode): string {
   const holder = document.createElement('div');
   holder.append(DOMSerializer.fromSchema(composerSchema).serializeFragment(doc.content));
-  for (const paragraph of holder.querySelectorAll('li > p:only-child')) {
+  for (const paragraph of holder.querySelectorAll('li > p:only-child, dd > p:only-child')) {
     paragraph.replaceWith(...paragraph.childNodes);
   }
 
@@ -304,6 +311,26 @@ function html(doc: ProseMirrorNode): string {
     const dollar = document.createElement('span');
     dollar.textContent = '$';
     suffix.before(dollar);
+  }
+
+  const protectedTexts: Text[] = [];
+  const walker = document.createTreeWalker(holder, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (node instanceof Text && !node.parentElement?.closest('code, pre, a, time')) {
+      protectedTexts.push(node);
+    }
+  }
+  for (const node of protectedTexts) {
+    if (!receiverFormats(node.data)) continue;
+    const pieces = node.data.split(/([*_~`|])/u);
+    node.replaceWith(
+      ...pieces.map((piece, index) => {
+        if (index % 2 === 0) return document.createTextNode(piece);
+        const literal = document.createElement('span');
+        literal.textContent = piece;
+        return literal;
+      })
+    );
   }
 
   const blocks = Array.from(holder.children);
@@ -375,9 +402,10 @@ export function serializeComposer(doc: ProseMirrorNode): ComposerMessage {
   const flat = expandMfm(source);
   const linked = linkMscs(flat);
   const imageSourcePacks = imageSourcePacksOf(flat);
-  if (isPlain(linked)) {
+  const plainBody = plainTextOf(source).trim();
+  if (isPlain(linked) && !receiverFormats(plainBody)) {
     return {
-      body: plainTextOf(source).trim(),
+      body: plainBody,
       formatted: null,
       mentions,
       ...(imageSourcePacks.length > 0 && { imageSourcePacks }),
@@ -443,6 +471,20 @@ export function mentionsOf(doc: ProseMirrorNode): OutgoingMentions {
 const tokenizer = MarkdownIt('commonmark', { html: false })
   .enable(['strikethrough', 'table'])
   .use(mfmPlugin);
+
+const RECEIVER_FORMATS = new Set([
+  'em_open',
+  'strong_open',
+  's_open',
+  'code_inline',
+  'spoiler_open',
+]);
+
+function receiverFormats(text: string): boolean {
+  return tokenizer
+    .parseInline(text, {})
+    .some((token) => token.children?.some((child) => RECEIVER_FORMATS.has(child.type)));
+}
 
 tokenizer.block.ruler.before(
   'heading',
@@ -571,6 +613,10 @@ const markdownParser = new MarkdownParser(
 
 const ATOM_PLACEHOLDER = '\uFFFC';
 
+function parseMarkdown(source: string): ProseMirrorNode {
+  return markdownParser.parse(source.replaceAll('¯\\_(ツ)_/¯', '¯\\\\\\_(ツ)\\_/¯'));
+}
+
 export function atomText(node: ProseMirrorNode): string {
   const { emoticon, room_ping: roomPing, image, math_inline: math } = composerSchema.nodes;
   if (node.type === emoticon) return `:${node.attrs.shortcode as string}:`;
@@ -652,7 +698,7 @@ function spliceAtoms(node: ProseMirrorNode, atoms: ProseMirrorNode[]): ProseMirr
 
 /** Plain-text mode: what was typed is the body, parsed as markdown for the HTML. */
 export function serializePlain(doc: ProseMirrorNode): ComposerMessage {
-  const body = plainTextOf(doc).trim();
+  const body = plainTextOf(doc).replaceAll('\u00a0', ' ').trim();
   const mentions = mentionsOf(doc);
   const imageSourcePacks = imageSourcePacksOf(doc);
   if (body === '')
@@ -666,31 +712,46 @@ export function serializePlain(doc: ProseMirrorNode): ComposerMessage {
   const { source, atoms } = markdownSourceOf(doc);
   const parsed = linkMscs(
     withoutTrailingParagraph(
-      flattenRoomPings(spliceAtoms(markdownParser.parse(source.trim()), atoms))
+      flattenRoomPings(spliceAtoms(parseMarkdown(source.replaceAll('\u00a0', ' ').trim()), atoms))
     )
   );
   return {
     body,
-    formatted: isPlain(parsed) && plainTextOf(parsed) === body ? null : html(parsed),
+    formatted:
+      isPlain(parsed) && plainTextOf(parsed) === body && !receiverFormats(body)
+        ? null
+        : html(parsed),
     mentions,
     ...(imageSourcePacks.length > 0 && { imageSourcePacks }),
   };
 }
 
-export function plainEditSource(body: string, html: string): string {
+export function plainEditDoc(body: string, html: string): ProseMirrorNode {
   const sent = serializePlain(textDoc(body)).formatted;
   const target = parseMatrixHtml(html);
-  if (sent !== null && parseMatrixHtml(sent).eq(target)) return body;
-  return composerMarkdown(target);
+  if (sent !== null && parseMatrixHtml(sent).eq(target)) return textDoc(body);
+
+  const atoms: ProseMirrorNode[] = [];
+  function replaceAtoms(node: ProseMirrorNode): ProseMirrorNode {
+    if (node.type === composerSchema.nodes.mention || node.type === composerSchema.nodes.emoticon) {
+      atoms.push(node);
+      return composerSchema.text(ATOM_PLACEHOLDER, node.marks);
+    }
+    if (node.isLeaf) return node;
+    return node.copy(Fragment.fromArray(node.children.map(replaceAtoms)));
+  }
+
+  const source = composerMarkdown(replaceAtoms(target));
+  return spliceAtoms(textDoc(source), atoms);
 }
 
 export function richFromPlain(doc: ProseMirrorNode): ProseMirrorNode {
   const { source, atoms } = markdownSourceOf(doc);
-  return spliceAtoms(markdownParser.parse(source.trim()), atoms);
+  return spliceAtoms(parseMarkdown(source.trim()), atoms);
 }
 
 export function markdownSlice(text: string): Slice {
-  const parsed = markdownParser.parse(text);
+  const parsed = parseMarkdown(text);
   const only = parsed.childCount === 1 ? parsed.firstChild : null;
   if (only?.type === composerSchema.nodes.paragraph) return new Slice(only.content, 0, 0);
   return new Slice(parsed.content, 0, 0);

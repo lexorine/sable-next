@@ -5,9 +5,10 @@
     editor: ComposerEditor;
     placeholder: string;
     showPlaceholder: boolean;
+    expanded?: boolean;
   }
 
-  let { editor, placeholder, showPlaceholder }: Props = $props();
+  let { editor, placeholder, showPlaceholder, expanded = false }: Props = $props();
 
   function mount(node: HTMLElement): () => void {
     const detach = editor.mount(node);
@@ -27,6 +28,7 @@
 <div
   class="editor"
   class:empty={showPlaceholder}
+  class:expanded
   data-placeholder={placeholder}
   {@attach mount}
 ></div>
@@ -34,6 +36,7 @@
 <style>
   .editor {
     flex: 1;
+    font-size: max(var(--font-size-editor), var(--font-size-input-min));
     max-height: 10rem;
     min-height: var(--target);
     min-width: 0;
@@ -45,14 +48,12 @@
 
   /* `white-space` comes from prosemirror.css, imported by `composer-editor.ts`. */
   .editor :global([contenteditable='true']) {
-    font-size: max(var(--font-size-editor), var(--font-size-input-min));
     outline: 0;
     overflow-wrap: anywhere;
   }
 
   .editor :global(.keyboard-reset) {
     border: 0;
-    font-size: max(var(--font-size-editor), var(--font-size-input-min));
     inset: 0;
     opacity: 0;
     padding: 0;
@@ -63,6 +64,17 @@
 
   .editor :global([contenteditable='true'] p) {
     margin: 0;
+  }
+
+  @media (width >= 48rem) and (any-pointer: fine) {
+    .editor {
+      max-height: clamp(10rem, 30dvh, 20rem);
+    }
+  }
+
+  .editor.expanded {
+    height: clamp(10rem, calc((100dvh - var(--keyboard-overlap)) / 2), 40rem);
+    max-height: none;
   }
 
   .editor :global([contenteditable='true'] p + p) {
@@ -108,19 +120,19 @@
   }
 
   .editor :global(:not(pre) > code) {
-    background: var(--surface-var-container);
-    border: var(--border-width) solid var(--surface-var-container-line);
+    background: var(--bg-container);
+    border: var(--border-width) solid var(--bg-container-line);
     border-radius: var(--radii-300);
-    color: var(--surface-var-on-container);
+    color: var(--bg-on-container);
     font-family: var(--font-family-mono);
     padding: 0 var(--space-050);
   }
 
   .editor :global(pre) {
-    background: var(--surface-var-container);
-    border: var(--border-width) solid var(--surface-var-container-line);
+    background: var(--bg-container);
+    border: var(--border-width) solid var(--bg-container-line);
     border-radius: var(--radius);
-    color: var(--surface-var-on-container);
+    color: var(--bg-on-container);
     font-family: var(--font-family-mono);
     margin: 0;
     overflow-x: auto;
@@ -183,6 +195,14 @@
     font-weight: var(--font-weight-bold);
   }
 
+  .editor :global(dt) {
+    font-weight: var(--font-weight-bold);
+  }
+
+  .editor :global(dd) {
+    margin-inline-start: var(--space-600);
+  }
+
   .editor :global([data-mx-maths]) {
     font-family: var(--font-family-mono);
   }
@@ -204,6 +224,7 @@
     color: var(--surface-var-on-container);
     content: attr(data-placeholder);
     inset-inline: var(--space-200);
+    opacity: var(--opacity-placeholder);
     overflow: hidden;
     pointer-events: none;
     position: absolute;

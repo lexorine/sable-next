@@ -8,11 +8,14 @@ plugins {
     id("io.sentry.android.gradle") version "6.19.0"
 }
 
+val fossBuild = providers.environmentVariable("SABLE_FOSS").orNull == "1"
+
 sentry {
     org.set(System.getenv("SENTRY_ORG"))
     projectName.set(System.getenv("SENTRY_PROJECT"))
     authToken.set(System.getenv("SENTRY_AUTH_TOKEN"))
     autoUploadProguardMapping.set(!System.getenv("SENTRY_AUTH_TOKEN").isNullOrBlank())
+    includeProguardMapping.set(!fossBuild)
     tracingInstrumentation { enabled.set(false) }
     autoInstallation { enabled.set(false) }
     telemetry.set(false)
@@ -36,7 +39,7 @@ android {
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
         applicationId = "moe.sable.next"
-        missingDimensionStrategy("push", "gms")
+        missingDimensionStrategy("push", if (fossBuild) "foss" else "gms")
         minSdk = 24
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
@@ -108,6 +111,21 @@ android {
 }
 
 androidComponents {
+    onVariants { variant ->
+        if (!fossBuild) return@onVariants
+        val abiCode = when (variant.flavorName) {
+            "arm" -> 1
+            "arm64" -> 2
+            "x86" -> 3
+            "x86_64" -> 4
+            else -> 0
+        }
+        variant.outputs.forEach { output ->
+            output.versionCode.set(
+                tauriProperties.getProperty("tauri.android.versionCode", "1").toInt() * 10 + abiCode
+            )
+        }
+    }
     onVariants(selector().withBuildType("debug")) { variant ->
         variant.packaging.jniLibs.keepDebugSymbols.addAll(
             "*/arm64-v8a/*.so",
@@ -132,8 +150,10 @@ configurations.all {
 }
 
 dependencies {
-    implementation("io.sentry:sentry-android:8.58.0")
-    implementation("io.sentry:sentry-android-ndk:8.58.0")
+    if (!fossBuild) {
+        implementation("io.sentry:sentry-android:8.58.0")
+        implementation("io.sentry:sentry-android-ndk:8.58.0")
+    }
     implementation("androidx.webkit:webkit:1.14.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("androidx.activity:activity-ktx:1.10.1")
@@ -147,8 +167,30 @@ dependencies {
 
 apply(from = "tauri.build.gradle.kts")
 
+val sortTauriConfig by tasks.registering {
+    val config = file("src/main/assets/tauri.conf.json")
+    doLast {
+        if (!config.exists()) return@doLast
+        fun sorted(value: Any?): Any? = when (value) {
+            is Map<*, *> -> value.entries.sortedBy { it.key as String }.associate { it.key to sorted(it.value) }
+            is List<*> -> value.map(::sorted)
+            else -> value
+        }
+        config.writeText(groovy.json.JsonOutput.toJson(sorted(groovy.json.JsonSlurper().parse(config))))
+    }
+}
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
+    exclude(if (fossBuild) "**/google/NativeSentry.kt" else "**/foss/NativeSentry.kt")
+}
+
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.configureEach {
+    dependsOn(sortTauriConfig)
+}
+
 // Native FCM push (Sygnal): applies only once google-services.json is added to this
 // directory, so builds without Firebase configured still succeed.
-if (file("google-services.json").exists()) {
+// Skipped for FOSS builds: the plugin injects the Firebase project ids as string
+// resources even when no Firebase library is linked.
+if (!fossBuild && file("google-services.json").exists()) {
     apply(plugin = "com.google.gms.google-services")
 }

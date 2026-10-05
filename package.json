@@ -1,6 +1,6 @@
 {
   "name": "sable-next",
-  "version": "0.0.1",
+  "version": "1.22.9",
   "private": true,
   "license": "AGPL-3.0-or-later",
   "type": "module",
@@ -27,6 +27,8 @@
     "stylelint:fix": "stylelint \"src/**/*.{css,svelte}\" --fix",
     "fmt": "oxfmt .",
     "fmt:check": "oxfmt --check .",
+    "knope": "mise run knope --",
+    "document-change": "mise run knope:document-change",
     "wasm:build": "mise exec -- node scripts/build-wasm.mjs --release",
     "wasm:dev": "mise exec -- node scripts/build-wasm.mjs",
     "wasm:watch": "mise exec -- watchexec --restart --watch crates/sable-core --watch crates/sable-wasm -- pnpm wasm:dev",
@@ -95,7 +97,7 @@
     "@axe-core/playwright": "^4.13.0",
     "@eslint/js": "^10.0.1",
     "@playwright/test": "^1.63.0",
-    "@sentry/cli": "2.58.4",
+    "@sentry/cli": "2.58.6",
     "@sentry/sveltekit": "^11.0.0",
     "@storybook/addon-a11y": "10.6.0",
     "@storybook/addon-docs": "10.6.0",
@@ -144,7 +146,7 @@
       "version": "^24.14.0"
     }
   },
-  "packageManager": "pnpm@12.4.1",
+  "packageManager": "pnpm@12.7.0",
   "imports": {
     "#src/generated/*": "./src/generated/*.ts",
     "#src/generated/wasm/*.js": "./src/generated/wasm/*.js",

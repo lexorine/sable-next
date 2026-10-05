@@ -10,6 +10,7 @@ export default mergeConfig(
   defineConfig({
     resolve: process.env.VITEST ? { conditions: ['browser'] } : undefined,
     test: {
+      maxWorkers: 4,
       alias: {
         '$app/paths/internal/client': new URL(
           './node_modules/@sveltejs/kit/src/runtime/app/paths/internal/client.js',
@@ -45,6 +46,7 @@ export default mergeConfig(
               'src/lib/platform/keyboard.test.ts',
               'src/lib/settings/theme-styles.test.ts',
               'src/lib/features/room/messages/reply-preview.test.ts',
+              'src/lib/ui/primitives/Switcher.svelte.test.ts',
             ],
           },
         },
@@ -71,6 +73,7 @@ export default mergeConfig(
               'src/lib/platform/keyboard.test.ts',
               'src/lib/settings/theme-styles.test.ts',
               'src/lib/features/room/messages/reply-preview.test.ts',
+              'src/lib/ui/primitives/Switcher.svelte.test.ts',
             ],
           },
         },

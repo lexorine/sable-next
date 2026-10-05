@@ -20,10 +20,11 @@ use matrix_sdk::ruma::api::client::state::{get_state_event_for_key, get_state_ev
 use matrix_sdk::ruma::api::error::ErrorKind;
 use matrix_sdk::ruma::api::federation::discovery::get_server_version;
 use matrix_sdk::ruma::events::InitialStateEvent;
+use matrix_sdk::ruma::events::fully_read::FullyReadEventContent;
 use matrix_sdk::ruma::events::relation::{InReplyTo, Reply, Thread};
 use matrix_sdk::ruma::events::room::ImageInfo;
 use matrix_sdk::ruma::events::room::avatar::RoomAvatarEventContent;
-use matrix_sdk::ruma::events::room::create::RoomCreateEventContent;
+use matrix_sdk::ruma::events::room::create::{PreviousRoom, RoomCreateEventContent};
 use matrix_sdk::ruma::events::room::encryption::RoomEncryptionEventContent;
 use matrix_sdk::ruma::events::room::message::Relation;
 use matrix_sdk::ruma::events::room::power_levels::{RoomPowerLevels, RoomPowerLevelsEventContent};
@@ -33,8 +34,8 @@ use matrix_sdk::ruma::profile::{ProfileFieldName, ProfileFieldValue};
 use matrix_sdk::ruma::room::RoomType;
 use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::ruma::{
-    MilliSecondsSinceUnixEpoch, OwnedMxcUri, OwnedRoomId, OwnedUserId, RoomId, RoomOrAliasId,
-    ServerName, UInt, events::room::member::MembershipState,
+    MilliSecondsSinceUnixEpoch, OwnedMxcUri, OwnedRoomId, RoomId, RoomOrAliasId, ServerName, UInt,
+    events::room::member::MembershipState,
 };
 use matrix_sdk::ruma::{
     RoomVersionId, api::client::discovery::get_capabilities::v3::RoomVersionStability,
@@ -48,7 +49,8 @@ use crate::protocol::{
     Command, CommandErr, CommandOk, CoreEvent, CreateJoinRuleView, CreateRoomKind,
     HomeserverSoftwareView, ImageSourcePackReferenceView, ImageSourcePackView, MembershipView,
     MessageKind, MutualRoomView, PackImageInfoView, PaginationDirection, ProfilePropagationView,
-    RoomOpenView, RoomStateEventView, RoomTag, RoomVersionView, RoomVersionsView, UrlPreviewView,
+    RoomOpenView, RoomStateEventView, RoomTag, RoomVersionView, RoomVersionsView,
+    UrlPreviewVideoView, UrlPreviewView,
 };
 use matrix_sdk_ui::notification_client::NotificationProcessSetup;
 
@@ -60,6 +62,7 @@ use crate::outgoing::{gif_content, location_content, message_content, reply_to, 
 use crate::presence;
 use crate::profiles::profile_view;
 use crate::verification::{encryption_status, sign_out_safety};
+use crate::widgets::RelationsFilter;
 use crate::{Core, SubscriptionKind};
 use crate::{notifications, push_check, push_rules, session, view, webpush};
 
@@ -70,6 +73,41 @@ fn preview_refused(error: &matrix_sdk::HttpError) -> bool {
     error
         .as_client_api_error()
         .is_some_and(|api_error| api_error.status_code.as_u16() == 403)
+}
+
+pub(crate) const PREVIEW_THEME_COLOR: &str = "com.sable.theme_color";
+pub(crate) const PREVIEW_CARD: &str = "com.sable.card";
+pub(crate) const PREVIEW_AUTHOR: &str = "com.sable.author_name";
+
+pub(crate) fn preview_video(data: &serde_json::Value) -> Option<UrlPreviewVideoView> {
+    let source = data
+        .get("og:video")?
+        .as_str()
+        .filter(|source| source.starts_with("mxc://"))?
+        .to_owned();
+    let mime = data
+        .get("og:video:type")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let number = |key: &str| data.get(key).and_then(serde_json::Value::as_u64);
+    Some(UrlPreviewVideoView {
+        source,
+        mime,
+        width: number("og:video:width"),
+        height: number("og:video:height"),
+    })
+}
+
+pub(crate) fn preview_theme_color(data: &serde_json::Value) -> Option<String> {
+    let color = data.get(PREVIEW_THEME_COLOR)?.as_str()?;
+    let digits = color.strip_prefix('#')?;
+    (matches!(digits.len(), 3 | 4 | 6 | 8) && digits.chars().all(|c| c.is_ascii_hexdigit()))
+        .then(|| color.to_owned())
+}
+
+pub(crate) fn preview_card(data: &serde_json::Value) -> Option<String> {
+    let card = data.get(PREVIEW_CARD)?.as_str()?;
+    matches!(card, "summary" | "summary_large_image").then(|| card.to_owned())
 }
 
 fn url_preview(url: String, data: &serde_json::Value) -> Option<UrlPreviewView> {
@@ -91,9 +129,17 @@ fn url_preview(url: String, data: &serde_json::Value) -> Option<UrlPreviewView> 
         image_mime: text("og:image:type"),
         image_width: number("og:image:width"),
         image_height: number("og:image:height"),
+        video: preview_video(data),
+        theme_color: preview_theme_color(data),
+        card: preview_card(data),
+        author_name: text(PREVIEW_AUTHOR),
     };
 
-    if preview.title.is_none() && preview.description.is_none() && preview.image.is_none() {
+    if preview.title.is_none()
+        && preview.description.is_none()
+        && preview.image.is_none()
+        && preview.video.is_none()
+    {
         return None;
     }
     Some(preview)
@@ -157,7 +203,10 @@ impl Core {
     ///
     /// Returns a protocol error when the command is invalid, the user is not
     /// authenticated, or the Matrix operation fails.
-    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one sequential flow kept in a single function"
+    )]
     pub async fn dispatch(self: &Arc<Self>, command: Command) -> Result<CommandOk, CommandErr> {
         match command {
             Command::DiscoverHomeserver { server_name } => {
@@ -305,6 +354,22 @@ impl Core {
                 })
             }
 
+            Command::RequestOpenIdToken => {
+                let response = self
+                    .client()
+                    .await?
+                    .account()
+                    .request_openid_token()
+                    .await
+                    .or_failed(self, "request_openid_token")?;
+
+                Ok(CommandOk::RequestOpenIdToken {
+                    access_token: response.access_token,
+                    matrix_server_name: response.matrix_server_name.to_string(),
+                    expires_in: u32::try_from(response.expires_in.as_secs()).unwrap_or(u32::MAX),
+                })
+            }
+
             Command::SubscribeRoomList => self.subscribe_room_list().await,
 
             Command::SubscribeTimeline {
@@ -332,7 +397,7 @@ impl Core {
                 direction,
                 count,
             } => {
-                let (timeline, focused) = self
+                let (timeline, focused, thread) = self
                     .subscriptions
                     .lock()
                     .await
@@ -342,12 +407,19 @@ impl Core {
                             (
                                 timeline,
                                 matches!(subscription.kind, SubscriptionKind::FocusedTimeline(_)),
+                                subscription.thread_root.is_some(),
                             )
                         })
                     })
                     .ok_or(CommandErr::UnknownSubscription)?;
                 if matches!(direction, PaginationDirection::Forward) && !focused {
                     return Err(CommandErr::InvalidPaginationDirection);
+                }
+                if matches!(direction, PaginationDirection::Forward) && thread {
+                    return Ok(CommandOk::Paginate {
+                        direction,
+                        reached_end: true,
+                    });
                 }
                 let _foreground = self.begin_foreground_pagination();
                 let reached_end = match direction {
@@ -376,6 +448,7 @@ impl Core {
                 link_previews,
                 image_source_packs,
                 bot_command,
+                forum_title,
             } => {
                 let timeline = self.timeline_for(&room_id, thread_root.as_ref()).await?;
                 let (body, formatted, persona) = match persona {
@@ -402,6 +475,7 @@ impl Core {
                             image_source_pack_references(&image_source_packs),
                         ),
                         (crate::bot_commands::COMMAND_FIELD, bot_command),
+                        (view::FORUM_TITLE, forum_title_value(forum_title)),
                     ],
                 );
                 timeline
@@ -610,6 +684,7 @@ impl Core {
                 mentions,
                 mentions_room,
                 persona,
+                forum_title,
             } => {
                 self.edit_message(
                     &room_id,
@@ -623,6 +698,7 @@ impl Core {
                     mentions,
                     mentions_room,
                     persona,
+                    forum_title,
                 )
                 .await?;
                 Ok(CommandOk::EditMessage)
@@ -633,11 +709,21 @@ impl Core {
                 event_id,
                 thread_root,
             } => {
-                self.timeline_for(&room_id, thread_root.as_ref())
+                let fetched = self
+                    .timeline_for(&room_id, thread_root.as_ref())
                     .await?
                     .fetch_details_for_event(&event_id)
-                    .await
-                    .or_failed(self, "fetch_event_details")?;
+                    .await;
+                match fetched {
+                    Err(TimelineError::EventNotInTimeline(_)) => {
+                        tracing::debug!(
+                            context = "fetch_event_details",
+                            "the event left the timeline"
+                        );
+                        return Err(CommandErr::Unavailable);
+                    }
+                    other => other.or_failed(self, "fetch_event_details")?,
+                }
 
                 Ok(CommandOk::FetchEventDetails)
             }
@@ -866,12 +952,14 @@ impl Core {
                 );
                 request.additional_creators = additional_creators;
 
-                let response = self
-                    .client()
-                    .await?
+                let client = self.client().await?;
+                let old_room = request.room_id.clone();
+                let response = client
                     .send(request)
                     .await
                     .map_err(|error| self.room_error("upgrade_room", error.into()))?;
+                self.copy_room_packs(&client, &old_room, &response.replacement_room)
+                    .await;
 
                 Ok(CommandOk::UpgradeRoom {
                     replacement_room: response.replacement_room,
@@ -1114,6 +1202,17 @@ impl Core {
                 })
             }
 
+            Command::ReplacedRooms => {
+                let client = self.client().await?;
+                let mut rooms = Vec::new();
+                for room in client.joined_rooms() {
+                    if room.is_tombstoned() {
+                        rooms.push(view::listless_room_summary(room).await);
+                    }
+                }
+                Ok(CommandOk::ReplacedRooms { rooms })
+            }
+
             Command::RoomCosmetics { room_id, space_id } => Ok(CommandOk::RoomCosmetics(
                 self.room_cosmetics(&room_id, space_id).await?,
             )),
@@ -1201,6 +1300,37 @@ impl Core {
                     .and_then(|raw| raw.get_field::<serde_json::Value>("content").ok().flatten());
 
                 Ok(CommandOk::RoomAccountData { content })
+            }
+
+            Command::ReadMarker { room_id } => {
+                let room = self.room(&room_id).await?;
+                let fully_read = room
+                    .account_data_static::<FullyReadEventContent>()
+                    .await
+                    .map_err(|error| self.room_error("read_marker", error))?
+                    .and_then(|raw| raw.deserialize().ok())
+                    .map(|event| event.content.event_id);
+                let event_id = fully_read.or_else(|| {
+                    room.read_receipts()
+                        .latest_active
+                        .map(|receipt| receipt.event_id)
+                });
+                Ok(CommandOk::ReadMarker { event_id })
+            }
+
+            Command::EventCached { room_id, event_id } => {
+                let (cache, _handles) = self
+                    .room(&room_id)
+                    .await?
+                    .event_cache()
+                    .await
+                    .or_failed(self, "event_cached")?;
+                let cached = cache
+                    .find_event(&event_id)
+                    .await
+                    .or_failed(self, "event_cached")?
+                    .is_some();
+                Ok(CommandOk::EventCached { cached })
             }
 
             Command::AccountDataTypes => Ok(CommandOk::AccountDataTypes {
@@ -1414,9 +1544,12 @@ impl Core {
                 source_pack,
                 shortcode,
                 thread_root,
+                subscription,
             } => {
                 self.ensure_reaction_target(&room_id, &event_id).await?;
-                let timeline = self.timeline_for(&room_id, thread_root.as_ref()).await?;
+                let timeline = self
+                    .subscribed_timeline(&room_id, thread_root.as_ref(), subscription)
+                    .await?;
                 let shortcode = match shortcode
                     .or_else(|| source_pack.as_ref().map(|source| source.shortcode.clone()))
                 {
@@ -1464,6 +1597,7 @@ impl Core {
                 room_id,
                 event_type,
                 msgtype,
+                state_key,
                 limit,
                 since,
             } => Ok(CommandOk::RoomTimelineEvents {
@@ -1472,6 +1606,7 @@ impl Core {
                         &room_id,
                         &event_type,
                         msgtype.as_deref(),
+                        state_key.as_deref(),
                         limit,
                         since.as_ref(),
                     )
@@ -1506,6 +1641,101 @@ impl Core {
             }
             Command::OpenIdToken => Ok(CommandOk::OpenIdToken {
                 token: self.openid_token().await?,
+            }),
+            Command::WidgetSendDelayedEvent {
+                room_id,
+                event_type,
+                state_key,
+                content,
+                delay_ms,
+                sticky_duration_ms,
+            } => Ok(CommandOk::WidgetSendDelayedEvent {
+                delay_id: self
+                    .widget_send_delayed_event(
+                        &room_id,
+                        &event_type,
+                        state_key,
+                        content,
+                        delay_ms,
+                        sticky_duration_ms,
+                    )
+                    .await?,
+            }),
+            Command::WidgetSendStickyEvent {
+                room_id,
+                event_type,
+                content,
+                sticky_duration_ms,
+            } => Ok(CommandOk::WidgetSendStickyEvent {
+                event_id: self
+                    .widget_send_sticky_event(&room_id, &event_type, content, sticky_duration_ms)
+                    .await?,
+            }),
+            Command::RestartDelayedEvent { delay_id } => {
+                self.restart_delayed_event(delay_id).await?;
+                Ok(CommandOk::RestartDelayedEvent)
+            }
+            Command::WidgetSendToDevice {
+                event_type,
+                encrypted,
+                messages,
+            } => {
+                self.widget_send_to_device(&event_type, encrypted, messages)
+                    .await?;
+                Ok(CommandOk::WidgetSendToDevice)
+            }
+            Command::RoomAccountDataRaw {
+                room_id,
+                event_type,
+            } => Ok(CommandOk::RoomAccountDataRaw {
+                event: self.room_account_data_raw(&room_id, &event_type).await?,
+            }),
+            Command::RoomStickyEvents { room_id } => Ok(CommandOk::RoomStickyEvents {
+                events: self.room_sticky_events(&room_id).await?,
+            }),
+            Command::RoomEventRelations {
+                room_id,
+                event_id,
+                rel_type,
+                event_type,
+                from,
+                to,
+                limit,
+                direction,
+            } => Ok(CommandOk::RoomEventRelations {
+                relations: self
+                    .room_event_relations(
+                        &room_id,
+                        &event_id,
+                        RelationsFilter {
+                            rel_type: rel_type.as_deref(),
+                            event_type: event_type.as_deref(),
+                            from: from.as_deref(),
+                            to: to.as_deref(),
+                            limit,
+                            direction,
+                        },
+                    )
+                    .await?,
+            }),
+            Command::TurnServer => Ok(CommandOk::TurnServer {
+                server: self.turn_server().await?,
+            }),
+            Command::RtcTransports => Ok(CommandOk::RtcTransports {
+                body: self.rtc_transports().await?,
+            }),
+            Command::RtcLivekit { endpoint, body } => Ok(CommandOk::RtcLivekit {
+                body: self.rtc_livekit(endpoint, &body).await?,
+            }),
+            Command::SetWidgetFeed { enabled } => {
+                self.set_widget_feed(enabled);
+                Ok(CommandOk::SetWidgetFeed)
+            }
+            Command::KnownRooms => Ok(CommandOk::KnownRooms {
+                room_ids: self.known_room_ids().await?,
+            }),
+            Command::IntegrationManagerUrl { room_id } => Ok(CommandOk::IntegrationManagerUrl {
+                url: self.integration_manager_url(&room_id).await?,
             }),
             Command::ScheduleMessage {
                 room_id,
@@ -1899,10 +2129,7 @@ impl Core {
                     .client()
                     .await?
                     .subscribe_to_ignore_user_list_changes()
-                    .get()
-                    .iter()
-                    .filter_map(|user_id| user_id.parse().ok())
-                    .collect::<Vec<OwnedUserId>>();
+                    .get();
                 users.sort();
 
                 Ok(CommandOk::IgnoredUsers { users })
@@ -1979,10 +2206,12 @@ impl Core {
                 ),
             }),
 
-            Command::MembershipNotifications => Ok(CommandOk::MembershipNotifications {
-                enabled: push_rules::membership_notifications(
-                    &self.push_rules().await?.snapshot().await,
-                ),
+            Command::EventNotifications => Ok(CommandOk::EventNotifications {
+                events: push_rules::event_notifications(&self.push_rules().await?.snapshot().await),
+            }),
+
+            Command::MasterMute => Ok(CommandOk::MasterMute {
+                muted: push_rules::master_muted(&self.push_rules().await?.snapshot().await),
             }),
 
             Command::SetPusher { pusher } => {
@@ -2023,6 +2252,10 @@ impl Core {
 
             Command::PingPushGateway { url } => Ok(CommandOk::PingPushGateway {
                 reached: push_check::ping_gateway(&url).await,
+            }),
+
+            Command::DiscoverPushGateway { endpoint } => Ok(CommandOk::DiscoverPushGateway {
+                gateway: push_check::discover_gateway(&endpoint).await,
             }),
 
             Command::SendDiagnosticPush { pushkey, app_id } => Ok(CommandOk::SendDiagnosticPush {
@@ -2154,14 +2387,26 @@ impl Core {
                 Ok(CommandOk::SetMentionNotifications)
             }
 
-            Command::SetMembershipNotifications { enabled } => {
+            Command::SetEventNotification { event, enabled } => {
+                let rules = self.push_rules().await?;
+                let writes = push_rules::plan_event(&rules.snapshot().await, event, enabled)
+                    .or_failed(self, "set_event_notification")?;
+                rules
+                    .apply(writes)
+                    .await
+                    .or_failed(self, "set_event_notification")?;
+
+                Ok(CommandOk::SetEventNotification)
+            }
+
+            Command::SetMasterMute { muted } => {
                 self.push_rules()
                     .await?
-                    .apply(push_rules::plan_membership(enabled))
+                    .apply(push_rules::plan_master(muted))
                     .await
-                    .or_failed(self, "set_membership_notifications")?;
+                    .or_failed(self, "set_master_mute")?;
 
-                Ok(CommandOk::SetMembershipNotifications)
+                Ok(CommandOk::SetMasterMute)
             }
 
             Command::Notification { room_id, event_id } => {
@@ -2523,6 +2768,7 @@ impl Core {
                 room_version,
                 join_rule,
                 federate,
+                predecessor,
             } => {
                 let client = self.client().await?;
                 let mut request = create_room::v3::Request::new();
@@ -2554,10 +2800,11 @@ impl Core {
                         Some(RoomType::from(crate::calendar::CALENDAR_ROOM_TYPE))
                     }
                 };
-                if room_type.is_some() || !federate {
+                if room_type.is_some() || !federate || predecessor.is_some() {
                     let mut creation = RoomCreateEventContent::new_v11();
                     creation.room_type = room_type;
                     creation.federate = federate;
+                    creation.predecessor = predecessor.map(PreviousRoom::new);
                     request.creation_content = Some(
                         Raw::new(&creation)
                             .or_failed(self, "create_room_creation_content")?
@@ -2805,6 +3052,7 @@ impl Core {
                 private_receipt,
                 thread_root,
                 subscription,
+                fully_read,
             } => {
                 let receipt_type = if private_receipt {
                     matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType::ReadPrivate
@@ -2846,33 +3094,29 @@ impl Core {
                     return Ok(CommandOk::MarkRead);
                 };
 
-                let timeline = if let Some(subscription) = subscription {
-                    let timeline = self
-                        .subscriptions
-                        .lock()
-                        .await
-                        .get(&subscription)
-                        .filter(|subscription| subscription.thread_root == thread_root)
-                        .and_then(|subscription| subscription.timeline.clone())
-                        .ok_or(CommandErr::UnknownSubscription)?;
-                    if timeline.room().room_id() != room_id {
-                        return Err(CommandErr::UnknownSubscription);
-                    }
-                    timeline
-                } else {
-                    self.timeline_for(&room_id, thread_root.as_ref()).await?
-                };
+                let timeline = self
+                    .subscribed_timeline(&room_id, thread_root.as_ref(), subscription)
+                    .await?;
                 timeline
                     .send_single_receipt(receipt_type, event_id.clone())
                     .await
                     .or_failed(self, "mark_read")?;
-                if thread_root.is_none() {
+                if fully_read && thread_root.is_none() {
                     timeline
                         .send_multiple_receipts(Receipts::new().fully_read_marker(event_id))
                         .await
                         .or_failed(self, "mark_read")?;
                 }
                 Ok(CommandOk::MarkRead)
+            }
+
+            Command::SetFullyRead { room_id, event_id } => {
+                self.room(&room_id)
+                    .await?
+                    .send_multiple_receipts(Receipts::new().fully_read_marker(event_id))
+                    .await
+                    .map_err(|error| self.room_error("set_fully_read", error))?;
+                Ok(CommandOk::SetFullyRead)
             }
 
             Command::MarkUnread {
@@ -2966,6 +3210,13 @@ fn extra_content<const N: usize>(
     extra
 }
 
+pub(crate) fn forum_title_value(title: Option<String>) -> Option<serde_json::Value> {
+    title
+        .map(|title| title.trim().to_owned())
+        .filter(|title| !title.is_empty())
+        .map(serde_json::Value::String)
+}
+
 fn empty_mentions_extra() -> Option<serde_json::Map<String, serde_json::Value>> {
     extra_content(None, [("m.mentions", Some(serde_json::json!({})))])
 }
@@ -3045,6 +3296,27 @@ fn bundled_link_previews(previews: &[UrlPreviewView]) -> Option<serde_json::Valu
                     }
                     if let Some(height) = preview.image_height {
                         bundle.insert("og:image:height".to_owned(), height.into());
+                    }
+                    if let Some(video) = &preview.video {
+                        bundle.insert("og:video".to_owned(), video.source.clone().into());
+                        if let Some(mime) = &video.mime {
+                            bundle.insert("og:video:type".to_owned(), mime.clone().into());
+                        }
+                        if let Some(width) = video.width {
+                            bundle.insert("og:video:width".to_owned(), width.into());
+                        }
+                        if let Some(height) = video.height {
+                            bundle.insert("og:video:height".to_owned(), height.into());
+                        }
+                    }
+                    if let Some(color) = &preview.theme_color {
+                        bundle.insert(PREVIEW_THEME_COLOR.to_owned(), color.clone().into());
+                    }
+                    if let Some(card) = &preview.card {
+                        bundle.insert(PREVIEW_CARD.to_owned(), card.clone().into());
+                    }
+                    if let Some(author) = &preview.author_name {
+                        bundle.insert(PREVIEW_AUTHOR.to_owned(), author.clone().into());
                     }
                     serde_json::Value::Object(bundle)
                 })
@@ -3318,6 +3590,47 @@ mod tests {
         let empty = serde_json::json!({ "og:title": "   ", "og:image": "https://cdn/x.png" });
         assert!(super::url_preview("https://e".to_owned(), &empty).is_none());
         assert!(super::url_preview("https://e".to_owned(), &serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn a_video_alone_is_a_preview() {
+        let data = serde_json::json!({
+            "og:video": "mxc://s/clip",
+            "og:video:type": "video/mp4",
+            "og:video:width": 1280,
+            "og:video:height": 720,
+        });
+        let preview = super::url_preview("https://e".to_owned(), &data).expect("a preview");
+        let video = preview.video.expect("a video");
+        assert_eq!(video.source, "mxc://s/clip");
+        assert_eq!(video.mime.as_deref(), Some("video/mp4"));
+        assert_eq!((video.width, video.height), (Some(1280), Some(720)));
+
+        let remote = serde_json::json!({ "og:video": "https://cdn.example/clip.mp4" });
+        assert!(super::url_preview("https://e".to_owned(), &remote).is_none());
+    }
+
+    #[test]
+    fn presentation_hints_are_validated() {
+        let data = serde_json::json!({
+            "og:title": "Title",
+            "com.sable.theme_color": "#ff4500",
+            "com.sable.card": "summary_large_image",
+            "com.sable.author_name": "someone",
+        });
+        let preview = super::url_preview("https://e".to_owned(), &data).expect("a preview");
+        assert_eq!(preview.theme_color.as_deref(), Some("#ff4500"));
+        assert_eq!(preview.card.as_deref(), Some("summary_large_image"));
+        assert_eq!(preview.author_name.as_deref(), Some("someone"));
+
+        let data = serde_json::json!({
+            "og:title": "Title",
+            "com.sable.theme_color": "red; background:url(x)",
+            "com.sable.card": "player",
+        });
+        let preview = super::url_preview("https://e".to_owned(), &data).expect("a preview");
+        assert_eq!(preview.theme_color, None);
+        assert_eq!(preview.card, None);
     }
 
     #[test]

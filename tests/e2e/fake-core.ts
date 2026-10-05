@@ -5,10 +5,12 @@ import type {
   CommandOk,
   CoreEvent,
   EncryptionStatusView,
+  EventNotificationsView,
   ImagePackView,
   KeywordNotificationView,
   MentionNotificationsView,
   ProfileView,
+  MemberView,
   RoomSummary,
   SessionInfo,
   SidebarItemView,
@@ -19,6 +21,7 @@ import type {
 
 export type RoomCoreMode =
   | 'ready'
+  | 'room_name_overflow'
   | 'thread_links'
   | 'thread_error'
   | 'loading'
@@ -53,7 +56,12 @@ declare global {
     __e2eSwitchAccountDelayMs?: number;
     __e2eCommandPayloads: Command[];
     __e2eProfileSaveError?: boolean;
+    __e2eSendError?: string;
     __e2eFetchMedia?: (source: string, width: number, height: number) => Promise<Uint8Array>;
+    __e2eMembers?: MemberView[];
+    __e2eRelationEvents?: unknown[];
+    __e2eMediaReady?: Promise<void>;
+    __e2eReleaseMedia: () => void;
     __e2eAnchorPositions: number[];
     __e2eTimelineRooms: string[];
     __e2eTimelineSubscriptions: number[];
@@ -135,12 +143,13 @@ export async function installFakeCore(page: Page, mode: WorkerMode): Promise<voi
       name_color_dark: null,
       animal: null,
       extra: [],
+      supporter_awards: null,
       legacy_fields: [],
     };
     const room: RoomSummary = {
       room_id: '!room:example.test',
       canonical_alias: null,
-      name: 'General',
+      name: workerMode === 'room_name_overflow' ? 'Room name fits until hover' : 'General',
       topic: null,
       avatar_url: null,
       is_direct: false,
@@ -164,13 +173,15 @@ export async function installFakeCore(page: Page, mode: WorkerMode): Promise<voi
       supports_knock_restricted: false,
       space_children: [],
       unread:
-        workerMode === 'unread_history' || workerMode === 'unread_context_error'
-          ? 9_995
-          : workerMode === 'unread_catchup'
-            ? 75
-            : 2,
-      notifying: 2,
-      highlight: 1,
+        workerMode === 'room_name_overflow'
+          ? 0
+          : workerMode === 'unread_history' || workerMode === 'unread_context_error'
+            ? 9_995
+            : workerMode === 'unread_catchup'
+              ? 75
+              : 2,
+      notifying: workerMode === 'room_name_overflow' ? 0 : 2,
+      highlight: workerMode === 'room_name_overflow' ? 0 : 1,
       marked_unread: false,
       latest_event: {
         sender: '@alice:example.test',
@@ -421,11 +432,13 @@ export async function installFakeCore(page: Page, mode: WorkerMode): Promise<voi
             reactions: [],
             is_own: false,
             read_by: [],
+            read_timestamps: {},
             per_message_profile: null,
             bundled_link_previews: [],
             link_previews_removed: null,
             mention: 'none',
             forwarded: null,
+            forum_title: null,
           };
         }
       );
@@ -519,7 +532,15 @@ export async function installFakeCore(page: Page, mode: WorkerMode): Promise<voi
     let unreadContextOpened = false;
     const notificationKeywords: KeywordNotificationView[] = [];
     let defaultGroupMode: 'all' | 'mentions' = 'mentions';
-    let membershipNotifications: boolean | null = false;
+    const eventNotifications: EventNotificationsView = {
+      membership: false,
+      reactions: false,
+      edits: false,
+      notices: false,
+      invites: true,
+      calls: true,
+    };
+    let masterMute: boolean | null = false;
     const mentionNotificationModes: MentionNotificationsView = {
       room: 'notify',
       user: 'loud',
@@ -732,6 +753,8 @@ export async function installFakeCore(page: Page, mode: WorkerMode): Promise<voi
     let backupDownload: Extract<CommandOk, { type: 'download_key_backup' }>['download'] | null =
       null;
 
+    const fullyReadEventId = (roomId: string): string =>
+      `$${(joinedRooms.find((room) => room.room_id === roomId)?.name ?? 'General').toLowerCase()}-${workerMode === 'unread' || workerMode === 'unread_history' || workerMode === 'unread_context_error' || workerMode === 'unread_catchup' ? '4' : '19'}:example.test`;
     const handlers: Handlers = {
       discover_homeserver: () => ({
         type: 'discover_homeserver',
@@ -805,6 +828,12 @@ export async function installFakeCore(page: Page, mode: WorkerMode): Promise<voi
         if (window.__e2eSwitchAccountError) throw new FakeCoreError('unavailable');
         return { type: 'switch_account', session };
       },
+      request_open_id_token: () => ({
+        type: 'request_open_id_token',
+        access_token: 'e2e-openid-token',
+        matrix_server_name: 'example.test',
+        expires_in: 3600,
+      }),
       homeserver_info: () => ({
         type: 'homeserver_info',
         homeserver: 'https://example.test',
@@ -1011,7 +1040,7 @@ export async function installFakeCore(page: Page, mode: WorkerMode): Promise<voi
       },
       room_members: () => ({
         type: 'room_members',
-        members: [
+        members: window.__e2eMembers ?? [
           {
             user_id: '@alice:example.test',
             display_name: 'Alice',
@@ -1029,6 +1058,7 @@ export async function installFakeCore(page: Page, mode: WorkerMode): Promise<voi
         return { type: 'unsubscribe' };
       },
       send_message: (command) => {
+        if (window.__e2eSendError) throw new FakeCoreError(window.__e2eSendError);
         receiveMessage(command.body, true);
         return { type: 'send_message' };
       },
@@ -1045,6 +1075,7 @@ export async function installFakeCore(page: Page, mode: WorkerMode): Promise<voi
         identity: `${session.user_id}:${session.device_id}`,
         encrypt_media: false,
         mode: 'legacy',
+        can_publish: true,
         publisher_id: 'legacy',
         backends: [
           {
@@ -1101,10 +1132,8 @@ export async function installFakeCore(page: Page, mode: WorkerMode): Promise<voi
         type: 'mention_notifications',
         modes: mentionNotificationModes,
       }),
-      membership_notifications: () => ({
-        type: 'membership_notifications',
-        enabled: membershipNotifications,
-      }),
+      event_notifications: () => ({ type: 'event_notifications', events: eventNotifications }),
+      master_mute: () => ({ type: 'master_mute', muted: masterMute }),
       web_pusher_support: () => ({ type: 'web_pusher_support', vapid: null }),
       web_pushers: () => ({ type: 'web_pushers', pushers: [] }),
       ping_push_gateway: () => ({ type: 'ping_push_gateway', reached: null }),
@@ -1140,12 +1169,17 @@ export async function installFakeCore(page: Page, mode: WorkerMode): Promise<voi
       ignored_users: () => ({ type: 'ignored_users', users: [] }),
       invite_triage: () => ({ type: 'invite_triage', invites: [] }),
       bulk_redact: () => ({ type: 'bulk_redact', redacted: 0 }),
+      redacted_content: () => ({
+        type: 'redacted_content',
+        content: { content: null, per_message_profile: null },
+      }),
       delete_thread: () => ({ type: 'delete_thread' }),
       pinned_events: () => ({ type: 'pinned_events', event_ids: [] }),
       reaction_shortcodes: () => ({ type: 'reaction_shortcodes', shortcodes: [] }),
       calendar_entries: () => ({ type: 'calendar_entries', entries: [], rsvps: [] }),
       room_has_space_parent: () => ({ type: 'room_has_space_parent', has_space_parent: false }),
       unjoined_space_parents: () => ({ type: 'unjoined_space_parents', parents: [] }),
+      replaced_rooms: () => ({ type: 'replaced_rooms', rooms: [] }),
       room_open: (command, port) => {
         const permissions = handlers.room_permissions(
           { type: 'room_permissions', room_id: command.room_id },
@@ -1238,6 +1272,10 @@ export async function installFakeCore(page: Page, mode: WorkerMode): Promise<voi
                 image_mime: null,
                 image_width: null,
                 image_height: null,
+                video: null,
+                theme_color: null,
+                card: null,
+                author_name: null,
               }
             : null,
       }),
@@ -1248,14 +1286,17 @@ export async function installFakeCore(page: Page, mode: WorkerMode): Promise<voi
         keywords: notificationKeywords.map((entry) => ({ ...entry })),
       }),
       timestamp_to_event: () => ({ type: 'timestamp_to_event', event_id: null }),
+      event_cached: () => ({ type: 'event_cached', cached: false }),
       room_account_data: (command) => ({
         type: 'room_account_data',
         content:
           command.event_type === 'm.fully_read'
-            ? {
-                event_id: `$${(joinedRooms.find((room) => room.room_id === command.room_id)?.name ?? 'General').toLowerCase()}-${workerMode === 'unread' || workerMode === 'unread_history' || workerMode === 'unread_context_error' || workerMode === 'unread_catchup' ? '4' : '19'}:example.test`,
-              }
+            ? { event_id: fullyReadEventId(command.room_id) }
             : null,
+      }),
+      read_marker: (command) => ({
+        type: 'read_marker',
+        event_id: fullyReadEventId(command.room_id),
       }),
       account_data_types: () => ({ type: 'account_data_types', event_types: [] }),
       access_token: () => ({ type: 'access_token', token: 'e2e-access-token' }),
@@ -1397,6 +1438,35 @@ export async function installFakeCore(page: Page, mode: WorkerMode): Promise<voi
           matrix_server_name: 'example.test',
           expires_in_ms: 3_600_000,
         },
+      }),
+      discover_push_gateway: () => ({ type: 'discover_push_gateway', gateway: null }),
+      widget_send_delayed_event: () => ({
+        type: 'widget_send_delayed_event',
+        delay_id: 'e2e-widget-delay',
+      }),
+      widget_send_sticky_event: () => ({
+        type: 'widget_send_sticky_event',
+        event_id: '$e2e-widget-sticky',
+      }),
+      restart_delayed_event: () => ({ type: 'restart_delayed_event' }),
+      widget_send_to_device: () => ({ type: 'widget_send_to_device' }),
+      room_account_data_raw: () => ({ type: 'room_account_data_raw', event: null }),
+      room_sticky_events: () => ({ type: 'room_sticky_events', events: [] }),
+      room_event_relations: () => ({
+        type: 'room_event_relations',
+        relations: { chunk: window.__e2eRelationEvents ?? [], next_batch: null, prev_batch: null },
+      }),
+      turn_server: () => ({
+        type: 'turn_server',
+        server: { username: 'e2e', password: 'e2e', uris: [], ttl_ms: 3_600_000 },
+      }),
+      rtc_transports: () => ({ type: 'rtc_transports', body: { rtc_transports: [] } }),
+      rtc_livekit: () => ({ type: 'rtc_livekit', body: {} }),
+      set_widget_feed: () => ({ type: 'set_widget_feed' }),
+      known_rooms: () => ({ type: 'known_rooms', room_ids: [] }),
+      integration_manager_url: () => ({
+        type: 'integration_manager_url',
+        url: 'https://integrations.example.test/index.html',
       }),
       schedule_message: () => ({ type: 'schedule_message', delay_id: 'e2e-delay' }),
       schedule_attachment: () => ({ type: 'schedule_attachment', delay_id: 'e2e-attachment' }),
@@ -1604,9 +1674,13 @@ export async function installFakeCore(page: Page, mode: WorkerMode): Promise<voi
           defaultGroupMode = command.mode;
         return { type: 'set_default_notification_mode' };
       },
-      set_membership_notifications: (command) => {
-        membershipNotifications = command.enabled;
-        return { type: 'set_membership_notifications' };
+      set_event_notification: (command) => {
+        eventNotifications[command.event] = command.enabled;
+        return { type: 'set_event_notification' };
+      },
+      set_master_mute: (command) => {
+        masterMute = command.muted;
+        return { type: 'set_master_mute' };
       },
       send_state_event: (command) => {
         if (command.event_type === 'im.vector.modular.widgets')
@@ -1701,11 +1775,11 @@ export async function installFakeCore(page: Page, mode: WorkerMode): Promise<voi
           commandLog.push(`fetch_media ${String(width)}x${String(height)}`);
           window.setTimeout(
             () => {
-              void (window.__e2eFetchMedia?.(source, width, height) ?? servedPng(source)).then(
-                (bytes) => {
+              void Promise.resolve(window.__e2eMediaReady)
+                .then(() => window.__e2eFetchMedia?.(source, width, height) ?? servedPng(source))
+                .then((bytes) => {
                   this.onmessage?.({ data: { id: request.id, bytes } } as MessageEvent);
-                }
-              );
+                });
             },
             workerMode === 'delayed_media' ? 1_000 : 100
           );

@@ -22,11 +22,7 @@ export class MemberProfile {
   }
 
   showPmp(userId: string, anchor: HTMLElement, pmp: PerMessageProfileView): void {
-    this.userId = userId;
-    this.anchor = anchor;
-    this.open = true;
-    this.failed = false;
-    this.profile = null;
+    void this.show(userId, anchor);
     this.pmp = pmp;
   }
 
@@ -39,7 +35,7 @@ export class MemberProfile {
     this.pmp = null;
     this.failed = false;
     try {
-      const profile = await this.core.userProfile(userId);
+      const profile = await this.core.userProfile(userId, true);
       if (request === this.#request) this.profile = profile;
     } catch {
       if (request === this.#request) this.failed = true;

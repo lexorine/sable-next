@@ -13,6 +13,8 @@ import type {
   DirectoryRoomType,
   EditVersionView,
   EncryptionStatusView,
+  EventNotificationsView,
+  EventNotificationView,
   KeyBackupStatusView,
   KeyBackupDownloadView,
   HomeserverSoftwareView,
@@ -47,6 +49,7 @@ import type {
   ReactionShortcodeView,
   RedactedContentView,
   RegisteredPusherView,
+  RelationsView,
   RegistrationResultView,
   RoomAttachmentKind,
   RoomAttachmentView,
@@ -61,6 +64,7 @@ import type {
   RoomSummary,
   RoomTag,
   RoomVersionsView,
+  RtcLivekitEndpoint,
   ScheduledMessageView,
   SealedAccountDataView,
   SearchFilter,
@@ -75,6 +79,7 @@ import type {
   SyncStatus,
   TimelineFocusView,
   TimelineItemView,
+  TurnServerView,
   UrlPreviewView,
   UserDirectoryEntryView,
   UserSecurityView,
@@ -91,6 +96,7 @@ export type CallGrant = {
   identity: string;
   encryptMedia: boolean;
   mode?: 'legacy' | 'compatibility' | 'matrix_2';
+  canPublish?: boolean;
   publisherId?: string;
   backends?: CallBackendGrant[];
 };
@@ -109,6 +115,7 @@ export type CreateRoomOptions = {
   roomVersion?: string | null;
   joinRule?: CreateJoinRuleView | null;
   federate?: boolean;
+  predecessor?: string | null;
 };
 
 export interface OutgoingMentions {
@@ -129,6 +136,7 @@ export type SendMessageOptions = {
   linkPreviews?: UrlPreviewView[];
   imageSourcePacks?: ImageSourcePackReferenceView[];
   botCommand?: unknown;
+  forumTitle?: string | null;
 };
 
 export type SendAttachmentOptions = {
@@ -221,6 +229,14 @@ export function createCommands(transport: () => Transport) {
 
     async cancelRegistration(): Promise<void> {
       await transport().send({ type: 'cancel_registration' });
+    },
+
+    async requestOpenIdToken(): Promise<{ access_token: string; matrix_server_name: string }> {
+      const response = await transport().send({ type: 'request_open_id_token' });
+      return {
+        access_token: response.access_token,
+        matrix_server_name: response.matrix_server_name,
+      };
     },
 
     async homeserverInfo(): Promise<{
@@ -405,6 +421,11 @@ export function createCommands(transport: () => Transport) {
       return response.parents;
     },
 
+    async replacedRooms(): Promise<RoomSummary[]> {
+      const response = await transport().send({ type: 'replaced_rooms' });
+      return response.rooms;
+    },
+
     async roomCosmetics(roomId: string, spaceId: string | null): Promise<RoomCosmeticsView> {
       const response = await transport().send({
         type: 'room_cosmetics',
@@ -499,6 +520,15 @@ export function createCommands(transport: () => Transport) {
       return response.event_id;
     },
 
+    async eventCached(roomId: string, eventId: string): Promise<boolean> {
+      const response = await transport().send({
+        type: 'event_cached',
+        room_id: roomId,
+        event_id: eventId,
+      });
+      return response.cached;
+    },
+
     async roomAccountData(roomId: string, eventType: string): Promise<unknown> {
       const response = await transport().send({
         type: 'room_account_data',
@@ -506,6 +536,11 @@ export function createCommands(transport: () => Transport) {
         event_type: eventType,
       });
       return response.content;
+    },
+
+    async readMarker(roomId: string): Promise<string | null> {
+      const response = await transport().send({ type: 'read_marker', room_id: roomId });
+      return response.event_id;
     },
 
     async accountDataTypes(): Promise<string[]> {
@@ -614,6 +649,7 @@ export function createCommands(transport: () => Transport) {
         identity: response.identity,
         encryptMedia: response.encrypt_media,
         mode: response.mode,
+        canPublish: response.can_publish,
         publisherId: response.publisher_id,
         backends: response.backends,
       };
@@ -691,6 +727,7 @@ export function createCommands(transport: () => Transport) {
         room_version: options.roomVersion ?? null,
         join_rule: options.joinRule ?? null,
         federate: options.federate ?? true,
+        predecessor: options.predecessor ?? null,
       });
       return response.room_id;
     },
@@ -834,6 +871,7 @@ export function createCommands(transport: () => Transport) {
         link_previews: $state.snapshot(options.linkPreviews ?? []),
         image_source_packs: $state.snapshot(options.imageSourcePacks ?? []),
         bot_command: $state.snapshot(options.botCommand ?? null),
+        forum_title: options.forumTitle ?? null,
       });
     },
 
@@ -969,6 +1007,7 @@ export function createCommands(transport: () => Transport) {
         mentions: [...mentions.userIds],
         mentions_room: mentions.room,
         persona: $state.snapshot(options.persona ?? null),
+        forum_title: options.forumTitle ?? null,
       });
     },
 
@@ -1226,6 +1265,7 @@ export function createCommands(transport: () => Transport) {
       roomId: string,
       eventType: string,
       msgtype: string | null,
+      stateKey: string | null,
       limit: number,
       since: string | null
     ): Promise<unknown[]> {
@@ -1234,6 +1274,7 @@ export function createCommands(transport: () => Transport) {
         room_id: roomId,
         event_type: eventType,
         msgtype,
+        state_key: stateKey,
         limit,
         since,
       });
@@ -1274,6 +1315,128 @@ export function createCommands(transport: () => Transport) {
     async openIdToken(): Promise<OpenIdTokenView> {
       const response = await transport().send({ type: 'open_id_token' });
       return response.token;
+    },
+
+    async widgetSendDelayedEvent(
+      roomId: string,
+      eventType: string,
+      stateKey: string | null,
+      content: unknown,
+      delayMs: number,
+      stickyDurationMs: number | null
+    ): Promise<string> {
+      const response = await transport().send({
+        type: 'widget_send_delayed_event',
+        room_id: roomId,
+        event_type: eventType,
+        state_key: stateKey,
+        content,
+        delay_ms: delayMs,
+        sticky_duration_ms: stickyDurationMs,
+      });
+      return response.delay_id;
+    },
+
+    async widgetSendStickyEvent(
+      roomId: string,
+      eventType: string,
+      content: unknown,
+      stickyDurationMs: number
+    ): Promise<string> {
+      const response = await transport().send({
+        type: 'widget_send_sticky_event',
+        room_id: roomId,
+        event_type: eventType,
+        content,
+        sticky_duration_ms: stickyDurationMs,
+      });
+      return response.event_id;
+    },
+
+    async restartDelayedEvent(delayId: string): Promise<void> {
+      await transport().send({ type: 'restart_delayed_event', delay_id: delayId });
+    },
+
+    async widgetSendToDevice(
+      eventType: string,
+      encrypted: boolean,
+      messages: unknown
+    ): Promise<void> {
+      await transport().send({
+        type: 'widget_send_to_device',
+        event_type: eventType,
+        encrypted,
+        messages,
+      });
+    },
+
+    async roomAccountDataRaw(roomId: string, eventType: string): Promise<unknown> {
+      const response = await transport().send({
+        type: 'room_account_data_raw',
+        room_id: roomId,
+        event_type: eventType,
+      });
+      return response.event;
+    },
+
+    async roomStickyEvents(roomId: string): Promise<unknown[]> {
+      const response = await transport().send({ type: 'room_sticky_events', room_id: roomId });
+      return response.events;
+    },
+
+    async roomEventRelations(
+      roomId: string,
+      eventId: string,
+      filter: {
+        relType?: string;
+        eventType?: string;
+        from?: string;
+        to?: string;
+        limit?: number;
+        direction?: PaginationDirection;
+      } = {}
+    ): Promise<RelationsView> {
+      const response = await transport().send({
+        type: 'room_event_relations',
+        room_id: roomId,
+        event_id: eventId,
+        rel_type: filter.relType ?? null,
+        event_type: filter.eventType ?? null,
+        from: filter.from ?? null,
+        to: filter.to ?? null,
+        limit: filter.limit ?? null,
+        direction: filter.direction ?? null,
+      });
+      return response.relations;
+    },
+
+    async turnServer(): Promise<TurnServerView> {
+      const response = await transport().send({ type: 'turn_server' });
+      return response.server;
+    },
+
+    async rtcTransports(): Promise<unknown> {
+      const response = await transport().send({ type: 'rtc_transports' });
+      return response.body;
+    },
+
+    async rtcLivekit(endpoint: RtcLivekitEndpoint, body: unknown): Promise<unknown> {
+      const response = await transport().send({ type: 'rtc_livekit', endpoint, body });
+      return response.body;
+    },
+
+    async setWidgetFeed(enabled: boolean): Promise<void> {
+      await transport().send({ type: 'set_widget_feed', enabled });
+    },
+
+    async integrationManagerUrl(roomId: string): Promise<string> {
+      const response = await transport().send({ type: 'integration_manager_url', room_id: roomId });
+      return response.url;
+    },
+
+    async knownRooms(): Promise<string[]> {
+      const response = await transport().send({ type: 'known_rooms' });
+      return response.room_ids;
     },
 
     async scheduleMessage(
@@ -1346,7 +1509,8 @@ export function createCommands(transport: () => Transport) {
       eventId: string,
       key: string,
       threadRoot: string | null = null,
-      sourcePack: ImageSourcePackView | null = null
+      sourcePack: ImageSourcePackView | null = null,
+      subscription: SubscriptionId | null = null
     ): Promise<void> {
       await transport().send({
         type: 'react',
@@ -1356,6 +1520,7 @@ export function createCommands(transport: () => Transport) {
         key,
         source_pack: $state.snapshot(sourcePack),
         shortcode: null,
+        subscription,
       });
     },
 
@@ -1522,7 +1687,8 @@ export function createCommands(transport: () => Transport) {
       eventId: string | null,
       privateReceipt = false,
       threadRoot: string | null = null,
-      subscription: SubscriptionId | null = null
+      subscription: SubscriptionId | null = null,
+      fullyRead = false
     ): Promise<void> {
       await transport().send({
         type: 'mark_read',
@@ -1531,7 +1697,12 @@ export function createCommands(transport: () => Transport) {
         private_receipt: privateReceipt,
         thread_root: threadRoot,
         subscription,
+        fully_read: fullyRead,
       });
+    },
+
+    async setFullyRead(roomId: string, eventId: string): Promise<void> {
+      await transport().send({ type: 'set_fully_read', room_id: roomId, event_id: eventId });
     },
 
     async markUnread(roomId: string, readMarker: string | null = null): Promise<void> {
@@ -1588,13 +1759,22 @@ export function createCommands(transport: () => Transport) {
       await transport().send({ type: 'set_mention_notifications', rule, mode });
     },
 
-    async membershipNotifications(): Promise<boolean | null> {
-      const response = await transport().send({ type: 'membership_notifications' });
-      return response.enabled;
+    async eventNotifications(): Promise<EventNotificationsView> {
+      const response = await transport().send({ type: 'event_notifications' });
+      return response.events;
     },
 
-    async setMembershipNotifications(enabled: boolean): Promise<void> {
-      await transport().send({ type: 'set_membership_notifications', enabled });
+    async setEventNotification(event: EventNotificationView, enabled: boolean): Promise<void> {
+      await transport().send({ type: 'set_event_notification', event, enabled });
+    },
+
+    async masterMute(): Promise<boolean | null> {
+      const response = await transport().send({ type: 'master_mute' });
+      return response.muted;
+    },
+
+    async setMasterMute(muted: boolean): Promise<void> {
+      await transport().send({ type: 'set_master_mute', muted });
     },
 
     async setDefaultNotificationMode(direct: boolean, mode: NotificationModeView): Promise<void> {

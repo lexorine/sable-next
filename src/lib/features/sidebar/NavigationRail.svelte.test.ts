@@ -624,6 +624,49 @@ test('records the active desktop direct chat', async () => {
   expect(savedSpacePaths()).toEqual({ direct: '/direct/!dm%3Aexample.org' });
 });
 
+test('restores the home and rooms tabs to their last desktop room', async () => {
+  localStorage.setItem(
+    'sable-space-paths',
+    JSON.stringify({ home: '/home/!a%3Aexample.org', rooms: '/rooms/!b%3Aexample.org' })
+  );
+  setPreference('showHome', true);
+  renderRail({ spaces: [] });
+  await tick();
+
+  expect(tab('nav.home')).toHaveAttribute('href', '/home/!a%3Aexample.org');
+  expect(tab('nav.unspaced')).toHaveAttribute('href', '/rooms/!b%3Aexample.org');
+});
+
+test('records the active desktop home and rooms routes', async () => {
+  renderRail({ spaces: [] });
+  await tick();
+
+  visit('/home/!a%3Aexample.org');
+  navigated();
+  visit('/rooms/!b%3Aexample.org');
+  navigated();
+
+  expect(savedSpacePaths()).toEqual({
+    home: '/home/!a%3Aexample.org',
+    rooms: '/rooms/!b%3Aexample.org',
+  });
+});
+
+test('a space opened through the rooms tab does not become the rooms tab target', async () => {
+  renderRail({ spaces: [] });
+  await tick();
+
+  visit('/rooms/!space%3Aexample.org?via=example.org');
+  navigated();
+  visit('/space/!space%3Aexample.org/lobby', { spaceId: '!space:example.org' });
+  navigated();
+  visit('/rooms');
+  navigated();
+
+  expect(tab('nav.unspaced')).toHaveAttribute('href', '/rooms');
+  expect(savedSpacePaths().rooms).toBe('/rooms');
+});
+
 test('offers join by address from the add button', async () => {
   const visited: string[] = [];
   renderRail({

@@ -8,6 +8,7 @@ import type {
   RoomStateEventView,
 } from '#src/generated/protocol';
 import { parseRoomWidget, type RoomWidget } from '#lib/features/widgets/widget-content.js';
+import { enrichWidgetUrl } from '#lib/features/widgets/widget-url.js';
 import { parsePowerLevelTags, type PowerLevelTagMap } from './settings/power-level-tags.js';
 import type { PinnedEvents } from './timeline/pinned-events.svelte.js';
 
@@ -72,11 +73,26 @@ export class RoomDetails {
     };
   }
 
+  async addWidget(name: string, url: string, userId: string): Promise<void> {
+    const id = `${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+    await this.commands.sendStateEvent(this.#roomId, 'im.vector.modular.widgets', id, {
+      type: 'm.custom',
+      url: enrichWidgetUrl(url),
+      name,
+      id,
+      creatorUserId: userId,
+    });
+    await this.refreshWidgets();
+  }
+
   async removeWidget(widgetId: string): Promise<void> {
-    const roomId = this.#roomId;
+    await this.commands.sendStateEvent(this.#roomId, 'im.vector.modular.widgets', widgetId, {});
+    await this.refreshWidgets();
+  }
+
+  async refreshWidgets(): Promise<void> {
     const generation = this.#generation;
-    await this.commands.sendStateEvent(roomId, 'im.vector.modular.widgets', widgetId, {});
-    const widgets = await this.commands.roomStateEvents(roomId, 'im.vector.modular.widgets');
+    const widgets = await this.commands.roomStateEvents(this.#roomId, 'im.vector.modular.widgets');
     if (generation === this.#generation) this.widgets = parseWidgets(widgets);
   }
 }

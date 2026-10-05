@@ -110,7 +110,7 @@ pub(crate) fn previews_removed_edit(
 }
 
 impl Core {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "mirrors the protocol fields")]
     pub(crate) async fn edit_message(
         &self,
         room_id: &OwnedRoomId,
@@ -124,6 +124,7 @@ impl Core {
         mentions: Vec<OwnedUserId>,
         mentions_room: bool,
         persona: Option<PerMessageProfileView>,
+        forum_title: Option<String>,
     ) -> Result<(), CommandErr> {
         let edited = edit_content(
             body,
@@ -163,7 +164,7 @@ impl Core {
                 .make_edit_event(&event_id, edited)
                 .await
                 .or_failed(self, "edit_message")?;
-            self.edit_with_persona(&room, &content, persona.as_ref())
+            self.edit_with_persona(&room, &content, persona.as_ref(), forum_title)
                 .await?;
         }
 
@@ -665,7 +666,10 @@ const FORWARD_META: &str = "com.famedly.app.forwarded";
 const SABLE_FORWARD_META: &str = "moe.sable.message.forward";
 
 #[cfg(test)]
-#[allow(clippy::large_futures)]
+#[expect(
+    clippy::large_futures,
+    reason = "the dispatch future is large and cannot be boxed"
+)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
@@ -1082,6 +1086,7 @@ mod tests {
             mentions: Vec::new(),
             mentions_room: false,
             persona: None,
+            forum_title: None,
         })
         .await
         .unwrap();
@@ -1175,6 +1180,7 @@ mod tests {
                     private_receipt: false,
                     thread_root,
                     subscription: Some(subscription),
+                    fully_read: false,
                 })
                 .await;
             assert!(matches!(
@@ -1188,8 +1194,60 @@ mod tests {
             private_receipt: false,
             thread_root: Some(root.to_owned()),
             subscription: Some(subscription),
+            fully_read: false,
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_thread_timeline_is_already_at_its_end_going_forward() {
+        use crate::protocol::{Command, CommandOk, PaginationDirection};
+        use matrix_sdk_test::{ALICE, JoinedRoomBuilder, event_factory::EventFactory};
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        client.event_cache().subscribe().unwrap();
+        let room_id = room_id!("!thread:example.org");
+        let root = event_id!("$root");
+        let factory = EventFactory::new().room(room_id).sender(*ALICE);
+        server.mock_room_state_encryption().plain().mount().await;
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id)
+                    .add_timeline_event(factory.text_msg("root").event_id(root)),
+            )
+            .await;
+        let core = core(&server, client).await;
+        let subscription = core.allocate_subscription();
+        let timeline = core
+            .thread_timeline(&room_id.to_owned(), &root.to_owned())
+            .await
+            .unwrap();
+        core.subscriptions.lock().await.insert(
+            subscription,
+            crate::Subscription {
+                tasks: Vec::new(),
+                timeline: Some(timeline),
+                thread_root: Some(root.to_owned()),
+                kind: crate::SubscriptionKind::FocusedTimeline(room_id.to_owned()),
+            },
+        );
+
+        let result = core
+            .dispatch(Command::Paginate {
+                subscription,
+                direction: PaginationDirection::Forward,
+                count: 20,
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Ok(CommandOk::Paginate {
+                direction: PaginationDirection::Forward,
+                reached_end: true,
+            })
+        ));
     }
 }

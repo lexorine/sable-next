@@ -264,8 +264,9 @@ export class TimelineWindow<T> {
       anchors: this.anchors.map((anchor) => ({ ...anchor })),
       offset: this.offset,
     };
+    let leadIn = 0;
     if (index < this.start || index >= this.end) {
-      smooth = false;
+      if (smooth) leadIn = index >= this.end ? -1 : 1;
       await this.renderRange(
         Math.max(0, index - PAGE),
         Math.min(this.items.length, index + PAGE + 1)
@@ -298,8 +299,15 @@ export class TimelineWindow<T> {
     this.jumping = smooth;
     this.active = smooth;
     this.missedDelta = 0;
+    if (leadIn !== 0) {
+      const room =
+        leadIn < 0
+          ? target - this.top
+          : this.top + this.contentHeight - viewport.clientHeight - target;
+      this.writeOffset(target + leadIn * Math.max(0, Math.min(viewport.clientHeight, room)));
+    }
     this.writeOffset(target, smooth);
-    if (!smooth && this.atEnd()) this.pinned = true;
+    if (!smooth && this.atEnd(1)) this.pinned = true;
     if (smooth) this.scheduleSettle();
     this.publish(this.capture());
     if (this.pending) this.scheduleSettle();
@@ -480,27 +488,38 @@ export class TimelineWindow<T> {
     if (previous) this.countBucket(previous.bucket, -previous.height);
     this.countBucket(bucket, height);
     this.sizes.set(key, { height, bucket });
-    if (previous === undefined) this.prefix = null;
+    if (previous === undefined && this.prefix !== null) {
+      const row = this.rows.find((candidate) => candidate.key === key);
+      if (row && row.index < this.prefix.start) {
+        const counted = this.prefix.unmeasured.get(this.bucketOf(row.value));
+        if (counted) counted.count -= 1;
+        this.prefix.measured += height;
+      }
+    }
   }
 
   private estimatePrefix(): number {
     let cache = this.prefix;
-    if (cache === null || cache.items !== this.items || cache.start !== this.start) {
-      cache = { items: this.items, start: this.start, measured: 0, unmeasured: new Map() };
-      for (const item of this.items.slice(0, this.start)) {
-        const size = this.sizes.get(item.key);
-        if (size === undefined) {
-          const bucket = this.bucketOf(item.value);
-          const counted = cache.unmeasured.get(bucket);
-          if (counted) counted.count += 1;
-          else
-            cache.unmeasured.set(bucket, {
-              count: 1,
-              hint: this.options.estimateSize?.(item.value),
-            });
-        } else cache.measured += size.height;
-      }
+    if (cache === null || cache.items !== this.items) {
+      cache = { items: this.items, start: 0, measured: 0, unmeasured: new Map() };
       this.prefix = cache;
+    }
+    if (cache.start !== this.start) {
+      const from = Math.min(cache.start, this.start);
+      const sign = this.start > cache.start ? 1 : -1;
+      for (const item of this.items.slice(from, Math.max(cache.start, this.start))) {
+        const size = this.sizes.get(item.key);
+        if (size !== undefined) {
+          cache.measured += sign * size.height;
+          continue;
+        }
+        const bucket = this.bucketOf(item.value);
+        const counted = cache.unmeasured.get(bucket);
+        if (counted) counted.count += sign;
+        else
+          cache.unmeasured.set(bucket, { count: 1, hint: this.options.estimateSize?.(item.value) });
+      }
+      cache.start = this.start;
     }
     let total = cache.measured;
     for (const [bucket, { count, hint }] of cache.unmeasured)
@@ -549,7 +568,7 @@ export class TimelineWindow<T> {
     const viewportHeight = viewport.clientHeight;
     const contentHeight = this.contentHeight;
     this.top = this.height - contentHeight - Number.parseFloat(this.options.content.style.bottom);
-    if (this.active) this.trackMovement();
+    if (this.active || !this.pinned) this.trackMovement();
     const elements = this.elements();
     for (const element of elements) {
       const key = element.dataset.timelineKey;
@@ -560,7 +579,7 @@ export class TimelineWindow<T> {
       this.start === 0 && this.end === this.items.length && contentHeight <= viewportHeight;
     const reachedEnd =
       canFollowLatest &&
-      (contentFits || (this.ready && viewportHeight > this.viewportHeight && this.atEnd()));
+      (contentFits || (this.ready && viewportHeight > this.viewportHeight && this.atEnd(1)));
     if (reachedEnd) this.pinned = true;
     this.viewportHeight = viewportHeight;
     if (this.pinned && this.active && !this.jumping) {
@@ -620,7 +639,7 @@ export class TimelineWindow<T> {
     if (this.disposed) return;
     const viewport = this.options.viewport;
     const delta = this.trackMovement();
-    if (delta === 0 && viewport.scrollHeight !== this.scrollHeight && this.atEnd()) {
+    if (delta === 0 && viewport.scrollHeight !== this.scrollHeight && this.atEnd(1)) {
       this.pinned = true;
       this.publish();
     }

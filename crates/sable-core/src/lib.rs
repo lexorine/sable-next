@@ -12,6 +12,7 @@ mod calls;
 mod cosmetics;
 mod dispatch;
 mod errors;
+pub use errors::CoreError;
 pub(crate) use errors::ResultExt;
 pub mod image_packs;
 mod inbox;
@@ -111,6 +112,7 @@ pub struct Core {
         HashMap<matrix_sdk::ruma::OwnedRoomId, Vec<matrix_sdk::ruma::OwnedEventId>>,
     >,
     cosmetics: std::sync::Mutex<cosmetics::CosmeticsCache>,
+    cosmetics_fetches: std::sync::Mutex<HashMap<matrix_sdk::ruma::OwnedRoomId, Arc<Mutex<()>>>>,
     media_health: std::sync::Mutex<media_health::MediaHealth>,
     media_downloads: tokio::sync::Semaphore,
     key_backup_downloads: tokio::sync::Semaphore,
@@ -140,6 +142,7 @@ pub struct Core {
     notification_encrypted_content: AtomicBool,
     notification_sounds: AtomicBool,
     notify_once: AtomicBool,
+    widget_feed: AtomicBool,
     notifications_enabled: AtomicBool,
     search_crawler_enabled: AtomicBool,
     search_network: search::CrawlNetwork,
@@ -218,7 +221,6 @@ enum SubscriptionKind {
 }
 
 impl Core {
-    #[allow(clippy::arc_with_non_send_sync)] // WASM keeps the core on one event-loop thread
     pub fn new(
         store_id: impl Into<String>,
         sessions: Box<dyn SessionStore>,
@@ -226,7 +228,13 @@ impl Core {
         Self::new_with_event_cache(store_id, sessions, true)
     }
 
-    #[allow(clippy::arc_with_non_send_sync)] // WASM keeps the core on one event-loop thread
+    #[cfg_attr(
+        target_family = "wasm",
+        expect(
+            clippy::arc_with_non_send_sync,
+            reason = "WASM keeps the core on one event-loop thread"
+        )
+    )]
     pub fn new_with_event_cache(
         store_id: impl Into<String>,
         sessions: Box<dyn SessionStore>,
@@ -243,6 +251,7 @@ impl Core {
             notification_encrypted_content: AtomicBool::new(false),
             notification_sounds: AtomicBool::new(true),
             notify_once: AtomicBool::new(true),
+            widget_feed: AtomicBool::new(false),
             notifications_enabled: AtomicBool::new(true),
             search_crawler_enabled: AtomicBool::new(true),
             search_network: search::CrawlNetwork::default(),
@@ -268,6 +277,7 @@ impl Core {
             session_handlers: std::sync::Mutex::new(Vec::new()),
             probed_pinned_rooms: std::sync::Mutex::new(HashMap::new()),
             cosmetics: std::sync::Mutex::new(cosmetics::CosmeticsCache::default()),
+            cosmetics_fetches: std::sync::Mutex::new(HashMap::new()),
             media_health: std::sync::Mutex::new(media_health::MediaHealth::default()),
             media_downloads: tokio::sync::Semaphore::new(media::MAX_MEDIA_DOWNLOADS),
             notification_routes: Mutex::new(HashMap::new()),
@@ -427,13 +437,6 @@ impl Core {
             .filter(|account| account.device_invalidated)
         {
             account.session.credentials.discard_tokens();
-            if let Err(error) = self.discard_account_store(&account.store_id).await {
-                tracing::error!(
-                    ?error,
-                    account_id = account.account_id,
-                    "could not discard retired account store"
-                );
-            }
         }
         if migrated
             || reanchored
@@ -621,7 +624,10 @@ impl Core {
 }
 
 #[cfg(test)]
-#[allow(clippy::large_futures)]
+#[expect(
+    clippy::large_futures,
+    reason = "the dispatch future is large and cannot be boxed"
+)]
 mod tests {
     use super::*;
     use crate::protocol::{Command, CommandErr, CommandOk};
@@ -630,16 +636,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SessionStore for FailingClearSessionStore {
-        async fn load(&self) -> Result<Option<Vec<u8>>, String> {
+        async fn load(&self) -> Result<Option<Vec<u8>>, crate::store::StoreError> {
             Ok(None)
         }
 
-        async fn save(&self, _bytes: Vec<u8>) -> Result<(), String> {
+        async fn save(&self, _bytes: Vec<u8>) -> Result<(), crate::store::StoreError> {
             Ok(())
         }
 
-        async fn clear(&self) -> Result<(), String> {
-            Err("storage unavailable".to_owned())
+        async fn clear(&self) -> Result<(), crate::store::StoreError> {
+            Err(crate::store::StoreError::Message(
+                "storage unavailable".to_owned(),
+            ))
         }
     }
 
@@ -649,16 +657,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SessionStore for TestSessionStore {
-        async fn load(&self) -> Result<Option<Vec<u8>>, String> {
+        async fn load(&self) -> Result<Option<Vec<u8>>, crate::store::StoreError> {
             Ok(self.bytes.lock().await.clone())
         }
 
-        async fn save(&self, bytes: Vec<u8>) -> Result<(), String> {
+        async fn save(&self, bytes: Vec<u8>) -> Result<(), crate::store::StoreError> {
             *self.bytes.lock().await = Some(bytes);
             Ok(())
         }
 
-        async fn clear(&self) -> Result<(), String> {
+        async fn clear(&self) -> Result<(), crate::store::StoreError> {
             *self.bytes.lock().await = None;
             Ok(())
         }
@@ -921,23 +929,38 @@ mod tests {
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
-#[allow(clippy::large_futures)]
+#[expect(
+    clippy::large_futures,
+    reason = "the dispatch future is large and cannot be boxed"
+)]
 mod sdk_timeline_tests;
 
 #[cfg(all(test, not(target_family = "wasm")))]
-#[allow(clippy::large_futures)]
+#[expect(
+    clippy::large_futures,
+    reason = "the dispatch future is large and cannot be boxed"
+)]
 mod sdk_notification_tests;
 
 #[cfg(all(test, not(target_family = "wasm")))]
-#[allow(clippy::large_futures)]
+#[expect(
+    clippy::large_futures,
+    reason = "the dispatch future is large and cannot be boxed"
+)]
 mod sdk_helpers_tests;
 
 #[cfg(all(test, not(target_family = "wasm")))]
-#[allow(clippy::large_futures)]
+#[expect(
+    clippy::large_futures,
+    reason = "the dispatch future is large and cannot be boxed"
+)]
 mod sdk_verification_tests;
 
 #[cfg(test)]
-#[allow(clippy::large_futures)]
+#[expect(
+    clippy::large_futures,
+    reason = "the dispatch future is large and cannot be boxed"
+)]
 mod live_tests {
     use super::*;
     use crate::protocol::{Command, CommandErr, CommandOk};

@@ -6,6 +6,7 @@ export type CallTile = {
   key: string;
   participant: CallParticipant;
   source: CallTileSource;
+  watching: boolean;
 };
 
 export type CallGrid = { columns: number; width: number; height: number };
@@ -21,6 +22,21 @@ export function cameraVisible(participant: CallParticipant): boolean {
   return visible(participant, participant.camera);
 }
 
+const publishesAnything = (participant: CallParticipant): boolean =>
+  Boolean(participant.microphone ?? participant.camera ?? participant.screenShare);
+
+export function presentParticipants(
+  participants: readonly CallParticipant[],
+  memberIdentities: ReadonlySet<string>
+): CallParticipant[] {
+  return participants.filter(
+    (participant) =>
+      participant.local === true ||
+      publishesAnything(participant) ||
+      memberIdentities.has(participant.identity)
+  );
+}
+
 export function callTiles(
   participants: readonly CallParticipant[],
   watchedScreenShareIds: readonly string[] = []
@@ -28,14 +44,15 @@ export function callTiles(
   const tiles: CallTile[] = [];
   for (const participant of participants) {
     const base = `${participant.backendId ?? 'legacy'}:${participant.identity}`;
-    tiles.push({ key: `${base}:camera`, participant, source: 'camera' });
+    tiles.push({ key: `${base}:camera`, participant, source: 'camera', watching: false });
     const screenShare = participant.screenShare;
-    if (
-      screenShareVisible(participant) &&
-      screenShare &&
-      (participant.local === true || watchedScreenShareIds.includes(screenShare.id))
-    ) {
-      tiles.push({ key: `${base}:screen`, participant, source: 'screen' });
+    if (screenShare && !screenShare.muted) {
+      tiles.push({
+        key: `${base}:screen`,
+        participant,
+        source: 'screen',
+        watching: participant.local === true || watchedScreenShareIds.includes(screenShare.id),
+      });
     }
   }
   return tiles;
@@ -44,9 +61,9 @@ export function callTiles(
 export function featuredTiles(tiles: readonly CallTile[], pinned: string | null): CallTile[] {
   if (pinned !== null) {
     const tile = tiles.find((candidate) => candidate.key === pinned);
-    if (tile) return [tile];
+    if (tile && (tile.source === 'camera' || tile.watching)) return [tile];
   }
-  const screens = tiles.filter((tile) => tile.source === 'screen');
+  const screens = tiles.filter((tile) => tile.source === 'screen' && tile.watching);
   const remote = screens.filter((tile) => !tile.participant.local);
   return remote.length > 0 ? remote : screens;
 }

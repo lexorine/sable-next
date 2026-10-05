@@ -39,6 +39,42 @@ test('connects each backend while publishing media only on the publisher and sha
   expect(created[1].transport.setEncryptionKey).toHaveBeenCalledOnce();
 });
 
+test('lists a peer subscribed on several backends once, on the backend it publishes to', async () => {
+  const created: ReturnType<typeof fakeTransport>[] = [];
+  const transport = createMultiSfuTransport(false, undefined, {
+    createTransport: () => {
+      const next = fakeTransport();
+      created.push(next);
+      return next;
+    },
+  });
+  await transport.connect({
+    url: '',
+    token: '',
+    microphoneEnabled: false,
+    cameraEnabled: false,
+    publisherId: 'publish',
+    backends: [
+      { id: 'publish', url: 'wss://one', jwt: 'one', identity: 'me' },
+      { id: 'remote', url: 'wss://two', jwt: 'two', identity: 'me-remote' },
+    ],
+    encryptionKeys: [],
+  });
+  created[0].getState().participants = [{ identity: 'peer' }];
+  created[1].getState().participants = [
+    { identity: 'peer', microphone: { id: 'mic', muted: false, subscribed: true } },
+  ];
+  created[1].emitConnection('connected');
+
+  expect(transport.getState().participants).toEqual([
+    {
+      identity: 'peer',
+      backendId: 'remote',
+      microphone: { id: 'mic', muted: false, subscribed: true },
+    },
+  ]);
+});
+
 test('starts the publisher and healthy subscribers while another subscriber is blocked', async () => {
   let releaseBlocked!: () => void;
   const blocked = new Promise<void>((resolve) => {
@@ -425,6 +461,43 @@ test('a publisher move republishes on the new backend and demotes the old one', 
   expect(publisher.transport.setMicrophoneEnabled).toHaveBeenCalledWith(true);
   expect(subscriber.transport.setMicrophoneEnabled).not.toHaveBeenCalled();
 });
+
+test.each(['setCameraEnabled', 'setMicrophoneEnabled'] as const)(
+  'does not retry a failed %s request when the publisher changes',
+  async (method) => {
+    const created: ReturnType<typeof fakeTransport>[] = [];
+    const transport = createMultiSfuTransport(false, undefined, {
+      createTransport: () => {
+        const next = fakeTransport();
+        created.push(next);
+        return next;
+      },
+    });
+    await transport.connect({
+      url: '',
+      token: '',
+      microphoneEnabled: false,
+      cameraEnabled: false,
+      publisherId: 'old',
+      backends: [{ id: 'old', url: 'wss://old', jwt: 'old', identity: 'me' }],
+      encryptionKeys: [],
+    });
+    vi.mocked(created[0][method]).mockRejectedValueOnce(
+      new DOMException('Device not found', 'NotFoundError')
+    );
+    await expect(transport[method](true)).rejects.toThrow('Device not found');
+
+    await transport.reconcileBackends?.(
+      [{ id: 'new', url: 'wss://new', jwt: 'new', identity: 'me' }],
+      'new'
+    );
+
+    expect(created[1].connect).toHaveBeenCalledWith(
+      expect.objectContaining({ microphoneEnabled: false, cameraEnabled: false })
+    );
+    await transport.disconnect();
+  }
+);
 
 test('does not report connected when the publisher is absent', async () => {
   const transport = createMultiSfuTransport(false, undefined, {

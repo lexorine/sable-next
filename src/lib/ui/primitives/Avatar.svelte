@@ -24,6 +24,7 @@
     color?: string;
     decorative?: boolean;
     uniform?: boolean;
+    recolor?: boolean;
     original?: boolean;
     class?: ClassValue;
     children?: Snippet;
@@ -39,6 +40,7 @@
     color,
     decorative = alt === undefined,
     uniform = false,
+    recolor = false,
     original = false,
     class: className = '',
     children,
@@ -46,7 +48,7 @@
 
   let fallback = $derived(initials ?? toInitials(name));
   let accessibleLabel = $derived(alt ?? name ?? fallback);
-  let isMxc = $derived(src?.startsWith('mxc://') ?? false);
+  let isMxc = $derived((src?.startsWith('mxc://') || src?.startsWith('{')) ?? false);
   let imageStatus = $state<Avatar.RootProps['loadingStatus']>('loading');
   let paintedSrc = $state<string | null>(null);
   let failedSrc = $state<string | null>(null);
@@ -89,6 +91,7 @@
       width={96}
       height={96}
       {uniform}
+      tint={recolor}
       {original}
       onloaded={() => {
         paintedSrc = src;

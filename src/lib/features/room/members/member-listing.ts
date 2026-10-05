@@ -1,12 +1,15 @@
 import type { MemberView, MembershipView } from '#src/generated/protocol';
 
+import { profileOverrides } from '#lib/profile/profile-overrides.svelte.js';
+
 export type MemberSort = 'name-asc' | 'name-desc' | 'newest' | 'oldest';
-export type MembershipFilter = 'join' | 'invite' | 'leave' | 'kick' | 'ban';
+export type MembershipFilter = 'join' | 'invite' | 'knock' | 'leave' | 'kick' | 'ban';
 
 export const MEMBER_SORTS: readonly MemberSort[] = ['name-asc', 'name-desc', 'newest', 'oldest'];
 export const MEMBERSHIP_FILTERS: readonly MembershipFilter[] = [
   'join',
   'invite',
+  'knock',
   'leave',
   'kick',
   'ban',
@@ -26,6 +29,7 @@ export const MEMBER_SORT_LABELS: Record<MemberSort, string> = {
 export const MEMBERSHIP_FILTER_LABELS: Record<MembershipFilter, string> = {
   join: 'timeline.memberFilterJoined',
   invite: 'timeline.memberFilterInvited',
+  knock: 'room.membersRequests',
   leave: 'timeline.memberFilterLeft',
   kick: 'timeline.memberFilterKicked',
   ban: 'timeline.memberFilterBanned',
@@ -36,7 +40,7 @@ export function membershipFor(filter: MembershipFilter): MembershipView {
 }
 
 export function memberName(member: MemberView): string {
-  return member.display_name ?? member.user_id;
+  return profileOverrides.name(member.user_id, member.display_name ?? member.user_id);
 }
 
 export function matchesFilter(member: MemberView, filter: MembershipFilter): boolean {

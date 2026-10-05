@@ -10,6 +10,7 @@
   import { pixelatedImage } from '#lib/ui/pixelated.js';
   import { automaticMediaRetryDelay, mediaRetryDelay } from '#lib/ui/media-retry.js';
   import {
+    cachedMediaType,
     cachedMediaUrl,
     discardMediaUrl,
     holdMediaUrl,
@@ -53,6 +54,7 @@
     onfailed?: () => void;
     retryable?: boolean;
     uniform?: boolean;
+    tint?: boolean;
     original?: boolean;
     autoplay?: boolean | null;
     spoilerReason?: string | null;
@@ -83,6 +85,7 @@
     onfailed,
     retryable = false,
     uniform = false,
+    tint = false,
     original = false,
     autoplay = null,
     spoilerReason = null,
@@ -92,8 +95,9 @@
   }: Props = $props();
   const core = useCoreClient();
   let outcome = $state.raw<{ key: string; url: string | null; undecodable?: true } | null>(null);
-  let backoff = $derived({ source, attempt: 0, manual: 0, automatic: 0, at: 0 });
+  let backoff = $derived({ source, attempt: 0, forced: 0, manual: 0, automatic: 0, at: 0 });
   let attempt = $derived(backoff.attempt);
+  let forced = $derived(backoff.forced);
   let clock = $state(Date.now());
   let gifPreview = $state<HTMLCanvasElement>();
   let gifImage = $state<HTMLImageElement>();
@@ -120,6 +124,9 @@
       intrinsicHeight > 0;
     return hasIntrinsicSize ? intrinsicWidth / intrinsicHeight : null;
   });
+  let intrinsicCssWidth = $derived(
+    eventRatio !== null && intrinsicWidth !== null ? `${String(intrinsicWidth)}px` : undefined
+  );
   let animated = $derived(
     animatedHint ??
       (ANIMATED_MIMES.includes(mime ?? '') ||
@@ -187,6 +194,12 @@
     if (!image?.complete) return null;
     return dominantColor(image);
   });
+  let tinted = $derived(
+    tint &&
+      preferences.tintRoomIcons &&
+      imageLoaded &&
+      cachedMediaType(core, requested, requestedWidth, requestedHeight) === 'image/svg+xml'
+  );
   let animatedGif = $derived(animatedHint !== false && (mime === 'image/gif' || named('.gif')));
   let manualGif = $derived(animatedGif && !(autoplay ?? preferences.autoplayGifs));
   let paused = $derived((animated || original) && animationsPaused());
@@ -269,7 +282,7 @@
     }
 
     let active = true;
-    const load = attempt > 0 ? retryMediaUrl : loadMediaUrl;
+    const load = attempt > 0 && forced === attempt ? retryMediaUrl : loadMediaUrl;
     void load(core, requestSource, requestWidth, requestHeight, mime)
       .then((nextUrl) => {
         if (!active) return;
@@ -400,7 +413,8 @@
     if (undecodable) await core.commands.forgetMedia(requested).catch(() => undefined);
     undecodableThumbnail = null;
     outcome = null;
-    backoff = { ...backoff, attempt: backoff.attempt + 1, manual: backoff.manual + 1, at: 0 };
+    const next = backoff.attempt + 1;
+    backoff = { ...backoff, attempt: next, forced: next, manual: backoff.manual + 1, at: 0 };
   }
 
   /* The fallback where frames cannot be decoded. `drawImage` copies an animated
@@ -491,19 +505,23 @@
   {:else if url}
     <img
       bind:this={imageElement}
-      class="media-image-content"
+      class={['media-image-content', { tinted }]}
       style:background-color={plate ?? undefined}
       src={heldUrl}
       {alt}
       {title}
       {width}
       {height}
+      decoding="async"
       onload={imageShown}
       onerror={brokenImage}
       {@attach (node) => {
         if (node instanceof HTMLImageElement && node.complete) loadedUrl = url;
       }}
     />
+    {#if tinted}
+      <span class="media-image-tint" style:--media-tint="url({url})" aria-hidden="true"></span>
+    {/if}
   {:else if showUnavailable}
     <span class="media-image-unavailable">
       <ImageBrokenIcon />
@@ -543,11 +561,13 @@
         interactive: !showUnavailable && (manualGif || onclick || href),
         gif: manualGif,
         pixelated,
+        painted,
       },
       { spoilered: spoilerHidden && !showUnavailable },
     ]}
     {style}
     style:--media-ratio={aspectRatio}
+    style:--media-width={intrinsicCssWidth}
     style:contain-intrinsic-inline-size="{width}px"
   >
     <span
@@ -604,6 +624,7 @@
     class={[className, 'media-image', 'interactive', { gif: manualGif, pixelated }]}
     {style}
     style:--media-ratio={aspectRatio}
+    style:--media-width={intrinsicCssWidth}
     style:contain-intrinsic-inline-size="{width}px"
     type="button"
     aria-label={mediaLabel}
@@ -620,6 +641,7 @@
     class={[className, 'media-image', { pixelated }]}
     {style}
     style:--media-ratio={aspectRatio}
+    style:--media-width={intrinsicCssWidth}
     style:contain-intrinsic-inline-size="{width}px"
   >
     <!-- eslint-disable-next-line @typescript-eslint/no-confusing-void-expression -->
@@ -647,6 +669,10 @@
     border-radius: var(--radius);
   }
 
+  .spoilerable-media.painted {
+    background: none;
+  }
+
   .spoilered .media-image-visual {
     filter: blur(2.75rem);
     pointer-events: none;
@@ -672,6 +698,17 @@
     width: 100%;
   }
 
+  .media-image-content.tinted {
+    opacity: 0;
+  }
+
+  .media-image-tint {
+    background: currentcolor;
+    inset: 0;
+    mask: var(--media-tint) center / contain no-repeat;
+    position: absolute;
+  }
+
   .pixelated .media-image-content {
     image-rendering: pixelated;
   }
@@ -694,11 +731,14 @@
   }
 
   @media (prefers-reduced-motion: no-preference) {
-    .media-image-blurhash,
-    .media-image-placeholder {
+    .media-image-blurhash {
       transition:
         opacity var(--duration-slow) ease-in-out,
         filter var(--duration-slow) ease-in-out;
+    }
+
+    .media-image-placeholder {
+      transition: opacity var(--duration-slow) ease-in-out;
     }
   }
 

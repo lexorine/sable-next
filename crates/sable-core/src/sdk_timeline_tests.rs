@@ -88,6 +88,76 @@ fn event_ids(
 }
 
 #[tokio::test]
+async fn timeline_view_preserves_available_read_receipt_timestamps() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    client.event_cache().subscribe().unwrap();
+    let room_id = room_id!("!receipts:example.org");
+    let event_id = event_id!("$read");
+    let bob = user_id!("@bob:example.org");
+    let carol = user_id!("@carol:example.org");
+    let factory = EventFactory::new().room(room_id).sender(*ALICE);
+    let timestamp = matrix_sdk::ruma::MilliSecondsSinceUnixEpoch::from_system_time(
+        std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+    )
+    .unwrap();
+    server.mock_room_state_encryption().plain().mount().await;
+    let room = server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(factory.text_msg("read me").event_id(event_id))
+                .add_receipt(
+                    factory
+                        .read_receipts()
+                        .add_with_timestamp(
+                            event_id,
+                            bob,
+                            ReceiptType::Read,
+                            ReceiptThread::Unthreaded,
+                            Some(timestamp),
+                        )
+                        .add_with_timestamp(
+                            event_id,
+                            carol,
+                            ReceiptType::Read,
+                            ReceiptThread::Unthreaded,
+                            None,
+                        )
+                        .into_event(),
+                ),
+        )
+        .await;
+    let timeline = build_room_timeline(&room, &TimelineFocusView::Live, false)
+        .await
+        .unwrap();
+    let items = timeline.items().await;
+    let item = items
+        .iter()
+        .find(|item| item.as_event().and_then(|event| event.event_id()) == Some(event_id))
+        .unwrap();
+    let view = crate::view::timeline_item(
+        item,
+        client.user_id(),
+        &BTreeSet::new(),
+        &crate::view::Highlights::default(),
+        &crate::view::LocalContent::default(),
+    );
+    assert!(view.read_by.iter().any(|reader| reader == bob));
+    assert!(view.read_by.iter().any(|reader| reader == carol));
+    assert_eq!(
+        view.read_timestamps.get(bob.as_str()),
+        Some(&1_700_000_000_000)
+    );
+    assert!(!view.read_timestamps.contains_key(carol.as_str()));
+    let serialized = serde_json::to_value(&view).unwrap();
+    assert_eq!(
+        serialized["read_timestamps"][bob.as_str()],
+        1_700_000_000_000_u64
+    );
+}
+
+#[tokio::test]
 async fn live_timeline_receives_sync_and_reconciles_a_limited_gap() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
@@ -1942,7 +2012,7 @@ async fn a_reply_to_an_uncaptioned_gallery_quotes_its_file_names() {
 }
 
 #[tokio::test]
-async fn replies_to_state_and_membership_events_quote_their_type() {
+async fn replies_to_state_and_membership_events_carry_no_body() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
     client.event_cache().subscribe().unwrap();
@@ -1985,8 +2055,8 @@ async fn replies_to_state_and_membership_events_quote_their_type() {
         .and_then(|view| view.in_reply_to.as_ref())
         .expect("a membership reply");
 
-    assert_eq!(state_reply.body.as_deref(), Some("m.room.name"));
-    assert_eq!(membership_reply.body.as_deref(), Some("m.room.member"));
+    assert_eq!(state_reply.body, None);
+    assert_eq!(membership_reply.body, None);
 }
 
 fn state_changes(
@@ -2234,13 +2304,14 @@ async fn fetching_members_names_a_bridge_ghost_the_sync_never_shipped() {
     assert_eq!(named, "Marie");
 }
 
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[expect(clippy::unwrap_used, reason = "test code")]
 async fn dispatch_mark_read(
     server: &MatrixMockServer,
     client: matrix_sdk::Client,
     room_id: matrix_sdk::ruma::OwnedRoomId,
     event_id: Option<matrix_sdk::ruma::OwnedEventId>,
     private_receipt: bool,
+    fully_read: bool,
 ) {
     let sync_service = Arc::new(SyncService::builder(client.clone()).build().await.unwrap());
     let (core, _events) = Core::new("test", Box::new(MemorySessionStore::default()));
@@ -2258,12 +2329,18 @@ async fn dispatch_mark_read(
         private_receipt,
         thread_root: None,
         subscription: None,
+        fully_read,
     })
     .await
     .unwrap();
 }
 
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::too_many_lines,
+    reason = "test code; one sequential flow kept in a single function"
+)]
 async fn mark_read_body(
     private_receipt: bool,
     event_id: Option<matrix_sdk::ruma::OwnedEventId>,
@@ -2339,6 +2416,7 @@ async fn mark_read_body(
         room_id.to_owned(),
         event_id,
         private_receipt,
+        true,
     )
     .await;
 
@@ -2380,7 +2458,6 @@ async fn mark_read_body(
     )
 }
 
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[tokio::test]
 async fn marking_unread_writes_the_room_account_data_flag() {
     let server = MatrixMockServer::new().await;
@@ -2438,7 +2515,6 @@ async fn marking_unread_writes_the_room_account_data_flag() {
     assert_eq!(body["unread"], json!(true));
 }
 
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[tokio::test]
 async fn marking_unread_from_a_message_walks_the_read_marker_back() {
     let server = MatrixMockServer::new().await;
@@ -2545,6 +2621,125 @@ async fn marking_a_room_read_uses_the_latest_threaded_event() {
             .any(|(path, body)| path.ends_with("/m.read/$read") && body["thread_id"] == "main"),
         "{receipts:?}"
     );
+}
+
+#[tokio::test]
+async fn a_receipt_short_of_the_latest_message_leaves_the_marker() {
+    let server = MatrixMockServer::new().await;
+    let client = server
+        .client_builder()
+        .on_builder(|builder| builder.with_threading_support(crate::session::THREADING_SUPPORT))
+        .build()
+        .await;
+    client.event_cache().subscribe().unwrap();
+    let room_id = room_id!("!receipts:example.org");
+    let factory = EventFactory::new().room(room_id).sender(*ALICE);
+    server.mock_room_state_encryption().plain().mount().await;
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(factory.text_msg("read me").event_id(event_id!("$read"))),
+        )
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(format!(
+            r"^/_matrix/client/v3/rooms/{room_id}/receipt/m\.read/.*$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(server.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/_matrix/client/v3/rooms/{room_id}/read_markers"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(0)
+        .mount(server.server())
+        .await;
+
+    dispatch_mark_read(
+        &server,
+        client,
+        room_id.to_owned(),
+        Some(event_id!("$read").to_owned()),
+        false,
+        false,
+    )
+    .await;
+}
+
+#[expect(clippy::unwrap_used, clippy::expect_used, reason = "test code")]
+async fn read_marker_for(fully_read: bool) -> CommandOk {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    client.event_cache().subscribe().unwrap();
+    let room_id = room_id!("!marker:example.org");
+    let me = client
+        .user_id()
+        .expect("the mock client is logged in")
+        .to_owned();
+    let factory = EventFactory::new().room(room_id).sender(*ALICE);
+    let room = JoinedRoomBuilder::new(room_id)
+        .add_timeline_bulk([
+            factory
+                .text_msg("one")
+                .event_id(event_id!("$one"))
+                .into_raw(),
+            factory
+                .text_msg("two")
+                .event_id(event_id!("$two"))
+                .into_raw(),
+        ])
+        .add_receipt(
+            factory
+                .read_receipts()
+                .add(
+                    event_id!("$two"),
+                    &me,
+                    ReceiptType::Read,
+                    ReceiptThread::Unthreaded,
+                )
+                .into_event(),
+        );
+    let room = if fully_read {
+        room.add_account_data(factory.fully_read(event_id!("$one")))
+    } else {
+        room
+    };
+    server.sync_room(&client, room).await;
+
+    let sync_service = Arc::new(SyncService::builder(client.clone()).build().await.unwrap());
+    let (core, _events) = Core::new("test", Box::new(MemorySessionStore::default()));
+    *core.session.write().await = Some(Session {
+        account_id: "test".to_owned(),
+        client,
+        sync_service,
+        homeserver: server.server().uri(),
+        oauth: false,
+    });
+    core.dispatch(Command::ReadMarker {
+        room_id: room_id.to_owned(),
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn the_read_marker_is_the_fully_read_event() {
+    let CommandOk::ReadMarker { event_id } = read_marker_for(true).await else {
+        panic!("wrong response");
+    };
+    assert_eq!(event_id.as_deref(), Some(event_id!("$one")));
+}
+
+#[tokio::test]
+async fn the_read_marker_falls_back_to_the_read_receipt() {
+    let CommandOk::ReadMarker { event_id } = read_marker_for(false).await else {
+        panic!("wrong response");
+    };
+    assert_eq!(event_id.as_deref(), Some(event_id!("$two")));
 }
 
 async fn sender_names(timeline: &Arc<matrix_sdk_ui::timeline::Timeline>) -> Vec<Option<String>> {
@@ -3415,6 +3610,7 @@ async fn a_new_calendar_room_is_set_up_by_its_creator() {
             room_version: None,
             join_rule: None,
             federate: true,
+            predecessor: None,
         })
         .await
         .unwrap();
@@ -3466,6 +3662,7 @@ async fn an_encrypted_private_space_includes_encryption_in_its_creation_request(
             room_version: None,
             join_rule: None,
             federate: true,
+            predecessor: None,
         })
         .await
         .unwrap();

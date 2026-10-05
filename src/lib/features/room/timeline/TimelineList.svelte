@@ -12,6 +12,7 @@
     TimelineItemView,
   } from '#src/generated/protocol';
   import { i18n } from '#lib/i18n.js';
+  import { windowActivity } from '#lib/platform/window-activity.js';
   import type { ResumeAnchor, RoomTimeline } from '#lib/rooms/timeline.svelte.js';
   import { preferences } from '#lib/settings/preferences.svelte.js';
   import { motionMs, shouldReduceMotion } from '#lib/ui/motion.js';
@@ -44,6 +45,7 @@
   import { TimelineEventIndex } from './timeline-event-index';
   import {
     cumulativeReadBy,
+    cumulativeReadTimestamps,
     isCollapsed,
     latestEventId,
     mergeAggregations,
@@ -52,6 +54,7 @@
     unreadCountAfter,
     visibleAggregations,
     visibleTimelineItems,
+    withReadMarkerBefore,
     type ReplyDirection,
   } from './timeline-format';
   import { MAX_EMPTY_REFILLS, TimelinePagination } from './timeline-pagination.svelte.js';
@@ -80,7 +83,8 @@
     onRequestFuture: () => Promise<void>;
     onRetryLoad?: () => Promise<void>;
     threadRootId?: string | null;
-    onRead: (eventId: string) => Promise<void>;
+    onRead: (eventId: string, fullyRead: boolean) => Promise<void>;
+    onFullyRead?: (roomId: string, eventId: string) => void;
     hasUnread?: boolean;
     onLoadReadMarker?: () => Promise<string | null>;
     onRequestUnread?: (eventId: string) => Promise<void>;
@@ -129,6 +133,7 @@
     onRetryLoad,
     threadRootId = null,
     onRead,
+    onFullyRead,
     hasUnread = false,
     onLoadReadMarker,
     onRequestUnread,
@@ -189,9 +194,21 @@
   let switchingToUnread = false;
   let resumeTask: Promise<void> | null = null;
   let resumeFailed = $state(false);
+  const readRoomId = untrack(() => roomId);
+  let readUpTo: string | null = null;
+  let fullyReadAt: string | null = null;
+  function settleFullyRead(): void {
+    if (!readRoomId || !onFullyRead || readUpTo === null || readUpTo === fullyReadAt) return;
+    fullyReadAt = readUpTo;
+    onFullyRead(readRoomId, readUpTo);
+  }
+  $effect(() => {
+    if (!windowActivity.active) untrack(settleFullyRead);
+  });
   onDestroy(() => {
     unreadNavigation?.abort();
     unread.destroy();
+    settleFullyRead();
   });
   let followingRead = $state(false);
   let eventItems = $derived(visibleTimelineItems(timeline.items, preferences, { readOnly }));
@@ -202,7 +219,11 @@
     })
   );
   let visibleItems = $derived(
-    followingRead ? allItems.filter((item) => item.content.kind !== 'read_marker') : allItems
+    unread.firstEventId !== null
+      ? withReadMarkerBefore(allItems, unread.firstEventId)
+      : followingRead
+        ? allItems.filter((item) => item.content.kind !== 'read_marker')
+        : allItems
   );
   let entries = $derived.by((): readonly TimelineEntry<RowValue>[] => {
     identity.reconcile(visibleItems);
@@ -262,6 +283,7 @@
     )
   );
   let readersByItem = $derived(cumulativeReadBy(timeline.items));
+  let receiptTimestampsByItem = $derived(cumulativeReadTimestamps(timeline.items));
   let menuOpen = $state(false);
   const pagination = new TimelinePagination(
     () => timeline,
@@ -506,7 +528,8 @@
       timeline.items,
       hasUnread,
       onLoadReadMarker,
-      eventItems
+      eventItems,
+      timeline.readMarkerEventId
     );
     if (
       !entries.some(({ value }) => value.item.content.kind === 'read_marker') &&
@@ -603,7 +626,13 @@
     if (tail === sentEcho) return;
     const seeded = sentEcho !== undefined;
     sentEcho = tail;
-    if (seeded && last?.is_own && untrack(() => nearLatest)) void engine.jumpTo(null, 'start');
+    if (
+      seeded &&
+      (timeline.mode.kind === 'live' || timeline.mode.kind === 'thread') &&
+      last?.is_own &&
+      untrack(() => nearLatest)
+    )
+      void engine.jumpTo(null, 'start');
   });
   export function composerFocused(event: FocusEvent): void {
     if (!controller || !revealed || !isEditableTarget(event.target)) return;
@@ -730,8 +759,14 @@
   }
   async function markRead(eventId: string): Promise<void> {
     if (windowState.pinned) followingRead = true;
-    await onRead(eventId);
-    if (disposed) return;
+    const fullyRead = eventId === latestEventId(timeline.items);
+    await onRead(eventId, fullyRead);
+    readUpTo = eventId;
+    if (fullyRead) fullyReadAt = eventId;
+    if (disposed) {
+      settleFullyRead();
+      return;
+    }
     if (eventId === latestEventId(timeline.items)) unread.dismiss();
   }
   async function jumpToUnread(): Promise<void> {
@@ -749,7 +784,13 @@
     const deadline = performance.now() + 30_000;
     let emptyPages = 0;
     try {
-      await unread.initialize(timeline.items, hasUnread, onLoadReadMarker, eventItems);
+      await unread.initialize(
+        timeline.items,
+        hasUnread,
+        onLoadReadMarker,
+        eventItems,
+        timeline.readMarkerEventId
+      );
       if (unread.failed) {
         unreadError = 'jump';
         return;
@@ -808,7 +849,7 @@
     try {
       await onMarkRead();
       if (!disposed) {
-        unread.dismiss();
+        unread.clear();
         followingRead = windowState.pinned;
       }
     } catch {
@@ -819,13 +860,22 @@
   }
   export function dismissUnread(): void {
     unreadNavigation?.abort();
-    unread.dismiss();
+    unread.clear();
   }
-  export function jumpToEvent(eventId: string): void {
+  let replayingEventId = $state<string | null>(null);
+  async function replayHighlight(eventId: string): Promise<void> {
+    replayingEventId = eventId;
+    await tick();
+    await new Promise(requestAnimationFrame);
+    if (replayingEventId === eventId) replayingEventId = null;
+  }
+  export function jumpToEvent(eventId: string): boolean {
     const key = entryFor(eventId)?.key;
-    if (!key || !controller) return;
+    if (!key || !controller) return false;
     focus.cancel();
-    void controller.jumpTo(key, 'start', !shouldReduceMotion());
+    void controller.jumpTo(key, 'center', !shouldReduceMotion());
+    if (eventId === (focusEventId ?? landedEventId)) void replayHighlight(eventId);
+    return true;
   }
 
   export function stepReply(direction: ReplyDirection): string | null {
@@ -857,7 +907,28 @@
     }
     void controller?.jumpTo(null, 'start', !shouldReduceMotion());
   }
+  function onEscape(event: KeyboardEvent): void {
+    if (
+      event.key !== 'Escape' ||
+      event.defaultPrevented ||
+      event.repeat ||
+      event.ctrlKey ||
+      event.metaKey ||
+      event.altKey ||
+      event.shiftKey ||
+      !active ||
+      !onMarkRead ||
+      (event.target instanceof Element && event.target.closest('[role="dialog"], [role="menu"]'))
+    ) {
+      return;
+    }
+    event.preventDefault();
+    jumpToLatest();
+    if (unread.active || hasUnread) void markAllRead();
+  }
 </script>
+
+<svelte:window onkeydown={onEscape} />
 
 <TimelineReadReceipt
   {timeline}
@@ -875,6 +946,7 @@
   {members}
   {currentUserId}
   readers={(item) => readersByItem.get(item.id) ?? item.read_by}
+  receiptTimestamps={(item) => receiptTimestampsByItem.get(item.id) ?? item.read_timestamps}
   {canRedactOwn}
   {canRedactOthers}
   {onMatrixLink}
@@ -1003,6 +1075,7 @@
                       ? personas(item.thread_summary.latest_event_id)
                       : null}
                     highlighted={item.event_id !== null &&
+                      item.event_id !== replayingEventId &&
                       item.event_id === (focusEventId ?? landedEventId)}
                     selected={replyEventId !== null && item.event_id === replyEventId}
                     {onMatrixLink}
@@ -1134,7 +1207,7 @@
     --timeline-row-padding: var(--space-200);
   }
 
-  @media (width >= 48rem) and (hover: hover) and (pointer: fine) {
+  @media (width >= 48rem) and (any-hover: hover) and (any-pointer: fine) {
     .timeline-content {
       --line-height-body: 1.47;
     }
@@ -1332,6 +1405,6 @@
     box-shadow: var(--shadow-float);
     inset-inline-end: var(--page-gutter);
     position: absolute;
-    z-index: 1;
+    z-index: 4;
   }
 </style>

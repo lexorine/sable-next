@@ -324,16 +324,16 @@ test('an arrival the reader is watching does not bounce the timeline', async ({
 
 function sampleUntilAtBottom(timeline: RoomTimeline): Promise<number[]> {
   return timeline.viewport.evaluate(async (node) => {
-    const offsets: number[] = [];
+    const distances: number[] = [];
     const deadline = performance.now() + 5_000;
     do {
       await new Promise(requestAnimationFrame);
-      offsets.push(node.scrollTop);
+      distances.push(node.scrollHeight - node.clientHeight - node.scrollTop);
     } while (
       node.scrollHeight - node.clientHeight - node.scrollTop > 1 &&
       performance.now() < deadline
     );
-    return offsets;
+    return distances;
   });
 }
 
@@ -416,6 +416,30 @@ test('the gesture sampler flags smooth programmatic scrolling', async ({ page })
     node.scrollTo({ top: 500, behavior: 'smooth' });
   });
   expect((await sampling.finish()).unexpectedScrolls).toEqual(['scrollTo']);
+});
+
+test('the gesture sampler distinguishes a canvas resize clamp from reader movement', async ({
+  page,
+}) => {
+  await page.setContent(
+    '<div id="probe" style="height:200px;overflow:auto"><div class="items" style="height:800px;position:relative"><div class="item" data-event-id="reader" style="position:absolute;top:600px;height:40px">Reader</div></div></div>'
+  );
+  const viewport = page.locator('#probe');
+  await viewport.evaluate((node) => {
+    node.scrollTop = 600;
+  });
+  await viewport.evaluate(instrumentSelfWrites);
+  const sampling = await startGestureSample(viewport, { frames: 20, quietFrames: 6 });
+  await viewport.evaluate((node) => {
+    const canvas = node.querySelector<HTMLElement>('.items');
+    const row = node.querySelector<HTMLElement>('.item');
+    if (!canvas || !row) throw new Error('missing probe content');
+    canvas.style.height = '700px';
+    row.style.top = '500px';
+  });
+  const result = await sampling.finish();
+  expect(result.readerMovement).toBe(0);
+  expect(result.frameError).toBe(0);
 });
 
 test('the anchor sampler reports a row that disappears', async ({ page, timeline }) => {
@@ -1159,22 +1183,32 @@ test.describe('mobile', () => {
     await page.waitForTimeout(250);
     expect(await page.evaluate(() => window.__e2eSelfWriteCount)).toBe(0);
     await timeline.expectAnchorHeld(anchor, { tolerance: 2 });
-    await timeline.viewport.dispatchEvent('touchend', { touches: [] });
-    for (let frame = 0; frame < 5; frame += 1) {
-      await timeline.viewport.evaluate((node) => {
+    const subscription = await core.subscription();
+    const older = timelineItem('ios-older-again', 'More iOS history');
+    const writes = await timeline.viewport.evaluate(
+      async (node, { subscription, older }) => {
         const descriptor = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop');
         if (!descriptor?.set) throw new Error('missing native scrollTop setter');
-        descriptor.set.call(node, node.scrollTop - 6);
-      });
-      await timeline.viewport.dispatchEvent('scroll');
-      if (frame === 2) {
-        await core.emitTimelineDiff(await core.subscription(), [
-          { op: 'push_front', value: timelineItem('ios-older-again', 'More iOS history') },
-        ]);
-      }
-      await page.waitForTimeout(60);
-      expect(await page.evaluate(() => window.__e2eSelfWriteCount)).toBe(0);
-    }
+        node.dispatchEvent(Object.assign(new Event('touchend'), { touches: [] }));
+        const counts: number[] = [];
+        for (let frame = 0; frame < 5; frame += 1) {
+          descriptor.set.call(node, node.scrollTop - 6);
+          node.dispatchEvent(new Event('scroll'));
+          if (frame === 2) {
+            window.__e2eEmitTimelineEvent({
+              type: 'timeline_diff',
+              subscription,
+              diffs: [{ op: 'push_front', value: older }],
+            });
+          }
+          await new Promise((resolve) => setTimeout(resolve, 60));
+          counts.push(window.__e2eSelfWriteCount);
+        }
+        return counts;
+      },
+      { subscription, older }
+    );
+    expect(writes).toEqual([0, 0, 0, 0, 0]);
     await expect(timeline.itemById(anchor.itemId)).toHaveAttribute('data-index', String(index + 2));
     await timeline.expectAnchorHeld({ ...anchor, y: anchor.y + 30 }, { tolerance: 2 });
   });
@@ -1195,13 +1229,12 @@ test.describe('mobile', () => {
     );
     await timeline.waitForScrollSettled();
     await expect(timeline.jumpToLatest).toBeVisible();
-    const before = await timeline.scrollTop();
-    const end = await timeline.scrollableHeight();
+    const before = await timeline.distanceFromBottom();
     const sampling = sampleUntilAtBottom(timeline);
     await timeline.jumpToLatest.tap();
-    const offsets = await sampling;
+    const distances = await sampling;
     expect(
-      offsets.some((offset) => offset > before + 1 && offset < end - 1),
+      distances.some((distance) => distance > 1 && distance < before - 1),
       'a reduced-motion jump should land without rendering intermediate positions'
     ).toBe(false);
     await expect.poll(() => timeline.distanceFromBottom()).toBeLessThanOrEqual(1);
@@ -1305,13 +1338,12 @@ test.describe('mobile', () => {
         { intervals: [250] }
       )
       .toBe(true);
-    const before = await timeline.scrollTop();
-    const end = await timeline.scrollableHeight();
+    const before = await timeline.distanceFromBottom();
     const sampling = sampleUntilAtBottom(timeline);
     await timeline.jumpToLatest.tap();
-    const offsets = await sampling;
+    const distances = await sampling;
     expect(
-      offsets.some((offset) => offset > before + 1 && offset < end - 1),
+      distances.some((distance) => distance > 1 && distance < before - 1),
       'the requested smooth jump should render intermediate positions'
     ).toBe(true);
     await expect.poll(() => timeline.distanceFromBottom()).toBe(0);
@@ -1698,7 +1730,7 @@ test('shows jump to latest for a sent echo while reading a page back and returns
   await expect(timeline.jumpToLatest).toBeHidden();
 });
 
-test('an animated jump to a reply target settles on it instead of the end', async ({
+test('a reply target can be jumped to again after scrolling away', async ({
   page,
   app,
   timeline,
@@ -1729,15 +1761,23 @@ test('an animated jump to a reply target settles on it instead of the end', asyn
   ]);
   await timeline.expectAtLatest('Answering something older');
 
-  await timeline.container
+  const replyChip = timeline.container
     .locator('.item')
     .filter({ hasText: 'Answering something older' })
-    .locator('.reply-preview')
-    .click();
+    .locator('.reply-preview');
+  await replyChip.click();
 
   await expect.poll(() => new URL(page.url()).searchParams.get('event')).toBe(target);
   await timeline.waitForScrollSettled();
 
   await expect.poll(() => timeline.distanceFromBottom()).toBeGreaterThan(0);
+  await expect(timeline.itemByEventId(target)).toBeInViewport();
+
+  await timeline.scrollToBottomAndNotify();
+  await timeline.waitForScrollSettled();
+  await expect(timeline.itemByEventId(target)).not.toBeInViewport();
+
+  await replyChip.click();
+  await timeline.waitForScrollSettled();
   await expect(timeline.itemByEventId(target)).toBeInViewport();
 });

@@ -91,7 +91,7 @@
   let packs = $state.raw<ImagePackView[]>([]);
   let loading = $state(true);
   let failed = $state(false);
-  let recent = $derived(readRecent());
+  let recent = $derived(readRecent(tab === 'sticker' ? 'sticker' : 'emoticon'));
   let recentReactions = $derived(uniqueReactions());
   let preview = $state.raw<{ image: PackImageView; pack: ImagePackView } | null>(null);
   let activeCell = $state.raw<{ section: string; index: number }>({ section: '', index: 0 });
@@ -272,7 +272,19 @@
         null
       );
     } else {
-      addCells('recent', $i18n.t('timeline.frequentlyUsed'), frequentCells);
+      if (tab === 'sticker') {
+        if (recentImages.length > 0) {
+          rows.push({
+            id: 'emoji-recent',
+            kind: 'header',
+            label: $i18n.t('timeline.frequentlyUsed'),
+            pack: null,
+          });
+          addImages('recent', recentImages, null);
+        }
+      } else {
+        addCells('recent', $i18n.t('timeline.frequentlyUsed'), frequentCells);
+      }
       for (const section of sections) {
         const id = sectionId(section.pack);
         rows.push({ id, kind: 'header', label: packName(section.pack), pack: section.pack });
@@ -296,7 +308,6 @@
   let rowIndex = $derived(new Map(pickerRows.map((row, index) => [row.id, index])));
 
   function pickerRowKey(index: number): string | number {
-    // VirtualList keys old visible indices before dropping them when the row count shrinks.
     return pickerRows[index]?.id ?? index;
   }
 
@@ -455,12 +466,17 @@
     onPickUnicode(best ?? text);
   }
 
+  function focusSearch(element: HTMLElement): void {
+    if (variant !== 'popover' || !window.matchMedia('(any-pointer: fine)').matches) return;
+    element.focus({ preventScroll: true });
+  }
+
   function attachSize(element: HTMLElement): (() => void) | undefined {
     return resizable ? trackBoardSize(element) : undefined;
   }
 
   function pick(image: PackImageView): void {
-    rememberEmote(image.shortcode);
+    rememberEmote(image.shortcode, tab === 'sticker' ? 'sticker' : 'emoticon');
     onPick(image, tab as ImageUsageView);
   }
 
@@ -563,6 +579,7 @@
       placeholder={gifTab ? $i18n.t('composer.searchGifs') : $i18n.t('composer.searchPacks')}
       aria-label={gifTab ? $i18n.t('composer.searchGifs') : $i18n.t('composer.searchPacks')}
       onkeydown={submitQuery}
+      {@attach focusSearch}
     />
     {#if !gifTab && sections.length > 0}
       <p class="pack-visibility">{$i18n.t('composer.packMediaVisibility')}</p>
@@ -629,15 +646,7 @@
                     {/if}
                   </div>
                 {:else if row.kind === 'header'}
-                  <h3>
-                    {row.label}
-                    {#if row.pack}
-                      <span class="section-origin">{originLabels[row.pack.origin]}</span>
-                      {#if row.pack.attribution}
-                        <span class="section-attribution">{row.pack.attribution}</span>
-                      {/if}
-                    {/if}
-                  </h3>
+                  <h3>{row.label}</h3>
                 {:else if row.kind === 'cells'}
                   <div
                     class="unicode"
@@ -819,7 +828,7 @@
     width: 100%;
   }
 
-  @media (hover: none) {
+  @media (any-hover: none) {
     .board.sheet .preview:has(.preview-hint) {
       display: none;
     }
@@ -887,6 +896,10 @@
     width: var(--size-x100);
   }
 
+  .board :global(.media-image.pixelated .media-image-content) {
+    image-rendering: auto;
+  }
+
   .rail-pack {
     align-items: center;
     background: transparent;
@@ -940,12 +953,6 @@
     top: 0;
     width: max-content;
     z-index: 1;
-  }
-
-  .section-origin,
-  .section-attribution {
-    color: var(--surface-var-on-container);
-    font-weight: 400;
   }
 
   .grids ul {

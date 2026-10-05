@@ -1,5 +1,10 @@
 <script lang="ts">
-  import type { DefaultNotificationModesView, NotificationModeView } from '#src/generated/protocol';
+  import type {
+    DefaultNotificationModesView,
+    EventNotificationsView,
+    EventNotificationView,
+    NotificationModeView,
+  } from '#src/generated/protocol';
 
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
@@ -8,18 +13,26 @@
     preferences,
     setPreference,
   } from '#lib/settings/preferences.svelte.js';
+  import SettingsRow from '#lib/ui/primitives/SettingsRow.svelte';
   import SettingsAnchorLink from '#lib/ui/primitives/SettingsAnchorLink.svelte';
   import Alert from '#lib/ui/primitives/Alert.svelte';
   import Select from '#lib/ui/primitives/Select.svelte';
+  import Switch from '#lib/ui/primitives/Switch.svelte';
 
   import { settingsChanges } from './notifications.svelte';
   import '#lib/ui/primitives/settings-row.css';
 
   const core = useCoreClient();
-  const modes: Exclude<NotificationModeView, 'mute'>[] = ['all', 'mentions'];
   const modeLabels: Record<Exclude<NotificationModeView, 'mute'>, string> = {
     all: 'room.notifyAll',
     mentions: 'room.notifyMentions',
+  };
+
+  const modes: Exclude<NotificationModeView, 'mute'>[] = ['all', 'mentions'];
+  const badgeModes: BadgeNotificationMode[] = ['all', 'mentions', 'quiet'];
+  const badgeModeLabels: Record<BadgeNotificationMode, string> = {
+    ...modeLabels,
+    quiet: 'room.notifyMentionsQuiet',
   };
 
   const badgeRows: {
@@ -39,13 +52,23 @@
     { key: 'group', label: 'settings.notificationDefaultGroup', direct: false },
   ];
 
-  const membershipItems = [
+  const eventRows: { key: EventNotificationView; label: string }[] = [
+    { key: 'membership', label: 'settings.notificationMembership' },
+    { key: 'reactions', label: 'settings.notificationReactions' },
+    { key: 'edits', label: 'settings.notificationEdits' },
+    { key: 'notices', label: 'settings.notificationNotices' },
+    { key: 'invites', label: 'settings.notificationInvites' },
+    { key: 'calls', label: 'settings.notificationCalls' },
+  ];
+
+  const eventItems = [
     { value: 'on', label: 'settings.mentionsNotify' },
     { value: 'off', label: 'settings.mentionsOff' },
   ];
 
   let current = $state<DefaultNotificationModesView | null>(null);
-  let membership = $state<boolean | null>(null);
+  let events = $state<EventNotificationsView | null>(null);
+  let muted = $state<boolean | null>(null);
   let failed = $state(false);
   $effect(() => {
     void settingsChanges.version;
@@ -61,9 +84,15 @@
       .catch(() => {
         if (alive) failed = true;
       });
-    void core.commands.membershipNotifications().then(
-      (enabled) => {
-        if (alive) membership = enabled;
+    void core.commands.eventNotifications().then(
+      (view) => {
+        if (alive) events = view;
+      },
+      () => undefined
+    );
+    void core.commands.masterMute().then(
+      (value) => {
+        if (alive) muted = value;
       },
       () => undefined
     );
@@ -80,16 +109,30 @@
   ): void {
     if (current) current = { ...current, [key]: mode };
 
-    void core.commands.setDefaultNotificationMode(isDirect, mode).catch(() => {
+    void core.commands.setDefaultNotificationMode(isDirect, mode).then(
+      () => {
+        settingsChanges.version += 1;
+      },
+      () => {
+        failed = true;
+        settingsChanges.version += 1;
+      }
+    );
+  }
+
+  function saveMute(value: boolean): void {
+    muted = value;
+
+    void core.commands.setMasterMute(value).catch(() => {
       failed = true;
       settingsChanges.version += 1;
     });
   }
 
-  function saveMembership(enabled: boolean): void {
-    membership = enabled;
+  function saveEvent(event: EventNotificationView, enabled: boolean): void {
+    if (events) events = { ...events, [event]: enabled };
 
-    void core.commands.setMembershipNotifications(enabled).catch(() => {
+    void core.commands.setEventNotification(event, enabled).catch(() => {
       failed = true;
       settingsChanges.version += 1;
     });
@@ -103,23 +146,22 @@
     </h3>
     <SettingsAnchorLink anchor="notification-badges" />
   </div>
-  <p class="hint">{$i18n.t('settings.notificationBadgesHint')}</p>
+  <p class="hint settings-description">{$i18n.t('settings.notificationBadgesHint')}</p>
 
-  <div class="rows">
+  <ul class="settings-rows">
     {#each badgeRows as { key, label } (key)}
-      <label>
-        <span>{$i18n.t(label)}</span>
+      <SettingsRow title={$i18n.t(label)}>
         <Select
           aria-label={`${$i18n.t('settings.notificationBadges')}: ${$i18n.t(label)}`}
           value={preferences[key]}
-          items={modes.map((mode) => ({ value: mode, label: $i18n.t(modeLabels[mode]) }))}
+          items={badgeModes.map((mode) => ({ value: mode, label: $i18n.t(badgeModeLabels[mode]) }))}
           onValueChange={(value) => {
             setPreference(key, value as BadgeNotificationMode);
           }}
         />
-      </label>
+      </SettingsRow>
     {/each}
-  </div>
+  </ul>
 </section>
 
 <section class="defaults settings-form" aria-labelledby="notification-push">
@@ -129,7 +171,7 @@
     </h3>
     <SettingsAnchorLink anchor="notification-push" />
   </div>
-  <p class="hint">{$i18n.t('settings.notificationPushHint')}</p>
+  <p class="hint settings-description">{$i18n.t('settings.notificationPushHint')}</p>
 
   {#if failed}
     <Alert variant="warning" role="status">
@@ -137,10 +179,21 @@
     </Alert>
   {/if}
 
-  <div class="rows">
+  <ul class="settings-rows">
+    {#if muted !== null}
+      <SettingsRow
+        title={$i18n.t('settings.notificationMasterMute')}
+        description={$i18n.t('settings.notificationMasterMuteHint')}
+      >
+        <Switch
+          label={$i18n.t('settings.notificationMasterMute')}
+          checked={muted}
+          onCheckedChange={saveMute}
+        />
+      </SettingsRow>
+    {/if}
     {#each pushRows as { key, label, direct } (key)}
-      <label>
-        <span>{$i18n.t(label)}</span>
+      <SettingsRow title={$i18n.t(label)}>
         {#if current}
           <Select
             aria-label={`${$i18n.t('settings.notificationPush')}: ${$i18n.t(label)}`}
@@ -151,62 +204,23 @@
             }}
           />
         {/if}
-      </label>
+      </SettingsRow>
     {/each}
-    {#if membership !== null}
-      <label>
-        <span>{$i18n.t('settings.notificationMembership')}</span>
-        <Select
-          aria-label={$i18n.t('settings.notificationMembership')}
-          value={membership ? 'on' : 'off'}
-          items={membershipItems.map((item) => ({ value: item.value, label: $i18n.t(item.label) }))}
-          onValueChange={(value) => {
-            saveMembership(value === 'on');
-          }}
-        />
-      </label>
+    {#if events}
+      {#each eventRows as { key, label } (key)}
+        {#if events[key] !== null}
+          <SettingsRow title={$i18n.t(label)}>
+            <Select
+              aria-label={$i18n.t(label)}
+              value={events[key] ? 'on' : 'off'}
+              items={eventItems.map((item) => ({ value: item.value, label: $i18n.t(item.label) }))}
+              onValueChange={(value) => {
+                saveEvent(key, value === 'on');
+              }}
+            />
+          </SettingsRow>
+        {/if}
+      {/each}
     {/if}
-  </div>
+  </ul>
 </section>
-
-<style>
-  .defaults {
-    background: var(--surface-var-container);
-    border-radius: var(--radius);
-    display: grid;
-    gap: var(--space-300);
-  }
-
-  h3 {
-    font-size: var(--font-size-heading);
-    margin: 0;
-  }
-
-  .hint {
-    color: var(--surface-var-on-container);
-    font-size: var(--font-size-small);
-    margin: 0;
-  }
-
-  .rows {
-    display: grid;
-    gap: var(--space-300);
-  }
-
-  label {
-    align-items: stretch;
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-200);
-    justify-content: space-between;
-  }
-
-  @media (width >= 32rem) {
-    label {
-      align-items: center;
-      display: grid;
-      gap: var(--space-400);
-      grid-template-columns: minmax(0, 1fr) minmax(14rem, 20rem);
-    }
-  }
-</style>

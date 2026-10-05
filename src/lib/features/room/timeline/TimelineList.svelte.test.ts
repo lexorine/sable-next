@@ -100,11 +100,13 @@ function item(id: string): TimelineItemView {
     reactions: [],
     is_own: false,
     read_by: [],
+    read_timestamps: {},
     per_message_profile: null,
     bundled_link_previews: [],
     link_previews_removed: null,
     mention: 'none',
     forwarded: null,
+    forum_title: null,
   };
 }
 
@@ -235,6 +237,34 @@ test('a permalink whose context does not fill the viewport paginates on its own'
   await runAnimationFrames();
 
   expect(future).toHaveBeenCalled();
+});
+
+test('own historical messages added to a permalink do not jump to the end', async () => {
+  const roomTimeline = timeline();
+  roomTimeline.items = [item('target')];
+  roomTimeline.mode = { kind: 'focused', eventId: '$target' };
+  roomTimeline.forwardPagination = 'end';
+  roomTimeline.backwardPagination = 'end';
+  const jumps = vi.spyOn(TimelineWindow.prototype, 'jumpTo');
+  render(TimelineListHarness, {
+    props: {
+      list: {
+        timeline: roomTimeline,
+        focusEventId: '$target',
+        onRequestHistory: () => Promise.resolve(true),
+        onRequestFuture: async () => {},
+        onRead: async () => {},
+      },
+    },
+  });
+  viewport();
+  await runAnimationFrames();
+  jumps.mockClear();
+
+  roomTimeline.items = [...roomTimeline.items, { ...item('own-history'), is_own: true }];
+  await runAnimationFrames();
+
+  expect(jumps).not.toHaveBeenCalledWith(null, 'start');
 });
 
 test('stops focused automatic pagination after a failed or empty page', async () => {
@@ -1354,6 +1384,24 @@ test('follows an own echo appended while the reader is still near latest', async
   expect(followingLive()).toBe(true);
 });
 
+test('follows an own message sent in a thread while the reader is near latest', async () => {
+  const roomTimeline = timeline();
+  roomTimeline.items = liveItems(20);
+  const { element, end, setScrollHeight } = await mountLive(roomTimeline);
+  roomTimeline.mode = { kind: 'thread', rootEventId: '$root' };
+  await tick();
+
+  await dragTo(element, end, end - 30);
+  touch(element, 'touchend', 170);
+  await finishWheelGesture(element);
+
+  roomTimeline.items = [...roomTimeline.items, { ...item('own-thread-message'), is_own: true }];
+  setScrollHeight(2_100);
+  await runAnimationFrames();
+
+  expect(element.scrollHeight - element.clientHeight - element.scrollTop).toBe(0);
+});
+
 test('follows an own message that arrives already sent while the reader is near latest', async () => {
   const roomTimeline = timeline();
   roomTimeline.items = liveItems(20);
@@ -1932,9 +1980,43 @@ test('a reader at the latest message also reads the hidden events after it', asy
 
   expect(document.querySelector('[data-item-id="join"]')).toBeNull();
   await vi.waitFor(() => {
-    expect(read).toHaveBeenLastCalledWith('$join');
+    expect(read).toHaveBeenLastCalledWith('$join', true);
   });
   setPreference('hideMembershipEvents', false);
+});
+
+test('the read marker waits for the latest message or for the reader to leave', async () => {
+  const roomTimeline = timeline();
+  roomTimeline.items = [item('read'), ...Array.from({ length: 12 }, (_, i) => item(`new-${i}`))];
+  const read = vi.fn((_eventId: string, _fullyRead: boolean) => Promise.resolve());
+  const fullyRead = vi.fn();
+  const { unmount } = render(TimelineListHarness, {
+    props: {
+      list: {
+        timeline: roomTimeline,
+        roomId: '!room:example.org',
+        hasUnread: true,
+        onLoadReadMarker: () => Promise.resolve('$read'),
+        onRequestHistory: () => Promise.resolve(true),
+        onRequestFuture: async () => {},
+        onRead: read,
+        onFullyRead: fullyRead,
+      },
+    },
+  });
+  unreadViewport();
+  await tick();
+  await runAnimationFrames();
+  await vi.waitFor(() => {
+    expect(read).toHaveBeenCalled();
+  });
+  const [eventId, latest] = read.mock.calls.at(-1) ?? [];
+  expect(eventId).not.toBe('$new-11');
+  expect(latest).toBe(false);
+  expect(fullyRead).not.toHaveBeenCalled();
+
+  unmount();
+  expect(fullyRead).toHaveBeenCalledExactlyOnceWith('!room:example.org', eventId);
 });
 
 function unreadViewport(): HTMLDivElement {
@@ -2190,6 +2272,83 @@ test('a notification below unread keeps the bar and blocks receipts until jumpin
   });
 });
 
+test('an unread context without an SDK marker lands before returning to live', async () => {
+  const roomTimeline = timeline();
+  roomTimeline.mode = { kind: 'unread', eventId: '$read' };
+  roomTimeline.readMarkerEventId = '$read';
+  roomTimeline.forwardPagination = 'end';
+  roomTimeline.items = [item('read'), ...Array.from({ length: 12 }, (_, i) => item(`new-${i}`))];
+  const order: string[] = [];
+  vi.spyOn(TimelineWindow.prototype, 'jumpTo').mockImplementation((key) => {
+    order.push(`jump:${String(key)}`);
+    return Promise.resolve(true);
+  });
+  const resume = vi.fn(() => {
+    order.push('resume');
+    return new Promise<void>(() => {});
+  });
+  render(TimelineListHarness, {
+    props: {
+      list: {
+        timeline: roomTimeline,
+        hasUnread: true,
+        onLoadReadMarker: () => new Promise<string | null>(() => {}),
+        onRequestHistory: () => Promise.resolve(false),
+        onRequestFuture: () => Promise.resolve(),
+        onRead: () => Promise.resolve(),
+        onResumeLive: resume,
+      },
+    },
+  });
+  unreadViewport();
+  await tick();
+  await runAnimationFrames();
+  expect(order[0]).toBe('jump:item:unread-marker');
+  expect(order).toContain('resume');
+});
+
+test('the unread marker stays where the room opened while receipts move the read marker', async () => {
+  const roomTimeline = timeline();
+  const unread = Array.from({ length: 12 }, (_, i) => item(`new-${i}`));
+  roomTimeline.items = [item('read'), readMarker('marker'), ...unread];
+  render(TimelineListHarness, {
+    props: {
+      list: {
+        timeline: roomTimeline,
+        hasUnread: true,
+        onRequestHistory: () => Promise.resolve(true),
+        onRequestFuture: async () => {},
+        onRead: async () => {},
+      },
+    },
+  });
+  unreadViewport();
+  await tick();
+  await runAnimationFrames();
+  const markerFollows = (): string | null | undefined =>
+    document
+      .querySelector('.unread')
+      ?.closest('[data-item-id]')
+      ?.nextElementSibling?.getAttribute('data-item-id');
+  expect(markerFollows()).toBe('new-0');
+
+  roomTimeline.items = [
+    item('read'),
+    ...unread.slice(0, 6),
+    readMarker('moved'),
+    ...unread.slice(6),
+  ];
+  await tick();
+  await runAnimationFrames();
+  expect(document.querySelectorAll('.unread')).toHaveLength(1);
+  expect(markerFollows()).toBe('new-0');
+
+  roomTimeline.items = [item('read'), ...unread];
+  await tick();
+  await runAnimationFrames();
+  expect(markerFollows()).toBe('new-0');
+});
+
 test('marking the unread bar as read keeps it on failure and clears it on success', async () => {
   const roomTimeline = timeline();
   roomTimeline.items = [
@@ -2218,6 +2377,36 @@ test('marking the unread bar as read keeps it on failure and clears it on succes
   await userEvent.click(screen.getByRole('button', { name: 'Mark as read' }));
   await tick();
   expect(screen.queryByRole('button', { name: 'Jump to unread' })).not.toBeInTheDocument();
+});
+
+test('Escape jumps to the latest message and marks the room read', async () => {
+  const roomTimeline = timeline();
+  roomTimeline.items = [
+    readMarker('marker'),
+    ...Array.from({ length: 12 }, (_, i) => item(`new-${i}`)),
+  ];
+  const mark = vi.fn().mockResolvedValue(undefined);
+  const jumps = vi.spyOn(TimelineWindow.prototype, 'jumpTo');
+  render(TimelineListHarness, {
+    props: {
+      list: {
+        timeline: roomTimeline,
+        landingEventId: '$new-10',
+        onRequestHistory: () => Promise.resolve(true),
+        onRequestFuture: async () => {},
+        onRead: async () => {},
+        onMarkRead: mark,
+      },
+    },
+  });
+  unreadViewport();
+  await tick();
+  await runAnimationFrames();
+  jumps.mockClear();
+  await userEvent.keyboard('{Escape}');
+  await tick();
+  expect(jumps).toHaveBeenCalledWith(null, 'start', expect.anything());
+  expect(mark).toHaveBeenCalledOnce();
 });
 
 test('an unread search with no history progress is bounded and can be retried', async () => {

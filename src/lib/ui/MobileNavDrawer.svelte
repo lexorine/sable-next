@@ -17,7 +17,7 @@
   } from './swipe-gesture';
   import { BREAKPOINTS } from './breakpoints';
   import { createMediaQuery } from './media-query.svelte';
-  import { backToRoomList } from '#lib/features/room/room-navigation.js';
+  import { backToRoomList, goToPage, isRoomSwitch } from '#lib/features/room/room-navigation.js';
 
   interface Props {
     children: Snippet;
@@ -38,19 +38,24 @@
       so room-list hydration cannot flash the sidebar over a room. */
   const LIST_INDEX_PATHS = new Set(['/home', '/rooms', '/direct']);
   const BLANK_INDEX_PATHS = new Set(['/home', '/rooms']);
-  /** Routes on which the mobile quick tools bar should be shown; this should
-      match all routes linked from the mobile toolbar except for the root. */
   const MOBILE_QUICK_TOOLS_PATHS = new Set(['/navigate', '/inbox', '/profile']);
   let pathname = $derived(page.url.pathname);
   let settledPath = $state(page.url.pathname);
   let routeChanging = $derived(pathname !== settledPath && page.params.roomId === undefined);
   let spaceIndex = $derived(/^\/space\/[^/]+$/.test(pathname));
+  let spaceLobby = $derived(/^\/space\/[^/]+\/lobby$/.test(pathname));
+  let settingsPage = $derived(/^\/settings(\/[^/]+)?$/.test(pathname));
   let defaultOpen = $derived(LIST_INDEX_PATHS.has(pathname) || spaceIndex);
   let pinnedOpen = $derived(BLANK_INDEX_PATHS.has(pathname) || spaceIndex);
   let pinnedClosed = $derived(MOBILE_QUICK_TOOLS_PATHS.has(pathname));
   let showMobileQuickTools = $derived(MOBILE_QUICK_TOOLS_PATHS.has(pathname));
   let showMobileBackBar = $derived(
-    !appLayout.matches && !pinnedOpen && !showMobileQuickTools && page.params.roomId === undefined
+    !appLayout.matches &&
+      !pinnedOpen &&
+      !showMobileQuickTools &&
+      !spaceLobby &&
+      !settingsPage &&
+      page.params.roomId === undefined
   );
   let open = $derived(
     pinnedClosed
@@ -107,6 +112,7 @@
     if (next === open || (!next && pinnedOpen)) return;
     void goto('', {
       shallow: true,
+      replace: true,
       state: { ...page.state, mobileDrawer: next ? 'open' : 'closed' },
     });
     requestAnimationFrame(() => {
@@ -120,6 +126,7 @@
 
   function handleTouchStart(event: TouchEvent) {
     cancelSettling();
+    if (appLayout.matches) return;
     const target = event.currentTarget;
     if (!(target instanceof HTMLDivElement)) return;
 
@@ -173,7 +180,18 @@
   function revealCurrentPage(event: MouseEvent) {
     if (appLayout.matches || !(event.target instanceof Element)) return;
     const link = event.target.closest('a[href]');
-    if (link instanceof HTMLAnchorElement && link.pathname === pathname) setOpen(false);
+    if (!(link instanceof HTMLAnchorElement)) return;
+    if (link.pathname === pathname) {
+      event.preventDefault();
+      setOpen(false);
+      return;
+    }
+    const plain =
+      event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey;
+    if (plain && isRoomSwitch(link.href)) {
+      event.preventDefault();
+      goToPage(link.href);
+    }
   }
 
   function handleKeydown(event: KeyboardEvent) {
@@ -237,6 +255,7 @@
     <section
       class="drawer-panel content-panel"
       class:with-quick-tools={showMobileQuickTools}
+      class:with-back-bar={showMobileBackBar}
       inert={open && !appLayout.matches}
     >
       {#if showMobileBackBar}
@@ -312,10 +331,6 @@
     overflow: hidden;
   }
 
-  /* Note that visibility+height is used here deliberately instead of
-     display: none; otherwise the animation when clicking toolbar buttons
-     doesn't work when switching from /rooms (sidebar) to other pages
-     (drawer content). */
   .mobile-quick-tools {
     flex: 0 0 auto;
     height: 0;
@@ -339,6 +354,7 @@
       padding-bottom: calc(var(--safe-bottom) - var(--edge-inset-bottom));
     }
 
+    .content-panel.with-back-bar,
     .content-panel:has(> .content > :global([data-inset-owner~='top'])) {
       padding-top: 0;
     }

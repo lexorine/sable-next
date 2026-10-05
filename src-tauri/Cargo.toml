@@ -1,12 +1,13 @@
 [package]
 name = "app"
-version = "0.1.0"
+version = "1.22.9"
 description = "A Tauri App"
 authors = ["you"]
-license = "AGPL-3.0-or-later"
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 repository = ""
-edition = "2024"
-rust-version = "1.97.1"
+edition.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -80,11 +81,11 @@ tauri-plugin-android-fs = "=29.0.0"
 # Push drags in Firebase and APNs, which only these two builds should carry.
 [target."cfg(any(target_os = \"android\", target_os = \"ios\"))".dependencies]
 tauri-plugin-app-icon = { version = "0.1.0", git = "https://github.com/SableClient/tauri-plugin-app-icon", rev = "bab80ae17f6d018702e472c539d0f02eba480c21" }
-tauri-plugin-geolocation = "2.3.3"
+tauri-plugin-geolocation = { version = "2.3.3", optional = true }
 tauri-plugin-notifications = { version = "0.5.0", git = "https://github.com/SableClient/tauri-plugin-notifications.git", rev = "f230395e47f326cc09bcf644f7952d57cab518f7", default-features = false, features = [
   "push-notifications",
 ] }
-tauri-plugin-livekit-mobile = { version = "0.2.0", git = "https://github.com/SableClient/tauri-plugin-livekit-mobile.git", rev = "ca97b1ecd6fae4fc8faa3fe0b3e67661a98f7fe9" }
+tauri-plugin-livekit-mobile = { version = "0.2.0", git = "https://github.com/SableClient/tauri-plugin-livekit-mobile.git", rev = "b18b6822fc48d44a0e316d737584d06a49027a90" }
 # Injects the --safe-area-inset-* custom properties: Android reports the system
 # bars to nobody, and `env()` there only covers a display cutout.
 tauri-plugin-edge-to-edge = { version = "0.3.3", git = "https://github.com/SableClient/tauri-plugin-edge-to-edge.git", rev = "33c6116c27be28c06df5a9d02231ecc5fdeb93c5" }
@@ -99,7 +100,7 @@ tauri-plugin-sharekit = "=0.4.0-rc.7"
 [target."cfg(target_os = \"windows\")".dependencies]
 enigo = { version = "0.6.1", default-features = false }
 sable-hdr = { path = "../crates/sable-hdr", version = "0.1.0", features = ["tauri"] }
-windows = { version = "0.61", features = [
+windows = { version = "0.62.2", features = [
   "Win32_Foundation",
   "Win32_System_Console",
   "Win32_System_ProcessStatus",
@@ -153,8 +154,9 @@ objc2-photos = { version = "0.3.2", default-features = false, features = [
 # Exactly one must be on. The Linux release build passes
 # `--no-default-features --features cef`; everything else takes the default.
 [features]
-default = ["wry"]
+default = ["wry", "geolocation"]
 wry = ["tauri/wry", "dep:webkit2gtk"]
+geolocation = ["dep:tauri-plugin-geolocation"]
 cef = [
   "dep:tauri-runtime-cef",
   "dep:winit",

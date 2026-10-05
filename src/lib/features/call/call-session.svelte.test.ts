@@ -1,4 +1,4 @@
-import { beforeEach, expect, test, vi } from 'vitest';
+import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 
 import type { CoreEvent } from '#src/generated/protocol';
 import type { CoreClient } from '#lib/core/client.svelte.js';
@@ -30,7 +30,9 @@ type Harness = {
   leaveCall: ReturnType<typeof vi.fn>;
 };
 
-function harness(options: { encryptMedia?: boolean; joinError?: Error } = {}): Harness {
+function harness(
+  options: { encryptMedia?: boolean; joinError?: Error; canPublish?: boolean } = {}
+): Harness {
   const listeners = new Set<(event: CoreEvent) => void>();
   const transportListeners = new Set<(state: CallTransportState) => void>();
   const connected: CallTransportState[] = [];
@@ -73,6 +75,7 @@ function harness(options: { encryptMedia?: boolean; joinError?: Error } = {}): H
       jwt: 'jwt',
       identity: '@erwan:example.org:LAPTOP',
       encryptMedia: options.encryptMedia ?? false,
+      canPublish: options.canPublish,
     });
   });
   const leaveCall = vi.fn(() => Promise.resolve());
@@ -118,6 +121,10 @@ beforeEach(() => {
   resetCallOwner();
 });
 
+afterEach(() => {
+  vi.useRealTimers();
+});
+
 test('an unencrypted call connects without waiting for a key', async () => {
   const { client, transport } = harness();
   const session = new CallSession(client, { createTransport: () => transport });
@@ -129,10 +136,38 @@ test('an unencrypted call connects without waiting for a key', async () => {
   expect(transport.connect).toHaveBeenCalledOnce();
 });
 
+test('a call the account cannot publish to is joined listen-only', async () => {
+  const { client, transport } = harness({ canPublish: false });
+  const session = new CallSession(client, { createTransport: () => transport });
+
+  await session.join('!room:example.org', { microphone: true, camera: true });
+  await session.setMicrophoneEnabled(true);
+
+  expect(session.lifecycle).toBe('active');
+  expect(session.listenOnly).toBe(true);
+  expect(transport.connect).toHaveBeenCalledWith(
+    expect.objectContaining({ microphoneEnabled: false, cameraEnabled: false })
+  );
+  expect(transport.setMicrophoneEnabled).not.toHaveBeenCalled();
+});
+
+test('toggling a watched screen leaves other watched screens open', () => {
+  const { client } = harness();
+  const session = new CallSession(client);
+  session.toggleWatchScreenShare('first');
+  session.toggleWatchScreenShare('second');
+
+  session.toggleWatchScreenShare('first');
+  expect(session.watchedScreenShareIds).toEqual(['second']);
+
+  session.toggleWatchScreenShare('first');
+  expect(session.watchedScreenShareIds).toEqual(['second', 'first']);
+});
+
 test('joining clears screen shares watched in an earlier call', async () => {
   const { client, transport } = harness();
   const session = new CallSession(client, { createTransport: () => transport });
-  session.watchScreenShare('screen');
+  session.toggleWatchScreenShare('screen');
 
   await session.join('!room:example.org', { microphone: true, camera: false });
 
@@ -792,6 +827,79 @@ test('a camera that cannot start is reported, not swallowed', async () => {
   session.clearDeviceError();
   expect(session.deviceError).toBeNull();
 });
+
+test('camera warnings expire without retrying', async () => {
+  vi.useFakeTimers();
+  const { client, transport, emitTransportState } = harness();
+  const session = new CallSession(client, { createTransport: () => transport });
+  await session.join('!room:example.org', { microphone: true, camera: false });
+  vi.mocked(transport.setCameraEnabled).mockRejectedValue(
+    new DOMException('No camera found', 'NotFoundError')
+  );
+
+  await session.setCameraEnabled(true);
+  expect(session.deviceError).toBe('camera');
+
+  vi.advanceTimersByTime(5_000);
+  expect(session.deviceError).toBeNull();
+  emitTransportState({ ...idleTransportState(), connection: 'reconnecting' });
+  emitTransportState({ ...idleTransportState(), connection: 'connected' });
+  expect(session.deviceError).toBeNull();
+  expect(transport.setCameraEnabled).toHaveBeenCalledOnce();
+
+  await session.setCameraEnabled(true);
+  expect(session.deviceError).toBe('camera');
+  await session.leave();
+});
+
+test.each(['camera', 'microphone'] as const)(
+  'repeated %s failures restart the warning timeout',
+  async (kind) => {
+    vi.useFakeTimers();
+    const { client, transport } = harness();
+    const session = new CallSession(client, { createTransport: () => transport });
+    await session.join('!room:example.org', { microphone: true, camera: false });
+    const error = new DOMException('Device not found', 'NotFoundError');
+    vi.mocked(transport.setCameraEnabled).mockRejectedValue(error);
+    vi.mocked(transport.setMicrophoneEnabled).mockRejectedValue(error);
+
+    await session.setCameraEnabled(true);
+    vi.advanceTimersByTime(4_000);
+    if (kind === 'camera') await session.setCameraEnabled(true);
+    else await session.setMicrophoneEnabled(true);
+
+    vi.advanceTimersByTime(1_000);
+    expect(session.deviceError).toBe(kind);
+    vi.advanceTimersByTime(4_000);
+    expect(session.deviceError).toBeNull();
+    await session.leave();
+  }
+);
+
+test.each(['dismiss', 'recover', 'leave'])(
+  '%s cancels the device warning timer',
+  async (action) => {
+    vi.useFakeTimers();
+    const { client, transport } = harness();
+    const session = new CallSession(client, { createTransport: () => transport });
+    await session.join('!room:example.org', { microphone: true, camera: false });
+    vi.mocked(transport.setCameraEnabled).mockRejectedValueOnce(
+      new DOMException('Device not found', 'NotFoundError')
+    );
+
+    await session.setCameraEnabled(true);
+    expect(session.deviceError).toBe('camera');
+    expect(vi.getTimerCount()).toBe(1);
+
+    if (action === 'dismiss') session.clearDeviceError();
+    else if (action === 'recover') await session.setCameraEnabled(true);
+    else await session.leave();
+
+    expect(session.deviceError).toBeNull();
+    expect(vi.getTimerCount()).toBe(0);
+    await session.leave();
+  }
+);
 
 test('a transport with a camera switch flips the camera through it', async () => {
   const { client, transport } = harness();

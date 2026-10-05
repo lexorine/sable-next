@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { bestGrid, callTiles, featuredTiles, togglePin } from './call-layout';
+import { bestGrid, callTiles, featuredTiles, presentParticipants, togglePin } from './call-layout';
 import type { CallParticipant } from './call-transport';
 
 const track = (muted = false) => ({ id: 't', muted, subscribed: true });
@@ -27,6 +27,18 @@ describe('bestGrid', () => {
   });
 });
 
+describe('presentParticipants', () => {
+  it('drops a connection that publishes nothing and is no roster member', () => {
+    const publisher: CallParticipant = { identity: '@a:x:D1', microphone: track(true) };
+    const listed: CallParticipant = { identity: '@b:x:D2' };
+    const ghost: CallParticipant = { identity: 'C4xBBxDY6DejjOq73dPNUwHHsq3vuLudRj4hmvc' };
+    expect(presentParticipants([publisher, listed, ghost], new Set(['@b:x:D2']))).toEqual([
+      publisher,
+      listed,
+    ]);
+  });
+});
+
 describe('callTiles', () => {
   it('adds a separate screen tile next to the camera tile', () => {
     const sharer: CallParticipant = { identity: 'a', screenShare: track() };
@@ -38,9 +50,21 @@ describe('callTiles', () => {
     ]);
   });
 
-  it('hides a remote screen until it is watched', () => {
+  it('offers a remote screen before it is watched', () => {
     const sharer: CallParticipant = { identity: 'a', screenShare: track() };
-    expect(callTiles([sharer]).map((tile) => tile.key)).toEqual(['legacy:a:camera']);
+    expect(callTiles([sharer]).map((tile) => [tile.key, tile.watching])).toEqual([
+      ['legacy:a:camera', false],
+      ['legacy:a:screen', false],
+    ]);
+    expect(callTiles([sharer], ['t'])[1].watching).toBe(true);
+  });
+
+  it('includes unsubscribed screen shares', () => {
+    const sharer: CallParticipant = {
+      identity: 'a',
+      screenShare: { ...track(), subscribed: false },
+    };
+    expect(callTiles([sharer])[1]).toMatchObject({ source: 'screen', watching: false });
   });
 });
 
@@ -78,6 +102,10 @@ describe('featuredTiles', () => {
 
   it('falls back to the grid when nothing is shared or pinned', () => {
     expect(featuredTiles(callTiles([{ identity: 'x' }], watched), 'gone')).toEqual([]);
+  });
+
+  it('keeps an unwatched screen in the grid even if it was pinned', () => {
+    expect(featuredTiles(callTiles([remote]), 'legacy:them:screen')).toEqual([]);
   });
 });
 

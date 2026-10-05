@@ -39,6 +39,7 @@
   import { replyPreviewBody } from './reply-preview';
   import { FormattedBodyImages } from './formatted-body-images';
   import ImageSpoilerControl from '#lib/ui/ImageSpoilerControl.svelte';
+  import { toasts } from '#lib/ui/toasts.svelte.js';
 
   interface Props {
     html: string;
@@ -55,9 +56,17 @@
   const bodyImages = new FormattedBodyImages(core, fallbackLabel, paint);
   let definitionAnchor = $state.raw<HTMLElement | null>(null);
   let definitionPinned = $state(false);
+  let emote = $derived(
+    definitionAnchor?.tagName === 'IMG' ? (definitionAnchor as HTMLImageElement) : null
+  );
+  let link = $derived(
+    definitionAnchor?.tagName === 'A' ? (definitionAnchor as HTMLAnchorElement) : null
+  );
   let definition = $derived(
     definitionAnchor?.dataset.abbrDefinition ??
+      (emote ? emoteShortcode(emote) : null) ??
       (definitionAnchor ? timeDetail(definitionAnchor) : null) ??
+      (link ? linkTarget(link) : null) ??
       ''
   );
   let renderedHtml = $derived(bodyImages.defer(html));
@@ -194,6 +203,11 @@
     return emoticon ? `:${label}:` : label;
   }
 
+  function emoteShortcode(image: HTMLImageElement): string | null {
+    const label = image.alt.replace(/^:|:$/g, '');
+    return label ? `:${label}:` : null;
+  }
+
   async function renderMaths(elements: NodeListOf<HTMLElement>): Promise<void> {
     const [{ default: katex }] = await Promise.all([
       import('katex'),
@@ -207,6 +221,12 @@
         throwOnError: false,
       });
     }
+  }
+
+  function isExplicitLink(anchor: HTMLAnchorElement): boolean {
+    return (
+      anchor.hasAttribute('data-mx-link') || anchor.hasAttribute('data-org.matrix.msc4550.link')
+    );
   }
 
   function decorate(html: string) {
@@ -236,7 +256,7 @@
           anchor.target = '_blank';
           anchor.rel = 'noopener noreferrer';
 
-          const link = parseMatrixLink(anchor.href);
+          const link = isExplicitLink(anchor) ? null : parseMatrixLink(anchor.href);
           if (link) {
             anchor.dataset.matrixLink = link.kind;
             if (link.kind === 'user') continue;
@@ -260,6 +280,10 @@
         }
         for (const element of node.querySelectorAll<HTMLElement>('[data-mx-bg-color]')) {
           element.style.backgroundColor = element.dataset.mxBgColor ?? '';
+        }
+        for (const image of node.querySelectorAll<HTMLImageElement>('img[data-mx-emoticon]')) {
+          image.alt ||= image.title;
+          image.removeAttribute('title');
         }
         for (const element of node.querySelectorAll<HTMLTimeElement>('time[datetime]')) {
           if (element.parentElement?.classList.contains('time-chip')) continue;
@@ -384,6 +408,7 @@
 
   /** Past this many lines a block collapses behind a toggle. */
   const CODE_LINE_LIMIT = 14;
+  const CODE_HIGHLIGHT_LIMIT = 20_000;
 
   function classLanguage(element: Element | null): string | null {
     const named = [...(element?.classList ?? [])].find((name) => name.startsWith('language-'));
@@ -447,10 +472,14 @@
   async function paintHighlight(block: HTMLPreElement, language: string | null): Promise<void> {
     const code = block.querySelector('code');
     const source = code?.textContent;
-    if (!code || !source) return;
+    if (!code || !source || language === null || source.length > CODE_HIGHLIGHT_LIMIT) return;
 
-    const { highlightCode } = await import('./code-highlight');
-    const html = await highlightCode(source, language);
+    const html = await import('./code-highlight')
+      .then(({ highlightCode }) => highlightCode(source, language))
+      .catch((error: unknown) => {
+        console.debug('[sable code] highlighter chunk unavailable', error);
+        return null;
+      });
     // The row may have scrolled out of the virtualiser while the grammar loaded.
     if (html === null || !code.isConnected) return;
     code.innerHTML = html;
@@ -484,6 +513,7 @@
       })
       .catch((error: unknown) => {
         console.debug('[sable code] clipboard unavailable', error);
+        toasts.error($i18n.t('errors.actionFailed'));
       });
     return true;
   }
@@ -496,11 +526,20 @@
     return true;
   }
 
+  function linkTarget(anchor: HTMLAnchorElement): string | null {
+    if (anchor.dataset.matrixLink || anchor.dataset.settingsLink) return null;
+    const text = anchor.textContent.trim();
+    return text === anchor.href || text === anchor.getAttribute('href') ? null : anchor.href;
+  }
+
   function definitionOf(target: EventTarget | null): HTMLElement | null {
-    const found =
+    let found =
       target instanceof Element
-        ? target.closest<HTMLElement>('abbr[data-abbr-definition], .time-chip')
+        ? target.closest<HTMLElement>(
+            'abbr[data-abbr-definition], .time-chip, img[data-mx-emoticon], a[href]'
+          )
         : null;
+    if (found instanceof HTMLAnchorElement && !linkTarget(found)) found = null;
     const spoiler = found?.closest<HTMLElement>('[data-mx-spoiler]');
     return spoiler && spoiler.ariaPressed !== 'false' ? null : found;
   }
@@ -512,6 +551,12 @@
 
   function handleDefinitionOver(event: PointerEvent | FocusEvent): void {
     const abbr = definitionOf(event.target);
+    if (
+      abbr instanceof HTMLAnchorElement &&
+      'pointerType' in event &&
+      event.pointerType === 'touch'
+    )
+      return;
     if (abbr) definitionAnchor = abbr;
   }
 
@@ -593,6 +638,23 @@
   </Button>
 {/if}
 
+{#snippet emoteCard()}
+  <span class="emote-card">
+    {#if emote?.src}
+      <img
+        class={['emote-card-image', { pixelated: emote.classList.contains('pixelated') }]}
+        src={emote.src}
+        alt=""
+      />
+    {/if}
+    <span class="emote-card-name">{definition}</span>
+  </span>
+{/snippet}
+
+{#snippet linkCard()}
+  <span class="link-card">{definition}</span>
+{/snippet}
+
 {#if definitionAnchor && definition}
   <Tooltip
     label={definition}
@@ -600,10 +662,33 @@
     open
     customAnchor={definitionAnchor}
     side="top"
+    content={emote ? emoteCard : link ? linkCard : undefined}
   />
 {/if}
 
 <style>
+  .emote-card {
+    align-items: center;
+    display: flex;
+    gap: var(--space-300);
+  }
+
+  .emote-card-image {
+    height: var(--space-800);
+    object-fit: contain;
+    width: var(--space-800);
+  }
+
+  .emote-card-image.pixelated {
+    image-rendering: pixelated;
+  }
+
+  .emote-card-name,
+  .link-card {
+    font-size: var(--font-size-subheading);
+    font-weight: var(--font-weight-medium);
+  }
+
   .formatted-body + :global(.reveal-images) {
     margin-top: var(--space-100);
   }
@@ -720,6 +805,18 @@
     padding-inline-start: var(--space-200);
   }
 
+  .formatted-body :global(dl) {
+    margin: var(--space-200) 0;
+  }
+
+  .formatted-body :global(dt) {
+    font-weight: var(--font-weight-bold);
+  }
+
+  .formatted-body :global(dd) {
+    margin-inline-start: var(--space-600);
+  }
+
   .formatted-body :global(a) {
     color: var(--tc-link, var(--primary-main));
     text-decoration: var(--link-decoration);
@@ -754,9 +851,13 @@
     text-decoration: none;
   }
 
+  .formatted-body :global([data-mx-spoiler]:not([data-image-spoiler])) {
+    background: var(--surface-container-active);
+    border-radius: var(--radius);
+  }
+
   .formatted-body :global([data-mx-spoiler]:not([data-image-spoiler], [aria-pressed='false'])) {
     background: var(--surface-var-on-container);
-    border-radius: var(--radius);
     color: transparent;
     cursor: pointer;
   }

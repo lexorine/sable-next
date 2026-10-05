@@ -1,10 +1,15 @@
 [package]
 name = "sable-core"
 version = "0.1.0"
-edition = "2024"
-license = "AGPL-3.0-or-later"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 
 [features]
+default = ["client"]
+client = []
+server = []
 unoptimized-build = []
 typegen = ["dep:specta", "dep:specta-serde", "dep:specta-typescript"]
 
@@ -20,6 +25,7 @@ matrix-sdk-base = { workspace = true }
 ruma.workspace = true
 mime = "0.3"
 http = "1.5"
+web-time = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 futures-util = { workspace = true }
@@ -28,6 +34,7 @@ specta = { workspace = true, optional = true }
 specta-serde = { workspace = true, optional = true }
 specta-typescript = { workspace = true, optional = true }
 url = { workspace = true }
+thiserror = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = ["stream"] }
 ammonia = "4"
 async-trait = "0.1"
@@ -42,6 +49,7 @@ charabia = { version = "0.10", default-features = false, features = [
 ] }
 rust-stemmers = "1.2"
 html-escape = "0.2"
+pulldown-cmark = { version = "0.13", default-features = false }
 linkify = "0.11"
 regex-lite = "0.1"
 miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
@@ -68,7 +76,7 @@ webpki-roots = "1"
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 matrix-sdk = { workspace = true, features = ["indexeddb", "js", "automatic-room-key-forwarding"] }
-matrix-sdk-indexeddb = { version = "0.19.1", git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "bc2502ee3d3ba1dc687740df5be0f8635032399e", default-features = false, features = [
+matrix-sdk-indexeddb = { version = "0.19.1", git = "https://github.com/eleboucher/matrix-rust-sdk", rev = "4aea59dd962fd65393d7ed30b37656d1dc10ae7f", default-features = false, features = [
   "e2e-encryption",
   "state-store",
   "event-cache-store",
@@ -94,8 +102,8 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
 matrix-sdk = { workspace = true, features = ["testing"] }
-matrix-sdk-test = { version = "0.19.1", git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "bc2502ee3d3ba1dc687740df5be0f8635032399e" }
-matrix-sdk-test-utils = { version = "0.19.1", git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "bc2502ee3d3ba1dc687740df5be0f8635032399e" }
+matrix-sdk-test = { version = "0.19.1", git = "https://github.com/eleboucher/matrix-rust-sdk", rev = "4aea59dd962fd65393d7ed30b37656d1dc10ae7f" }
+matrix-sdk-test-utils = { version = "0.19.1", git = "https://github.com/eleboucher/matrix-rust-sdk", rev = "4aea59dd962fd65393d7ed30b37656d1dc10ae7f" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wiremock = "0.6"

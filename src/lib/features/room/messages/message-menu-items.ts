@@ -5,6 +5,7 @@ import BookmarkIcon from 'phosphor-svelte/lib/BookmarkSimpleIcon';
 import CodeIcon from 'phosphor-svelte/lib/CodeIcon';
 import CopyIcon from 'phosphor-svelte/lib/CopyIcon';
 import DownloadIcon from 'phosphor-svelte/lib/DownloadSimpleIcon';
+import FavoriteIcon from 'phosphor-svelte/lib/HeartIcon';
 import ForwardIcon from 'phosphor-svelte/lib/ShareFatIcon';
 import HistoryIcon from 'phosphor-svelte/lib/ClockCounterClockwiseIcon';
 import PinIcon from 'phosphor-svelte/lib/PushPinIcon';
@@ -37,6 +38,7 @@ export type MessageActions = {
   onReproxy?: () => void;
   onDelete?: () => void;
   onCopyText?: () => void;
+  copyTextLabel?: string;
   onCopyLink?: () => void;
   copyLinkLabel?: string;
   onPin?: () => void;
@@ -44,6 +46,8 @@ export type MessageActions = {
   onForward?: () => void;
   onRemoveLinkPreviews?: () => void;
   onDownload?: () => void;
+  onFavoriteGif?: () => void;
+  gifFavorited?: boolean;
   onStealEmotes?: () => void;
   onDownloadEmotes?: () => void;
   stealCount?: number;
@@ -98,7 +102,7 @@ export function messageMenuRows(actions: MessageActions): MessageMenuRow[] {
   if (actions.onCopyText) {
     rows.push({
       key: 'copy',
-      label: 'timeline.copyMessage',
+      label: actions.copyTextLabel ?? 'timeline.copyMessage',
       icon: CopyIcon,
       run: actions.onCopyText,
     });
@@ -149,6 +153,14 @@ export function messageMenuRows(actions: MessageActions): MessageMenuRow[] {
       label: 'timeline.downloadFile',
       icon: DownloadIcon,
       run: actions.onDownload,
+    });
+  }
+  if (actions.onFavoriteGif) {
+    rows.push({
+      key: 'favorite-gif',
+      label: actions.gifFavorited ? 'composer.gifUnfavorite' : 'composer.gifFavorite',
+      icon: FavoriteIcon,
+      run: actions.onFavoriteGif,
     });
   }
   if (actions.onStealEmotes) {

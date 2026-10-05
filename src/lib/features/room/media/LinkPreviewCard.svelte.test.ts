@@ -11,7 +11,9 @@ vi.mock('#lib/core/context.js');
 
 import { core as baseCore } from '#lib/core/__mocks__/context.js';
 
-const core = Object.assign(baseCore, { urlPreview: vi.fn<() => Promise<UrlPreviewView | null>>() });
+const core = Object.assign(baseCore, {
+  urlPreview: vi.fn<() => Promise<UrlPreviewView | null>>(),
+});
 
 import LinkPreviewCard from './LinkPreviewCard.svelte';
 import LinkPreviewCardMediaHarness from './LinkPreviewCardMediaHarness.test.svelte';
@@ -29,6 +31,10 @@ function preview(overrides: Partial<UrlPreviewView> = {}): UrlPreviewView {
     image_mime: null,
     image_width: null,
     image_height: null,
+    video: null,
+    theme_color: null,
+    card: null,
+    author_name: null,
     ...overrides,
   };
 }
@@ -43,7 +49,10 @@ afterEach(() => {
 test('renders the resolved preview as a link', async () => {
   preferences.urlPreviews = true;
   core.urlPreview.mockResolvedValue(preview({ url: 'https://example.org/render' }));
-  render(LinkPreviewCard, { url: 'https://example.org/render', encrypted: false });
+  render(LinkPreviewCard, {
+    url: 'https://example.org/render',
+    encrypted: false,
+  });
 
   await tick();
   await Promise.resolve();
@@ -57,13 +66,19 @@ test('renders the resolved preview as a link', async () => {
 test('a second card for the same url does not re-request it', async () => {
   preferences.urlPreviews = true;
   core.urlPreview.mockResolvedValue(preview({ url: 'https://example.org/cached' }));
-  const first = render(LinkPreviewCard, { url: 'https://example.org/cached', encrypted: false });
+  const first = render(LinkPreviewCard, {
+    url: 'https://example.org/cached',
+    encrypted: false,
+  });
   await tick();
   await Promise.resolve();
   await tick();
   first.unmount();
 
-  render(LinkPreviewCard, { url: 'https://example.org/cached', encrypted: false });
+  render(LinkPreviewCard, {
+    url: 'https://example.org/cached',
+    encrypted: false,
+  });
   await tick();
   await Promise.resolve();
   await tick();
@@ -79,7 +94,10 @@ test('an in-flight request does not write into a torn-down component', async () 
       resolve = res;
     })
   );
-  const instance = render(LinkPreviewCard, { url: 'https://example.org/b', encrypted: false });
+  const instance = render(LinkPreviewCard, {
+    url: 'https://example.org/b',
+    encrypted: false,
+  });
   await tick();
 
   instance.unmount();
@@ -87,6 +105,17 @@ test('an in-flight request does not write into a torn-down component', async () 
     resolve(preview({ url: 'https://example.org/b' }));
   }).not.toThrow();
   await tick();
+});
+
+test('renders no bundled preview while url previews are disabled', () => {
+  preferences.urlPreviews = false;
+  render(LinkPreviewCard, {
+    url: 'https://example.org/c',
+    encrypted: false,
+    bundled: preview({ url: 'https://example.org/c' }),
+  });
+
+  expect(screen.queryByRole('link')).not.toBeInTheDocument();
 });
 
 test('does nothing while url previews are disabled', async () => {
@@ -105,8 +134,14 @@ test('does nothing while url previews are disabled', async () => {
 test('an encrypted room needs its own consent, and an unknown one is treated as encrypted', async () => {
   preferences.urlPreviews = true;
   core.urlPreview.mockResolvedValue(preview());
-  const encrypted = render(LinkPreviewCard, { url: 'https://example.org/d', encrypted: true });
-  const unknown = render(LinkPreviewCard, { url: 'https://example.org/e', encrypted: null });
+  const encrypted = render(LinkPreviewCard, {
+    url: 'https://example.org/d',
+    encrypted: true,
+  });
+  const unknown = render(LinkPreviewCard, {
+    url: 'https://example.org/e',
+    encrypted: null,
+  });
 
   await tick();
   await Promise.resolve();
@@ -138,7 +173,10 @@ test('an image-only preview renders inline instead of as a card', async () => {
       image_height: 240,
     })
   );
-  render(LinkPreviewCard, { url: 'https://media.example/anim.gif', encrypted: false });
+  render(LinkPreviewCard, {
+    url: 'https://media.example/anim.gif',
+    encrypted: false,
+  });
 
   await tick();
   await Promise.resolve();
@@ -197,9 +235,15 @@ test('an image-only preview opens the media viewer instead of the url', async ()
 test('a preview carrying a title stays a card even with an image', async () => {
   preferences.urlPreviews = true;
   core.urlPreview.mockResolvedValue(
-    preview({ url: 'https://example.org/post', image: 'mxc://example.org/hero' })
+    preview({
+      url: 'https://example.org/post',
+      image: 'mxc://example.org/hero',
+    })
   );
-  render(LinkPreviewCard, { url: 'https://example.org/post', encrypted: false });
+  render(LinkPreviewCard, {
+    url: 'https://example.org/post',
+    encrypted: false,
+  });
 
   await tick();
   await Promise.resolve();
@@ -211,6 +255,7 @@ test('a preview carrying a title stays a card even with an image', async () => {
 });
 
 test('uses a site-specific presentation for a recognised URL', () => {
+  preferences.urlPreviews = true;
   render(LinkPreviewCard, {
     url: 'https://youtu.be/MTn_bhTVr2U',
     encrypted: false,
@@ -230,9 +275,15 @@ test('a preview keeps its text but drops its picture where media previews are of
   preferences.urlPreviews = true;
   mediaPreviewSettings.global = { media_previews: 'off' };
   core.urlPreview.mockResolvedValue(
-    preview({ url: 'https://example.org/pictured', image: 'mxc://example.org/thumb' })
+    preview({
+      url: 'https://example.org/pictured',
+      image: 'mxc://example.org/thumb',
+    })
   );
-  render(LinkPreviewCardMediaHarness, { url: 'https://example.org/pictured', joinRule: 'invite' });
+  render(LinkPreviewCardMediaHarness, {
+    url: 'https://example.org/pictured',
+    joinRule: 'invite',
+  });
 
   await tick();
   await Promise.resolve();
@@ -248,12 +299,18 @@ test.each([
   ['https://example.org/image-only', null, null],
   ['https://youtu.be/MTn_bhTVr2U', 'A video', 'YouTube'],
 ])('the image at %s can be hidden without following its link', async (url, title, site_name) => {
+  preferences.urlPreviews = true;
   const onDocumentClick = vi.fn();
   document.addEventListener('click', onDocumentClick);
   render(LinkPreviewCard, {
     url,
     encrypted: false,
-    bundled: preview({ url, title, site_name, image: 'mxc://example.org/preview-spoiler' }),
+    bundled: preview({
+      url,
+      title,
+      site_name,
+      image: 'mxc://example.org/preview-spoiler',
+    }),
   });
   await tick();
   const hide = screen.getByRole('button', { name: 'Hide image' });
@@ -264,4 +321,86 @@ test.each([
   await userEvent.click(screen.getByRole('button', { name: 'Reveal image' }));
   expect(document.querySelector('.spoilerable-media')).not.toHaveClass('spoilered');
   document.removeEventListener('click', onDocumentClick);
+});
+
+test('a video-only preview plays inline without the card', async () => {
+  preferences.urlPreviews = true;
+  core.urlPreview.mockResolvedValue(
+    preview({
+      url: 'https://cdn.example/clip.mp4',
+      title: null,
+      video: {
+        source: 'mxc://example.org/clip',
+        mime: 'video/mp4',
+        width: 1280,
+        height: 720,
+      },
+    })
+  );
+  const { container } = render(LinkPreviewCard, {
+    url: 'https://cdn.example/clip.mp4',
+    encrypted: false,
+  });
+
+  await tick();
+  await Promise.resolve();
+  await tick();
+
+  expect(screen.getByRole('button', { name: /Play/ })).toBeInTheDocument();
+  expect(container.querySelector('.link-preview')).toBeNull();
+});
+
+test('a page with a video keeps its text under the player', async () => {
+  preferences.urlPreviews = true;
+  core.urlPreview.mockResolvedValue(
+    preview({
+      url: 'https://site.example/watch',
+      title: 'A clip',
+      author_name: 'someone',
+      video: {
+        source: 'mxc://example.org/clip',
+        mime: 'video/mp4',
+        width: null,
+        height: null,
+      },
+    })
+  );
+  const { container } = render(LinkPreviewCard, {
+    url: 'https://site.example/watch',
+    encrypted: false,
+  });
+
+  await tick();
+  await Promise.resolve();
+  await tick();
+
+  expect(screen.getByRole('button', { name: /Play/ })).toBeInTheDocument();
+  expect(screen.getByRole('link', { name: /A clip/ })).toBeInTheDocument();
+  expect(container.querySelector('.link-preview-author')).toHaveTextContent('someone');
+});
+
+test('the theme colour becomes the card accent and a summary card is compact', async () => {
+  preferences.urlPreviews = true;
+  core.urlPreview.mockResolvedValue(
+    preview({
+      url: 'https://site.example/post',
+      image: 'mxc://example.org/pic',
+      image_width: 1600,
+      image_height: 900,
+      theme_color: '#ff4500',
+      card: 'summary',
+    })
+  );
+  const { container } = render(LinkPreviewCard, {
+    url: 'https://site.example/post',
+    encrypted: false,
+  });
+
+  await tick();
+  await Promise.resolve();
+  await tick();
+
+  const card = container.querySelector('.link-preview');
+  expect(card).toHaveClass('accented', 'compact');
+  expect(card).toHaveStyle({ '--link-preview-accent': '#ff4500' });
 });

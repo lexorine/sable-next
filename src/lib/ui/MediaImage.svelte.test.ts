@@ -10,7 +10,7 @@ vi.mock('#lib/core/context.js');
 import { core } from '#lib/core/__mocks__/context.js';
 
 import MediaImage from './MediaImage.svelte';
-import { cachedMediaUrl } from './media-url.js';
+import { cachedMediaUrl, loadMediaUrl } from './media-url.js';
 import { preferences } from '#lib/settings/preferences.svelte.js';
 
 afterEach(() => {
@@ -108,9 +108,7 @@ test('a 2540-emote pack restores an evicted preview while other media is pending
   });
   core.fetchMedia.mockResolvedValue(new Uint8Array([1]));
   for (let index = 0; index < 2540; index += 1) {
-    const row = render(MediaImage, { props: props(index) });
-    await settle();
-    row.unmount();
+    await loadMediaUrl({ session: null, commands: core }, props(index).source, 144, 144);
   }
   expect(core.fetchMedia).toHaveBeenCalledTimes(2540);
   expect(cachedMediaUrl({ session: null }, props(0).source, 144, 144)).toBeUndefined();
@@ -289,6 +287,36 @@ test('keeps the unavailable state while an automatic retry is in flight', async 
   vi.useRealTimers();
 });
 
+test('a remounted image does not ask again for a source still held', async () => {
+  vi.useFakeTimers();
+  core.fetchMedia.mockRejectedValue(new Error('media unavailable'));
+  const props = {
+    source: 'mxc://dead.example/remounted',
+    alt: 'Avatar',
+    width: 96,
+    height: 96,
+  };
+
+  render(MediaImage, { props }).unmount();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(core.fetchMedia).toHaveBeenCalledTimes(1);
+
+  const remounted = render(MediaImage, { props });
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(core.fetchMedia).toHaveBeenCalledTimes(1);
+
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(core.fetchMedia).toHaveBeenCalledTimes(2);
+
+  const latecomer = render(MediaImage, { props });
+  await vi.advanceTimersByTimeAsync(2_000);
+  expect(core.fetchMedia).toHaveBeenCalledTimes(2);
+
+  latecomer.unmount();
+  remounted.unmount();
+  vi.useRealTimers();
+});
+
 test('a manual retry shows its progress instead of the unavailable state', async () => {
   vi.useFakeTimers();
   core.fetchMedia
@@ -379,6 +407,35 @@ test('loads SVG images from the original rather than a thumbnail', async () => {
   await tick();
   await Promise.resolve();
   expect(core.fetchMedia).toHaveBeenCalledWith('mxc://example.org/vector', 0, 0);
+});
+
+test('masks a vector avatar with its own bytes when tinting is on', async () => {
+  preferences.tintRoomIcons = true;
+  core.fetchMedia.mockResolvedValue(
+    new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg"/>')
+  );
+  render(MediaImage, {
+    props: { source: 'mxc://example.org/tinted', alt: '', width: 96, height: 96, tint: true },
+  });
+  await settle();
+  await fireEvent.load(find('img'));
+
+  expect(find('.media-image-tint')).toBeTruthy();
+  expect(find('img').classList.contains('tinted')).toBe(true);
+  preferences.tintRoomIcons = false;
+});
+
+test('leaves a raster avatar untinted', async () => {
+  preferences.tintRoomIcons = true;
+  core.fetchMedia.mockResolvedValue(new Uint8Array([0x89, 0x50, 0x4e, 0x47]));
+  render(MediaImage, {
+    props: { source: 'mxc://example.org/raster', alt: '', width: 96, height: 96, tint: true },
+  });
+  await settle();
+  await fireEvent.load(find('img'));
+
+  expect(document.querySelector('.media-image-tint')).toBeNull();
+  preferences.tintRoomIcons = false;
 });
 
 test('loads GIFs from the original so they animate', async () => {

@@ -14,7 +14,7 @@
   import LobbyTile from './LobbyTile.svelte';
   import { bestGrid, GRID_GAP_PX, NARROW_STAGE_PX } from './call-layout';
   import { DEVICE_PREFERENCE } from './devices';
-  import { participantKeys } from './participant-keys.js';
+  import { numberedName, participantKeys } from './participant-keys.js';
   import type { CallMedia } from './call-session.svelte.js';
   import { startInputMeter } from './input-meter';
 
@@ -143,7 +143,6 @@
     <Button
       {...props}
       variant="secondary"
-      size="large"
       class="test-mic"
       aria-disabled={media.microphone ? undefined : 'true'}
       aria-pressed={testing && media.microphone}
@@ -164,7 +163,7 @@
 {/snippet}
 
 {#snippet joinAction()}
-  <Button variant="primary" size="large" disabled={joining} loading={joining} onclick={onJoin}>
+  <Button variant="primary" disabled={joining} loading={joining} onclick={onJoin}>
     <PhoneIcon aria-hidden="true" weight="fill" />
     {joining ? $i18n.t('call.joining') : $i18n.t('call.joinVoice')}
   </Button>
@@ -211,7 +210,11 @@
           />
         {/if}
         {#each others as person, index (otherKeys[index])}
-          <LobbyTile name={person.name} userId={person.userId} avatar={person.avatar} />
+          <LobbyTile
+            name={numberedName(person.name, otherKeys[index] ?? person.userId)}
+            userId={person.userId}
+            avatar={person.avatar}
+          />
         {/each}
         {#if alone}
           <li class="waiting"><p>{$i18n.t('call.lobbyEmpty')}</p></li>
@@ -374,7 +377,8 @@
     padding: var(--space-300);
   }
 
-  .dock :global(.btn.test-mic[aria-disabled='true']) {
-    opacity: var(--opacity-disabled);
+  .dock :global(.btn.test-mic) {
+    border-radius: var(--radius-inner);
+    border-width: var(--border-width);
   }
 </style>

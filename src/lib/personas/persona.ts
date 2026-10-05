@@ -44,30 +44,31 @@ function live(selection: PersonaSelectionView | undefined, now: number): boolean
   return selection.valid_until === null || selection.valid_until > now;
 }
 
+export type PersonaAssociation = PersonaSelectionView | false | undefined;
+
 export function resolvePersona({
   personas,
   proxied,
   room,
+  spaces = [],
   account,
   now,
 }: {
   personas: readonly PersonaView[];
   proxied?: PersonaView | undefined;
-  room?: PersonaSelectionView | undefined;
+  room?: PersonaAssociation;
+  spaces?: readonly PersonaAssociation[];
   account?: PersonaSelectionView | undefined;
   now: number;
 }): PersonaView | undefined {
-  if (proxied) return proxied;
-
-  if (live(room, now)) {
-    const selected = personaById(personas, room?.persona_id);
-    if (selected) return selected;
+  let inherited: PersonaView | undefined;
+  for (const selection of [room, ...spaces, account]) {
+    if (selection === false) return undefined;
+    if (!live(selection, now)) continue;
+    inherited = personaById(personas, selection?.persona_id);
+    if (inherited) break;
   }
-  if (live(account, now)) {
-    const selected = personaById(personas, account?.persona_id);
-    if (selected) return selected;
-  }
-  return undefined;
+  return proxied ?? inherited;
 }
 
 export interface ProxyMatch {
@@ -95,7 +96,9 @@ export function resolveProxy(
 
     return {
       persona,
-      body: body.slice(trigger.prefix?.length ?? 0, body.length - (trigger.suffix?.length ?? 0)),
+      body: body
+        .slice(trigger.prefix?.length ?? 0, body.length - (trigger.suffix?.length ?? 0))
+        .trim(),
       trigger,
     };
   }
@@ -137,8 +140,9 @@ export function stripProxyHtml(
     }
   };
 
-  remove(prefix.length, false);
-  remove(suffix.length, true);
+  const body = text.slice(prefix.length, text.length - suffix.length);
+  remove(prefix.length + body.length - body.trimStart().length, false);
+  remove(suffix.length + body.length - body.trimEnd().length, true);
   return document.body.innerHTML;
 }
 

@@ -54,14 +54,19 @@ function setup(
       toggleReaction,
     },
   } as unknown as CoreClient;
-  const personas = {
+  const stub = {
     personas: [],
     selectionFor: () => null,
     disabledIn: () => false,
     select: () => Promise.resolve(),
     ...store,
+  };
+  const personas = {
+    ...stub,
+    associationFor: (id: string) =>
+      stub.disabledIn(id) ? false : (stub.selectionFor(id) ?? undefined),
   } as unknown as PersonaStore;
-  const timeline = { items, aggregations: [] } as unknown as RoomTimeline;
+  const timeline = { items, aggregations: [], subscriptionId: 7 } as unknown as RoomTimeline;
 
   return {
     sendMessage,
@@ -101,7 +106,7 @@ test('quick reactions resume live before choosing the latest message', async () 
   ];
   live.resolve(undefined);
   await reacting;
-  expect(fixture.toggleReaction).toHaveBeenCalledWith(ROOM, '$latest', '😂', null, null);
+  expect(fixture.toggleReaction).toHaveBeenCalledWith(ROOM, '$latest', '😂', null, null, 7);
   expect(fixture.sendMessage).not.toHaveBeenCalled();
 });
 
@@ -120,7 +125,7 @@ test.each(['message', 'image', 'sticker', 'unable_to_decrypt'] as const)(
     } as TimelineItemView;
     const fixture = setup([item('$old', '@ana:example.org'), latest], '@kris:example.org');
     await fixture.conversation.quickReact(ROOM, '😂');
-    expect(fixture.toggleReaction).toHaveBeenCalledWith(ROOM, '$latest', '😂', null, null);
+    expect(fixture.toggleReaction).toHaveBeenCalledWith(ROOM, '$latest', '😂', null, null, 7);
   }
 );
 
@@ -139,7 +144,8 @@ test('quick reactions in a thread target its latest message and preserve the sou
     '$reply',
     'mxc://example.org/wave',
     '$root',
-    sourcePack
+    sourcePack,
+    7
   );
 });
 
@@ -152,7 +158,7 @@ test('toggling an existing custom quick reaction omits its source pack', async (
   };
   const fixture = setup([latest], '@kris:example.org');
   await fixture.conversation.quickReact(ROOM, key, sourcePack);
-  expect(fixture.toggleReaction).toHaveBeenCalledWith(ROOM, '$latest', key, null, null);
+  expect(fixture.toggleReaction).toHaveBeenCalledWith(ROOM, '$latest', key, null, null, 7);
 });
 
 test('reaction failures reach the composer', async () => {
@@ -363,7 +369,7 @@ test('a visible reaction aggregation can be replied to', () => {
     kind: 'reply',
     eventId: '$reaction:example.org',
     sender: 'Ana',
-    body: 'm.reaction',
+    body: 'Ana reacted with 🎉',
   });
 });
 
@@ -508,6 +514,73 @@ function encryptedScheduleFailure(): Error {
   Object.assign(error, { detail: { code: 'encrypted_schedule_unsupported' } });
   return error;
 }
+
+test('an empty caption edit keeps the attachment', async () => {
+  const { conversation, editMessage } = setup([], '@kris:example.org');
+  conversation.edit('$image', 'caption', null, true);
+  await conversation.sendMessage(ROOM, '');
+  expect(editMessage).toHaveBeenCalledWith(
+    ROOM,
+    '$image',
+    '',
+    expect.objectContaining({ mediaCaption: true })
+  );
+});
+
+function proxying() {
+  setPreference('personaProxying', true);
+  return setup([], '@kris:example.org', {
+    personas: [
+      {
+        id: 'kris',
+        display_name: 'Kris',
+        avatar_url: null,
+        pronouns: [],
+        color_on_light: null,
+        color_on_dark: null,
+        triggers: [{ prefix: 'k:', suffix: null, keep_trigger: false }],
+        pluralkit: null,
+      },
+    ],
+  });
+}
+
+test.each([
+  ['k:hello', 'k:<em>hello</em>'],
+  ['k: hello ', 'k: <em>hello</em> '],
+])('attachment captions apply persona triggers in %j', async (caption, formattedCaption) => {
+  const { conversation, sendAttachment } = proxying();
+  const file = new File(['picture'], 'picture.png', { type: 'image/png' });
+  await conversation.sendAttachment(ROOM, file, { caption, formattedCaption });
+  expect(sendAttachment.mock.lastCall).toMatchObject([
+    ROOM,
+    file,
+    {
+      caption: 'hello',
+      formattedCaption: '<em>hello</em>',
+      persona: { id: 'kris' },
+    },
+  ]);
+});
+
+test('messages trim whitespace after removing persona triggers', async () => {
+  const { conversation, sendMessage } = proxying();
+  await conversation.sendMessage(ROOM, 'k: hello ', 'k: <em>hello</em> ');
+  expect(sendMessage.mock.lastCall).toMatchObject([
+    ROOM,
+    'hello',
+    {
+      formatted: '<em>hello</em>',
+      persona: { id: 'kris' },
+    },
+  ]);
+});
+
+test('messages containing only a persona trigger and whitespace are not sent', async () => {
+  const { conversation, sendMessage } = proxying();
+  await conversation.sendMessage(ROOM, 'k: \t\n ');
+  expect(sendMessage).not.toHaveBeenCalled();
+});
 
 test('personas off in a room ignore the selection and proxy triggers', async () => {
   setPreference('personaProxying', true);

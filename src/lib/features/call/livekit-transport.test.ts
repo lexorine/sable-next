@@ -34,9 +34,9 @@ function roomFixture() {
     cameraEnabled = enabled;
     return Promise.resolve();
   });
-  const screen = vi.fn((enabled: boolean) => {
+  const screen = vi.fn<Room['localParticipant']['setScreenShareEnabled']>((enabled: boolean) => {
     screenEnabled = enabled;
-    return Promise.resolve();
+    return Promise.resolve(undefined);
   });
   const localParticipant = {
     getTrackPublication: vi.fn(() => undefined),
@@ -106,6 +106,132 @@ afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  preferences.callCameraResolution = 'auto';
+  preferences.callCameraBitrate = 'auto';
+  preferences.callCameraCodec = 'auto';
+  preferences.callScreenResolution = 'auto';
+  preferences.callScreenBitrate = 'auto';
+  preferences.callScreenCodec = 'auto';
+  preferences.callSimulcast = true;
+});
+
+test('automatic video quality leaves capture and encoding choices to LiveKit', async () => {
+  const fixture = roomFixture();
+  const transport = createLivekitTransport({ encryptMedia: false, createRoom: () => fixture.room });
+  await transport.connect({ ...connectOptions, cameraEnabled: true });
+  expect(fixture.camera).toHaveBeenCalledWith(true, {}, {});
+  await transport.capabilities.screenShare?.setEnabled(true);
+  const [, capture, publish] = fixture.localParticipant.setScreenShareEnabled.mock.calls[0];
+  expect(capture).not.toHaveProperty('resolution');
+  expect(publish).not.toHaveProperty('screenShareEncoding');
+  expect(publish).not.toHaveProperty('videoCodec');
+  await transport.disconnect();
+});
+
+test('turning simulcast off applies to camera and screen publishing', async () => {
+  preferences.callSimulcast = false;
+  const fixture = roomFixture();
+  const transport = createLivekitTransport({ encryptMedia: false, createRoom: () => fixture.room });
+  try {
+    await transport.connect({ ...connectOptions, cameraEnabled: true });
+    expect(fixture.camera).toHaveBeenCalledWith(true, {}, { simulcast: false });
+    await transport.capabilities.screenShare?.setEnabled(true);
+    expect(fixture.localParticipant.setScreenShareEnabled.mock.calls[0][2]).toMatchObject({
+      simulcast: false,
+    });
+  } finally {
+    await transport.disconnect();
+  }
+});
+
+test('camera quality applies on join and when enabling the camera later', async () => {
+  preferences.callCameraResolution = '360';
+  preferences.callCameraBitrate = '250';
+  preferences.callCameraCodec = 'h264';
+  preferences.videoInputDevice = 'camera-1';
+  const fixture = roomFixture();
+  const createRoom = vi.fn(() => fixture.room);
+  const transport = createLivekitTransport({ encryptMedia: false, createRoom });
+  try {
+    await transport.connect({ ...connectOptions, cameraEnabled: true });
+    const capture = { deviceId: 'camera-1', resolution: { width: 640, height: 360 } };
+    const publish = {
+      videoEncoding: { maxBitrate: 250_000 },
+      videoCodec: 'h264',
+      backupCodec: { codec: 'vp8', encoding: { maxBitrate: 250_000 } },
+    };
+    expect(createRoom).toHaveBeenCalledWith(
+      expect.objectContaining({ videoCaptureDefaults: capture })
+    );
+    expect(fixture.camera).toHaveBeenLastCalledWith(true, capture, publish);
+    preferences.callCameraBitrate = '8000';
+    await transport.setCameraEnabled(false);
+    await transport.setCameraEnabled(true);
+    expect(fixture.camera).toHaveBeenLastCalledWith(true, capture, publish);
+  } finally {
+    preferences.videoInputDevice = '';
+    await transport.disconnect();
+  }
+});
+
+test.each([false, true])(
+  'screen quality applies with native audio capture %s',
+  async (nativeAudio) => {
+    preferences.callScreenResolution = '720';
+    preferences.callScreenBitrate = '1000';
+    preferences.callScreenCodec = 'vp9';
+    preferences.callCameraBitrate = '250';
+    screenAudio.screenAudioSupported.mockReturnValue(nativeAudio);
+    const fixture = roomFixture();
+    const transport = createLivekitTransport({
+      encryptMedia: false,
+      createRoom: () => fixture.room,
+    });
+    try {
+      await transport.connect(connectOptions);
+      await transport.capabilities.screenShare?.setEnabled(true);
+      expect(fixture.localParticipant.setScreenShareEnabled).toHaveBeenLastCalledWith(
+        true,
+        expect.objectContaining({ resolution: { width: 1280, height: 720 } }),
+        expect.objectContaining({
+          screenShareEncoding: { maxBitrate: 1_000_000 },
+          videoCodec: 'vp9',
+          backupCodec: { codec: 'vp8', encoding: { maxBitrate: 1_000_000 } },
+        })
+      );
+    } finally {
+      await transport.disconnect();
+      screenAudio.screenAudioSupported.mockReturnValue(false);
+    }
+  }
+);
+
+test('HDR sharing uses the screen resolution and publish quality', async () => {
+  preferences.callScreenResolution = '480';
+  preferences.callScreenBitrate = '500';
+  preferences.callScreenCodec = 'av1';
+  const fixture = roomFixture();
+  const publisher = withPublishing(fixture);
+  hdr.startHdrShare.mockResolvedValue(Object.assign(audioTrackStub(), { kind: 'video' }));
+  const transport = createLivekitTransport({ encryptMedia: false, createRoom: () => fixture.room });
+  await transport.connect(connectOptions);
+  await transport.capabilities.screenShare?.setEnabled(true, undefined, {
+    kind: 'hdr',
+    monitor: 2,
+  });
+  expect(hdr.startHdrShare).toHaveBeenLastCalledWith(2, expect.any(Function), {
+    width: 853,
+    height: 480,
+  });
+  expect(publisher.publishTrack).toHaveBeenCalledWith(
+    expect.anything(),
+    expect.objectContaining({
+      source: 'screen_share',
+      screenShareEncoding: { maxBitrate: 500_000 },
+      videoCodec: 'av1',
+    })
+  );
+  await transport.disconnect();
 });
 
 test('imports the publisher key before connecting or capturing audio', async () => {
@@ -317,7 +443,11 @@ test('a share without our own audio capture asks the browser for stereo system a
     true,
     expect.objectContaining({
       systemAudio: 'include',
-      audio: expect.objectContaining({ channelCount: 2, echoCancellation: false }) as unknown,
+      audio: expect.objectContaining({
+        channelCount: 2,
+        echoCancellation: false,
+        restrictOwnAudio: true,
+      }) as unknown,
     }),
     expect.objectContaining({ forceStereo: true, dtx: false, red: false })
   );
@@ -343,7 +473,7 @@ test('an HDR monitor is published as the screen share and stopped with it', asyn
     monitor: 1,
   });
 
-  expect(hdr.startHdrShare).toHaveBeenCalledWith(1, expect.any(Function));
+  expect(hdr.startHdrShare).toHaveBeenCalledWith(1, expect.any(Function), undefined);
   expect(participant.publishTrack).toHaveBeenCalledWith(
     expect.anything(),
     expect.objectContaining({ source: 'screen_share' })

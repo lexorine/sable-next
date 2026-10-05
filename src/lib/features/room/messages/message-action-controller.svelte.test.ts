@@ -28,11 +28,13 @@ function message(): TimelineItemView {
     reactions: [],
     is_own: true,
     read_by: [],
+    read_timestamps: {},
     per_message_profile: null,
     bundled_link_previews: [],
     link_previews_removed: null,
     mention: 'none',
     forwarded: null,
+    forum_title: null,
   };
 }
 

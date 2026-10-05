@@ -147,9 +147,19 @@
   const touches = new SvelteMap<number, { x: number; y: number }>();
   let pinchDistance = 0;
   let pinchZoom = 1;
+  let pinchCenter: Vector2 | null = null;
   let panPointerId: number | null = null;
   let panOrigin: Vector2 = { x: 0, y: 0 };
   let panStartPointer: Vector2 = { x: 0, y: 0 };
+  let lens = $state<{
+    pointerId: number;
+    x: number;
+    y: number;
+    stage: DOMRect;
+    image: DOMRect;
+  } | null>(null);
+  let lensZoom = $state(2);
+  let lensSize = $state(192);
   let isImage = $derived(item?.kind === 'image' || item?.kind === 'sticker');
   let streamUnavailable = $derived(resource.streamUnavailable);
   let transcode = $derived(
@@ -246,6 +256,10 @@
 
   const MIN_ZOOM = 0.1;
   const ZOOM_STEP = 0.2;
+  const LENS_MIN_ZOOM = 1.25;
+  const LENS_MAX_ZOOM = 16;
+  const LENS_MIN_SIZE = 96;
+  const LENS_MAX_SIZE = 640;
   let maxZoom = $derived(isPdf ? 5 : 500);
   let pannable = $derived(zoom > fitRatio * 1.001 || rotation % 360 !== 0);
 
@@ -346,6 +360,15 @@
     }
     if (!isImage || spoilerHidden) return;
     event.preventDefault();
+    if (lens) {
+      const factor = 1 - (event.deltaY || event.deltaX) * 0.001;
+      if (event.shiftKey) {
+        lensSize = Math.min(LENS_MAX_SIZE, Math.max(LENS_MIN_SIZE, lensSize * factor));
+      } else {
+        lensZoom = Math.min(LENS_MAX_ZOOM, Math.max(LENS_MIN_ZOOM, lensZoom * factor));
+      }
+      return;
+    }
     zoomTowards(event, zoom * (1 - event.deltaY * 0.001));
   }
 
@@ -383,6 +406,15 @@
     return Math.hypot(second.x - first.x, second.y - first.y);
   }
 
+  function center(): Vector2 | null {
+    if (touches.size !== 2) return null;
+    const [first, second] = [...touches.values()] as [
+      { x: number; y: number },
+      { x: number; y: number },
+    ];
+    return { x: (first.x + second.x) / 2, y: (first.y + second.y) / 2 };
+  }
+
   function toggleFileZoom(event: MouseEvent): void {
     if (!isPdf || event.button !== 0 || event.target instanceof HTMLButtonElement) return;
     setZoom(zoom === 1 ? 2 : 1);
@@ -401,6 +433,22 @@
     if (event.button !== 0) return;
     clearTimeout(tapTimer);
     if (!backdropPress && handleDoubleTap(event)) return;
+    if (
+      event.pointerType === 'mouse' &&
+      stageEl &&
+      imageEl &&
+      event.target === imageEl &&
+      !pannable
+    ) {
+      lens = {
+        pointerId: event.pointerId,
+        x: event.clientX,
+        y: event.clientY,
+        stage: stageEl.getBoundingClientRect(),
+        image: imageEl.getBoundingClientRect(),
+      };
+      return;
+    }
     if (event.pointerType === 'touch') {
       tap =
         touches.size === 0 && !(event.target instanceof Element && event.target.closest('button'))
@@ -410,6 +458,7 @@
       if (touches.size === 2) {
         pinchDistance = distance();
         pinchZoom = zoom;
+        pinchCenter = center();
         panPointerId = null;
         dragging = true;
         endSwipe();
@@ -443,6 +492,11 @@
     ) {
       backdropPress = null;
     }
+    if (lens?.pointerId === event.pointerId) {
+      lens.x = event.clientX;
+      lens.y = event.clientY;
+      return;
+    }
     if (!isImage) return;
     if (
       tap?.pointerId === event.pointerId &&
@@ -453,7 +507,7 @@
     if (event.pointerType === 'touch' && touches.has(event.pointerId)) {
       touches.set(event.pointerId, { x: event.clientX, y: event.clientY });
       if (touches.size === 2 && pinchDistance > 0) {
-        setZoom(pinchZoom * (distance() / pinchDistance));
+        trackPinchZoom();
         return;
       }
     }
@@ -487,6 +541,21 @@
     if (swipe.axis === 'horizontal') swipeX = dx;
   }
 
+  function trackPinchZoom() {
+    const newPinchCenter = center();
+    if (newPinchCenter) {
+      const nextZoom = pinchZoom * (distance() / pinchDistance);
+      zoomTowards({ clientX: newPinchCenter.x, clientY: newPinchCenter.y }, nextZoom);
+    }
+    if (newPinchCenter && pinchCenter) {
+      pan = clampCurrentPan({
+        x: pan.x + (newPinchCenter.x - pinchCenter.x),
+        y: pan.y + (newPinchCenter.y - pinchCenter.y),
+      });
+    }
+    pinchCenter = newPinchCenter;
+  }
+
   function endSwipe(): void {
     swipe = null;
     swipeX = 0;
@@ -518,6 +587,7 @@
       backdropPress = null;
       if (event.type === 'pointerup' && event.target === stageEl) onClose();
     }
+    if (lens?.pointerId === event.pointerId) lens = null;
     if (!isImage) return;
     if (tap?.pointerId === event.pointerId) {
       if (event.type === 'pointerup') {
@@ -750,6 +820,7 @@
           class:spoilered={spoilerHidden}
           class:has-nav={items.length > 1}
           class:chrome-hidden={chromeHidden}
+          class:magnifying={lens !== null}
           bind:this={stageEl}
           onwheel={handleWheel}
           onpointerdown={startPan}
@@ -818,6 +889,26 @@
                 onload={onImageLoad}
                 oncontextmenu={mouseContextMenu(openImageMenu)}
               />
+              {#if lens}
+                <div
+                  class="lens"
+                  aria-hidden="true"
+                  style:left={`${String(lens.x - lens.stage.x - lensSize / 2)}px`}
+                  style:top={`${String(lens.y - lens.stage.y - lensSize / 2)}px`}
+                  style:width={`${String(lensSize)}px`}
+                  style:height={`${String(lensSize)}px`}
+                >
+                  <img
+                    class:pixelated
+                    src={url}
+                    alt=""
+                    draggable="false"
+                    style:width={`${String(lens.image.width * lensZoom)}px`}
+                    style:height={`${String(lens.image.height * lensZoom)}px`}
+                    style:transform={`translate(${String(lensSize / 2 - (lens.x - lens.image.x) * lensZoom)}px, ${String(lensSize / 2 - (lens.y - lens.image.y) * lensZoom)}px)`}
+                  />
+                </div>
+              {/if}
               <ActionMenu
                 bind:open={imageMenuOpen}
                 label={$i18n.t('viewer.imageMenu')}
@@ -845,6 +936,10 @@
             {#if preview}
               <MediaImage
                 class="viewer-preview"
+                style={[
+                  preview.width ? `--preview-width: ${String(preview.width)}px` : '',
+                  preview.height ? `--preview-height: ${String(preview.height)}px` : '',
+                ].join(';')}
                 source={preview.source}
                 thumbnail={preview.thumbnail}
                 alt=""
@@ -1006,21 +1101,28 @@
   }
 
   .stage {
+    --stage-padding-block: var(--space-200);
+    --stage-padding-left: var(--space-200);
+    --stage-padding-right: var(--space-200);
+
     align-items: center;
     display: flex;
     justify-content: center;
     min-height: 0;
     overflow: hidden;
-    padding: var(--space-200);
+    padding: var(--stage-padding-block) var(--stage-padding-right) var(--stage-padding-block)
+      var(--stage-padding-left);
     position: relative;
     touch-action: none;
   }
 
   .stage.has-nav {
-    padding-inline: calc(
-        max(var(--space-100), var(--safe-left)) + var(--control-height-500) + var(--space-200)
-      )
-      calc(max(var(--space-100), var(--safe-right)) + var(--control-height-500) + var(--space-200));
+    --stage-padding-left: calc(
+      max(var(--space-100), var(--safe-left)) + var(--control-height-500) + var(--space-200)
+    );
+    --stage-padding-right: calc(
+      max(var(--space-100), var(--safe-right)) + var(--control-height-500) + var(--space-200)
+    );
   }
 
   .stage :global(.pdf-viewer) {
@@ -1062,6 +1164,28 @@
 
   .stage img.pixelated {
     image-rendering: pixelated;
+  }
+
+  .stage.magnifying,
+  .stage.magnifying img {
+    cursor: none;
+  }
+
+  .lens {
+    background: var(--viewer-immersive);
+    border-radius: 50%;
+    box-shadow: var(--shadow-float);
+    overflow: hidden;
+    pointer-events: none;
+    position: absolute;
+    z-index: 1;
+  }
+
+  .stage .lens img {
+    left: 0;
+    position: absolute;
+    top: 0;
+    transition: none;
   }
 
   .stage .media-player {
@@ -1113,7 +1237,8 @@
 
   @media (width < 48rem) {
     .stage.has-nav {
-      padding-inline: var(--space-200);
+      --stage-padding-left: var(--space-200);
+      --stage-padding-right: var(--space-200);
     }
 
     :global(.nav) {
@@ -1143,7 +1268,11 @@
 
   .stage :global(.viewer-preview) {
     aspect-ratio: auto;
-    inset: var(--space-200);
+    inset: var(--stage-padding-block) var(--stage-padding-right) var(--stage-padding-block)
+      var(--stage-padding-left);
+    margin: auto;
+    max-height: var(--preview-height, none);
+    max-width: var(--preview-width, none);
     position: absolute;
   }
 
@@ -1212,11 +1341,14 @@
     }
 
     .stage {
-      padding: var(--space-400);
+      --stage-padding-block: var(--space-400);
+      --stage-padding-left: var(--space-400);
+      --stage-padding-right: var(--space-400);
     }
 
     .stage.has-nav {
-      padding-inline: calc(var(--space-600) + var(--control-height-500) + var(--space-200));
+      --stage-padding-left: calc(var(--space-600) + var(--control-height-500) + var(--space-200));
+      --stage-padding-right: calc(var(--space-600) + var(--control-height-500) + var(--space-200));
     }
 
     :global(.previous) {

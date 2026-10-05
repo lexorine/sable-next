@@ -19,11 +19,13 @@ export function timelineItem(id: string, body: string): TimelineItemView {
     reactions: [],
     is_own: false,
     read_by: [],
+    read_timestamps: {},
     per_message_profile: null,
     bundled_link_previews: [],
     link_previews_removed: null,
     mention: 'none',
     forwarded: null,
+    forum_title: null,
   };
 }
 
@@ -54,7 +56,7 @@ export function timelineImage(id: string): TimelineItemView {
       filename: 'History image',
       caption: null,
       html: null,
-      source: JSON.stringify({ Plain: 'mxc://example.test/history-image' }),
+      source: 'mxc://example.test/history-image',
       mime: 'image/png',
       size: null,
       blurhash: null,

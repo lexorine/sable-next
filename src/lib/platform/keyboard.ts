@@ -1,13 +1,13 @@
 import { on } from 'svelte/events';
 
+import { hasIosKeyboardContextQuirk } from './input.js';
+
 function keyboardInset(viewport: VisualViewport): number {
   const scale = viewport.scale || 1;
   const offset = scale === 1 ? viewport.offsetTop : 0;
   return Math.max(0, Math.round(window.innerHeight - (viewport.height * scale + offset)));
 }
 
-// Inner containers do the app's scrolling, so a nonzero document offset is a
-// WebKit keyboard-reveal side effect that touch panning cannot undo. Zero it.
 export function resetDocumentScroll(): void {
   const scroller = document.scrollingElement;
   if (!scroller || window.scrollY === 0) return;
@@ -24,7 +24,9 @@ export function trackKeyboardInset(): () => void {
   const viewport = window.visualViewport;
   if (!viewport) return () => {};
 
+  const opensWithoutResize = os === 'ios' || hasIosKeyboardContextQuirk();
   let frame = 0;
+  let settleFrame = 0;
   let last = -1;
 
   const write = (): void => {
@@ -41,16 +43,32 @@ export function trackKeyboardInset(): () => void {
     frame = requestAnimationFrame(write);
   };
 
+  const settle = (): void => {
+    if (!opensWithoutResize) return;
+    cancelAnimationFrame(settleFrame);
+    const until = performance.now() + 1000;
+    const step = (): void => {
+      write();
+      settleFrame = performance.now() < until ? requestAnimationFrame(step) : 0;
+    };
+    settleFrame = requestAnimationFrame(step);
+  };
+
   write();
   const stopResize = on(viewport, 'resize', schedule);
   const stopScroll = on(viewport, 'scroll', schedule);
   const stopWindowScroll = on(window, 'scroll', schedule);
+  const stopFocusIn = on(window, 'focusin', settle);
+  const stopFocusOut = on(window, 'focusout', settle);
 
   return () => {
     if (frame) cancelAnimationFrame(frame);
+    cancelAnimationFrame(settleFrame);
     stopResize();
     stopScroll();
     stopWindowScroll();
+    stopFocusIn();
+    stopFocusOut();
     document.documentElement.style.removeProperty('--keyboard-height');
   };
 }

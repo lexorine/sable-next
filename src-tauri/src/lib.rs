@@ -11,7 +11,7 @@ pub mod deep_link_ipc;
 #[cfg(target_os = "ios")]
 // Objective-C bindings expose PhotoKit calls as unsafe; keep that exception out
 // of the Rust-only application code.
-#[allow(unsafe_code)]
+#[expect(unsafe_code, reason = "FFI call")]
 mod ios;
 mod map_tiles;
 #[cfg(all(feature = "cef", target_os = "linux"))]
@@ -84,25 +84,41 @@ struct AppState {
 /// reference until the renderer answers - 51200 of those and the app aborts.
 const EVENT_BATCH_LIMIT: usize = 256;
 
+const EVENT_BACKLOG_LIMIT: usize = 4096;
+
 #[derive(Default)]
-struct EventSink(Mutex<Option<Channel<Vec<CoreEvent>>>>);
+struct EventSink(Mutex<SinkState>);
+
+#[derive(Default)]
+struct SinkState {
+    channel: Option<Channel<Vec<CoreEvent>>>,
+    backlog: Vec<CoreEvent>,
+}
 
 impl EventSink {
     fn replace(&self, channel: Channel<Vec<CoreEvent>>) {
-        *self
+        let mut state = self
             .0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(channel);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pending = std::mem::take(&mut state.backlog);
+        while !pending.is_empty() {
+            let tail = pending.split_off(pending.len().min(EVENT_BATCH_LIMIT));
+            let _ = channel.send(std::mem::replace(&mut pending, tail));
+        }
+        state.channel = Some(channel);
     }
 
     fn send(&self, events: Vec<CoreEvent>) {
-        let channel = self
+        let mut state = self
             .0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        if let Some(channel) = channel {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(channel) = state.channel.clone() {
+            drop(state);
             let _ = channel.send(events);
+        } else if state.backlog.len() < EVENT_BACKLOG_LIMIT {
+            state.backlog.extend(events);
         }
     }
 }
@@ -138,7 +154,10 @@ async fn forget_media(state: State<'_, AppState>, source: String) -> Result<(), 
 /// The MIME type [`stream_video`] delivers.
 #[cfg(all(feature = "cef", target_os = "linux"))]
 #[tauri::command]
-#[allow(clippy::unnecessary_wraps)] // The frontend transport expects a Result.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the frontend transport expects a Result"
+)]
 async fn video_stream_mime() -> Result<&'static str, CommandErr> {
     Ok(video_transcode::STREAM_MIME)
 }
@@ -286,6 +305,11 @@ async fn send_attachment_base64(
 }
 
 #[tauri::command]
+const fn has_geolocation() -> bool {
+    cfg!(feature = "geolocation")
+}
+
+#[tauri::command]
 async fn upload_media_base64(
     state: State<'_, AppState>,
     request: Base64Invoke,
@@ -294,7 +318,10 @@ async fn upload_media_base64(
 }
 
 #[tauri::command]
-#[allow(clippy::needless_pass_by_value)] // Tauri extracts command state by value
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri extracts command state by value"
+)]
 fn subscribe_events(state: State<'_, AppState>, channel: Channel<Vec<CoreEvent>>) {
     state.event_sink.replace(channel);
 }
@@ -310,7 +337,10 @@ async fn register_push(
 }
 
 #[tauri::command]
-#[allow(clippy::needless_pass_by_value)] // Tauri extracts command state by value
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri extracts command state by value"
+)]
 fn device_pusher(
     app: AppHandle<BrowserEngine>,
     user_id: String,
@@ -336,7 +366,6 @@ async fn test_notification(
 }
 
 #[tauri::command]
-#[allow(clippy::needless_pass_by_value)] // Tauri extracts command state by value
 #[expect(
     clippy::fn_params_excessive_bools,
     reason = "notification preference command arguments"
@@ -384,6 +413,8 @@ fn setup(app: &mut tauri::App<BrowserEngine>) -> Result<(), Box<dyn std::error::
             });
         #[cfg(desktop)]
         let builder = window_geometry::restore(app.handle(), builder, &config.label);
+        #[cfg(desktop)]
+        let builder = window_geometry::restore_title_bar(app.handle(), builder);
         #[cfg(all(desktop, not(all(feature = "cef", target_os = "linux"))))]
         let builder = match proxy::launch_proxy() {
             Ok(Some(url)) => builder.proxy_url(tauri::Url::parse(url)?),
@@ -446,6 +477,7 @@ fn setup(app: &mut tauri::App<BrowserEngine>) -> Result<(), Box<dyn std::error::
     #[cfg(mobile)]
     network::attach(&core);
     let pushing = core.clone();
+    tauri::async_runtime::spawn(restore_ahead_of_webview(core.clone()));
     #[cfg(target_os = "android")]
     let _ = cold_push::CORE.set(core.clone());
     app.manage(AppState {
@@ -480,7 +512,10 @@ fn setup(app: &mut tauri::App<BrowserEngine>) -> Result<(), Box<dyn std::error::
 
 #[cfg(desktop)]
 #[tauri::command]
-#[allow(clippy::needless_pass_by_value)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the framework passes this argument by value"
+)]
 fn apply_desktop_window_settings(
     app: AppHandle<BrowserEngine>,
     settings: tray::DesktopWindowSettings,
@@ -490,7 +525,10 @@ fn apply_desktop_window_settings(
 
 #[cfg(desktop)]
 #[tauri::command]
-#[allow(clippy::needless_pass_by_value)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the framework passes this argument by value"
+)]
 fn set_tray_unread(app: AppHandle<BrowserEngine>, unread: bool) -> Result<(), String> {
     tray::set_unread_dot(&app, unread).map_err(|error| error.to_string())
 }
@@ -554,7 +592,10 @@ fn pending_deep_links() -> Vec<String> {
 
 #[cfg(desktop)]
 #[tauri::command]
-#[allow(clippy::needless_pass_by_value)] // Tauri extracts command inputs by value
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri extracts command inputs by value"
+)]
 fn toggle_devtools(window: tauri::WebviewWindow<BrowserEngine>) {
     if window.is_devtools_open() {
         window.close_devtools();
@@ -641,16 +682,28 @@ async fn stop_screen_audio() {
 }
 
 #[tauri::command]
-#[allow(clippy::needless_pass_by_value)] // Tauri extracts command inputs by value
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tauri extracts command inputs by value"
+)]
 fn open_external_url(app: AppHandle<BrowserEngine>, url: String) -> Result<(), CommandErr> {
     let parsed = tauri::Url::parse(&url).map_err(|_| CommandErr::Denied)?;
-    if !matches!(parsed.scheme(), "http" | "https") {
+    if !matches!(parsed.scheme(), "http" | "https" | "mailto" | "tel") {
         return Err(CommandErr::Denied);
     }
 
     app.opener()
         .open_url(parsed.to_string(), None::<String>)
         .map_err(|_| CommandErr::Unavailable)
+}
+
+async fn restore_ahead_of_webview(core: Arc<Core>) {
+    if !matches!(core.v1_migration_complete().await, Ok(true)) {
+        return;
+    }
+    if let Err(error) = Box::pin(core.dispatch(Command::Restore)).await {
+        log::warn!("Early session restore failed: {error:?}");
+    }
 }
 
 fn spawn_event_pump<R: tauri::Runtime>(
@@ -733,8 +786,10 @@ fn with_platform_plugins(builder: tauri::Builder<BrowserEngine>) -> tauri::Build
     let builder = builder
         .plugin(tauri_plugin_app_icon::init())
         .plugin(tauri_plugin_edge_to_edge::init())
-        .plugin(tauri_plugin_geolocation::init())
         .plugin(tauri_plugin_livekit_mobile::init());
+
+    #[cfg(all(any(target_os = "android", target_os = "ios"), feature = "geolocation"))]
+    let builder = builder.plugin(tauri_plugin_geolocation::init());
 
     #[cfg(any(
         target_os = "android",
@@ -775,8 +830,12 @@ pub fn run() {
 
     let builder = tauri::Builder::<BrowserEngine>::new();
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    let builder = builder.on_web_content_process_terminate(|_| {
+    let builder = builder.on_web_content_process_terminate(|webview| {
         tracing::error!("webview content process terminated");
+        // WebKit leaves the page blank until reloaded.
+        if let Err(error) = webview.reload() {
+            tracing::error!(%error, "webview reload failed");
+        }
     });
     let builder = if let Some(client) = sentry_guard.as_ref() {
         builder.plugin(tauri_plugin_sentry::init_with_no_injection(client))
@@ -816,7 +875,11 @@ pub fn run() {
 
     if let Err(error) = builder
         .plugin(tauri_plugin_deep_link::init())
-        .plugin(tauri_plugin_opener::init())
+        .plugin(
+            tauri_plugin_opener::Builder::new()
+                .open_js_links_on_click(false)
+                .build(),
+        )
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_os::init())
@@ -828,6 +891,7 @@ pub fn run() {
             v1_migration::begin_v1_migration,
             v1_migration::import_v1_crypto_batch,
             v1_migration::finish_v1_migration,
+            v1_migration::skip_v1_migration,
             submit_command,
             subscribe_events,
             fetch_media,
@@ -886,6 +950,7 @@ pub fn run() {
             share_inbox::share_inbox_read,
             share_inbox::share_inbox_clear,
             sentry::set_native_sentry_enabled,
+            has_geolocation,
             #[cfg(target_os = "ios")]
             ios::save_media_to_photos,
             #[cfg(target_os = "ios")]
@@ -915,7 +980,7 @@ mod tests {
 
     use super::EventSink;
     use sable_core::protocol::CoreEvent;
-    use tauri::ipc::Channel;
+    use tauri::ipc::{Channel, InvokeResponseBody};
 
     #[test]
     fn replaces_the_event_channel_after_a_frontend_reload() {
@@ -955,6 +1020,42 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             1
+        );
+    }
+
+    #[test]
+    fn replays_events_sent_before_the_first_subscription_in_batches() {
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let seen = batches.clone();
+        let channel = Channel::new(move |body| {
+            let InvokeResponseBody::Json(json) = body else {
+                unreachable!("events are serialised as JSON");
+            };
+            let events: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(events.len());
+            Ok(())
+        });
+
+        let sink = EventSink::default();
+        sink.send(
+            (0..300)
+                .map(|_| CoreEvent::SessionEnded {
+                    reason: "early".to_owned(),
+                })
+                .collect(),
+        );
+        sink.replace(channel);
+        sink.send(vec![CoreEvent::SessionEnded {
+            reason: "live".to_owned(),
+        }]);
+
+        assert_eq!(
+            *batches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            [256, 44, 1]
         );
     }
 }

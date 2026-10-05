@@ -360,11 +360,6 @@ impl Core {
         {
             return Err(CommandErr::NotLoggedIn);
         }
-        if let Some(expected) = reauth
-            && expected.device_invalidated
-        {
-            self.discard_account_store(&expected.store_id).await?;
-        }
         let mut updated = registry.clone();
         if let Some(expected) = reauth {
             updated
@@ -570,7 +565,6 @@ impl Core {
         };
         account.needs_reauth = true;
         account.device_invalidated = device_invalidated;
-        let store_id = account.store_id.clone();
         if device_invalidated {
             account.session.credentials.discard_tokens();
         }
@@ -579,22 +573,11 @@ impl Core {
             registry.active_account_id = None;
         }
         let bytes = serde_json::to_vec(registry).or_failed(self, "retire_session_serialize")?;
-        let client = self.account_clients.lock().await.get(account_id).cloned();
         self.invalidate_account_client(account_id).await;
         self.sessions
             .save(bytes)
             .await
-            .or_failed(self, "retire_session_save")?;
-        if device_invalidated {
-            if let Some(client) = client {
-                client
-                    .pause()
-                    .await
-                    .or_failed(self, "retire_session_close")?;
-            }
-            self.discard_account_store(&store_id).await?;
-        }
-        Ok(())
+            .or_failed(self, "retire_session_save")
     }
 
     async fn remove_account(&self, account_id: Option<&str>) -> Result<(), CommandErr> {
@@ -628,6 +611,30 @@ impl Core {
             self.discard_account_store(&store_id).await?;
         }
         Ok(())
+    }
+
+    pub(crate) async fn retire_replaced_store(
+        &self,
+        reauth: Option<&PersistedAccount>,
+        store_id: &str,
+    ) {
+        let Some(replaced) = reauth.filter(|account| account.device_invalidated) else {
+            return;
+        };
+        let Some(base) = session::base_client(store_id) else {
+            tracing::error!("could not carry room keys: the new client is gone");
+            return;
+        };
+        match crate::store_disposal::carry_room_keys(&replaced.store_id, &base).await {
+            Ok(imported) => tracing::info!(imported, "carried room keys to the new device"),
+            Err(error) => {
+                tracing::error!("could not carry room keys to the new device: {error}");
+                return;
+            }
+        }
+        if let Err(error) = self.discard_account_store(&replaced.store_id).await {
+            tracing::error!(?error, "could not discard the replaced account store");
+        }
     }
 
     pub(crate) async fn discard_account_store(&self, store_id: &str) -> Result<(), CommandErr> {
@@ -680,7 +687,10 @@ impl Core {
         session.take()
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one sequential flow kept in a single function"
+    )]
     pub(crate) async fn start_session(
         self: &Arc<Self>,
         client: matrix_sdk::Client,
@@ -749,7 +759,10 @@ impl Core {
         self.watch_notification_settings(generation);
         self.watch_space_sidebar(&client, generation);
         self.watch_calendars(&client, generation);
+        self.watch_widget_feed(&client, generation);
+        self.watch_room_widgets(&client, generation);
         self.watch_cosmetics(&client, generation);
+        self.watch_profile_changes(&client, generation);
         self.watch_bot_commands(&client, generation);
         self.watch_image_packs(&client, generation);
         self.watch_joined_invites(&client);
@@ -770,6 +783,7 @@ impl Core {
             .unwrap_or_else(|| self.store_id.clone());
         self.watch_search_index(&client, &store_id);
         self.watch_ignored_users(&client);
+        self.watch_backup_preference(&client);
         sync_service.start().await;
 
         client.send_queue().enable_upload_progress(true);
@@ -804,6 +818,9 @@ impl Core {
                     }
 
                     if stalled {
+                        if core.detect_account_lock(&support_client, generation).await {
+                            continue;
+                        }
                         if matches!(
                             core.require_sliding_sync(&support_client).await,
                             Err(CommandErr::SlidingSyncUnsupported)
@@ -953,10 +970,6 @@ impl Core {
         change: &matrix_sdk::SessionChange,
         generation: u64,
     ) -> bool {
-        if matches!(change, matrix_sdk::SessionChange::AccountLocked) {
-            self.lock_account(generation);
-            return false;
-        }
         let matrix_sdk::SessionChange::UnknownToken(data) = change else {
             if self.session_generation.load(Ordering::SeqCst) == generation {
                 self.emit(CoreEvent::SessionTokensRefreshed);
@@ -985,9 +998,6 @@ impl Core {
             let account_id = session.as_ref().map(|session| session.account_id.clone());
             if let Some(session) = session {
                 session.sync_service.stop().await;
-                if !soft_logout && let Err(error) = session.client.pause().await {
-                    tracing::error!("could not close rejected session stores: {error}");
-                }
             }
 
             let outcome = match account_id.as_deref() {
@@ -1043,7 +1053,7 @@ fn oauth_device_delete_url(
 const CACHE_DATABASES: [&str; 2] = ["matrix-sdk-event-cache.sqlite3", "matrix-sdk-media.sqlite3"];
 
 #[cfg(not(target_family = "wasm"))]
-async fn reset_account_cache(account: &PersistedAccount) -> Result<(), String> {
+async fn reset_account_cache(account: &PersistedAccount) -> Result<(), crate::CoreError> {
     use matrix_sdk_base::crypto::store::CryptoStore as _;
 
     let store = std::path::Path::new(&account.store_id).join("store");
@@ -1055,14 +1065,14 @@ async fn reset_account_cache(account: &PersistedAccount) -> Result<(), String> {
 
     let crypto = matrix_sdk::SqliteCryptoStore::open(&store, None)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::CoreError::backend)?;
     crypto
         .remove_custom_value(&format!(
             "sliding_sync_store::room-list::{}::instance",
             account.session.credentials.user_id()
         ))
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::CoreError::backend)?;
     drop(crypto);
 
     search::reset_state_cache(&store).await?;
@@ -1074,7 +1084,9 @@ async fn reset_account_cache(account: &PersistedAccount) -> Result<(), String> {
                 match std::fs::remove_file(&path) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(format!("{}: {error}", path.display())),
+                    Err(source) => {
+                        return Err(crate::store::StoreError::Path { path, source }.into());
+                    }
                 }
             }
         }
@@ -1083,7 +1095,6 @@ async fn reset_account_cache(account: &PersistedAccount) -> Result<(), String> {
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
-#[allow(clippy::large_futures)]
 mod regression_tests {
     use crate::session::{self, Credentials};
     use std::sync::Arc;
@@ -1109,7 +1120,7 @@ mod regression_tests {
 
     #[async_trait::async_trait]
     impl crate::store::SessionStore for DelayedSecondSave {
-        async fn load(&self) -> Result<Option<Vec<u8>>, String> {
+        async fn load(&self) -> Result<Option<Vec<u8>>, crate::store::StoreError> {
             Ok(self
                 .bytes
                 .lock()
@@ -1117,7 +1128,7 @@ mod regression_tests {
                 .clone())
         }
 
-        async fn save(&self, bytes: Vec<u8>) -> Result<(), String> {
+        async fn save(&self, bytes: Vec<u8>) -> Result<(), crate::store::StoreError> {
             if self
                 .attempts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -1133,12 +1144,12 @@ mod regression_tests {
             Ok(())
         }
 
-        async fn clear(&self) -> Result<(), String> {
+        async fn clear(&self) -> Result<(), crate::store::StoreError> {
             Ok(())
         }
     }
 
-    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    #[expect(clippy::unwrap_used, reason = "test code")]
     async fn core_with_room() -> (MatrixMockServer, Arc<Core>, Room) {
         let server = MatrixMockServer::new().await;
         server
@@ -1258,7 +1269,7 @@ mod regression_tests {
     }
 
     #[tokio::test]
-    async fn rejected_devices_discard_credentials_and_sqlite_stores_only_on_hard_logout() {
+    async fn rejected_devices_discard_credentials_but_keep_their_stores() {
         use crate::session::{AccountRegistry, PersistedAccount, current_session};
         for hard in [false, true] {
             let server = MatrixMockServer::new().await;
@@ -1302,7 +1313,7 @@ mod regression_tests {
             core.mark_account_needs_reauth(Some("a1"), hard)
                 .await
                 .unwrap();
-            assert_eq!(database.exists(), !hard);
+            assert!(database.exists());
             let bytes = core.sessions.load().await.unwrap().unwrap();
             let (registry, _) = AccountRegistry::from_bytes(&bytes, base).unwrap();
             let account = &registry.accounts[0];
@@ -1410,7 +1421,7 @@ mod regression_tests {
             (
                 format!("sable.search.room.{room_id}").into_bytes(),
                 serde_json::to_vec(&serde_json::json!({
-                    "version": 5, "next_chunk": 2, "edits": [],
+                    "version": 5, "derived": 1, "next_chunk": 2, "edits": [],
                     "chunks": [
                         { "id": 0, "start": 0, "bytes": 100, "count": 1 },
                         { "id": 1, "start": 200, "bytes": 100, "count": 1 }
@@ -1693,15 +1704,15 @@ mod regression_tests {
 
     #[async_trait::async_trait]
     impl crate::store::SessionStore for RejectSaves {
-        async fn load(&self) -> Result<Option<Vec<u8>>, String> {
+        async fn load(&self) -> Result<Option<Vec<u8>>, crate::store::StoreError> {
             Ok(None)
         }
-        async fn save(&self, _: Vec<u8>) -> Result<(), String> {
+        async fn save(&self, _: Vec<u8>) -> Result<(), crate::store::StoreError> {
             self.attempts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err("disk is full".to_owned())
+            Err(crate::store::StoreError::Message("disk is full".to_owned()))
         }
-        async fn clear(&self) -> Result<(), String> {
+        async fn clear(&self) -> Result<(), crate::store::StoreError> {
             Ok(())
         }
     }

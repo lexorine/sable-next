@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::ops::Range;
 use std::sync::{LazyLock, Mutex, PoisonError};
 
 use ammonia::{Builder, UrlRelative};
@@ -14,18 +15,22 @@ use matrix_sdk::ruma::html::{
     SanitizerConfig,
 };
 use matrix_sdk::ruma::{MatrixUri, MxcUri};
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use time::OffsetDateTime;
 
-const ALLOWED_TAGS: [&str; 38] = [
+const ALLOWED_TAGS: [&str; 41] = [
     "a",
     "b",
     "blockquote",
     "br",
     "caption",
     "code",
+    "dd",
     "del",
     "details",
     "div",
+    "dl",
+    "dt",
     "em",
     "h1",
     "h2",
@@ -69,7 +74,10 @@ const DESKTOP_APP_ORIGIN: &str = "tauri://localhost/";
 
 fn tag_attributes() -> HashMap<&'static str, HashSet<&'static str>> {
     HashMap::from([
-        ("a", HashSet::from(["href"])),
+        (
+            "a",
+            HashSet::from(["href", "data-mx-link", "data-org.matrix.msc4550.link"]),
+        ),
         ("code", HashSet::from(["class"])),
         ("pre", HashSet::from(["class"])),
         ("ol", HashSet::from(["start"])),
@@ -175,13 +183,17 @@ static MATRIX_POLICY: LazyLock<SanitizerConfig> = LazyLock::new(|| {
     SanitizerConfig::compat()
         .remove_reply_fallback()
         .remove_elements(["script", "style", "textarea", "option", "noscript"])
-        .allow_elements(["time"], ListBehavior::Add)
+        .allow_elements(["time", "dl", "dt", "dd"], ListBehavior::Add)
         .remove_attributes([PropertiesNames {
             parent: "a",
             properties: &["target"],
         }])
         .allow_attributes(
             [
+                PropertiesNames {
+                    parent: "a",
+                    properties: &["data-mx-link", "data-org.matrix.msc4550.link"],
+                },
                 PropertiesNames {
                     parent: "img",
                     properties: &["data-mx-emoticon"],
@@ -276,6 +288,54 @@ fn matrix_uri_spans(text: &str) -> Vec<(usize, usize)> {
             spans.push((start, end));
         }
         search = end.max(start + "matrix:".len());
+    }
+    spans
+}
+
+/// linkify rejects a bracketed IPv6 host, so `https://[::1]/` has to be spotted separately.
+fn ipv6_url_spans(text: &str) -> Vec<(usize, usize)> {
+    const TRAILING: [char; 9] = ['.', ',', ';', ':', '!', '?', ')', ']', '}'];
+    // ASCII-only lowercasing keeps byte offsets aligned with `text`.
+    let lowercase = text.to_ascii_lowercase();
+    let mut spans = Vec::new();
+    for scheme in ["http://[", "https://["] {
+        let mut search = 0;
+        while let Some(offset) = lowercase.get(search..).and_then(|rest| rest.find(scheme)) {
+            let start = search + offset;
+            let host_start = start + scheme.len();
+            search = host_start;
+            let follows_text = text
+                .get(..start)
+                .and_then(|before| before.chars().next_back())
+                .is_some_and(|character| {
+                    !character.is_whitespace()
+                        && !matches!(character, '(' | '[' | '{' | '<' | '"' | '\'')
+                });
+            let Some(close) = text.get(host_start..).and_then(|rest| rest.find(']')) else {
+                continue;
+            };
+            let host_end = host_start + close;
+            let valid_host = text
+                .get(host_start..host_end)
+                .is_some_and(|host| host.parse::<std::net::Ipv6Addr>().is_ok());
+            let mut end = text
+                .get(host_end + 1..)
+                .and_then(|rest| rest.find(char::is_whitespace))
+                .map_or(text.len(), |length| host_end + 1 + length);
+            while end > host_end + 1
+                && text
+                    .get(host_end + 1..end)
+                    .is_some_and(|tail| tail.ends_with(TRAILING))
+            {
+                end -= 1;
+            }
+            let tail_ok = text
+                .get(host_end + 1..end)
+                .is_some_and(|tail| tail.is_empty() || tail.starts_with([':', '/', '?', '#']));
+            if !follows_text && valid_host && tail_ok {
+                spans.push((start, end));
+            }
+        }
     }
     spans
 }
@@ -377,6 +437,11 @@ fn linkify_urls(text: &str) -> String {
                 .map(|(start, end)| (start, end, SpanKind::Url)),
         )
         .chain(
+            ipv6_url_spans(text)
+                .into_iter()
+                .map(|(start, end)| (start, end, SpanKind::Url)),
+        )
+        .chain(
             msc_spans(text)
                 .into_iter()
                 .map(|(start, end)| (start, end, SpanKind::Msc)),
@@ -401,13 +466,6 @@ fn linkify_urls(text: &str) -> String {
         html.push_str(&escape_html(before));
         match kind {
             SpanKind::Email => html.push_str(&anchor(&format!("mailto:{link}"), link)),
-            SpanKind::Url if is_mxc_uri(link) => {
-                let _ = write!(
-                    html,
-                    "<img src=\"{}\">",
-                    html_escape::encode_double_quoted_attribute(link)
-                );
-            }
             SpanKind::Url => html.push_str(&anchor(link, link)),
             SpanKind::Msc => {
                 let number = link.get("msc".len()..).unwrap_or_default();
@@ -422,6 +480,148 @@ fn linkify_urls(text: &str) -> String {
     }
     html.push_str(&escape_html(text.get(offset..).unwrap_or_default()));
     html
+}
+
+fn spoiler_bars(text: &str, index: usize) -> Option<(usize, &str)> {
+    let body = text.get(index..)?.strip_prefix("||")?;
+    let before = text.get(..index)?.chars().next_back();
+    if !before.is_none_or(|c| c.is_whitespace() || "([{<\"'".contains(c)) {
+        return None;
+    }
+    if body.starts_with(|c: char| c == '|' || c.is_whitespace()) {
+        return None;
+    }
+    let inner = body.get(..body.find("||")?)?;
+    if inner.ends_with(char::is_whitespace) {
+        return None;
+    }
+    Some((inner.len() + 4, inner))
+}
+
+fn math_span(text: &str, index: usize) -> Option<(usize, String)> {
+    let rest = text.get(index..)?;
+    let before = text.get(..index)?.chars().next_back();
+    if before.is_some_and(|c| c.is_alphanumeric() || c == '$') {
+        return None;
+    }
+    let (display, body) = match rest.strip_prefix("$$") {
+        Some(body) => (true, body),
+        None => (false, rest.strip_prefix('$')?),
+    };
+    let inner = body.get(..body.find(if display { "$$" } else { "$" })?)?;
+    if inner.trim().is_empty() || (!display && inner.contains('\n')) {
+        return None;
+    }
+    if !display {
+        let after = body.get(inner.len() + 1..)?.chars().next();
+        let bounded = !inner.starts_with(char::is_whitespace)
+            && !inner.ends_with(char::is_whitespace)
+            && !inner.starts_with('[')
+            && !after.is_some_and(|c| c.is_ascii_digit());
+        if !bounded {
+            return None;
+        }
+    }
+    let latex = inner.trim();
+    let attribute = html_escape::encode_double_quoted_attribute(latex);
+    let tag = if display { "div" } else { "span" };
+    let consumed = inner.len() + if display { 4 } else { 2 };
+    Some((
+        consumed,
+        format!(
+            "<{tag} data-mx-maths=\"{attribute}\"><code>{}</code></{tag}>",
+            escape_html(latex)
+        ),
+    ))
+}
+
+fn hide_spoiler_bars(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while let Some(rest) = text.get(index..).filter(|rest| !rest.is_empty()) {
+        if let Some((consumed, _)) = spoiler_bars(text, index) {
+            out.push_str(SPOILER_PLACEHOLDER);
+            index += consumed;
+        } else {
+            let character = rest.chars().next().unwrap_or_default();
+            out.push(character);
+            index += character.len_utf8();
+        }
+    }
+    out
+}
+
+fn link_words(text: &str) -> Vec<Range<usize>> {
+    let mut words = Vec::new();
+    let mut start = None;
+    for (index, character) in text.char_indices().chain([(text.len(), ' ')]) {
+        if character.is_whitespace() {
+            if let Some(from) = start.take()
+                && let Some(word) = text.get(from..index)
+                && (word.contains("://")
+                    || ["www.", "mailto:", "matrix:"]
+                        .iter()
+                        .any(|prefix| word.starts_with(prefix)))
+            {
+                words.push(from..index);
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+    }
+    words
+}
+
+fn inline_markdown(segment: &str) -> String {
+    let trimmed = segment.trim();
+    let lead = segment.get(..segment.len() - segment.trim_start().len());
+    let trail = segment.get(segment.trim_end().len()..);
+    let mut html = String::with_capacity(segment.len());
+    let mut formatted = false;
+    let links = link_words(trimmed);
+    for (event, range) in Parser::new_ext(trimmed, Options::ENABLE_STRIKETHROUGH).into_offset_iter()
+    {
+        if matches!(
+            event,
+            Event::Start(Tag::Emphasis | Tag::Strong | Tag::Strikethrough) | Event::Code(_)
+        ) {
+            formatted = true;
+            if links
+                .iter()
+                .any(|word| range.start < word.end && word.start < range.end)
+            {
+                return linkify_urls(segment);
+            }
+        }
+        match event {
+            Event::Start(Tag::Paragraph) => {
+                if !html.is_empty() {
+                    html.push_str("\n\n");
+                }
+            }
+            Event::End(TagEnd::Paragraph) => {}
+            Event::Start(Tag::Emphasis) => html.push_str("<em>"),
+            Event::End(TagEnd::Emphasis) => html.push_str("</em>"),
+            Event::Start(Tag::Strong) => html.push_str("<strong>"),
+            Event::End(TagEnd::Strong) => html.push_str("</strong>"),
+            Event::Start(Tag::Strikethrough) => html.push_str("<del>"),
+            Event::End(TagEnd::Strikethrough) => html.push_str("</del>"),
+            Event::Code(code) => {
+                let _ = write!(html, "<code>{}</code>", escape_html(&code));
+            }
+            Event::Text(text) => html.push_str(&linkify_urls(&text)),
+            Event::SoftBreak | Event::HardBreak => html.push('\n'),
+            _ => return linkify_urls(segment),
+        }
+    }
+    if !formatted {
+        return linkify_urls(segment);
+    }
+    format!(
+        "{}{html}{}",
+        lead.map(escape_html).unwrap_or_default(),
+        trail.map(escape_html).unwrap_or_default()
+    )
 }
 
 fn rewrite_mfm(text: &str) -> String {
@@ -463,9 +663,37 @@ fn rewrite_mfm_at_depth(text: &str, depth: usize) -> String {
             && let Some((consumed, element)) = mfm_element(rest, depth)
         {
             if let Some(before) = text.get(plain_start..index) {
-                html.push_str(&linkify_urls(before));
+                html.push_str(&inline_markdown(before));
             }
             html.push_str(&element);
+            index += consumed;
+            plain_start = index;
+            continue;
+        }
+        if code_ticks.is_none()
+            && !rest.starts_with("$[")
+            && let Some((consumed, element)) = math_span(text, index)
+        {
+            if let Some(before) = text.get(plain_start..index) {
+                html.push_str(&inline_markdown(before));
+            }
+            html.push_str(&element);
+            index += consumed;
+            plain_start = index;
+            continue;
+        }
+        if code_ticks.is_none()
+            && depth < MAX_MFM_DEPTH
+            && let Some((consumed, inner)) = spoiler_bars(text, index)
+        {
+            if let Some(before) = text.get(plain_start..index) {
+                html.push_str(&inline_markdown(before));
+            }
+            let _ = write!(
+                html,
+                "<span data-mx-spoiler=\"\">{}</span>",
+                rewrite_mfm_at_depth(inner, depth + 1)
+            );
             index += consumed;
             plain_start = index;
             continue;
@@ -473,7 +701,7 @@ fn rewrite_mfm_at_depth(text: &str, depth: usize) -> String {
         index += rest.chars().next().map_or(1, char::len_utf8);
     }
     if let Some(tail) = text.get(plain_start..) {
-        html.push_str(&linkify_urls(tail));
+        html.push_str(&inline_markdown(tail));
     }
     html
 }
@@ -914,13 +1142,13 @@ const SPOILER_PLACEHOLDER: &str = "[Spoiler]";
 #[must_use]
 pub fn preview_body(body: &str, formatted: Option<&str>) -> String {
     let Some(formatted) = formatted else {
-        return body.to_owned();
+        return hide_spoiler_bars(body);
     };
     if nests_too_deeply(formatted) {
         return if formatted.contains(SPOILER_ATTRIBUTE) {
             SPOILER_PLACEHOLDER.to_owned()
         } else {
-            body.to_owned()
+            hide_spoiler_bars(body)
         };
     }
     let html = Html::parse(formatted);
@@ -930,11 +1158,7 @@ pub fn preview_body(body: &str, formatted: Option<&str>) -> String {
         push_preview_text(&node, &mut text);
     }
     let text = text.trim_end_matches('\n');
-    if text.is_empty() {
-        body.to_owned()
-    } else {
-        text.to_owned()
-    }
+    hide_spoiler_bars(if text.is_empty() { body } else { text })
 }
 
 fn push_preview_text(node: &NodeRef, out: &mut String) {
@@ -978,6 +1202,8 @@ fn push_preview_text(node: &NodeRef, out: &mut String) {
                     | "h6"
                     | "li"
                     | "tr"
+                    | "dt"
+                    | "dd"
             );
             if block && !out.is_empty() && !out.ends_with('\n') {
                 out.push('\n');
@@ -1212,6 +1438,19 @@ mod tests {
     }
 
     #[test]
+    fn keeps_the_explicit_link_marker() {
+        for attribute in ["data-mx-link", "data-org.matrix.msc4550.link"] {
+            let html = display_html(
+                "",
+                Some(&format!(
+                    "<a {attribute} href=\"https://matrix.to/#/@alice:example.org\">DM me</a>"
+                )),
+            );
+            assert!(html.contains(attribute), "{attribute}: {html}");
+        }
+    }
+
+    #[test]
     fn preview_body_uses_formatted_text() {
         for (body, formatted, expected) in [
             ("***both***", "<strong><em>both</em></strong>", "both"),
@@ -1276,6 +1515,92 @@ mod tests {
     }
 
     #[test]
+    fn literal_double_bars_become_spoilers() {
+        let html = display_html("", Some("so. ||i could see it|| yes"));
+        assert!(html.contains("so. <span data-mx-spoiler=\"\">i could see it</span> yes"));
+
+        let html = display_html("", Some("a ||b|| and ||c||"));
+        assert_eq!(html.matches("data-mx-spoiler").count(), 2);
+    }
+
+    #[test]
+    fn spaced_escaped_or_verbatim_bars_stay_literal() {
+        for formatted in [
+            "a || b || c",
+            "a \\||b|| c",
+            "<code>||b||</code>",
+            "<a href=\"https://example.org\">||b||</a>",
+            "one || two",
+            "||",
+        ] {
+            assert!(
+                !display_html("", Some(formatted)).contains("data-mx-spoiler"),
+                "{formatted}"
+            );
+        }
+        assert!(display_html("a ||b|| c", None).contains("data-mx-spoiler"));
+    }
+
+    #[test]
+    fn preview_hides_literal_spoiler_bars() {
+        assert_eq!(
+            preview_body("x", Some("see ||this|| now")),
+            "see [Spoiler] now"
+        );
+        assert_eq!(preview_body("see ||this|| now", None), "see [Spoiler] now");
+    }
+
+    #[test]
+    fn unrendered_markdown_markers_become_formatting() {
+        let html = display_html(
+            "",
+            Some("a **b** and *c* and __d__ and _e_ and ~~f~~ `g&amp;h`"),
+        );
+        for expected in [
+            "<strong>b</strong>",
+            "<em>c</em>",
+            "<strong>d</strong>",
+            "<em>e</em>",
+            "<del>f</del>",
+            "<code>g&amp;h</code>",
+        ] {
+            assert!(html.contains(expected), "{expected} in {html}");
+        }
+        assert_eq!(
+            display_html("", Some("***a***")),
+            "<em><strong>a</strong></em>"
+        );
+        assert_eq!(
+            display_html("", Some("**a _b_ c**")),
+            "<strong>a <em>b</em> c</strong>"
+        );
+    }
+
+    #[test]
+    fn ordinary_text_with_markers_is_left_alone() {
+        for formatted in [
+            "2 * 3 * 4",
+            "snake_case_name and a_b_c",
+            "https://example.org/_a_/*b*",
+            "a ~~ b ~~ c",
+            "lonely *star",
+            "<code>**x**</code>",
+        ] {
+            let html = display_html("", Some(formatted));
+            assert!(
+                !html.contains("<em>") && !html.contains("<strong>") && !html.contains("<del>"),
+                "{formatted} became {html}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_marker_split_by_an_empty_span_stays_literal() {
+        let html = display_html("", Some("<span>*</span>like so* and <span>|</span>|x||"));
+        assert!(!html.contains("<em>") && !html.contains("data-mx-spoiler"));
+    }
+
+    #[test]
     fn keeps_spoilers_colours_and_code_languages() {
         let html = display_html(
             "",
@@ -1291,6 +1616,13 @@ mod tests {
         assert!(html.contains("data-mx-color=\"#ff0000\""));
         assert!(!html.contains("\"red\""));
         assert!(html.contains("class=\"language-rust\""));
+    }
+
+    #[test]
+    fn keeps_description_lists() {
+        let markup = "<dl><dt>term</dt><dd>details</dd></dl>";
+        assert_eq!(display_html("", Some(markup)), markup);
+        assert_eq!(preview_body("", Some(markup)), "term\ndetails");
     }
 
     #[test]
@@ -1343,6 +1675,34 @@ mod tests {
     }
 
     #[test]
+    fn plain_text_maths_becomes_a_maths_element() {
+        assert_eq!(
+            display_html("see $x^2$ now", None),
+            "<span data-plain-body>see <span data-mx-maths=\"x^2\"><code>x^2</code></span> now</span>"
+        );
+        assert_eq!(
+            display_html("$$a<b$$", None),
+            "<span data-plain-body><div data-mx-maths=\"a&lt;b\"><code>a&lt;b</code></div></span>"
+        );
+    }
+
+    #[test]
+    fn prices_and_code_are_not_maths() {
+        for body in [
+            "costs $5 and $10",
+            "a $ b $ c",
+            "`$x$`",
+            "\\$x$",
+            "$[unixtime 1]",
+        ] {
+            assert!(
+                !display_html(body, None).contains("data-mx-maths"),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
     fn marks_the_plain_branch_only() {
         assert_eq!(
             display_html("first\nsecond", None),
@@ -1372,6 +1732,20 @@ mod tests {
 
         assert!(html.starts_with("Use &lt;b&gt;text&lt;/b&gt;"));
         assert!(html.contains("href=\"https://example.org/a\""));
+    }
+
+    #[test]
+    fn linkifies_ipv6_literal_urls() {
+        let html = render_plain_text(
+            "see https://[2001:41d0:602:1eea:6767:6767:6767:6767]/ and (http://[::1]:8080/a?b=1).",
+        );
+
+        assert!(
+            html.contains("href=\"https://[2001:41d0:602:1eea:6767:6767:6767:6767]/\""),
+            "{html}"
+        );
+        assert!(html.contains("href=\"http://[::1]:8080/a?b=1\""), "{html}");
+        assert!(!render_plain_text("https://[nope]/").contains("<a "));
     }
 
     #[test]
@@ -1416,24 +1790,16 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_mxc_uri_renders_as_its_image() {
+    fn a_bare_mxc_uri_stays_plain_text() {
         let plain = display_html("hi mxc://example.org/pic. and https://example.org", None);
-        assert!(
-            plain.contains("hi <img src=\"mxc://example.org/pic\">."),
-            "{plain}"
-        );
+        assert!(plain.contains("hi mxc://example.org/pic. and "), "{plain}");
+        assert!(!plain.contains("<img"), "{plain}");
         assert!(plain.contains("<a href=\"https://example.org\""), "{plain}");
 
         let formatted = display_html("", Some("<p>see mxc://example.org/pic</p>"));
         assert!(
-            formatted.contains("<img src=\"mxc://example.org/pic\">"),
+            formatted.contains("see mxc://example.org/pic") && !formatted.contains("<img"),
             "{formatted}"
-        );
-
-        let invalid = display_html("mxc://example.org", None);
-        assert!(
-            !invalid.contains("<img") && !invalid.contains("<a "),
-            "{invalid}"
         );
     }
 
@@ -1533,8 +1899,8 @@ mod tests {
     #[test]
     fn escaped_markdown_and_mfm_render_as_literal_text() {
         for (body, formatted, visible) in [
-            ("\\*like so*", "*like so*", "*like so*"),
-            ("\\`code\\`", "`code`", "`code`"),
+            ("\\*like so*", "<span>*</span>like so*", "*like so*"),
+            ("\\`code\\`", "<span>`</span>code`", "`code`"),
             (
                 "\\$[unixtime 0]",
                 "<span>$</span>[unixtime 0]",

@@ -1,7 +1,8 @@
 // @vitest-environment happy-dom
 // @vitest-environment-options { "settings": { "disableIframePageLoading": true } }
 
-import { render, screen, within } from '@testing-library/svelte';
+import { screen, within } from '@testing-library/svelte';
+import { renderWithTooltips } from '#lib/test-support/render-with-tooltips.js';
 import { userEvent } from '@testing-library/user-event';
 import { afterEach, expect, test, vi } from 'vitest';
 
@@ -45,14 +46,32 @@ const commonProps = {
 const panel = () => screen.getByRole('complementary', { name: 'Widgets' });
 
 test('shows an empty message when there are no widgets', () => {
-  const { container } = render(WidgetsPanel, { ...commonProps, widgets: [], onClose: vi.fn() });
+  const { container } = renderWithTooltips(WidgetsPanel, {
+    ...commonProps,
+    widgets: [],
+    onClose: vi.fn(),
+  });
 
   expect(screen.getByText('This room has no widgets.')).toBeInTheDocument();
   expect(container.querySelector('iframe')).not.toBeInTheDocument();
 });
 
-test('renders a sandboxed iframe for the first widget, templated', () => {
-  render(WidgetsPanel, { ...commonProps, widgets, onClose: vi.fn() });
+test('lists the widgets without starting any', () => {
+  const { container } = renderWithTooltips(WidgetsPanel, {
+    ...commonProps,
+    widgets,
+    onClose: vi.fn(),
+  });
+
+  expect(screen.getByRole('button', { name: 'Jitsi' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Other' })).toBeInTheDocument();
+  expect(container.querySelector('iframe')).not.toBeInTheDocument();
+});
+
+test('renders a sandboxed iframe for the chosen widget, templated', async () => {
+  const user = userEvent.setup();
+  renderWithTooltips(WidgetsPanel, { ...commonProps, widgets, onClose: vi.fn() });
+  await user.click(screen.getByRole('button', { name: 'Jitsi' }));
 
   const iframe = screen.getByTitle<HTMLIFrameElement>('Jitsi');
   expect(iframe.tagName).toBe('IFRAME');
@@ -63,21 +82,33 @@ test('renders a sandboxed iframe for the first widget, templated', () => {
   expect(src.searchParams.get('wid')).toBe('widget-1');
 });
 
-test('switches the active widget on tab click', async () => {
+test('the back button stops the widget and returns to the list', async () => {
   const user = userEvent.setup();
-  render(WidgetsPanel, { ...commonProps, widgets, onClose: vi.fn() });
+  const { container } = renderWithTooltips(WidgetsPanel, {
+    ...commonProps,
+    widgets,
+    onClose: vi.fn(),
+  });
 
-  const tabs = screen.getAllByRole('tab');
-  expect(tabs.map((tab) => tab.textContent.trim())).toEqual(['Jitsi', 'Other']);
-  await user.click(screen.getByRole('tab', { name: 'Other' }));
-
+  await user.click(screen.getByRole('button', { name: 'Other' }));
   expect(screen.getByTitle('Other').tagName).toBe('IFRAME');
+
+  await user.click(screen.getByRole('button', { name: 'Back to widgets' }));
+
+  expect(container.querySelector('iframe')).not.toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Jitsi' })).toBeInTheDocument();
 });
 
 test('shows a remove action only when the caller can manage widgets', async () => {
   const user = userEvent.setup();
   const onRemove = vi.fn();
-  render(WidgetsPanel, { ...commonProps, widgets, canManage: true, onClose: vi.fn(), onRemove });
+  renderWithTooltips(WidgetsPanel, {
+    ...commonProps,
+    widgets,
+    canManage: true,
+    onClose: vi.fn(),
+    onRemove,
+  });
 
   await user.click(within(panel()).getByRole('button', { name: 'Remove Jitsi' }));
   expect(onRemove).not.toHaveBeenCalled();
@@ -89,7 +120,7 @@ test('shows a remove action only when the caller can manage widgets', async () =
 });
 
 test('omits the remove action when the caller cannot manage widgets', () => {
-  render(WidgetsPanel, { ...commonProps, widgets, canManage: false, onClose: vi.fn() });
+  renderWithTooltips(WidgetsPanel, { ...commonProps, widgets, canManage: false, onClose: vi.fn() });
 
   expect(screen.queryByRole('button', { name: /^Remove / })).not.toBeInTheDocument();
 });
@@ -97,7 +128,7 @@ test('omits the remove action when the caller cannot manage widgets', () => {
 test('calls onClose from the close button', async () => {
   const user = userEvent.setup();
   const onClose = vi.fn();
-  render(WidgetsPanel, { ...commonProps, widgets, onClose });
+  renderWithTooltips(WidgetsPanel, { ...commonProps, widgets, onClose });
 
   await user.click(screen.getByRole('button', { name: 'Close widgets' }));
   expect(onClose).toHaveBeenCalled();
@@ -106,19 +137,72 @@ test('calls onClose from the close button', async () => {
 test('resizes the side panel and reopens at that width', async () => {
   const user = userEvent.setup();
   const props = { ...commonProps, widgets: [], onClose: vi.fn() };
-  const first = render(WidgetsPanel, props);
+  const first = renderWithTooltips(WidgetsPanel, props);
 
   screen.getByRole('slider', { name: 'Resize widgets' }).focus();
   await user.keyboard('{ArrowLeft}');
   expect(panel().style.width).toBe('23rem');
   first.unmount();
 
-  render(WidgetsPanel, props);
+  renderWithTooltips(WidgetsPanel, props);
   expect(panel().style.width).toBe('23rem');
 });
 
 test('leaves the drawer variant unresizable', () => {
-  render(WidgetsPanel, { ...commonProps, widgets: [], modal: true, onClose: vi.fn() });
+  renderWithTooltips(WidgetsPanel, { ...commonProps, widgets: [], modal: true, onClose: vi.fn() });
 
   expect(screen.queryByRole('slider')).not.toBeInTheDocument();
+});
+
+test('a manager adds a widget by name and URL, and an invalid URL cannot be submitted', async () => {
+  const onAdd = vi.fn().mockResolvedValue(undefined);
+  renderWithTooltips(WidgetsPanel, {
+    ...commonProps,
+    widgets: [],
+    canManage: true,
+    onAdd,
+    onClose: vi.fn(),
+  });
+  const user = userEvent.setup();
+  await user.click(screen.getByRole('button', { name: 'Add custom widget' }));
+  const add = screen.getByRole('button', { name: 'Add widget' });
+
+  await user.type(screen.getByLabelText('Widget name'), 'Doom');
+  await user.type(screen.getByLabelText(/Widget URL/), 'not a url');
+  expect(add).toBeDisabled();
+
+  await user.clear(screen.getByLabelText(/Widget URL/));
+  await user.type(screen.getByLabelText(/Widget URL/), 'https://doom.example/play');
+  await user.click(add);
+
+  expect(onAdd).toHaveBeenCalledWith('Doom', 'https://doom.example/play');
+});
+
+test('a non-manager sees no add form', () => {
+  renderWithTooltips(WidgetsPanel, {
+    ...commonProps,
+    widgets: [],
+    onAdd: vi.fn(),
+    onClose: vi.fn(),
+  });
+
+  expect(screen.queryByLabelText('Widget name')).not.toBeInTheDocument();
+});
+
+test('the integration manager opens from the manager actions', async () => {
+  const integrationManagerUrl = vi.fn().mockReturnValue(new Promise(() => undefined));
+  (core.commands as unknown as Record<string, unknown>).integrationManagerUrl =
+    integrationManagerUrl;
+  renderWithTooltips(WidgetsPanel, {
+    ...commonProps,
+    widgets: [],
+    canManage: true,
+    onAdd: vi.fn(),
+    onClose: vi.fn(),
+  });
+  const user = userEvent.setup();
+
+  await user.click(screen.getByRole('button', { name: 'Integration manager' }));
+
+  expect(integrationManagerUrl).toHaveBeenCalledWith('!room:example.org');
 });

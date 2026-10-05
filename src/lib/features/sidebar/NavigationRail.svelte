@@ -23,6 +23,8 @@
   } from '#lib/spaces/sidebar-layout.js';
   import {
     DIRECT_PATHS_KEY,
+    HOME_PATHS_KEY,
+    ROOMS_PATHS_KEY,
     saveSpacePath,
     savedSpacePaths,
     spaceNavigationHref,
@@ -41,7 +43,6 @@
   import { resolveUnreadBadge } from '#lib/ui/primitives/unread-badge.js';
   import '#lib/ui/primitives/nav-tab.css';
   import CaretUpIcon from 'phosphor-svelte/lib/CaretUpIcon';
-  import ChatsIcon from 'phosphor-svelte/lib/ChatsIcon';
   import ChecksIcon from 'phosphor-svelte/lib/ChecksIcon';
   import CompassIcon from 'phosphor-svelte/lib/CompassIcon';
   import FolderOpenIcon from 'phosphor-svelte/lib/FolderOpenIcon';
@@ -52,6 +53,7 @@
   import SpeakerHighIcon from 'phosphor-svelte/lib/SpeakerHighIcon';
   import PencilSimpleIcon from 'phosphor-svelte/lib/PencilSimpleIcon';
   import PlusIcon from 'phosphor-svelte/lib/PlusIcon';
+  import UsersIcon from 'phosphor-svelte/lib/UsersIcon';
   import UserQuickTools from './UserQuickTools.svelte';
 
   type RailSection = 'home' | 'unspaced' | 'direct';
@@ -73,6 +75,7 @@
   };
 
   interface Props {
+    pathname?: string;
     spaces: readonly RoomSummary[];
     spaceUnread?: ReadonlyMap<string, UnreadCount>;
     callSpaces?: ReadonlySet<string>;
@@ -98,6 +101,7 @@
   }
 
   let {
+    pathname = page.url.pathname,
     spaces,
     spaceUnread = new Map(),
     callSpaces = new Set(),
@@ -139,7 +143,14 @@
     const own = props['aria-describedby'];
     return typeof own === 'string' ? `${own} ${id}` : id;
   }
+  const homeRoot = resolve('/(app)/home');
+  const roomsRoot = resolve('/(app)/rooms');
   const directRoot = resolve('direct');
+  const sectionRoots = [
+    [HOME_PATHS_KEY, homeRoot],
+    [ROOMS_PATHS_KEY, roomsRoot],
+    [DIRECT_PATHS_KEY, directRoot],
+  ] as const;
   let spacePaths = $state(savedSpacePaths());
   let dragged = $state<LayoutRef | null>(null);
   let dropState = $state<DropState<LayoutRef> | null>(null);
@@ -148,8 +159,9 @@
     ...(preferences.showHome
       ? [
           {
-            href: resolve('/(app)/home'),
+            href: homeRoot,
             activePrefix: '/home',
+            navigateHref: sectionHref(HOME_PATHS_KEY, homeRoot),
             icon: HouseIcon,
             label: 'nav.home',
             unread: homeUnread,
@@ -159,8 +171,9 @@
         ]
       : []),
     {
-      href: resolve('/(app)/rooms'),
+      href: roomsRoot,
       activePrefix: '/rooms',
+      navigateHref: sectionHref(ROOMS_PATHS_KEY, roomsRoot),
       icon: preferences.showHome ? HashIcon : HouseIcon,
       label: 'nav.unspaced',
       unread: unspacedUnread,
@@ -179,13 +192,8 @@
     {
       href: directRoot,
       activePrefix: '/direct',
-      navigateHref: spaceNavigationHref(
-        directRoot,
-        spacePaths[DIRECT_PATHS_KEY],
-        mobile,
-        directRoot
-      ),
-      icon: ChatsIcon,
+      navigateHref: sectionHref(DIRECT_PATHS_KEY, directRoot),
+      icon: UsersIcon,
       label: 'nav.direct',
       unread: directUnread,
       dm: true,
@@ -243,6 +251,10 @@
 
   function under(path: string, root: string): boolean {
     return path === root || path.startsWith(`${root}/`);
+  }
+
+  function sectionHref(key: string, root: string): string {
+    return spaceNavigationHref(root, spacePaths[key], mobile, root);
   }
 
   function spaceName(name: string | null, roomId: string): string {
@@ -408,13 +420,10 @@
 
   function isActive(item: RailItem): boolean {
     if (item.initial) {
-      return (
-        page.url.pathname.startsWith(`${item.activePrefix}/`) ||
-        page.url.pathname === item.activePrefix
-      );
+      return pathname.startsWith(`${item.activePrefix}/`) || pathname === item.activePrefix;
     }
 
-    return page.url.pathname.startsWith(item.activePrefix);
+    return pathname.startsWith(item.activePrefix);
   }
 
   function navigate(item: RailItem): void {
@@ -457,6 +466,7 @@
   }
 
   const monitor = dragList.autoScroll();
+  let previousPath = '';
 
   afterNavigate(() => {
     if (mobile) return;
@@ -468,7 +478,19 @@
       const href = resolve('/(app)/space/[spaceId]', { spaceId: roomPathParam(candidate) });
       return path === href || path.startsWith(`${href}/`);
     });
-    const key = under(path, directRoot) ? DIRECT_PATHS_KEY : space?.room_id;
+    const key = sectionRoots.find(([, root]) => under(path, root))?.[0] ?? space?.room_id;
+    const spaceParam = page.params.spaceId;
+    const bounced = spaceParam
+      ? sectionRoots.find(
+          ([, root]) => previousPath === `${root}/${encodeURIComponent(spaceParam)}`
+        )
+      : undefined;
+    previousPath = page.url.pathname;
+
+    if (bounced) {
+      spacePaths = { ...spacePaths, [bounced[0]]: bounced[1] };
+      saveSpacePath(bounced[0], bounced[1]);
+    }
     if (key === undefined || spacePaths[key] === path) return;
 
     spacePaths = { ...spacePaths, [key]: path };

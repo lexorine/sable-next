@@ -5,14 +5,19 @@
     PackImageInfoView,
     ImageSourcePackView,
     PackImageView,
+    PersonaView,
   } from '#src/generated/protocol';
   import { mergeProps, Portal } from 'bits-ui';
   import FileIcon from 'phosphor-svelte/lib/FileIcon';
+  import CheckIcon from 'phosphor-svelte/lib/CheckIcon';
+  import ArrowsInSimpleIcon from 'phosphor-svelte/lib/ArrowsInSimpleIcon';
+  import ArrowsOutSimpleIcon from 'phosphor-svelte/lib/ArrowsOutSimpleIcon';
   import MicrophoneIcon from 'phosphor-svelte/lib/MicrophoneIcon';
   import PaperPlaneIcon from 'phosphor-svelte/lib/PaperPlaneTiltIcon';
   import TextAaIcon from 'phosphor-svelte/lib/TextAaIcon';
+  import TrashIcon from 'phosphor-svelte/lib/TrashIcon';
   import type { Node as ProseMirrorNode } from 'prosemirror-model';
-  import { onDestroy, untrack } from 'svelte';
+  import { onDestroy, tick, untrack } from 'svelte';
 
   import type { OutgoingMentions } from '#lib/core/client.svelte.js';
   import type { SendAttachmentOptions } from '#lib/core/commands.svelte.js';
@@ -25,9 +30,10 @@
   import { i18n } from '#lib/i18n.js';
   import { isPackChange, loadPacks } from '#lib/emoji/load-packs.js';
   import { listenNativeFileDrop } from '#lib/platform/file-drop.js';
-  import { pickFiles } from '#lib/platform/files.js';
+  import { capturesFromCamera, pickFiles } from '#lib/platform/files.js';
   import { usePersonaStore } from '#lib/personas/personas.svelte.js';
   import { useRoomList } from '#lib/rooms/room-list.svelte.js';
+  import { enterInsertsNewline } from '#lib/settings/enter-key.svelte.js';
   import { preferences, setPreference } from '#lib/settings/preferences.svelte.js';
   import { BREAKPOINTS } from '#lib/ui/breakpoints.js';
   import { formatByteSize } from '#lib/ui/byte-size.js';
@@ -37,7 +43,6 @@
   import { isMacPlatform } from '#lib/ui/shortcuts/global-shortcuts.js';
   import { cachedMediaUrl, holdMediaUrl, loadMediaUrl } from '#lib/ui/media-url.js';
   import { createMediaQuery } from '#lib/ui/media-query.svelte.js';
-  import Alert from '#lib/ui/primitives/Alert.svelte';
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
   import Spinner from '#lib/ui/primitives/Spinner.svelte';
   import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
@@ -49,6 +54,7 @@
   import type { GifResult } from '#lib/features/gif/providers.js';
   import ComposerBoard from './ComposerBoard.svelte';
   import ComposerContextBanner from './ComposerContextBanner.svelte';
+  import ComposerError from './ComposerError.svelte';
   import ComposerDoor from './ComposerDoor.svelte';
   import PersonaPicker from './PersonaPicker.svelte';
   import PollComposer from './PollComposer.svelte';
@@ -74,10 +80,11 @@
   import type { ActiveColors, ColorKind, FormatAction } from './editor/formatting';
   import type { EmoteMedia } from './editor/node-views';
   import { composerSchema } from './editor/schema';
+  import { emoticonNode } from './editor/shortcodes';
   import type { BoardTab } from '#lib/ui/primitives/emote-board.js';
   import {
     commandTextOf,
-    plainEditSource,
+    plainEditDoc,
     serializeComposer,
     serializePlain,
   } from './editor/serialize';
@@ -106,6 +113,7 @@
   import { ROOM_MENTION, suggestionsFor } from './suggestions';
   import VoiceRecorder from './VoiceRecorder.svelte';
   import { isVoiceRecordingSupported } from './voice-recorder-support';
+  import './composer-chrome.css';
 
   interface Props {
     roomId: string;
@@ -163,6 +171,7 @@
     /** What the next send relates to: a message being replied to, or edited. */
     context?: ComposerContext | null;
     onCancelContext?: () => void;
+    onEditPersona?: (persona: PersonaView | null) => void;
     onToggleSilentReply?: () => void;
     onDeleteEdited?: (eventId: string, reason: string | null) => void;
     onEditLast?: (before?: string) => void;
@@ -190,6 +199,7 @@
     encrypted = null,
     context = null,
     onCancelContext,
+    onEditPersona,
     onToggleSilentReply,
     onDeleteEdited,
     onEditLast,
@@ -202,6 +212,11 @@
   const roomList = useRoomList();
   const personas = usePersonaStore();
   const appLayout = createMediaQuery(BREAKPOINTS.appLayout);
+  const roomyPointer = createMediaQuery('(width >= 32rem) and (any-pointer: fine)');
+  const composerShort = $derived(
+    preferences.composerForm === 'short' ||
+      (preferences.composerForm === 'adaptive' && roomyPointer.matches)
+  );
   const uid = $props.id();
   const hintId = `composer-hint-${uid}`;
   const listboxId = `composer-suggestions-${uid}`;
@@ -224,7 +239,8 @@
   let boardTab = $state<BoardTab>('emoticon');
   let boardQuery = $state('');
   let recording = $state(false);
-  let micDenied = $state(false);
+  let expanded = $state(false);
+  let recordingDraft: ProseMirrorNode | undefined;
   const voiceSupported = isVoiceRecordingSupported();
 
   function isGifSearchAction(value: unknown): value is ConversationSendResult {
@@ -241,6 +257,7 @@
   let staged = $state<StagedFile[]>([]);
   let inFlight = $state(0);
   let error = $state<string | null>(null);
+  let retry = $state<{ text: string; run: () => void } | null>(null);
   let pollOpen = $state(false);
   let locationOpen = $state(false);
   let scheduleOpen = $state(false);
@@ -283,29 +300,56 @@
 
   let desktop = $derived(appLayout.matches);
   let sending = $derived(inFlight > 0);
-  let hasContent = $derived(!empty || staged.length > 0);
+  let editingCaption = $derived(context?.kind === 'edit' && context.mediaCaption === true);
+  let hasContent = $derived(!empty || staged.length > 0 || editingCaption);
   let canDeleteEdited = $derived(context?.kind === 'edit' && onDeleteEdited !== undefined);
   let editingScheduled = $derived(context?.kind === 'schedule');
-  let primaryAction = $derived(
-    !hasContent &&
-      !canDeleteEdited &&
-      preferences.composerVoiceButton &&
-      voiceSupported &&
-      !micDenied
-      ? 'record'
-      : 'send'
-  );
+  let canVoice = $derived(context?.kind !== 'edit' && !editingScheduled && voiceSupported);
+  let showVoice = $derived(preferences.composerVoiceButton && canVoice);
   let sendLabel = $derived(
-    primaryAction === 'record'
-      ? $i18n.t('composer.voiceRecord')
-      : editingScheduled
-        ? $i18n.t('composer.scheduledSave')
+    editingScheduled
+      ? $i18n.t('composer.scheduledSave')
+      : context?.kind === 'edit'
+        ? !hasContent && canDeleteEdited
+          ? $i18n.t('timeline.deleteMessage')
+          : $i18n.t('composer.saveChanges')
         : $i18n.t('timeline.sendMessage')
+  );
+  let contextAnnouncement = $derived(
+    context?.kind === 'edit'
+      ? $i18n.t('composer.editing')
+      : context?.kind === 'schedule'
+        ? $i18n.t('composer.editingScheduled')
+        : context?.kind === 'reply'
+          ? $i18n.t('composer.replyingTo', { name: context.sender ?? '' })
+          : ''
   );
   let showPersonaPicker = $derived(preferences.personaPicker && personas.personas.length > 0);
 
-  let canSchedule = $derived(
-    onSchedule !== undefined && primaryAction === 'send' && hasContent && !readOnly
+  let canSchedule = $derived(onSchedule !== undefined && hasContent && !readOnly);
+  let sendShortcut = $derived(!enterInsertsNewline() ? 'Enter' : 'Shift+Enter');
+  let keyboardHint = $derived(
+    $i18n.t(
+      !hasContent && canDeleteEdited
+        ? 'composer.deleteHint'
+        : context?.kind === 'edit' || editingScheduled
+          ? 'composer.editHint'
+          : 'composer.sendHint',
+      {
+        shortcut: sendShortcut,
+        newline: enterInsertsNewline() ? 'Enter' : 'Shift+Enter',
+      }
+    )
+  );
+  let sendTooltip = $derived(
+    desktop
+      ? $i18n.t(canSchedule ? 'composer.sendScheduleTooltip' : 'composer.sendTooltip', {
+          action: sendLabel,
+          shortcut: sendShortcut,
+        })
+      : canSchedule
+        ? $i18n.t('composer.scheduleTooltip', { action: sendLabel })
+        : sendLabel
   );
 
   const sendPress = new LongPress({
@@ -406,8 +450,16 @@
   let active = $derived(Math.min(activeIndex, Math.max(0, suggestions.length - 1)));
   let placeholder = $derived(
     staged.length > 0
-      ? $i18n.t('composer.addMessageOrSend')
-      : $i18n.t('timeline.messagePlaceholder')
+      ? $i18n.t(
+          staged.length === 1 && preferences.sendAttachmentAsCaption
+            ? 'composer.addCaptionOrSend'
+            : 'composer.addMessageOrSend'
+        )
+      : context?.kind === 'reply' && context.sender
+        ? $i18n.t('composer.replyPlaceholder', { name: context.sender })
+        : roomName
+          ? $i18n.t('composer.roomPlaceholder', { room: roomName })
+          : $i18n.t('timeline.messagePlaceholder')
   );
 
   const media: EmoteMedia = {
@@ -580,7 +632,7 @@
       const formatted = formattedForEditing(context.html);
       if (formatted === null) editor.setText(context.body);
       else if (richText) editor.setHtml(formatted);
-      else editor.setText(plainEditSource(context.body, formatted));
+      else editor.setDoc(plainEditDoc(context.body, formatted));
       prefilledDoc = editor.doc();
     } else if (context === null) {
       const wasEditing = prefilledFor !== null;
@@ -795,6 +847,12 @@
     return $i18n.t(key, values);
   }
 
+  function failRetryably(cause: unknown, run: () => void): void {
+    const failure = sendFailure(cause);
+    error = $i18n.t(failure.key, failure.values);
+    retry = failure.retryable ? { text: error, run } : null;
+  }
+
   async function send(): Promise<void> {
     if (readOnly) return;
     if (editingScheduled) {
@@ -813,6 +871,7 @@
 
     const doc = editor.doc();
     const rich = richSend;
+    const captionEdit = editingCaption;
     const asCaption = preferences.sendAttachmentAsCaption;
     let unsent = staged;
 
@@ -874,7 +933,7 @@
           unsent = rest;
         }
 
-        if (captioned || message.body === '') return;
+        if (captioned || (message.body === '' && !captionEdit)) return;
         const action = message.imageSourcePacks
           ? await onSend(
               roomId,
@@ -895,7 +954,7 @@
       console.debug('[sable composer] send failed', cause);
       if (doc && editor.isEmpty()) editor.setDoc(doc);
       staged = [...unsent, ...staged];
-      error = failureText(cause);
+      failRetryably(cause, () => void send());
     } finally {
       inFlight -= 1;
     }
@@ -956,8 +1015,21 @@
     }
   }
 
-  async function sendVoice(file: File): Promise<void> {
+  function startRecording(): void {
+    recordingDraft = editor.doc();
+    recording = true;
+  }
+
+  async function stopRecording(): Promise<void> {
+    const draft = recordingDraft;
+    recordingDraft = undefined;
     recording = false;
+    await tick();
+    if (draft && editor.isEmpty()) editor.setDoc(draft);
+  }
+
+  async function sendVoice(file: File): Promise<void> {
+    void stopRecording();
     inFlight += 1;
     error = null;
 
@@ -967,7 +1039,7 @@
       });
     } catch (cause) {
       console.debug('[sable composer] voice message failed', cause);
-      error = failureText(cause);
+      failRetryably(cause, () => void sendVoice(file));
     } finally {
       inFlight -= 1;
     }
@@ -1017,14 +1089,7 @@
       return;
     }
 
-    editor.insert(
-      composerSchema.nodes.emoticon.create({
-        url: image.url,
-        body: image.body,
-        shortcode: image.shortcode,
-        sourcePack: image.source_pack,
-      })
-    );
+    editor.insert(emoticonNode(image));
     updateTyping();
   }
 
@@ -1066,8 +1131,16 @@
 
       if (!fileInput) return;
       fileInput.accept = accept;
+      fileInput.removeAttribute('capture');
       fileInput.click();
     })();
+  }
+
+  function capture(accept: string): void {
+    if (!fileInput) return;
+    fileInput.accept = accept;
+    fileInput.setAttribute('capture', 'environment');
+    fileInput.click();
   }
 
   function stageFromInput(event: Event): void {
@@ -1079,6 +1152,10 @@
 
   function reorderDrag(event: DragEvent): boolean {
     return event.dataTransfer?.types.includes(REORDER_DRAG_TYPE) ?? false;
+  }
+
+  function markInPageDrag(event: DragEvent): void {
+    event.dataTransfer?.setData(REORDER_DRAG_TYPE, '');
   }
 
   function handleDrop(event: DragEvent): void {
@@ -1131,7 +1208,7 @@
     const image = emotes.find((candidate) => candidate.shortcode === shortcode);
     if (!image) return composerSchema.text(suggestion.insert);
 
-    return composerSchema.nodes.emoticon.create({ url: image.url, shortcode });
+    return emoticonNode(image);
   }
 
   /** The servers cost a round trip, so the mention is inserted without them. */
@@ -1210,6 +1287,11 @@
     'room.replyNewer': 'newer',
   };
 
+  const EDIT_STEPS: Partial<Record<string, ReplyDirection>> = {
+    'room.editOlder': 'older',
+    'room.editNewer': 'newer',
+  };
+
   function stepReply(event: KeyboardEvent): void {
     if (
       !onReplyStep ||
@@ -1230,9 +1312,39 @@
     onReplyStep(direction);
   }
 
+  function stepEdit(event: KeyboardEvent): void {
+    if (
+      !onEditLast ||
+      !onEditNext ||
+      panelOpen ||
+      editingScheduled ||
+      event.defaultPrevented ||
+      (context && context.kind !== 'edit') ||
+      (!context && (!empty || staged.length > 0))
+    )
+      return;
+    const isMac = isMacPlatform();
+    const shortcut = effectiveShortcuts().find(
+      (candidate) => EDIT_STEPS[candidate.id] && matchesBinding(candidate.binding, event, isMac)
+    );
+    const direction = shortcut && EDIT_STEPS[shortcut.id];
+    if (!direction) return;
+
+    event.preventDefault();
+    if (direction === 'older') onEditLast(context?.eventId);
+    else if (context) onEditNext(context.eventId);
+  }
+
   function navigate(key: 'ArrowUp' | 'ArrowDown' | 'Enter' | 'Tab' | 'Escape'): boolean {
     if (!panelOpen) {
-      if (key === 'ArrowUp' && empty && staged.length === 0 && !context && onEditLast) {
+      if (
+        key === 'ArrowUp' &&
+        empty &&
+        editor.isPristine() &&
+        staged.length === 0 &&
+        !context &&
+        onEditLast
+      ) {
         onEditLast();
         return true;
       }
@@ -1288,6 +1400,7 @@
 
 <svelte:window
   onkeydown={handleKeydown}
+  ondragstart={markInPageDrag}
   ondragover={handleDragover}
   ondragleave={handleDragleave}
   ondrop={handleDrop}
@@ -1337,6 +1450,15 @@
             />
           {/key}
         {/if}
+        {#if error}
+          <ComposerError
+            message={error}
+            onRetry={retry?.text === error ? retry.run : undefined}
+            onDismiss={() => {
+              error = null;
+            }}
+          />
+        {/if}
         {#if staged.length > 0}
           <ComposerAttachments
             files={staged}
@@ -1358,30 +1480,18 @@
             }}
           />
         {/if}
-        {#if formattingOpen}
-          <ComposerFormatting
-            active={activeFormats}
-            source={sourceMode}
-            markdown={sourceMode || !richText}
-            colors={activeColors}
-            onFormat={(action: FormatAction) => {
-              editor.format(action);
-            }}
-            onColor={(kind: ColorKind, value: string | null) => {
-              editor.applyColor(kind, value);
-            }}
-            onToggleSource={() => {
-              sourceMode = editor.toggleSource();
-            }}
-          />
-        {/if}
         <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
         <form
           class="composer-row"
+          class:short={composerShort}
+          class:formatting-open={formattingOpen}
           hidden={activeBotCommand !== null}
           bind:this={rowEl}
           onmousedown={focusFromRow}
-          onkeydown={stepReply}
+          onkeydown={(event) => {
+            stepReply(event);
+            stepEdit(event);
+          }}
           onsubmit={(event) => {
             event.preventDefault();
             void send();
@@ -1393,10 +1503,7 @@
                 void sendVoice(file);
               }}
               onCancel={() => {
-                recording = false;
-              }}
-              onDenied={() => {
-                micDenied = true;
+                void stopRecording();
               }}
             />
           {:else}
@@ -1404,6 +1511,7 @@
               <ComposerDoor
                 {desktop}
                 onPick={pick}
+                onCapture={capturesFromCamera() ? capture : undefined}
                 onPoll={onCreatePoll
                   ? () => {
                       pollOpen = true;
@@ -1414,11 +1522,12 @@
                       locationOpen = true;
                     }
                   : undefined}
-                onVoice={!preferences.composerVoiceButton && voiceSupported && !micDenied
+                onSchedule={canSchedule
                   ? () => {
-                      recording = true;
+                      scheduleOpen = true;
                     }
                   : undefined}
+                onVoice={canVoice && !showVoice ? startRecording : undefined}
                 onBeforeOpen={!desktop ? blurEditor : undefined}
               />
             </div>
@@ -1434,10 +1543,54 @@
               onchange={stageFromInput}
             />
             <div class="composer-field">
-              <ComposerEditorView {editor} {showPlaceholder} {placeholder} />
+              <ComposerEditorView {editor} {showPlaceholder} {placeholder} {expanded} />
+              <Tooltip label={$i18n.t(expanded ? 'composer.collapse' : 'composer.expand')}>
+                {#snippet trigger({ props })}
+                  <IconButton
+                    {...mergeProps(props, {
+                      onclick: () => {
+                        expanded = !expanded;
+                        editor.focus();
+                      },
+                    })}
+                    variant="ghost"
+                    size="small"
+                    class="composer-expand"
+                    aria-pressed={expanded}
+                    label={$i18n.t('composer.expand')}
+                  >
+                    {#if expanded}<ArrowsInSimpleIcon />{:else}<ArrowsOutSimpleIcon />{/if}
+                  </IconButton>
+                {/snippet}
+              </Tooltip>
             </div>
+            {#if formattingOpen}
+              <div class="composer-formatting">
+                <ComposerFormatting
+                  active={activeFormats}
+                  source={sourceMode}
+                  markdown={sourceMode || !richText}
+                  colors={activeColors}
+                  onFormat={(action: FormatAction) => {
+                    editor.format(action);
+                  }}
+                  onColor={(kind: ColorKind, value: string | null) => {
+                    editor.applyColor(kind, value);
+                  }}
+                  onToggleSource={() => {
+                    sourceMode = editor.toggleSource();
+                  }}
+                />
+              </div>
+            {/if}
             {#snippet personaButton()}
-              <PersonaPicker {roomId} onBeforeOpen={!desktop ? blurEditor : undefined} />
+              <PersonaPicker
+                {roomId}
+                onBeforeOpen={!desktop ? blurEditor : undefined}
+                edit={context?.kind === 'edit' && onEditPersona
+                  ? { current: context.persona ?? null, onChoose: onEditPersona }
+                  : undefined}
+              />
             {/snippet}
             {#snippet formatButton()}
               <Tooltip label={$i18n.t('composer.formatting')}>
@@ -1476,17 +1629,27 @@
                   ...(preferences.composerFormatButton && { format: formatButton }),
                 }}
               />
-              <div class="composer-separator"></div>
-              <Tooltip label={sendLabel}>
+              {#if showVoice}
+                <Tooltip label={$i18n.t('composer.voiceRecord')}>
+                  {#snippet trigger({ props })}
+                    <IconButton
+                      {...mergeProps(props, {
+                        onclick: startRecording,
+                      })}
+                      variant="ghost"
+                      size="small"
+                      class="composer-voice"
+                      label={$i18n.t('composer.voiceRecord')}
+                    >
+                      <MicrophoneIcon />
+                    </IconButton>
+                  {/snippet}
+                </Tooltip>
+              {/if}
+              <Tooltip label={sendTooltip}>
                 {#snippet trigger({ props })}
                   <IconButton
                     {...mergeProps(props, {
-                      onclick:
-                        primaryAction === 'record'
-                          ? () => {
-                              recording = true;
-                            }
-                          : undefined,
                       onpointerdown: sendPress.start,
                       onpointermove: sendPress.move,
                       onpointerup: sendPress.lift,
@@ -1499,13 +1662,13 @@
                         }
                       },
                     })}
-                    type={primaryAction === 'record' ? 'button' : 'submit'}
+                    type="submit"
                     variant="ghost"
                     size="small"
                     class="composer-send"
                     data-pressing={sendPress.pressing || undefined}
                     style="--press-ms: {SCHEDULE_PRESS_MS}ms"
-                    disabled={primaryAction === 'send' && !hasContent && !canDeleteEdited}
+                    disabled={!hasContent && !canDeleteEdited}
                     label={sendLabel}
                     onpointercancel={sendPress.end}
                     oncontextmenu={(event: MouseEvent) => {
@@ -1521,10 +1684,14 @@
                       if (hasContent) event.preventDefault();
                     }}
                   >
-                    {#if primaryAction === 'record'}
-                      <MicrophoneIcon />
-                    {:else if sending}
+                    {#if sending}
                       <Spinner small />
+                    {:else if context?.kind === 'edit' || editingScheduled}
+                      {#if !hasContent && canDeleteEdited}
+                        <TrashIcon />
+                      {:else}
+                        <CheckIcon weight="bold" />
+                      {/if}
                     {:else}
                       <PaperPlaneIcon weight="fill" />
                     {/if}
@@ -1553,15 +1720,11 @@
           />
         {/if}
         <div class="composer-measurer" bind:this={measurerEl} aria-hidden="true"></div>
-        <p class="screen-reader-only" id={hintId}>
-          {preferences.enterForNewline
-            ? $i18n.t('composer.hintSendModifier')
-            : $i18n.t('composer.hintSend')}
-        </p>
+        <p class="screen-reader-only" id={hintId}>{keyboardHint}</p>
+        <p class="screen-reader-only" aria-live="polite">{contextAnnouncement}</p>
       </div>
     </div>
   {/if}
-  {#if error}<Alert class="send-error" variant="critical" role="alert">{error}</Alert>{/if}
 </div>
 
 {#if onSendLocation}
@@ -1631,61 +1794,6 @@
 />
 
 <style>
-  .composer-stack {
-    --composer-gutter: var(--space-200);
-    --target: var(--control-height-small);
-
-    margin: 0 auto;
-    position: relative;
-    width: calc(100% - var(--composer-gutter) - var(--composer-gutter));
-  }
-
-  @media (width < 48rem), (pointer: coarse) {
-    .composer-stack {
-      --target: var(--control-height-400);
-    }
-
-    .composer-stack :global(.icon-button-small) {
-      --button-height: var(--target);
-    }
-  }
-
-  @media (width >= 32rem) {
-    .composer-stack {
-      --composer-gutter: var(--page-gutter);
-    }
-
-    .composer-row {
-      gap: var(--space-200);
-    }
-  }
-
-  .composer-shell {
-    align-items: end;
-    display: flex;
-    position: relative;
-  }
-
-  .composer {
-    /* The panel behind is surface-container, so the fill has to be the variant. */
-    background: var(--surface-var-container);
-    border: var(--border-width) solid var(--surface-var-container-line);
-    border-radius: var(--radius);
-    color: var(--surface-var-on-container);
-    display: flex;
-    flex: 0 0 auto;
-    flex-direction: column;
-    min-width: 0;
-    position: relative;
-    width: 100%;
-  }
-
-  /* The text entry only: `:focus-within` ringed the bar for every button too. */
-  .composer:has(:global([contenteditable='true']):focus) {
-    border-color: var(--primary-main);
-    box-shadow: 0 0 0 var(--focus-ring-width) var(--focus-ring);
-  }
-
   .drop-overlay {
     align-items: center;
     background: var(--overlay);
@@ -1721,33 +1829,6 @@
     overflow-wrap: anywhere;
   }
 
-  .composer-row {
-    align-items: center;
-    display: grid;
-    gap: var(--space-100);
-    grid-template-areas:
-      'field field'
-      'before after';
-    grid-template-columns: auto 1fr;
-    padding: var(--space-100);
-    width: 100%;
-  }
-
-  .composer-row[hidden] {
-    display: none;
-  }
-
-  .composer-before,
-  .composer-after {
-    align-items: center;
-    display: flex;
-    gap: var(--space-100);
-  }
-
-  .composer-row > :global(.voice-recorder) {
-    grid-column: 1 / -1;
-  }
-
   .composer-measurer {
     box-sizing: border-box;
     height: 0;
@@ -1771,31 +1852,6 @@
     padding: var(--space-200) var(--space-300);
   }
 
-  .composer-field {
-    align-items: center;
-    display: flex;
-    grid-area: field;
-    min-width: 0;
-    position: relative;
-  }
-
-  :global(.composer-separator) {
-    align-self: center;
-    border-left: var(--border-width-400) solid var(--primary-container-line, rebeccapurple);
-    height: var(--size-x200);
-    width: 1px;
-  }
-
-  .composer-before {
-    align-self: end;
-    grid-area: before;
-  }
-
-  .composer-after {
-    grid-area: after;
-    justify-self: end;
-  }
-
   .composer-file {
     height: 1px;
     opacity: 0;
@@ -1804,81 +1860,19 @@
     width: 1px;
   }
 
-  :global(.composer-format) {
-    border-radius: var(--radius);
-    color: var(--surface-var-on-container);
-    flex: 0 0 auto;
-    height: var(--target);
-    min-height: var(--target);
-    position: relative;
-    width: var(--target);
-  }
+  .composer-field :global(.icon-button-small.composer-expand) {
+    --button-height: var(--size-x500);
+    --button-icon-size: var(--size-x50);
 
-  :global(.composer-format)::after {
-    border-radius: inherit;
-    content: '';
-    inset: calc((var(--target) - var(--target-hit)) / 2);
-    position: absolute;
-  }
-
-  :global(.composer-format svg) {
-    display: block;
-    height: var(--icon-size-small);
-    width: var(--icon-size-small);
-  }
-
-  :global(.composer-send) {
-    border-radius: var(--radius);
-    color: var(--primary-main);
-    height: var(--target);
-    min-height: var(--target);
-    position: relative;
-    width: var(--target);
-  }
-
-  :global(.composer-send)::after {
-    border-radius: inherit;
-    content: '';
-    inset: calc((var(--target) - var(--target-hit)) / 2);
-    position: absolute;
-  }
-
-  :global(.composer-send:disabled) {
     color: var(--sec-main);
+    inset-block-start: var(--space-050);
+    inset-inline-end: var(--space-050);
+    position: absolute;
   }
 
-  :global(.composer-send:not(:disabled):hover),
-  :global(.composer-send:not(:disabled):focus-visible) {
-    background: var(--surface-container-hover);
-  }
-
-  :global(.composer-send[data-pressing]) {
-    background: var(--surface-container-hover);
-  }
-
-  :global(.composer-send svg) {
-    display: block;
-    height: var(--icon-size-small);
-    width: var(--icon-size-small);
-  }
-
-  :global(.send-error) {
-    font-size: var(--font-size-small);
-    margin: 0;
-  }
-
-  @media (prefers-reduced-motion: no-preference) {
-    :global(.composer-send svg) {
-      transition: transform var(--motion-fast) var(--motion-easing-standard);
-    }
-
-    :global(.composer-send[data-pressing] svg) {
-      transform: scale(1.3);
-      transition: transform var(--press-ms) linear;
-    }
-
-    .composer {
-      transition: border-color var(--motion-fast) var(--motion-easing-standard);
-    }
+  .composer-field :global(.composer-expand)::after {
+    content: '';
+    inset: calc((var(--size-x500) - var(--target-hit)) / 2);
+    position: absolute;
   }
 </style>

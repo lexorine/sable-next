@@ -49,6 +49,16 @@ describe('resolveProxy', () => {
     expect(resolveProxy([kris], '[hello]')?.body).toBe('hello');
   });
 
+  it.each([
+    [trigger('k:'), 'k: \thello\n ', 'hello'],
+    [trigger(null, '-k'), ' \thello\n -k', 'hello'],
+    [trigger('[', ']'), '[ \thello\n ]', 'hello'],
+    [trigger('[', ']'), '[ \t\n ]', ''],
+    [trigger('k:', null, true), 'k: hello ', 'k: hello '],
+  ])('trims whitespace exposed by stripping %j', (wrapper, body, expected) => {
+    expect(resolveProxy([persona('Kris', [wrapper])], body)?.body).toBe(expected);
+  });
+
   it('keeps the trigger when the persona asks it to', () => {
     const kris = persona('Kris', [trigger('k:', null, true)]);
     expect(resolveProxy([kris], 'k:hello')?.body).toBe('k:hello');
@@ -92,6 +102,12 @@ describe('stripProxyHtml', () => {
     expect(stripProxyHtml('[<em>test</em>]', trigger('[', ']'))).toBe('<em>test</em>');
   });
 
+  it('trims exposed whitespace across formatted text nodes', () => {
+    expect(stripProxyHtml('<p>[ <em> hello </em> ]</p>', trigger('[', ']'))).toBe(
+      '<p><em>hello</em></p>'
+    );
+  });
+
   it('does not strip HTML that does not contain the trigger as text', () => {
     expect(stripProxyHtml('<em>test</em>', trigger('k:'))).toBeNull();
   });
@@ -130,6 +146,58 @@ describe('resolvePersona', () => {
       now: 1000,
     });
     expect(resolved?.id).toBe('Kris');
+  });
+
+  it('prefers the room, then the nearest space, then the account', () => {
+    const space = { persona_id: 'Robin', valid_until: null };
+    const account = { persona_id: 'Kris', valid_until: null };
+    expect(resolvePersona({ personas, spaces: [space], account, now: 1000 })?.id).toBe('Robin');
+    expect(
+      resolvePersona({
+        personas,
+        room: { persona_id: 'Kris', valid_until: null },
+        spaces: [space],
+        now: 1000,
+      })?.id
+    ).toBe('Kris');
+    expect(
+      resolvePersona({
+        personas,
+        spaces: [undefined, { persona_id: 'Gone', valid_until: null }, space],
+        account,
+        now: 1000,
+      })?.id
+    ).toBe('Robin');
+    expect(
+      resolvePersona({
+        personas,
+        spaces: [{ persona_id: 'Robin', valid_until: 500 }],
+        account,
+        now: 1000,
+      })?.id
+    ).toBe('Kris');
+  });
+
+  it('stops at a room or space that is off, and takes a proxy with it', () => {
+    const account = { persona_id: 'Kris', valid_until: null };
+    const space = { persona_id: 'Robin', valid_until: null };
+    expect(
+      resolvePersona({ personas, spaces: [false, space], account, now: 1000 })
+    ).toBeUndefined();
+    expect(
+      resolvePersona({ personas, proxied: robin, spaces: [false], account, now: 1000 })
+    ).toBeUndefined();
+    expect(resolvePersona({ personas, room: false, spaces: [space], now: 1000 })).toBeUndefined();
+  });
+
+  it('lets a room selection override a space that is off', () => {
+    const resolved = resolvePersona({
+      personas,
+      room: { persona_id: 'Robin', valid_until: null },
+      spaces: [false],
+      now: 1000,
+    });
+    expect(resolved?.id).toBe('Robin');
   });
 
   it('ignores a selection pointing at a deleted persona', () => {

@@ -49,7 +49,6 @@ pub(crate) fn log_console(level: ConsoleLevel, message: &str) -> Result<(), &'st
     if !enabled() {
         return Err("console forwarding requires --verbose");
     }
-    // Bypass SABLE_LOG and Sentry for local console output.
     let _ = writeln!(
         std::io::stderr().lock(),
         "[webview:{}] {message}",
@@ -63,7 +62,7 @@ pub fn attach_terminal() {
     use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 
     // SAFETY: AttachConsole takes only a process ID.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code, reason = "FFI call")]
     unsafe {
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
     }

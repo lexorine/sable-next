@@ -70,17 +70,20 @@ const root: TimelineItemView = {
   reactions: [],
   is_own: true,
   read_by: [],
+  read_timestamps: {},
   per_message_profile: null,
   bundled_link_previews: [],
   link_previews_removed: null,
   mention: 'none',
   forwarded: null,
+  forum_title: null,
 };
 
 const thread: ForumThread = {
   id: 'thread-row',
   item: root,
   eventId: '$thread:example.org',
+  title: null,
   sender: '@alice:example.org',
   senderName: 'Alice',
   senderAvatar: null,

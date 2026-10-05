@@ -47,6 +47,7 @@ export type CallVoiceState = {
 export type CallDeviceError = 'microphone' | 'camera' | 'screen' | 'screenAudio';
 
 const OWN_KEY_TIMEOUT_MS = 10_000;
+const DEVICE_ERROR_TIMEOUT_MS = 5_000;
 
 type PendingEvent = Extract<
   CoreEvent,
@@ -112,14 +113,16 @@ export class CallSession {
   watchedScreenShareIds = $state<string[]>([]);
   views = $state(0);
   deviceError = $state<CallDeviceError | null>(null);
+  listenOnly = $state(false);
+  #deviceErrorTimer: ReturnType<typeof setTimeout> | undefined;
   choosingScreenAudio = $state(false);
   choosingScreenSource = $state.raw<HdrMonitor[] | null>(null);
   #pendingScreenSource: ScreenSource | null = null;
 
-  watchScreenShare(trackId: string): void {
-    if (!this.watchedScreenShareIds.includes(trackId)) {
-      this.watchedScreenShareIds = [...this.watchedScreenShareIds, trackId];
-    }
+  toggleWatchScreenShare(trackId: string): void {
+    this.watchedScreenShareIds = this.watchedScreenShareIds.includes(trackId)
+      ? this.watchedScreenShareIds.filter((id) => id !== trackId)
+      : [...this.watchedScreenShareIds, trackId];
   }
 
   get startedAt(): number | null {
@@ -219,7 +222,7 @@ export class CallSession {
     this.#lastJoin = { roomId, media, serviceUrl };
     this.layout = { pinned: null, gridForced: false };
     this.watchedScreenShareIds = [];
-    this.deviceError = null;
+    this.clearDeviceError();
     const attempt = ++this.#attemptGeneration;
     const telemetry = new CallTelemetry({
       'call.microphone_requested': media.microphone,
@@ -329,6 +332,7 @@ export class CallSession {
       });
 
       this.#grant = grant;
+      this.listenOnly = grant.canPublish === false;
 
       this.encryptsMedia = grant.encryptMedia;
       this.mediaReady = false;
@@ -348,8 +352,8 @@ export class CallSession {
         await transport.connect({
           url: grant.url,
           token: grant.jwt,
-          microphoneEnabled: media.microphone,
-          cameraEnabled: media.camera,
+          microphoneEnabled: media.microphone && !this.listenOnly,
+          cameraEnabled: media.camera && !this.listenOnly,
           encryptionKeys: encryptionKeys.map(({ key }) => key),
           publisherId: connectPublisherId,
           backends: connectBackends,
@@ -395,7 +399,7 @@ export class CallSession {
     this.failure = null;
     this.roomId = null;
     this.connectedAt = null;
-    this.deviceError = null;
+    this.clearDeviceError();
   }
 
   clearFailure(): void {
@@ -412,16 +416,23 @@ export class CallSession {
   }
 
   clearDeviceError(): void {
+    clearTimeout(this.#deviceErrorTimer);
+    this.#deviceErrorTimer = undefined;
     this.deviceError = null;
   }
 
   async #device(kind: CallDeviceError, action: () => Promise<void> | undefined): Promise<void> {
+    if (this.listenOnly) return;
     try {
       await action();
-      if (this.deviceError === kind) this.deviceError = null;
+      if (this.deviceError === kind) this.clearDeviceError();
     } catch (error) {
       if (kind === 'screen' && error instanceof Error && error.name === 'NotAllowedError') return;
+      this.clearDeviceError();
       this.deviceError = error instanceof ScreenAudioError ? 'screenAudio' : kind;
+      this.#deviceErrorTimer = setTimeout(() => {
+        this.clearDeviceError();
+      }, DEVICE_ERROR_TIMEOUT_MS);
     }
   }
 
@@ -704,6 +715,7 @@ export class CallSession {
     this.#media = undefined;
     this.#livekit = undefined;
     this.#grant = undefined;
+    this.listenOnly = false;
     this.#session = undefined;
     this.#buffer = [];
     this.#pendingKeys = [];

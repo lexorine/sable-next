@@ -5,6 +5,7 @@ import type {
   RoomStateEventView,
 } from '#src/generated/protocol';
 import { RoomSession } from './room-session.svelte.js';
+import { FOUNDER_POWER_LEVEL } from './settings/power-level-tags';
 
 function deferred<T>() {
   return Promise.withResolvers<T>();
@@ -53,7 +54,7 @@ function fixture() {
     ),
     roomStateEvent: vi.fn((): Promise<unknown> => Promise.resolve(null)),
     roomStateEvents: vi.fn((): Promise<RoomStateEventView[]> => Promise.resolve([])),
-    sendStateEvent: vi.fn(() => Promise.resolve('$created')),
+    sendStateEvent: vi.fn((..._args: unknown[]) => Promise.resolve('$created')),
   };
   const pins = { set: vi.fn() };
   return { commands, pins, session: new RoomSession(commands, pins) };
@@ -62,6 +63,25 @@ function fixture() {
 async function settle() {
   for (let i = 0; i < 5; i += 1) await Promise.resolve();
 }
+
+test('opening a room loads the saved founder flair', async () => {
+  const { commands, session } = fixture();
+  commands.roomOpen.mockResolvedValueOnce({
+    ...opened('$new'),
+    power_level_tags: {
+      [FOUNDER_POWER_LEVEL]: { name: 'Founder', color: '#ff0000', icon: { key: '👑' } },
+    },
+  });
+
+  session.sync('!room', false, 0);
+  await settle();
+
+  expect(session.powerTags?.[FOUNDER_POWER_LEVEL]).toEqual({
+    name: 'Founder',
+    color: '#ff0000',
+    icon: '👑',
+  });
+});
 
 test('room changes discard stale details and pin updates', async () => {
   const { commands, pins, session } = fixture();
@@ -148,4 +168,30 @@ test('a member list revision keeps the current setting until the new one lands',
   next.resolve({ always_listed_from: 100 });
   await settle();
   expect(session.alwaysListedFrom).toBe(100);
+});
+
+test('adding a widget writes an enriched widget state event and reloads the list', async () => {
+  const { commands, session } = fixture();
+  commands.roomStateEvents.mockResolvedValueOnce([
+    { state_key: 'new', content: { type: 'm.custom', url: 'https://example.org/widget' } },
+  ]);
+  session.sync('!room', false, 0);
+  await settle();
+
+  await session.details.addWidget('Doom', 'https://example.org/widget', '@erwan:example.org');
+
+  const [roomId, type, , content] = commands.sendStateEvent.mock.calls[0] as [
+    string,
+    string,
+    string,
+    { url: string; type: string; name: string; creatorUserId: string },
+  ];
+  expect([roomId, type]).toEqual(['!room', 'im.vector.modular.widgets']);
+  expect(content).toMatchObject({
+    type: 'm.custom',
+    name: 'Doom',
+    creatorUserId: '@erwan:example.org',
+  });
+  expect(content.url).toContain('https://example.org/widget?matrix_user_id=$matrix_user_id');
+  expect(session.widgets).toHaveLength(1);
 });

@@ -30,6 +30,16 @@ struct Entry {
     on_dark: Option<String>,
     color: Option<String>,
     pronouns: Vec<PronounView>,
+    display_name: Option<String>,
+    avatar_url: Option<String>,
+}
+
+fn member_text(content: &Value, field: &str) -> Option<String> {
+    content
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 impl Entry {
@@ -56,6 +66,8 @@ impl Layer {
                 entry.on_light =
                     profile_hex_color(colors.and_then(|colors| colors.get("on_light")));
                 entry.on_dark = profile_hex_color(colors.and_then(|colors| colors.get("on_dark")));
+                entry.display_name = member_text(content, "displayname");
+                entry.avatar_url = member_text(content, "avatar_url");
             }
             COLOR_EVENT => entry.color = profile_hex_color(content.get("color")),
             PRONOUNS_EVENT => entry.pronouns = pronoun_sets(content.get("pronouns")),
@@ -113,7 +125,7 @@ pub(crate) fn resolve(room: &Layer, space: Option<&Layer>) -> Vec<SenderCosmetic
 
     users
         .into_iter()
-        .map(|user_id| {
+        .filter_map(|user_id| {
             let own = room.users.get(user_id).unwrap_or(&empty);
             let inherited = space
                 .and_then(|space| space.users.get(user_id))
@@ -126,7 +138,10 @@ pub(crate) fn resolve(room: &Layer, space: Option<&Layer>) -> Vec<SenderCosmetic
                     .or(inherited.color.as_ref())
                     .cloned()
             };
-            SenderCosmeticsView {
+            let differs = |inherited: &Option<String>, own: &Option<String>| {
+                inherited.clone().filter(|_| inherited != own)
+            };
+            let view = SenderCosmeticsView {
                 user_id: user_id.clone(),
                 color_on_light: pick(|entry| &entry.on_light),
                 color_on_dark: pick(|entry| &entry.on_dark),
@@ -135,7 +150,15 @@ pub(crate) fn resolve(room: &Layer, space: Option<&Layer>) -> Vec<SenderCosmetic
                 } else {
                     own.pronouns.clone()
                 },
-            }
+                space_display_name: differs(&inherited.display_name, &own.display_name),
+                space_avatar_url: differs(&inherited.avatar_url, &own.avatar_url),
+            };
+            let bare = view.color_on_light.is_none()
+                && view.color_on_dark.is_none()
+                && view.pronouns.is_empty()
+                && view.space_display_name.is_none()
+                && view.space_avatar_url.is_none();
+            (!bare).then_some(view)
         })
         .collect()
 }
@@ -227,7 +250,17 @@ pub(crate) async fn unjoined_space_parents(
         .collect()
 }
 
-async fn first_space_parent(room: &matrix_sdk::Room) -> Option<OwnedRoomId> {
+async fn first_space_parent(
+    client: &matrix_sdk::Client,
+    room: &matrix_sdk::Room,
+) -> Option<OwnedRoomId> {
+    if let Some(space) = crate::view::listing_spaces(client, room.room_id())
+        .await
+        .into_iter()
+        .next()
+    {
+        return Some(space);
+    }
     space_parents(room)
         .await
         .into_iter()
@@ -272,7 +305,7 @@ impl Core {
         let space_id = match space_id {
             Some(space_id) if space_id != room.room_id() => Some(space_id),
             Some(_) => None,
-            None => first_space_parent(room).await,
+            None => first_space_parent(client, room).await,
         };
         let space = space_id
             .as_ref()
@@ -291,6 +324,13 @@ impl Core {
     }
 
     async fn cosmetics_layer(&self, client: &matrix_sdk::Client, room: &matrix_sdk::Room) -> Layer {
+        let cached = self.cosmetics_cache().get(room.room_id());
+        if let Some(layer) = cached {
+            return layer;
+        }
+
+        let fetch = self.cosmetics_fetch_lock(room.room_id());
+        let _fetching = fetch.lock().await;
         let cached = self.cosmetics_cache().get(room.room_id());
         if let Some(layer) = cached {
             return layer;
@@ -318,6 +358,15 @@ impl Core {
                 stored_layer(room).await.unwrap_or_default()
             }
         }
+    }
+
+    fn cosmetics_fetch_lock(&self, room_id: &RoomId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .cosmetics_fetches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        locks.entry(room_id.to_owned()).or_default().clone()
     }
 
     fn cosmetics_cache(&self) -> std::sync::MutexGuard<'_, CosmeticsCache> {
@@ -377,7 +426,6 @@ impl Core {
 }
 
 #[cfg(test)]
-#[allow(clippy::large_futures)]
 mod tests {
     use matrix_sdk::ruma::serde::Raw;
     use matrix_sdk::ruma::{OwnedRoomId, RoomId, room_id};
@@ -456,14 +504,47 @@ mod tests {
                     color_on_light: Some("#222222".to_owned()),
                     color_on_dark: Some("#111111".to_owned()),
                     pronouns: vec![pronoun("she/her", None)],
+                    space_display_name: None,
+                    space_avatar_url: None,
                 },
                 SenderCosmeticsView {
                     user_id: BOB.try_into().unwrap(),
                     color_on_light: Some("#555555".to_owned()),
                     color_on_dark: Some("#555555".to_owned()),
                     pronouns: Vec::new(),
+                    space_display_name: None,
+                    space_avatar_url: None,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn the_space_name_and_picture_are_handed_on_beside_the_room_ones() {
+        let room = layer(&[(
+            MEMBER_EVENT,
+            ALICE,
+            json!({ "membership": "join", "displayname": "Room Alice" }),
+        )]);
+        let space = layer(&[(
+            MEMBER_EVENT,
+            ALICE,
+            json!({
+                "membership": "join",
+                "displayname": "Space Alice",
+                "avatar_url": "mxc://example.org/space"
+            }),
+        )]);
+
+        let resolved = resolve(&room, Some(&space));
+
+        assert_eq!(
+            resolved[0].space_display_name.as_deref(),
+            Some("Space Alice")
+        );
+        assert_eq!(
+            resolved[0].space_avatar_url.as_deref(),
+            Some("mxc://example.org/space")
         );
     }
 
@@ -490,6 +571,7 @@ mod tests {
 
         assert!(!room.apply(MEMBER_EVENT, ALICE, &json!({ "membership": "join" })));
         assert!(room.apply(MEMBER_EVENT, ALICE, &colored));
+        assert!(room.apply(MEMBER_EVENT, ALICE, &renamed));
         assert!(!room.apply(MEMBER_EVENT, ALICE, &renamed));
         assert!(room.apply(MEMBER_EVENT, ALICE, &json!({ "membership": "leave" })));
         assert!(resolve(&room, None).is_empty());
@@ -591,6 +673,35 @@ mod tests {
             assert_eq!(found.users[0].color_on_light.as_deref(), Some("#123456"));
             assert_eq!(found.users[0].pronouns, [pronoun("they/them", Some("en"))]);
         }
+    }
+
+    #[tokio::test]
+    async fn concurrent_reads_of_one_room_share_a_single_fetch() {
+        let server = MatrixMockServer::new().await;
+        let room_id = room_id!("!room:example.org");
+        let space_id = room_id!("!space:example.org");
+        let client = joined(&server, &[room_id, space_id]).await;
+        let (core, _events) = Core::new("cosmetics", Box::new(MemorySessionStore::default()));
+        serve_state(
+            &server,
+            room_id,
+            json!([state(COLOR_EVENT, ALICE, &json!({ "color": "#123456" }))]),
+            1,
+        )
+        .await;
+        serve_state(&server, space_id, json!([]), 1).await;
+        let room = client.get_room(room_id).unwrap();
+
+        let found = futures_util::future::join_all(
+            (0..5).map(|_| core.cosmetics_for(&client, &room, Some(space_id.to_owned()))),
+        )
+        .await;
+
+        assert!(
+            found
+                .iter()
+                .all(|view| view.users[0].color_on_light.as_deref() == Some("#123456"))
+        );
     }
 
     #[tokio::test]

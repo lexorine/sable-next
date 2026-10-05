@@ -133,7 +133,7 @@ fn cef_command_line_args(proxy: Option<&str>) -> Vec<(String, Option<String>)> {
         ),
         (
             "enable-features".into(),
-            Some("SharedArrayBuffer,WebRtcPipeWireCamera".into()),
+            Some("SharedArrayBuffer,WebRtcPipeWireCamera,WebRTCPipeWireCapturer".into()),
         ),
         (
             "disable-features".into(),
@@ -177,6 +177,11 @@ fn is_cef_subprocess() -> bool {
 }
 
 #[cfg(all(feature = "cef", target_os = "linux"))]
+fn is_crash_reporter() -> bool {
+    std::env::var_os("_CRASH_REPORTER_SERVER").is_some()
+}
+
+#[cfg(all(feature = "cef", target_os = "linux"))]
 fn is_cef_views() -> bool {
     std::env::var_os("SABLE_CEF_VIEWS").is_some()
 }
@@ -188,7 +193,7 @@ fn apply_env_defaults(defaults: &[(&str, std::ffi::OsString)]) {
             continue;
         }
         // SAFETY: single-threaded, before anything Tauri or CEF spawns a thread.
-        #[allow(unsafe_code)]
+        #[expect(unsafe_code, reason = "FFI call")]
         unsafe {
             std::env::set_var(key, value);
         }
@@ -204,7 +209,7 @@ fn mark_own_audio() {
         _ => marker.to_owned(),
     };
     // SAFETY: single-threaded, before anything Tauri or CEF spawns a thread.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code, reason = "FFI call")]
     unsafe {
         std::env::set_var("PULSE_PROP", value);
     }
@@ -280,7 +285,7 @@ fn main() {
     #[cfg(all(feature = "cef", target_os = "linux"))]
     if !is_cef_views() {
         // SAFETY: single-threaded, before anything Tauri or CEF spawns a thread.
-        #[allow(unsafe_code)]
+        #[expect(unsafe_code, reason = "FFI call")]
         unsafe {
             std::env::set_var("GDK_BACKEND", "x11");
         }
@@ -321,6 +326,11 @@ fn main() {
             return;
         }
 
+        if is_crash_reporter() {
+            app_lib::run();
+            return;
+        }
+
         if matches!(
             app_lib::deep_link_ipc::try_forward_to_primary(),
             app_lib::deep_link_ipc::ForwardResult::Forwarded
@@ -342,6 +352,12 @@ fn main() {
 
     #[cfg(all(feature = "cef", target_os = "linux"))]
     install_permission_policy();
+
+    #[cfg(all(feature = "cef", target_os = "linux"))]
+    tauri_runtime_cef::set_popup_policy(|request| {
+        !tauri_runtime_cef::NormalizedOrigin::parse(request.url)
+            .is_some_and(|origin| origin.is_app_local())
+    });
 
     app_lib::run();
 }

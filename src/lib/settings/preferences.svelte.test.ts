@@ -1,6 +1,18 @@
 import { expect, test } from 'vitest';
 
-import { preferences, sanitize } from './preferences.svelte.js';
+import {
+  composerSeparatorCount,
+  preferences,
+  sanitize,
+  withComposerSeparatorCount,
+} from './preferences.svelte.js';
+
+test.each([
+  [true, 'on'],
+  [false, 'off'],
+] as const)('migrates media loading %s as %s', (stored, expected) => {
+  expect(sanitize({ mediaAutoLoad: stored }, preferences).mediaAutoLoad).toBe(expected);
+});
 
 test('keeps the cached loading animal', () => {
   expect(sanitize({ loadingAnimal: 'otter' }, preferences).loadingAnimal).toBe('otter');
@@ -47,4 +59,96 @@ test('threads default to full conversations and keep a saved panel choice', () =
   expect(sanitize({ threadPresentation: 'unknown' }, preferences).threadPresentation).toBe(
     'timeline'
   );
+});
+
+test('reads a stored boolean enterForNewline as its enum equivalent', () => {
+  expect(sanitize({ enterForNewline: true }, preferences).enterForNewline).toBe('newline');
+  expect(sanitize({ enterForNewline: false }, preferences).enterForNewline).toBe('adaptive');
+  expect(sanitize({ enterForNewline: 'send' }, preferences).enterForNewline).toBe('send');
+});
+
+test('normalizes a legacy separator and keeps multiple separators', () => {
+  expect(
+    sanitize(
+      { composerButtonOrder: ['gif', 'separator', 'sticker', 'emoticon', 'persona', 'format'] },
+      preferences
+    ).composerButtonOrder
+  ).toEqual(['gif', 'separator:0', 'sticker', 'emoticon', 'persona', 'format']);
+
+  expect(
+    sanitize(
+      {
+        composerButtonOrder: [
+          'gif',
+          'separator:0',
+          'sticker',
+          'separator:1',
+          'emoticon',
+          'persona',
+          'format',
+        ],
+      },
+      preferences
+    ).composerButtonOrder
+  ).toEqual(['gif', 'separator:0', 'sticker', 'separator:1', 'emoticon', 'persona', 'format']);
+});
+
+test('adds or removes one separator in place without rebuilding order', () => {
+  const base = ['gif', 'sticker', 'emoticon', 'separator:0', 'persona', 'format'] as const;
+  expect(composerSeparatorCount(withComposerSeparatorCount(base, 0))).toBe(0);
+  expect(withComposerSeparatorCount(base, 0)).toEqual([
+    'gif',
+    'sticker',
+    'emoticon',
+    'persona',
+    'format',
+  ]);
+  expect(withComposerSeparatorCount(base, 1)).toEqual([
+    'gif',
+    'sticker',
+    'emoticon',
+    'separator:0',
+    'persona',
+    'format',
+  ]);
+  expect(withComposerSeparatorCount(base, 3)).toEqual([
+    'gif',
+    'sticker',
+    'emoticon',
+    'separator:0',
+    'separator:1',
+    'separator:2',
+    'persona',
+    'format',
+  ]);
+  const custom = [
+    'gif',
+    'separator:0',
+    'sticker',
+    'separator:1',
+    'emoticon',
+    'persona',
+    'format',
+  ] as const;
+  expect(withComposerSeparatorCount(custom, 1)).toEqual([
+    'gif',
+    'separator:0',
+    'sticker',
+    'emoticon',
+    'persona',
+    'format',
+  ]);
+  expect(withComposerSeparatorCount(custom, 3)).toEqual([
+    'gif',
+    'separator:0',
+    'sticker',
+    'separator:1',
+    'separator:2',
+    'emoticon',
+    'persona',
+    'format',
+  ]);
+  expect(
+    withComposerSeparatorCount(['format', 'gif', 'sticker', 'emoticon', 'persona'], 1)
+  ).toEqual(['format', 'gif', 'sticker', 'emoticon', 'separator:0', 'persona']);
 });

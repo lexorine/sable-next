@@ -52,6 +52,7 @@ afterEach(() => {
   core.roomPreview.mockResolvedValue({ name: null });
   roomList.rooms = [];
   preferences.pauseAnimationsWhenInactive = false;
+  preferences.mediaAutoLoad = 'on';
   vi.restoreAllMocks();
 });
 
@@ -153,8 +154,8 @@ test('uses the local room-list name before requesting a preview', async () => {
 
 test('sends external links to a new tab instead of the handler', async () => {
   const onMatrixLink = vi.fn();
-  render(FormattedBody, {
-    props: { html: '<a href="https://example.org/">Link</a>', onMatrixLink },
+  render(FormattedBodyHarness, {
+    props: { html: '<a href="https://example.org/">Link</a>', entries: [], onMatrixLink },
   });
   await tick();
 
@@ -544,6 +545,32 @@ test('shows a room abbreviation definition in a tooltip on hover', async () => {
   );
 });
 
+test('shows the target of a link whose text differs from it on hover', async () => {
+  render(FormattedBodyHarness, {
+    props: { html: '<p><a href="https://example.com/a">click here</a></p>', entries: [] },
+  });
+  await tick();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  await user.hover(screen.getByRole('link', { name: 'click here' }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  expect(document.querySelector('.tooltip')?.textContent.trim()).toBe('https://example.com/a');
+});
+
+test('shows no tooltip for a link whose text is its own address', async () => {
+  render(FormattedBodyHarness, {
+    props: { html: '<p><a href="https://example.com/">https://example.com/</a></p>', entries: [] },
+  });
+  await tick();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  await user.hover(screen.getByRole('link', { name: 'https://example.com/' }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  expect(document.querySelector('.tooltip')).not.toBeInTheDocument();
+});
+
 const TIME = '<time datetime="1970-01-01T00:00:00Z">1 Jan 1970, 00:00 (UTC)</time>';
 
 async function settle(): Promise<void> {
@@ -662,17 +689,34 @@ test('inline images wait behind a prompt where the media preview setting says so
   mediaPreviewSettings.global = {};
 });
 
-test('inline images load at once where media previews are on', async () => {
-  mediaPreviewSettings.global = { media_previews: 'private' };
+test('enabling all rooms reveals inline images without refreshing', async () => {
+  preferences.mediaAutoLoad = 'private';
   render(FormattedBodyMediaHarness, {
-    props: { html: '<img src="https://example.org/cat.png" alt="cat">', joinRule: 'invite' },
+    props: { html: '<img src="https://example.org/cat.png" alt="cat">', joinRule: 'public' },
   });
   await tick();
 
+  expect(screen.getByRole('button', { name: 'Show images' })).toBeInTheDocument();
+  preferences.mediaAutoLoad = 'on';
+  await tick();
   expect(screen.getByRole('img', { name: 'cat' })).toHaveAttribute(
     'src',
     'https://example.org/cat.png'
   );
   expect(screen.queryByRole('button', { name: 'Show images' })).not.toBeInTheDocument();
   mediaPreviewSettings.global = {};
+});
+
+test.each([
+  ['a block with no language', '<pre><code>const a = 1;</code></pre>'],
+  [
+    'a block over the size limit',
+    `<pre><code class="language-js">${'a'.repeat(20_001)}</code></pre>`,
+  ],
+])('%s is left unhighlighted', async (_name, html) => {
+  render(FormattedBody, { props: { html } });
+  await tick();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  expect(document.querySelector('pre code')?.querySelector('span')).toBeNull();
 });

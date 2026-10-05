@@ -1,10 +1,13 @@
-import { DOMParser, Schema, type ParseRule } from 'prosemirror-model';
+import { DOMParser, Schema, type Node as ProseMirrorNode, type ParseRule } from 'prosemirror-model';
 
 import { splitVia } from '#lib/rooms/join-address.js';
+import { parseMatrixLink } from '#lib/rooms/matrix-link.js';
 
 import { canonicalDatetime, isOpaqueMatrixColor, utcFallbackLabel } from '../time-markup';
 
 export const matrixTo = 'https://matrix.to/#/';
+
+const notExplicit = ':not([data-mx-link]):not([data-org\\.matrix\\.msc4550\\.link])';
 
 export const ROOM_PING = '@room';
 
@@ -15,6 +18,11 @@ export function mentionHref(userId: string, via: readonly string[]): string {
   if (!userId.startsWith('!') || via.length === 0) return `${matrixTo}${userId}`;
   const query = new URLSearchParams(via.map((server) => ['via', server]));
   return `${matrixTo}${userId}?${query.toString()}`;
+}
+
+export function emoticonLabel(node: ProseMirrorNode): string {
+  const body = node.attrs.body as string | null;
+  return body && !body.startsWith('mxc://') ? body : `:${node.attrs.shortcode as string}:`;
 }
 
 function languageOf(dom: HTMLElement): string {
@@ -124,6 +132,24 @@ export const composerSchema = new Schema({
       parseDOM: [{ tag: 'summary' }],
       toDOM: () => ['summary', 0],
     },
+    description_list: {
+      content: '(description_term | description_details)+',
+      group: 'block',
+      parseDOM: [{ tag: 'dl' }],
+      toDOM: () => ['dl', 0],
+    },
+    description_term: {
+      content: 'inline*',
+      defining: true,
+      parseDOM: [{ tag: 'dt' }],
+      toDOM: () => ['dt', 0],
+    },
+    description_details: {
+      content: 'block+',
+      defining: true,
+      parseDOM: [{ tag: 'dd' }],
+      toDOM: () => ['dd', 0],
+    },
     table: {
       content: 'table_row+',
       group: 'block',
@@ -180,7 +206,9 @@ export const composerSchema = new Schema({
       attrs: { userId: {}, name: {}, via: { default: [] as string[] } },
       parseDOM: [
         {
-          tag: `a[href^="${matrixTo}@"], a[href^="${matrixTo}#"], a[href^="${matrixTo}!"]`,
+          tag: ['@', '#', '!']
+            .map((sigil) => `a[href^="${matrixTo}${sigil}"]${notExplicit}`)
+            .join(', '),
           priority: 60,
           getAttrs: (dom) => {
             const { href, via } = splitVia(dom.getAttribute('href') ?? '');
@@ -257,7 +285,7 @@ export const composerSchema = new Schema({
           {
             'data-mx-emoticon': '',
             src: node.attrs.url as string,
-            alt: (node.attrs.body as string | null) ?? label,
+            alt: emoticonLabel(node),
             title: label,
             height: '32',
           },
@@ -404,7 +432,12 @@ export const composerSchema = new Schema({
       attrs: { href: {} },
       inclusive: false,
       parseDOM: [{ tag: 'a[href]', getAttrs: (dom) => ({ href: dom.getAttribute('href') }) }],
-      toDOM: (mark) => ['a', { href: mark.attrs.href as string }, 0],
+      toDOM: (mark) => {
+        const href = mark.attrs.href as string;
+        return parseMatrixLink(href)
+          ? ['a', { href, 'data-org.matrix.msc4550.link': '' }, 0]
+          : ['a', { href }, 0];
+      },
     },
   },
 });

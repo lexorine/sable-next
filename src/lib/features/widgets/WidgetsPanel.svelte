@@ -1,4 +1,7 @@
 <script lang="ts">
+  import ArrowLeftIcon from 'phosphor-svelte/lib/ArrowLeftIcon';
+  import GridFourIcon from 'phosphor-svelte/lib/GridFourIcon';
+  import PlusIcon from 'phosphor-svelte/lib/PlusIcon';
   import XIcon from 'phosphor-svelte/lib/XIcon';
   import { onMount } from 'svelte';
 
@@ -7,10 +10,13 @@
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
   import PanelHeader from '#lib/ui/primitives/PanelHeader.svelte';
   import PanelHeaderButton from '#lib/ui/primitives/PanelHeaderButton.svelte';
+  import Button from '#lib/ui/primitives/Button.svelte';
   import ResizeHandle from '#lib/ui/primitives/ResizeHandle.svelte';
+  import TextInput from '#lib/ui/primitives/TextInput.svelte';
 
   import type { RoomWidget } from './widget-content.js';
   import { templateWidgetUrl } from './widget-url.js';
+  import IntegrationManagerDialog from './IntegrationManagerDialog.svelte';
   import WidgetCapabilitiesDialog from './WidgetCapabilitiesDialog.svelte';
   import WidgetFrame from './WidgetFrame.svelte';
 
@@ -23,6 +29,7 @@
     canManage?: boolean;
     modal?: boolean;
     onClose: () => void;
+    onAdd?: (name: string, url: string) => Promise<void>;
     onRemove?: (widgetId: string) => void;
   }
 
@@ -35,6 +42,7 @@
     canManage = false,
     modal = false,
     onClose,
+    onAdd,
     onRemove,
   }: Props = $props();
 
@@ -59,6 +67,34 @@
     if (Number.isFinite(stored)) width = clampWidth(stored);
   });
   let pendingRemoval = $state<RoomWidget | null>(null);
+  let newName = $state('');
+  let newUrl = $state('');
+  let adding = $state(false);
+  let showAddForm = $state(false);
+  let integrationsOpen = $state(false);
+
+  let addUrl = $derived.by(() => {
+    try {
+      const parsed = new URL(newUrl.trim());
+      return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.toString() : null;
+    } catch {
+      return null;
+    }
+  });
+
+  async function submitAdd(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+    if (!onAdd || adding || addUrl === null || newName.trim() === '') return;
+    adding = true;
+    try {
+      await onAdd(newName.trim(), addUrl);
+      newName = '';
+      newUrl = '';
+      showAddForm = false;
+    } finally {
+      adding = false;
+    }
+  }
 
   interface PendingApproval {
     widgetName: string;
@@ -80,9 +116,7 @@
     };
   }
 
-  let activeWidget = $derived(
-    widgets.find((widget) => widget.id === activeId) ?? widgets[0] ?? null
-  );
+  let activeWidget = $derived(widgets.find((widget) => widget.id === activeId) ?? null);
   let activeUrl = $derived(
     activeWidget
       ? templateWidgetUrl(activeWidget, {
@@ -113,7 +147,16 @@
       onCommit={() => localStorage.setItem(WIDTH_STORAGE_KEY, String(width))}
     />
   {/if}
-  <PanelHeader class="widgets-header" title={$i18n.t('widgets.title')}>
+  <PanelHeader class="widgets-header" title={activeWidget?.name || $i18n.t('widgets.title')}>
+    {#snippet prefix()}
+      {#if activeWidget}
+        <PanelHeaderButton label={$i18n.t('widgets.back')} onclick={() => (activeId = null)}>
+          <ArrowLeftIcon />
+        </PanelHeaderButton>
+      {:else}
+        <GridFourIcon aria-hidden="true" />
+      {/if}
+    {/snippet}
     {#snippet suffix()}
       <PanelHeaderButton label={$i18n.t('widgets.close')} onclick={onClose}>
         <XIcon />
@@ -121,21 +164,26 @@
     {/snippet}
   </PanelHeader>
 
-  {#if widgets.length === 0}
-    <p class="widgets-empty">{$i18n.t('widgets.empty')}</p>
+  {#if activeWidget && activeUrl}
+    {#key activeUrl}
+      <div class="widgets-frame">
+        <WidgetFrame
+          {roomId}
+          widgetId={activeWidget.id}
+          url={activeUrl}
+          name={activeWidget.name}
+          onCapabilities={requestCapabilities(activeWidget.name)}
+        />
+      </div>
+    {/key}
   {:else}
-    <div class="widgets-tabs" role="tablist">
+    <div class="widgets-list">
+      {#if widgets.length === 0}
+        <p class="widgets-empty">{$i18n.t('widgets.empty')}</p>
+      {/if}
       {#each widgets as widget (widget.id)}
-        <div
-          class="widgets-tab choice"
-          data-selected={widget.id === activeWidget?.id ? 'true' : undefined}
-        >
-          <button
-            type="button"
-            role="tab"
-            aria-selected={widget.id === activeWidget?.id}
-            onclick={() => (activeId = widget.id)}
-          >
+        <div class="widgets-item choice">
+          <button type="button" onclick={() => (activeId = widget.id)}>
             {widget.name}
           </button>
           {#if canManage}
@@ -153,22 +201,46 @@
         </div>
       {/each}
     </div>
+  {/if}
 
-    {#if activeUrl && activeWidget}
-      {#key activeUrl}
-        <div class="widgets-frame">
-          <WidgetFrame
-            {roomId}
-            widgetId={activeWidget.id}
-            url={activeUrl}
-            name={activeWidget.name}
-            onCapabilities={requestCapabilities(activeWidget.name)}
+  {#if !activeWidget && canManage && onAdd}
+    <div class="widgets-manage">
+      {#if showAddForm}
+        <form class="widgets-add" onsubmit={submitAdd}>
+          <TextInput
+            bind:value={newName}
+            placeholder={$i18n.t('widgets.addName')}
+            aria-label={$i18n.t('widgets.addName')}
           />
-        </div>
-      {/key}
-    {/if}
+          <TextInput
+            bind:value={newUrl}
+            type="url"
+            placeholder={$i18n.t('widgets.addUrl')}
+            aria-label={$i18n.t('widgets.addUrl')}
+          />
+          <Button type="submit" disabled={adding || addUrl === null || newName.trim() === ''}>
+            {$i18n.t('widgets.add')}
+          </Button>
+        </form>
+      {:else}
+        <Button variant="ghost" onclick={() => (integrationsOpen = true)}>
+          <GridFourIcon />
+          {$i18n.t('widgets.integrationManager')}
+        </Button>
+        <Button variant="ghost" onclick={() => (showAddForm = true)}>
+          <PlusIcon />
+          {$i18n.t('widgets.addCustom')}
+        </Button>
+      {/if}
+    </div>
   {/if}
 </aside>
+
+<IntegrationManagerDialog
+  open={integrationsOpen}
+  {roomId}
+  onClose={() => (integrationsOpen = false)}
+/>
 
 {#if approval}
   {@const pending = approval}
@@ -196,11 +268,14 @@
 
 <style>
   .widgets-panel {
-    background: var(--surface-container);
+    --ghost-hover: var(--bg-container-hover);
+    --ghost-active: var(--bg-container-active);
+
+    background: var(--bg-container);
     box-sizing: border-box;
-    color: var(--surface-on-container);
+    color: var(--bg-on-container);
     display: grid;
-    grid-template-rows: auto auto minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr) auto;
     height: 100%;
     min-height: 0;
     overflow-x: hidden;
@@ -218,43 +293,63 @@
     z-index: 1;
   }
 
-  .widgets-empty {
-    color: var(--surface-var-on-container);
-    padding: var(--space-400);
-  }
-
-  .widgets-tabs {
-    display: flex;
-    flex-wrap: nowrap;
+  .widgets-manage {
+    align-self: start;
+    border-top: var(--border-width) solid var(--surface-container-line);
+    display: grid;
     gap: var(--space-100);
-    overflow-x: auto;
     padding: var(--space-300);
   }
 
-  .widgets-tab {
-    align-items: center;
-    background: var(--surface-var-container);
-    border: var(--border-width) solid var(--surface-var-container-line);
-    border-radius: var(--radius-pill);
-    color: var(--surface-var-on-container);
-    display: flex;
-    flex-shrink: 0;
-    gap: var(--space-100);
-    padding-inline-end: var(--space-100);
+  .widgets-add {
+    display: grid;
+    gap: var(--space-200);
   }
 
-  .widgets-tab button {
+  .widgets-empty {
+    color: var(--surface-var-on-container);
+    padding: var(--space-100);
+  }
+
+  .widgets-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-150);
+    overflow-y: auto;
+    padding: var(--space-300);
+  }
+
+  .widgets-item {
+    align-items: center;
+    background: var(--surface-container);
+    border-radius: var(--radius-inner);
+    color: var(--surface-on-container);
+    display: flex;
+    gap: var(--space-150);
+    padding-inline-end: var(--space-300);
+  }
+
+  .widgets-item:hover {
+    background: var(--surface-container-hover);
+    box-shadow: inset 0 0 0 var(--border-width) var(--surface-container-line);
+  }
+
+  .widgets-item button:first-child {
     background: none;
     border: none;
     color: inherit;
     cursor: pointer;
+    flex: 1;
     font: inherit;
-    font-size: var(--font-size-small);
     min-height: 2.75rem;
+    overflow: hidden;
     padding: var(--space-100) var(--space-300);
+    text-align: start;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
-  .widgets-tab :global(.icon-button) {
+  .widgets-item :global(.icon-button) {
     min-height: 2.75rem;
     min-width: 2.75rem;
   }

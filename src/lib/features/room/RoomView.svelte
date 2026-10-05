@@ -32,6 +32,7 @@
   import { useBookmarks } from '#lib/rooms/bookmarks.svelte.js';
   import ConversationComposer from './conversation/ConversationComposer.svelte';
   import { Conversation } from './conversation/conversation.svelte.js';
+  import { personaSpaces } from '#lib/features/composer/persona-spaces.js';
   import { usePersonaStore } from '#lib/personas/personas.svelte.js';
   import { i18n } from '#lib/i18n.js';
   import { afterOverlayPops, holdOverlayBack } from '#lib/platform/overlay-back.svelte.js';
@@ -139,6 +140,7 @@
     personas,
     timeline,
     roomId: () => resolvedRoomId,
+    spaceIds: (id) => personaSpaces(roomList.rooms, id, page.params.spaceId).order,
     encrypted: () => resolvedRoom?.encrypted ?? null,
     beforeSend: () => timelineList?.resumeLive(false) ?? resumeLive(),
   });
@@ -330,16 +332,18 @@
   let showReceiptFooter = $derived(
     !preferences.hideReadReceipts && preferences.readReceiptPlacement === 'room'
   );
-  let latestReadBy = $derived.by(() => {
-    if (!showReceiptFooter) return [];
-    const userId = core.session?.user_id;
+  let latestReceiptItem = $derived.by(() => {
+    if (!showReceiptFooter) return null;
     for (let index = timeline.items.length - 1; index >= 0; index -= 1) {
       const item = timeline.items[index];
       if (!item.event_id) continue;
-      return item.read_by.filter((readerId) => readerId !== userId);
+      return item;
     }
-    return [];
+    return null;
   });
+  let latestReadBy = $derived(
+    latestReceiptItem?.read_by.filter((readerId) => readerId !== core.session?.user_id) ?? []
+  );
   let receiptMembers = $derived(
     memberLoader.members.filter((member) => latestReadBy.includes(member.user_id))
   );
@@ -418,9 +422,10 @@
     if (!tags || !Object.values(tags).some((tag) => tag.icon || tag.color)) return {};
     return Object.fromEntries(
       memberLoader.members.flatMap((member) => {
-        const icon = tagForLevel(tags, member.power_level)?.icon ?? null;
+        const tag = tagForLevel(tags, member.power_level);
+        const icon = tag?.icon ?? null;
         const color = powerTag(member.power_level, $i18n.t, tags).color;
-        return icon || color ? [[member.user_id, { icon, color }]] : [];
+        return icon || color ? [[member.user_id, { icon, name: tag?.name ?? null, color }]] : [];
       })
     );
   });
@@ -571,6 +576,24 @@
     await memberLoader.load(activeRoomId, (roomId) => core.commands.roomMembers(roomId));
   }
 
+  let memberChangeKey = $derived.by(() => {
+    for (let index = timeline.items.length - 1; index >= 0; index -= 1) {
+      const { content, event_id: eventId } = timeline.items[index];
+      if (eventId && (content.kind === 'membership' || content.kind === 'profile_change')) {
+        return eventId;
+      }
+    }
+    return null;
+  });
+
+  $effect(() => {
+    if (memberChangeKey === null) return;
+    const activeRoomId = untrack(() => resolvedRoomId);
+    void untrack(() =>
+      memberLoader.refresh(activeRoomId, (roomId) => core.commands.roomMembers(roomId))
+    );
+  });
+
   function loadMembership(membership: MembershipView): Promise<MemberView[]> {
     return core.commands.roomMembers(resolvedRoomId, [membership]);
   }
@@ -583,12 +606,32 @@
     panels.closeMembers(desktop);
   }
 
+  $effect(() => {
+    const activeRoomId = resolvedRoomId;
+    return core.subscribeEvents((event) => {
+      if (event.type === 'room_widgets_changed' && event.room_id === activeRoomId) {
+        roomSession.details.refreshWidgets().catch((error: unknown) => {
+          console.debug('[sable room] widgets unavailable', error);
+        });
+      }
+    });
+  });
+
   function toggleWidgets(): void {
-    panels.widgetsOpen = !panels.widgetsOpen;
+    panels.toggleWidgets();
   }
 
   function closeWidgets(): void {
     panels.widgetsOpen = false;
+  }
+
+  async function addWidget(name: string, url: string): Promise<void> {
+    try {
+      await roomSession.details.addWidget(name, url, core.session?.user_id ?? '');
+    } catch (error) {
+      console.warn('[sable room] add widget failed', error);
+      toasts.error($i18n.t('errors.actionFailed'));
+    }
   }
 
   async function removeWidget(widgetId: string): Promise<void> {
@@ -635,7 +678,11 @@
       link.kind === 'event' ? link.eventId : null,
       via
     );
-    void goto(target);
+    if (link.kind === 'event' && target === `${page.url.pathname}${page.url.search}`) {
+      jumpToEvent(link.eventId);
+      return;
+    }
+    void afterOverlayPops().then(() => goto(target));
   }
 
   function copyEventLink(eventId: string): void {
@@ -678,7 +725,19 @@
 
   // A history entry, so back is a way out of the anchor.
   function jumpToEvent(eventId: string): void {
-    void goto(roomUrl(eventId), { reset: false });
+    if (eventId === page.url.searchParams.get('event')) {
+      if (!timelineList?.jumpToEvent(eventId)) {
+        void activeTimeline.start(
+          timelineOwner,
+          resolvedRoomId,
+          eventId,
+          preferences.showHiddenEvents
+        );
+      }
+      return;
+    }
+    const target = roomUrl(eventId);
+    void afterOverlayPops().then(() => goto(target, { reset: false }));
   }
 
   function requestHistory(): Promise<boolean> {
@@ -689,14 +748,21 @@
     await timeline.paginateForward(25);
   }
 
-  async function markRead(eventId: string): Promise<void> {
+  async function markRead(eventId: string, fullyRead: boolean): Promise<void> {
     await core.commands.markRead(
       resolvedRoomId,
       eventId,
       readReceiptIsPrivate(),
       null,
-      timeline.subscriptionId
+      timeline.subscriptionId,
+      fullyRead
     );
+  }
+
+  function setFullyRead(roomId: string, eventId: string): void {
+    void core.commands.setFullyRead(roomId, eventId).catch((error: unknown) => {
+      console.warn('[sable room] moving the read marker failed', error);
+    });
   }
 
   function markUnreadFrom(eventId: string): void {
@@ -704,12 +770,14 @@
       .markUnread(resolvedRoomId, eventBefore(timeline.items, eventId))
       .catch((error: unknown) => {
         console.warn('[sable room] mark as unread failed', error);
+        toasts.error($i18n.t('errors.actionFailed'));
       });
   }
 
   function markRoomRead(): void {
     void markAllRead().catch((error: unknown) => {
       console.warn('[sable room] mark as read failed', error);
+      toasts.error($i18n.t('errors.actionFailed'));
     });
   }
 
@@ -719,10 +787,8 @@
     list?.dismissUnread();
   }
 
-  async function loadReadMarker(): Promise<string | null> {
-    const content = await core.commands.roomAccountData(resolvedRoomId, 'm.fully_read');
-    const eventId = (content as { event_id?: unknown } | null)?.event_id;
-    return typeof eventId === 'string' ? eventId : null;
+  function loadReadMarker(): Promise<string | null> {
+    return core.commands.readMarker(resolvedRoomId);
   }
 
   function requestUnread(eventId: string): Promise<void> {
@@ -741,6 +807,7 @@
   function markRoomUnread(): void {
     void core.commands.markUnread(resolvedRoomId).catch((error: unknown) => {
       console.warn('[sable room] mark as unread failed', error);
+      toasts.error($i18n.t('errors.actionFailed'));
     });
   }
 
@@ -888,6 +955,7 @@
       onRequestHistory={requestHistory}
       onRequestFuture={requestFuture}
       onRead={markRead}
+      onFullyRead={setFullyRead}
       hasUnread={resolvedRoom === undefined || roomHasUnread}
       onLoadReadMarker={loadReadMarker}
       onRequestUnread={requestUnread}
@@ -932,6 +1000,7 @@
           <RoomReadReceipts
             bind:open={receiptsOpen}
             readers={latestReadBy}
+            timestamps={latestReceiptItem?.read_timestamps}
             members={receiptMembers}
             visible={timelineAtBottom}
             onMemberProfile={openProfile}
@@ -1015,13 +1084,18 @@
           </PanelHeaderButton>
         {/if}
       {/if}
-      {#if roomSession.widgets.length > 0}
+      {#if roomSession.widgets.length > 0 || canManageWidgets}
         <PanelHeaderButton
           label={$i18n.t('widgets.label')}
           aria-pressed={panels.widgetsOpen}
           onclick={toggleWidgets}
         >
-          <GridFourIcon weight={panels.widgetsOpen ? 'fill' : 'regular'} />
+          <span class="widgets-button-icon">
+            <GridFourIcon weight={panels.widgetsOpen ? 'fill' : 'regular'} />
+            {#if roomSession.widgets.length > 0}
+              <span class="widgets-count" aria-hidden="true">{roomSession.widgets.length}</span>
+            {/if}
+          </span>
         </PanelHeaderButton>
       {/if}
     {/snippet}
@@ -1074,7 +1148,9 @@
           onThreads={phone && !voiceView ? toggleThreads : undefined}
           onPins={phone ? () => (pinsOpen = true) : undefined}
           {pinsUnread}
-          onWidgets={phone && roomSession.widgets.length > 0 ? toggleWidgets : undefined}
+          onWidgets={phone && (roomSession.widgets.length > 0 || canManageWidgets)
+            ? toggleWidgets
+            : undefined}
           onReport={() => (reportOpen = true)}
           onLeave={() => (leaveOpen = true)}
         />
@@ -1221,7 +1297,7 @@
   {/if}
 
   {#if desktop}
-    {#if panels.desktopMembersOpen}
+    {#if panels.desktopMembersOpen && panels.threadRootId === null}
       <MembersDrawer
         members={memberLoader.members}
         loading={memberLoader.loading}
@@ -1241,6 +1317,7 @@
         avatarUrl={ownMember?.avatar_url ?? ''}
         canManage={canManageWidgets}
         onClose={closeWidgets}
+        onAdd={addWidget}
         onRemove={removeWidget}
       />
     {/if}
@@ -1276,6 +1353,7 @@
         canManage={canManageWidgets}
         modal
         onClose={closeWidgets}
+        onAdd={addWidget}
         onRemove={removeWidget}
       />
     </DialogFrame>
@@ -1378,6 +1456,34 @@
 </main>
 
 <style>
+  .widgets-button-icon {
+    display: inline-flex;
+    position: relative;
+  }
+
+  .widgets-button-icon > :global(svg) {
+    height: var(--button-icon-size);
+    width: var(--button-icon-size);
+  }
+
+  .widgets-count {
+    align-items: center;
+    background: var(--sec-main);
+    border-radius: var(--radii-pill);
+    color: var(--sec-on-main);
+    display: inline-flex;
+    font-size: var(--font-size-small);
+    font-weight: var(--font-weight-medium);
+    height: var(--size-x50);
+    inset-block-start: calc(var(--space-100) * -1);
+    inset-inline-start: calc(var(--space-100) * -1);
+    justify-content: center;
+    min-width: var(--size-x50);
+    padding: 0 var(--space-100);
+    pointer-events: none;
+    position: absolute;
+  }
+
   .room-view {
     --ghost-hover: var(--surface-container-hover);
     --ghost-active: var(--surface-container-active);

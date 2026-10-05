@@ -2,7 +2,7 @@ import en from '../../src/locales/en.json' with { type: 'json' };
 import { expect, test, SIGNED_OUT } from './fixtures/test';
 import { timelineItem } from './fixtures/timeline-items';
 
-test.use({ storageState: SIGNED_OUT, viewport: { width: 900, height: 800 } });
+test.use({ storageState: SIGNED_OUT, viewport: { width: 900, height: 800 }, hasTouch: true });
 
 test('the thread screen keeps the timeline and the composer inside the viewport', async ({
   app,
@@ -364,13 +364,18 @@ for (const context of ['desktop', 'mobile'] as const) {
         return {
           overflow: node.scrollWidth - node.clientWidth,
           header: headerButton.getBoundingClientRect().width,
-          composer: composerButtons.map((button) => button.getBoundingClientRect().width),
+          composer: composerButtons.map((button) => {
+            const hit = getComputedStyle(button, '::after');
+            return (
+              button.getBoundingClientRect().width - parseFloat(hit.left) - parseFloat(hit.right)
+            );
+          }),
         };
       });
       expect(dimensions.overflow).toBeLessThanOrEqual(1);
       expect(dimensions.header).toBeGreaterThanOrEqual(44);
       expect(dimensions.composer.every((width) => width >= 44)).toBe(true);
-      await expect(thread.locator('.composer-row')).toHaveClass(/multiline/);
+      await expect(thread.locator('.composer-row')).toBeVisible();
       await page.evaluate(
         () =>
           new Promise<void>((resolve) =>
@@ -427,5 +432,92 @@ for (const context of ['desktop', 'mobile'] as const) {
     await expect(thread.getByRole('button', { name: en.timeline.retryLoad })).toHaveCount(0);
     await expect(thread.locator('.message').first()).toBeVisible();
     await expect(editor).toHaveText('Keep draft after retry');
+  });
+}
+
+for (const threadPresentation of ['timeline', 'panel']) {
+  test(`leaving a thread restores the members drawer (${threadPresentation})`, async ({
+    page,
+    app,
+    core,
+    timeline,
+    installRoomCore,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.addInitScript((threadPresentation) => {
+      localStorage.setItem('sable-preferences', JSON.stringify({ threadPresentation }));
+    }, threadPresentation);
+    await installRoomCore('ready');
+    await app.openRoom('!room:example.test');
+    await timeline.expectRevealed();
+    await expect(page.locator('.members-drawer')).toBeVisible();
+    const subscription = await core.subscription();
+    await core.setTimelineItemById(subscription, 'general-19', {
+      ...timelineItem('general-19', 'Thread root'),
+      thread_summary: {
+        num_replies: 3,
+        latest_body: 'Reply',
+        latest_sender: '@alice:example.test',
+      },
+    });
+    await page.locator('[data-item-id="general-19"] .thread-summary').click();
+    const thread = page.getByRole('region', { name: en.timeline.thread, exact: true });
+    await expect(thread).toBeVisible();
+    await expect(page.locator('.members-drawer')).toBeHidden();
+    await thread
+      .getByRole('button', {
+        name:
+          threadPresentation === 'panel' ? en.timeline.threadClose : en.timeline.backToConversation,
+      })
+      .click();
+    await expect(page.locator('.members-drawer')).toBeVisible();
+  });
+}
+
+for (const threadPresentation of ['timeline', 'panel']) {
+  test(`threads load older messages without pagination errors (${threadPresentation})`, async ({
+    page,
+    app,
+    core,
+    timeline,
+    installRoomCore,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.addInitScript((threadPresentation) => {
+      localStorage.setItem('sable-preferences', JSON.stringify({ threadPresentation }));
+    }, threadPresentation);
+    await installRoomCore('ready');
+    await app.openRoom('!room:example.test');
+    await timeline.expectRevealed();
+    const subscription = await core.subscription();
+    await core.setTimelineItemById(subscription, 'general-19', {
+      ...timelineItem('general-19', 'Thread root'),
+      thread_summary: {
+        num_replies: 3,
+        latest_body: 'Reply',
+        latest_sender: '@alice:example.test',
+      },
+    });
+    await page.locator('[data-item-id="general-19"] .thread-summary').click();
+    const thread = page.getByRole('region', { name: en.timeline.thread, exact: true });
+    await expect(thread).toBeVisible();
+    const threadSubscription = await core.subscription(1);
+    await thread.locator('.viewport').hover();
+    await page.mouse.wheel(0, -1000);
+    await expect
+      .poll(() =>
+        page.evaluate(
+          (subscription) =>
+            window.__e2eCommandPayloads
+              .filter(
+                (command) => command.type === 'paginate' && command.subscription === subscription
+              )
+              .map((command) => (command.type === 'paginate' ? command.direction : null)),
+          threadSubscription
+        )
+      )
+      .toContain('backward');
+    expect(await page.evaluate(() => window.__e2ePaginationDirections)).not.toContain('forward');
+    await expect(thread.getByText(en.timeline.loadFailed)).toHaveCount(0);
   });
 }

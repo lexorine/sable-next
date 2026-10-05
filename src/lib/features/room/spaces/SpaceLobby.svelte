@@ -1,6 +1,7 @@
 <script lang="ts">
   import { CoreError } from '#src/transport';
   import type { RoomPermissionsView, RoomSummary, SpaceChildEdge } from '#src/generated/protocol';
+  import BackIcon from 'phosphor-svelte/lib/CaretLeftIcon';
   import DotsThreeVerticalIcon from 'phosphor-svelte/lib/DotsThreeVerticalIcon';
   import ListBulletsIcon from 'phosphor-svelte/lib/ListBulletsIcon';
   import HashIcon from 'phosphor-svelte/lib/HashIcon';
@@ -8,10 +9,11 @@
   import PlusIcon from 'phosphor-svelte/lib/PlusIcon';
   import SquaresFourIcon from 'phosphor-svelte/lib/SquaresFourIcon';
   import UsersThreeIcon from 'phosphor-svelte/lib/UsersThreeIcon';
-  import { onDestroy } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
   import { goto } from '$app/navigation';
+  import { afterOverlayPops } from '#lib/platform/overlay-back.svelte.js';
   import { resolve } from '$app/paths';
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
@@ -36,6 +38,9 @@
   import Spinner from '#lib/ui/primitives/Spinner.svelte';
   import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
   import { toasts } from '#lib/ui/toasts.svelte.js';
+  import { BREAKPOINTS } from '#lib/ui/breakpoints.js';
+  import { createMediaQuery } from '#lib/ui/media-query.svelte.js';
+  import { backToRoomList } from '#lib/features/room/room-navigation.js';
 
   import {
     applyChildOverrides,
@@ -45,6 +50,7 @@
     edgeSignature,
     levelTargets,
     inAllowList,
+    joinCandidates,
     lobbyAction,
     lobbyPhase,
     localHierarchyRooms,
@@ -74,6 +80,7 @@
   import RoomSettingsDialog from '../settings/RoomSettingsDialog.svelte';
   import SpaceLobbySection from './SpaceLobbySection.svelte';
   import { SpaceHierarchyLoader } from './space-hierarchy-loader.svelte';
+  import { JoinQueue } from './join-queue.svelte';
 
   interface Props {
     space: RoomSummary | null;
@@ -94,6 +101,7 @@
   const closed = new SvelteSet<string>();
   const visibleLevels = new SvelteSet<string>();
 
+  const appLayout = createMediaQuery(BREAKPOINTS.appLayout);
   const hierarchy = new SpaceHierarchyLoader(core);
   let fetched = $derived(hierarchy.fetched);
   let overrides = $state.raw<ChildOrderOverride[]>([]);
@@ -102,14 +110,23 @@
   let addKind = $state<AddExistingKind>('rooms');
   let failed = $derived(hierarchy.failed);
   let topicOpen = $state(false);
+  let joinAllOn = $state(false);
+  const joinQueue = new JoinQueue((roomId, error) => {
+    console.warn('[sable lobby] join failed', error);
+    joinErrors.set(roomId, joinErrorMessage(error));
+  });
 
   function openTopicLink(link: MatrixLink, anchor: HTMLAnchorElement): void {
     if (link.kind === 'user') return;
     topicOpen = false;
     const { via } = splitVia(anchor.href);
-    void goto(
-      roomSectionPath(roomList.rooms, link.roomId, link.kind === 'event' ? link.eventId : null, via)
+    const target = roomSectionPath(
+      roomList.rooms,
+      link.roomId,
+      link.kind === 'event' ? link.eventId : null,
+      via
     );
+    void afterOverlayPops().then(() => goto(target));
   }
   let permissions = $state<RoomPermissionsView | null>(null);
 
@@ -164,6 +181,7 @@
         name: room.room_id === spaceId ? (space?.name ?? label(room)) : label(room),
       }))
   );
+  let candidates = $derived(joinCandidates(sections, joinedIds, invitedIds));
   let pinnedIds = $derived(new Set(layoutSpaceIds(spaceSidebar.items)));
   let phase = $derived(
     lobbyPhase(sections.length, spaceId === null || !hierarchy.loadedLevels.has(spaceId))
@@ -172,6 +190,10 @@
   $effect(() => {
     hierarchy.reset(spaceId);
     if (spaceId === null) return;
+    joinAllOn = false;
+    untrack(() => {
+      joinQueue.cancel();
+    });
     overrides = [];
     suggestedOverrides = [];
     removed.clear();
@@ -186,7 +208,38 @@
     hierarchy.enqueue(levelTargets(sections, spaceId, visibleLevels));
   });
 
-  onDestroy(() => hierarchy.dispose());
+  onDestroy(() => {
+    hierarchy.dispose();
+    joinQueue.cancel();
+  });
+
+  $effect(() => {
+    if (!joinAllOn) return;
+    for (const section of sections) visibleLevels.add(section.key);
+    const targets = candidates.map(({ room, via, parentId }) => ({
+      roomId: room.room_id,
+      run: () => trackedJoin(room, via, parentId),
+    }));
+    untrack(() => {
+      joinQueue.add(targets);
+    });
+    if (joinQueue.idle && hierarchy.pendingLevels.size === 0) {
+      const settled = [...joinQueue.joined].every((id) => joinedIds.has(id));
+      if (settled) finishJoinAll();
+    }
+  });
+
+  function finishJoinAll(): void {
+    const failures = joinQueue.failed;
+    joinAllOn = false;
+    joinQueue.cancel();
+    if (failures > 0) toasts.error($i18n.t('room.lobbyJoinAllFailed', { count: failures }));
+  }
+
+  function stopJoinAll(): void {
+    joinAllOn = false;
+    joinQueue.cancel();
+  }
 
   $effect(() => {
     if (overrides.length === 0) return;
@@ -294,45 +347,63 @@
     );
   }
 
+  async function attemptJoin(
+    child: HierarchyRoomView,
+    via: readonly string[],
+    parentId: string
+  ): Promise<boolean> {
+    const address = child.canonical_alias ?? child.room_id;
+    let routing = viaFor(address, via);
+    if (routing.length === 0 && child.canonical_alias === null) {
+      routing = await core.commands.roomViaServers(parentId);
+    }
+    const action = lobbyAction(
+      child.join_rule,
+      invitedIds.has(child.room_id),
+      inAllowList(child, joinedIds, parentId)
+    );
+    if (action === 'knock') {
+      await core.commands.knockRoom(address, routing);
+      knocked.add(child.room_id);
+      return false;
+    }
+    try {
+      await core.commands.joinRoom(address, routing);
+    } catch (error) {
+      if (child.join_rule !== 'knock_restricted' || !(error instanceof CoreError)) throw error;
+      if (error.detail.code !== 'denied') throw error;
+      await core.commands.knockRoom(address, routing);
+      knocked.add(child.room_id);
+      return false;
+    }
+    return true;
+  }
+
+  async function trackedJoin(
+    child: HierarchyRoomView,
+    via: readonly string[],
+    parentId: string
+  ): Promise<boolean> {
+    joining.add(child.room_id);
+    joinErrors.delete(child.room_id);
+    try {
+      return await attemptJoin(child, via, parentId);
+    } finally {
+      joining.delete(child.room_id);
+    }
+  }
+
   async function join(
     child: HierarchyRoomView,
     via: readonly string[],
     parentId: string
   ): Promise<void> {
     if (joining.has(child.room_id)) return;
-    joining.add(child.room_id);
-    joinErrors.delete(child.room_id);
     try {
-      const address = child.canonical_alias ?? child.room_id;
-      let routing = viaFor(address, via);
-      if (routing.length === 0 && child.canonical_alias === null) {
-        routing = await core.commands.roomViaServers(parentId);
-      }
-      const action = lobbyAction(
-        child.join_rule,
-        invitedIds.has(child.room_id),
-        inAllowList(child, joinedIds, parentId)
-      );
-      if (action === 'knock') {
-        await core.commands.knockRoom(address, routing);
-        knocked.add(child.room_id);
-        return;
-      }
-      try {
-        await core.commands.joinRoom(address, routing);
-      } catch (error) {
-        if (child.join_rule !== 'knock_restricted' || !(error instanceof CoreError)) throw error;
-        if (error.detail.code !== 'denied') throw error;
-        await core.commands.knockRoom(address, routing);
-        knocked.add(child.room_id);
-        return;
-      }
-      open(child);
+      await trackedJoin(child, via, parentId);
     } catch (error) {
       console.warn('[sable lobby] join failed', error);
       joinErrors.set(child.room_id, joinErrorMessage(error));
-    } finally {
-      joining.delete(child.room_id);
     }
   }
 
@@ -345,6 +416,7 @@
       removed.add(entry.key);
     } catch (error) {
       console.warn('[sable lobby] remove failed', error);
+      toasts.error($i18n.t('errors.actionFailed'));
     }
   }
 
@@ -519,6 +591,18 @@
       },
     })}
   >
+    {#if !appLayout.matches}
+      <div class="mobile-back-menu">
+        <IconButton
+          variant="ghost"
+          size="small"
+          label={$i18n.t('timeline.back')}
+          onclick={backToRoomList}
+        >
+          <BackIcon />
+        </IconButton>
+      </div>
+    {/if}
     {#if space}
       <div class="hero-menu">
         {#if preferences.developerTools}
@@ -558,6 +642,17 @@
       uniform
     />
     <h1>{space?.name ?? $i18n.t('nav.space')}</h1>
+    {#if space?.topic}
+      <button
+        type="button"
+        class="topic"
+        onclick={() => {
+          topicOpen = true;
+        }}
+      >
+        <span class="topic-text">{space.topic}</span>
+      </button>
+    {/if}
     {#if canManage && space}
       {@const managed = space}
       <div class="hero-actions">
@@ -621,16 +716,33 @@
         />
       {/if}
     {/if}
-    {#if space?.topic}
-      <button
-        type="button"
-        class="topic"
-        onclick={() => {
-          topicOpen = true;
-        }}
-      >
-        <span class="topic-text">{space.topic}</span>
-      </button>
+    {#if joinAllOn}
+      <div class="join-all" role="status">
+        <Spinner small />
+        <span>
+          {$i18n.t(joinQueue.waiting ? 'room.lobbyJoinWaiting' : 'room.lobbyJoinProgress', {
+            done: joinQueue.done,
+            total: joinQueue.total,
+          })}
+        </span>
+        <Button variant="ghost" size="small" onclick={stopJoinAll}
+          >{$i18n.t('room.lobbyJoinStop')}</Button
+        >
+      </div>
+    {:else if candidates.length > 0}
+      <div class="hero-actions">
+        <Button
+          variant="secondary"
+          size="small"
+          class="hero-action"
+          onclick={() => {
+            joinAllOn = true;
+          }}
+        >
+          <PlusIcon />
+          {$i18n.t('room.lobbyJoinAll', { count: candidates.length })}
+        </Button>
+      </div>
     {/if}
   </header>
 
@@ -789,17 +901,34 @@
   .hero {
     display: grid;
     justify-items: center;
-    padding: var(--space-500) 0 var(--space-300);
+    padding: var(--space-500) 0 var(--space-100);
     position: relative;
     text-align: center;
     -webkit-touch-callout: none;
     user-select: none;
   }
 
+  .mobile-back-menu {
+    left: 0;
+    position: absolute;
+    top: var(--space-300);
+  }
+
   .hero-menu {
     position: absolute;
     right: 0;
     top: var(--space-300);
+  }
+
+  .join-all {
+    align-items: center;
+    color: var(--surface-var-on-container);
+    display: flex;
+    flex-wrap: wrap;
+    font-size: var(--font-size-small);
+    gap: var(--space-200);
+    justify-content: center;
+    margin-top: var(--space-300);
   }
 
   .hero-actions {

@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::BuildHasher;
 use std::sync::Arc;
 
@@ -71,7 +71,10 @@ use crate::protocol::{
 };
 
 // These are independent room capabilities, not a state machine.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "wire type mirroring the protocol"
+)]
 pub struct RoomInfo {
     pub is_space: bool,
     pub is_direct: bool,
@@ -225,7 +228,7 @@ fn latest_event(item: &RoomListItem) -> Option<LatestEventView> {
 
         LatestEventValue::Remote(event) => Some(LatestEventView {
             sender: event.sender(),
-            body: remote_preview(&event)?,
+            body: remote_preview(&event).unwrap_or_default(),
             timestamp: event.timestamp().map(|at| at.0.into()),
             sending: false,
             event_id: event.event_id().map(ToOwned::to_owned),
@@ -245,7 +248,7 @@ fn latest_event(item: &RoomListItem) -> Option<LatestEventView> {
         LatestEventValue::LocalIsSending(local) | LatestEventValue::LocalCannotBeSent(local) => {
             Some(LatestEventView {
                 sender: None,
-                body: local_preview(&local)?,
+                body: local_preview(&local).unwrap_or_default(),
                 timestamp: Some(local.timestamp.0.into()),
                 sending: true,
                 event_id: None,
@@ -254,7 +257,7 @@ fn latest_event(item: &RoomListItem) -> Option<LatestEventView> {
 
         LatestEventValue::LocalHasBeenSent { value, event_id } => Some(LatestEventView {
             sender: None,
-            body: local_preview(&value)?,
+            body: local_preview(&value).unwrap_or_default(),
             timestamp: Some(value.timestamp.0.into()),
             sending: false,
             event_id: Some(event_id),
@@ -444,6 +447,26 @@ pub async fn restricted_parents(client: &Client, room: &Room) -> Vec<OwnedRoomId
         }
     }
     parents
+}
+
+pub async fn listing_spaces(
+    client: &Client,
+    room_id: &matrix_sdk::ruma::RoomId,
+) -> Vec<OwnedRoomId> {
+    let mut spaces = Vec::new();
+    for space in client.joined_space_rooms() {
+        if space.is_tombstoned() {
+            continue;
+        }
+        let lists_room = space_children(&space)
+            .await
+            .iter()
+            .any(|edge| edge.room_id == room_id && !edge.via.is_empty());
+        if lists_room {
+            spaces.push(space.room_id().to_owned());
+        }
+    }
+    spaces
 }
 
 #[must_use]
@@ -808,11 +831,13 @@ pub fn aggregation_item(
         thread_summary: None,
         reactions: Vec::new(),
         read_by: Vec::new(),
+        read_timestamps: BTreeMap::new(),
         per_message_profile: None,
         bundled_link_previews: Vec::new(),
         link_previews_removed: None,
         mention: MentionView::None,
         forwarded: None,
+        forum_title: None,
     }
 }
 
@@ -931,10 +956,12 @@ pub async fn standalone_item(
         sender: Some(sender),
         reactions: Vec::new(),
         read_by: Vec::new(),
+        read_timestamps: BTreeMap::new(),
         bundled_link_previews: bundled_link_previews(raw.message()),
         link_previews_removed: link_previews_removed(raw.message()),
         per_message_profile: message_profile,
         forwarded: original.content.as_ref().and_then(forward_meta),
+        forum_title: None,
     })
 }
 
@@ -973,6 +1000,7 @@ pub fn timeline_item(
             let bundled_link_previews = bundled_link_previews(raw.message());
             let link_previews_removed = link_previews_removed(raw.message());
             let forwarded = forwarded(event, &raw);
+            let forum_title = forum_title(raw.message());
 
             TimelineItemView {
                 id,
@@ -989,21 +1017,16 @@ pub fn timeline_item(
                 in_reply_to: in_reply_to(event.content()),
                 thread_root: msg_like(event.content()).and_then(|msg| msg.thread_root.clone()),
                 thread_summary: thread_summary(event.content()),
-                reactions: if event
-                    .original_json()
-                    .is_none_or(crate::reactions::can_annotate)
-                {
-                    reactions(event.reactions())
-                } else {
-                    Vec::new()
-                },
+                reactions: annotatable_reactions(event),
                 is_own: event.is_own(),
                 read_by: event.read_receipts().keys().cloned().collect(),
+                read_timestamps: read_timestamps(event),
                 per_message_profile: message_profile,
                 bundled_link_previews,
                 link_previews_removed,
                 mention,
                 forwarded,
+                forum_title,
             }
         }
 
@@ -1035,14 +1058,35 @@ pub fn timeline_item(
                 reactions: Vec::new(),
                 is_own: false,
                 read_by: Vec::new(),
+                read_timestamps: BTreeMap::new(),
                 per_message_profile: None,
                 bundled_link_previews: Vec::new(),
                 link_previews_removed: None,
                 mention: MentionView::None,
                 forwarded: None,
+                forum_title: None,
             }
         }
     }
+}
+
+fn annotatable_reactions(event: &EventTimelineItem) -> Vec<ReactionGroup> {
+    if event
+        .original_json()
+        .is_none_or(crate::reactions::can_annotate)
+    {
+        reactions(event.reactions())
+    } else {
+        Vec::new()
+    }
+}
+
+fn read_timestamps(event: &EventTimelineItem) -> BTreeMap<String, u64> {
+    event
+        .read_receipts()
+        .iter()
+        .filter_map(|(user_id, receipt)| receipt.ts.map(|ts| (user_id.to_string(), ts.0.into())))
+        .collect()
 }
 
 fn send_state(state: &EventSendState) -> SendStateView {
@@ -1504,7 +1548,10 @@ fn audio_waveform(audio: &AudioMessageEventContent) -> Option<Vec<f32>> {
             .iter()
             .map(|amplitude| {
                 let value = u64::from(amplitude.get());
-                #[allow(clippy::cast_precision_loss)]
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "lossy conversion is display-only"
+                )]
                 let normalised = value as f32 / f32::from(UnstableAmplitude::MAX);
                 normalised
             })
@@ -1617,6 +1664,7 @@ pub(crate) const CALL_MEMBER_TYPE: &str = "org.matrix.msc3401.call.member";
 pub(crate) const CALL_TYPE: &str = "org.matrix.msc3401.call";
 
 pub(crate) const FORUM_ROOM_TYPE: &str = "pl.chrome.forum";
+pub(crate) const FORUM_TITLE: &str = "moe.sable.forum.title";
 
 pub(crate) const RTC_SLOT_TYPE: &str = "org.matrix.msc4143.rtc.slot";
 
@@ -1645,12 +1693,12 @@ pub(crate) fn audio_metadata(content: Option<&serde_json::Value>) -> Option<Audi
         title: text("title", AUDIO_METADATA_MAX_CHARS),
         artist: text("artist", AUDIO_METADATA_MAX_CHARS),
         album: text("album", AUDIO_METADATA_MAX_CHARS),
-        cover_art: text("cover_art", BLURHASH_MAX_CHARS),
+        cover_art_blurhash: text("cover_art_blurhash", BLURHASH_MAX_CHARS),
     };
     (view.title.is_some()
         || view.artist.is_some()
         || view.album.is_some()
-        || view.cover_art.is_some())
+        || view.cover_art_blurhash.is_some())
     .then_some(view)
 }
 
@@ -1720,6 +1768,11 @@ fn forward_meta(content: &serde_json::Value) -> Option<ForwardedView> {
     })
 }
 
+fn forum_title(content: Option<&serde_json::Value>) -> Option<String> {
+    let title = content?.get(FORUM_TITLE)?.as_str()?.trim();
+    (!title.is_empty()).then(|| title.to_owned())
+}
+
 fn link_previews_removed(content: Option<&serde_json::Value>) -> Option<bool> {
     content?
         .get(crate::dispatch::BUNDLED_LINK_PREVIEWS)?
@@ -1755,6 +1808,10 @@ fn bundled_link_previews(content: Option<&serde_json::Value>) -> Vec<UrlPreviewV
                         image_mime: text("og:image:type").map(ToOwned::to_owned),
                         image_width: dimension("og:image:width"),
                         image_height: dimension("og:image:height"),
+                        video: crate::dispatch::preview_video(bundle),
+                        theme_color: crate::dispatch::preview_theme_color(bundle),
+                        card: crate::dispatch::preview_card(bundle),
+                        author_name: text(crate::dispatch::PREVIEW_AUTHOR).map(ToOwned::to_owned),
                     })
                 })
                 .filter(|preview| seen.insert(preview.url.clone()))
@@ -2116,7 +2173,6 @@ fn thread_summary(content: &TimelineItemContent) -> Option<ThreadSummaryView> {
     })
 }
 
-// Standalone thread roots lack timeline thread state, so read the server's bundled summary.
 fn bundled_thread_summary(unsigned: &serde_json::Value) -> Option<ThreadSummaryView> {
     let summary = unsigned.pointer("/m.relations/m.thread")?;
     let count = u32::try_from(summary.get("count")?.as_u64()?).ok()?;
@@ -2156,11 +2212,6 @@ fn reply_preview_body(content: &TimelineItemContent) -> Option<String> {
             MsgLikeKind::Poll(state) => Some(state.results().question),
             _ => None,
         },
-        TimelineItemContent::MembershipChange(_) | TimelineItemContent::ProfileChange(_) => {
-            Some("m.room.member".to_owned())
-        }
-        TimelineItemContent::OtherState(state) => Some(state.content().event_type().to_string()),
-        TimelineItemContent::FailedToParseState { event_type, .. } => Some(event_type.to_string()),
         _ => None,
     }
 }
@@ -2436,7 +2487,7 @@ mod tests {
         let unstable = audio_metadata(Some(&json!({"info": {
             "org.matrix.msc4549.audio_metadata": {
                 "title": " Moonwalker ", "artist": "Jake Chudnow", "album": "",
-                "cover_art": "LBEpAr~VM{x[004:oyM|9GM|xtIU"
+                "cover_art_blurhash": "LBEpAr~VM{x[004:oyM|9GM|xtIU"
             }
         }})))
         .expect("metadata");
@@ -2444,7 +2495,7 @@ mod tests {
         assert_eq!(unstable.artist.as_deref(), Some("Jake Chudnow"));
         assert_eq!(unstable.album, None);
         assert_eq!(
-            unstable.cover_art.as_deref(),
+            unstable.cover_art_blurhash.as_deref(),
             Some("LBEpAr~VM{x[004:oyM|9GM|xtIU")
         );
 
@@ -2516,6 +2567,15 @@ mod tests {
         );
         let serialized = serde_json::to_value(view).unwrap();
         assert_eq!(serialized["kind"], "call_invite");
+    }
+
+    #[test]
+    fn reads_the_forum_title_and_ignores_blank_ones() {
+        let titled = json!({ "body": "x", super::FORUM_TITLE: "  Rules  " });
+        assert_eq!(super::forum_title(Some(&titled)).as_deref(), Some("Rules"));
+        let blank = json!({ "body": "x", super::FORUM_TITLE: "   " });
+        assert_eq!(super::forum_title(Some(&blank)), None);
+        assert_eq!(super::forum_title(Some(&json!({ "body": "x" }))), None);
     }
 
     #[test]

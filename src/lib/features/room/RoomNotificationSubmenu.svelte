@@ -6,9 +6,12 @@
   import { useCoreClient } from '#lib/core/context.js';
   import { settingsChanges } from '#lib/features/notifications/notifications.svelte.js';
   import { i18n } from '#lib/i18n.js';
+  import { isQuiet, setQuiet } from '#lib/rooms/quiet-rooms.svelte.js';
   import { useRoomList } from '#lib/rooms/room-list.svelte.js';
+  import { preferences } from '#lib/settings/preferences.svelte.js';
   import ActionMenuItem from '#lib/ui/primitives/ActionMenuItem.svelte';
   import ActionMenuSub from '#lib/ui/primitives/ActionMenuSub.svelte';
+  import { toasts } from '#lib/ui/toasts.svelte.js';
 
   interface Props {
     roomId: string;
@@ -19,10 +22,11 @@
   const core = useCoreClient();
   const roomList = useRoomList();
 
-  const modes: readonly { mode: NotificationModeView | null; label: string }[] = [
+  const modes: readonly { mode: NotificationModeView | null; label: string; quiet?: boolean }[] = [
     { mode: null, label: 'room.notifyDefault' },
     { mode: 'all', label: 'room.notifyAll' },
     { mode: 'mentions', label: 'room.notifyMentions' },
+    { mode: 'mentions', label: 'room.notifyMentionsQuiet', quiet: true },
     { mode: 'mute', label: 'room.notifyMute' },
   ];
   const modeLabels: Record<NotificationModeView, string> = {
@@ -33,7 +37,15 @@
 
   let mode = $state<NotificationModeView | null | undefined>();
   let fallback = $state<NotificationModeView>('mentions');
-  let defaultLabel = $derived($i18n.t(modeLabels[fallback]));
+  let defaultQuiet = $derived(
+    fallback === 'mentions' &&
+      (roomList.byId(roomId)?.is_direct
+        ? preferences.badgeDefaultDirect
+        : preferences.badgeDefaultGroup) === 'quiet'
+  );
+  let defaultLabel = $derived(
+    $i18n.t(defaultQuiet ? 'room.notifyMentionsQuiet' : modeLabels[fallback])
+  );
 
   $effect(() => {
     void settingsChanges.version;
@@ -50,7 +62,9 @@
     }
   }
 
-  function select(next: NotificationModeView | null): void {
+  function select(next: NotificationModeView | null, quiet = false): void {
+    if (quiet) setQuiet(roomId, true);
+    else if (mode === 'mentions' && isQuiet(roomId)) setQuiet(roomId, false);
     mode = next;
     void core.commands.setRoomNotificationMode(roomId, next).then(
       () => {
@@ -58,6 +72,7 @@
       },
       (error: unknown) => {
         console.warn('[sable room] notification mode failed', error);
+        toasts.error($i18n.t('errors.actionFailed'));
         void read();
       }
     );
@@ -70,12 +85,13 @@
     {$i18n.t('room.menuNotifications')}
   {/snippet}
   <IconContext values={{ 'aria-hidden': 'true' }}>
-    {#each modes as option (option.mode ?? 'default')}
-      {@const selected = mode === option.mode}
+    {#each modes as option (option.label)}
+      {@const selected =
+        mode === option.mode && (mode !== 'mentions' || !!option.quiet === isQuiet(roomId))}
       <ActionMenuItem
         checked={selected}
         onSelect={() => {
-          select(option.mode);
+          select(option.mode, option.quiet);
         }}
       >
         <span class="menu-check" aria-hidden="true">{selected ? '✓' : ''}</span>

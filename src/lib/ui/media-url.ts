@@ -1,27 +1,31 @@
 import QuickLRU from 'quick-lru';
 
 import { CoreError } from '#src/transport';
+import { mediaFailureHold } from '#lib/ui/media-retry.js';
 import type { CoreClient } from '#lib/core/client.svelte.js';
 import type { CoreCommands } from '#lib/core/commands.svelte.js';
 
 /* Not `SvelteMap`: callers read the cache from inside an effect, so a reactive
    miss re-runs every waiting media element each time any other one resolves. */
-type CachedMediaUrl = { url: string; bytes: number; ratio: number | undefined };
+type CachedMediaUrl = {
+  url: string;
+  bytes: number;
+  ratio: number | undefined;
+  type: string;
+};
 
 const objectUrls = new Map<string, CachedMediaUrl>();
 const pending = new Map<string, Promise<string>>();
 const holds = new Map<string, number>();
 const displaced = new Map<string, string[]>();
-/* Keep small previews across virtualized rows; the byte cap bounds blob memory.
-   Held entries are exempt from both limits. */
 const MAX_OBJECT_URLS = 512;
 const MAX_OBJECT_URL_BYTES = 32 * 1024 * 1024;
 const MAX_MEDIA_METADATA = 512;
-const MEDIA_FAILURE_TTL_MS = 30_000;
+const MEDIA_FAILURE_MEMORY_MS = 30 * 60_000;
 /* A deadline, not a verdict: `Unavailable` covers a blip as well as a 404. */
-const unavailable = new QuickLRU<string, true>({
+const failures = new QuickLRU<string, { count: number; until: number }>({
   maxSize: MAX_MEDIA_METADATA,
-  maxAge: MEDIA_FAILURE_TTL_MS,
+  maxAge: MEDIA_FAILURE_MEMORY_MS,
 });
 /* Not cleared by a retry: the core already knows the server is failing. */
 const refused = new QuickLRU<string, true>({ maxSize: MAX_MEDIA_METADATA });
@@ -29,13 +33,22 @@ const aspectRatios = new QuickLRU<string, number>({ maxSize: MAX_MEDIA_METADATA 
 let objectUrlBytes = 0;
 let evictQueued = false;
 
+function recordFailure(key: string): void {
+  const count = (failures.get(key)?.count ?? 0) + 1;
+  failures.set(key, { count, until: Date.now() + mediaFailureHold(count) });
+}
+
+function isHeld(key: string): boolean {
+  const failure = failures.get(key);
+  return failure !== undefined && Date.now() < failure.until;
+}
+
 function cacheKey(
   accountId: string | undefined,
   source: string,
   width: number,
   height: number
 ): string {
-  // Encrypted media always returns the original file, regardless of display size.
   if (isEncryptedMedia(source) || width === 0 || height === 0) {
     width = 0;
     height = 0;
@@ -147,6 +160,15 @@ export function cachedMediaUrl(
   return objectUrls.get(cacheKey(core.session?.account_id, source, width, height))?.url;
 }
 
+export function cachedMediaType(
+  core: Pick<CoreClient, 'session'>,
+  source: string,
+  width: number,
+  height: number
+): string | undefined {
+  return objectUrls.get(cacheKey(core.session?.account_id, source, width, height))?.type;
+}
+
 export function discardMediaUrl(
   core: Pick<CoreClient, 'session'>,
   source: string,
@@ -160,7 +182,7 @@ export function discardMediaUrl(
   URL.revokeObjectURL(cached.url);
   objectUrls.delete(key);
   objectUrlBytes -= cached.bytes;
-  unavailable.set(key, true);
+  recordFailure(key);
 }
 
 /**
@@ -180,42 +202,48 @@ export function loadMediaUrl(
   mime?: string | null
 ): Promise<string> {
   const key = cacheKey(core.session?.account_id, source, width, height);
-  if (unavailable.has(key) || refused.has(key)) {
+  if (isHeld(key) || refused.has(key)) {
     return Promise.reject(new Error('Media unavailable'));
   }
-  const request =
-    pending.get(key) ??
-    core.commands
-      .fetchMedia(source, width, height)
-      .then((bytes) => {
-        const type = mime ?? imageMime(bytes) ?? '';
-        const blob = new Blob([bytes], { type });
-        const publish = (): string => {
-          const objectUrl = URL.createObjectURL(blob);
-          const previous = objectUrls.get(key);
-          if (previous !== undefined) {
-            objectUrlBytes -= previous.bytes;
-            if (holds.has(key)) displaced.set(key, [...(displaced.get(key) ?? []), previous.url]);
-            else URL.revokeObjectURL(previous.url);
-          }
-          objectUrls.set(key, { url: objectUrl, bytes: blob.size, ratio: aspectRatios.get(key) });
-          objectUrlBytes += blob.size;
-          evict(key);
-          return objectUrl;
-        };
-        const measuring = measure(key, type, blob);
-        return measuring === null ? publish() : measuring.then(publish);
-      })
-      .finally(() => {
-        pending.delete(key);
-      });
+  const joined = pending.get(key);
+  if (joined !== undefined) return joined;
+  const request = core.commands
+    .fetchMedia(source, width, height)
+    .then((bytes) => {
+      const type = mime ?? imageMime(bytes) ?? '';
+      const blob = new Blob([bytes], { type });
+      const publish = (): string => {
+        const objectUrl = URL.createObjectURL(blob);
+        const previous = objectUrls.get(key);
+        if (previous !== undefined) {
+          objectUrlBytes -= previous.bytes;
+          if (holds.has(key)) displaced.set(key, [...(displaced.get(key) ?? []), previous.url]);
+          else URL.revokeObjectURL(previous.url);
+        }
+        objectUrls.set(key, {
+          url: objectUrl,
+          bytes: blob.size,
+          ratio: aspectRatios.get(key),
+          type,
+        });
+        objectUrlBytes += blob.size;
+        failures.delete(key);
+        evict(key);
+        return objectUrl;
+      };
+      const measuring = measure(key, type, blob);
+      return measuring === null ? publish() : measuring.then(publish);
+    })
+    .finally(() => {
+      pending.delete(key);
+    });
   pending.set(key, request);
   void request.catch((error: unknown) => {
     if (error instanceof CoreError && error.detail.code === 'media_server_unavailable') {
       refused.set(key, true, { maxAge: error.detail.retry_after_ms });
       return;
     }
-    unavailable.set(key, true);
+    recordFailure(key);
   });
   return request;
 }
@@ -228,8 +256,8 @@ export function retryMediaUrl(
   mime?: string | null
 ): Promise<string> {
   const prefix = `${core.session?.account_id ?? ''}:${source}:`;
-  for (const key of [...unavailable.keys()]) {
-    if (key.startsWith(prefix)) unavailable.delete(key);
+  for (const key of [...failures.keys()]) {
+    if (key.startsWith(prefix)) failures.delete(key);
   }
   return loadMediaUrl(core, source, width, height, mime);
 }

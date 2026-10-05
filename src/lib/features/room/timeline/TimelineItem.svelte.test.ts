@@ -27,6 +27,10 @@ const core = Object.assign(baseCore, {
       image_mime: null,
       image_width: null,
       image_height: null,
+      video: null,
+      theme_color: null,
+      card: null,
+      author_name: null,
     })
   ),
 });
@@ -52,13 +56,15 @@ vi.mock('#lib/rooms/presence.svelte.js', async () => {
   const actual = await vi.importActual<typeof import('#lib/rooms/presence.svelte.js')>(
     '#lib/rooms/presence.svelte.js'
   );
-  return { ...actual, usePresenceStore: () => ({ get: () => null }) };
+  return { ...actual, usePresenceStore: () => ({ get: () => null, peek: () => null }) };
 });
 
 import { preferences, setPreference } from '#lib/settings/preferences.svelte.js';
 
 import TimelineItemHarness from './TimelineItemHarness.test.svelte';
 import { senderColor } from './timeline-format';
+import { FOUNDER_POWER_LEVEL, powerTag } from '../members/power-tags';
+import { parsePowerLevelTags, tagForLevel } from '../settings/power-level-tags';
 
 const user = userEvent.setup({ delay: null });
 
@@ -84,6 +90,7 @@ afterEach(() => {
   document.body.replaceChildren();
   setPreference('replyPreviewStyle', 'connected');
   setPreference('showPronouns', true);
+  setPreference('showRoleTooltip', false);
   setPreference('showPronounPills', true);
   core.userProfile.mockReset();
   core.userProfile.mockRejectedValue(new Error('profile unavailable'));
@@ -106,11 +113,13 @@ function item(emote: boolean): TimelineItemView {
     reactions: [],
     is_own: false,
     read_by: [],
+    read_timestamps: {},
     per_message_profile: null,
     bundled_link_previews: [],
     link_previews_removed: null,
     mention: 'none',
     forwarded: null,
+    forum_title: null,
   };
 }
 
@@ -273,7 +282,7 @@ test("shows the sender's role icon after their name", async () => {
     props: {
       core,
       item: { item: item(false), collapsed: false },
-      roles: { '@alice:example.org': { icon: '🛡️', color: null } },
+      roles: { '@alice:example.org': { icon: '🛡️', name: 'Moderator', color: null } },
     },
   });
   await tick();
@@ -281,6 +290,48 @@ test("shows the sender's role icon after their name", async () => {
   const icon = document.querySelector('header .role-tag-icon');
   expect(icon?.textContent).toBe('🛡️');
   expect(icon?.previousElementSibling?.classList.contains('sender-identity')).toBe(true);
+});
+
+test('shows the role name on hover only when the setting is on', async () => {
+  setPreference('showRoleTooltip', true);
+  render(TimelineItemHarness, {
+    props: {
+      core,
+      item: { item: item(false), collapsed: false },
+      roles: { '@alice:example.org': { icon: '🛡️', name: 'Moderator', color: null } },
+    },
+  });
+  await tick();
+
+  const role = document.querySelector('header .sender-role');
+  if (role) await userEvent.hover(role);
+  expect(await screen.findByText('Moderator', {}, { timeout: 2000 })).toBeTruthy();
+});
+
+test('displays saved founder flair on a message', async () => {
+  core.userProfile.mockResolvedValue({ name_color_light: null, name_color_dark: null });
+  const tags = parsePowerLevelTags({
+    [FOUNDER_POWER_LEVEL]: { name: 'Founder', color: '#c04040', icon: { key: '👑' } },
+  });
+  render(TimelineItemHarness, {
+    props: {
+      core,
+      item: { item: item(false), collapsed: false },
+      roles: {
+        '@alice:example.org': {
+          icon: tagForLevel(tags, FOUNDER_POWER_LEVEL)?.icon ?? null,
+          name: 'Founder',
+          color: powerTag(FOUNDER_POWER_LEVEL, (key) => key, tags).color,
+        },
+      },
+    },
+  });
+  await tick();
+
+  expect(document.querySelector('header .role-tag-icon')?.textContent).toBe('👑');
+  const message = document.querySelector<HTMLElement>('.message');
+  expect(message?.style.getPropertyValue('--name-color-on-light')).toBe('#b8383a');
+  expect(message?.style.getPropertyValue('--name-color-on-dark')).toBe('#ee6a65');
 });
 
 test('reads an emote as one sentence, with the name only in the action', async () => {
@@ -319,7 +370,7 @@ test('badges a message with its own readers, and only in that placement', async 
   await tick();
 
   const badge = document.querySelector('.read-receipt-stack');
-  expect(badge?.getAttribute('title')).toBe('Bob');
+  expect(badge?.querySelector('[aria-label="Bob"]')).not.toBeNull();
 
   setPreference('readReceiptPlacement', 'room');
   await tick();
@@ -662,7 +713,7 @@ test('falls back to the role colour when the sender profile has none', async () 
     props: {
       core,
       item: { item: item(false), collapsed: false },
-      roles: { '@alice:example.org': { icon: null, color: '#c04040' } },
+      roles: { '@alice:example.org': { icon: null, name: null, color: '#c04040' } },
     },
   });
   await tick();
@@ -693,7 +744,11 @@ test.each(['connected', 'compact', 'expanded'] as const)(
     expect(name?.classList.contains('tinted')).toBe(true);
     expect(name?.style.getPropertyValue('--name-color-on-light')).toBe('#2244aa');
     expect(name?.style.getPropertyValue('--name-color-on-dark')).toBe('#88aaff');
-    expect(core.userProfile).toHaveBeenCalledWith('@bob:example.org');
+    expect(core.userProfile).toHaveBeenCalledWith(
+      '@bob:example.org',
+      false,
+      expect.any(AbortSignal)
+    );
   }
 );
 
@@ -766,11 +821,7 @@ test('a per-message profile takes the sender position and names the account behi
   const viaButton = via?.querySelector<HTMLButtonElement>('.name-button');
   if (!viaButton) throw new Error('the account behind the persona was not a button');
   await press(viaButton);
-  expect(onSenderProfile).toHaveBeenCalledWith(
-    '@alice:example.org',
-    viaButton,
-    persona.per_message_profile
-  );
+  expect(onSenderProfile).toHaveBeenCalledWith('@alice:example.org', viaButton);
 });
 
 test('without a persona the hover-only via keeps the account MXID', async () => {
@@ -1452,6 +1503,10 @@ test('a message whose embeds were removed renders none, bundled or found', async
         image_mime: null,
         image_width: null,
         image_height: null,
+        video: null,
+        theme_color: null,
+        card: null,
+        author_name: null,
       },
     ],
     link_previews_removed: true,
@@ -1476,4 +1531,33 @@ test('compact layout shows the time alone and keeps the full date in the title (
   const time = document.querySelector('.compact-gutter time');
   expect(time).toHaveTextContent(/^\d{1,2}:\d{2}/);
   expect(time?.getAttribute('title')).toContain(String(new Date(lastWeek.timestamp).getFullYear()));
+});
+
+test('quotes a reply to a membership event as its timeline text', async () => {
+  const target: TimelineItemView = {
+    ...item(false),
+    id: 'member',
+    event_id: '$original',
+    content: {
+      kind: 'membership',
+      user_id: '@nex:example.org',
+      change: 'left',
+      display_name: 'nex',
+      reason: null,
+    },
+  };
+  const base = replyItem('');
+  const reply: TimelineItemView = {
+    ...base,
+    in_reply_to: base.in_reply_to && { ...base.in_reply_to, body: null },
+  };
+  render(TimelineItemHarness, {
+    props: {
+      core,
+      item: { item: reply, collapsed: false, events: { get: () => target } as never },
+    },
+  });
+  await tick();
+
+  expect(document.querySelector('.reply-body')?.textContent).toBe('nex left the room');
 });

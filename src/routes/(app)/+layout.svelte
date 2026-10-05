@@ -5,7 +5,6 @@
   import { on } from 'svelte/events';
   import { page } from '$app/state';
   import AppShell from '#lib/ui/AppShell.svelte';
-  import InboxPanel from '#lib/features/inbox/InboxPanel.svelte';
   import SettingsPanel from '#lib/features/settings/SettingsPanel.svelte';
   import { followSettingsLink } from '#lib/features/settings/settings-navigation.js';
   import { BREAKPOINTS } from '#lib/ui/breakpoints.js';
@@ -26,8 +25,10 @@
   import { dismissedInvites } from '#lib/rooms/dismissed-invites.svelte.js';
   import { endSystemCall, fulfillSystemAnswer } from '#lib/platform/calls.js';
   import { profileOverrides } from '#lib/profile/profile-overrides.svelte.js';
+  import { supporter } from '#lib/supporter/supporter.svelte.js';
   import { PresenceStore, providePresenceStore } from '#lib/rooms/presence.svelte.js';
   import { goto } from '$app/navigation';
+  import { afterOverlayPops } from '#lib/platform/overlay-back.svelte.js';
   import { resolve } from '$app/paths';
   import { i18n } from '#lib/i18n.js';
   import Button from '#lib/ui/primitives/Button.svelte';
@@ -235,10 +236,11 @@
     return incomingCalls.start();
   });
 
-  function acceptIncoming(call: IncomingCall): void {
+  async function acceptIncoming(call: IncomingCall): Promise<void> {
     incomingCalls.accept(call);
-    void goto(roomSectionPath(roomList.rooms, call.roomId));
     void callSession.join(call.roomId, { microphone: true, camera: call.hasVideo });
+    await afterOverlayPops();
+    await goto(roomSectionPath(roomList.rooms, call.roomId));
   }
 
   function answerFromNotification(
@@ -732,6 +734,7 @@
     dismissedInvites.start(core);
     mediaPreviewSettings.start(core);
     profileOverrides.start(core);
+    supporter.start(core);
     return () => {
       roomList.stop();
       spaceSidebar.stop();
@@ -740,6 +743,7 @@
       dismissedInvites.stop();
       mediaPreviewSettings.stop();
       profileOverrides.stop();
+      supporter.stop();
     };
   });
 
@@ -970,9 +974,6 @@
         section={page.state.settings.section}
         focus={page.state.settings.focus}
       />
-    {/if}
-    {#if page.state.inbox}
-      <InboxPanel />
     {/if}
     <CommandPalette bind:open={paletteState.open} />
     <ShortcutsHelpDialog bind:open={shortcutsHelpState.open} />

@@ -4,6 +4,7 @@ import type {
   ImageSourcePackReferenceView,
   MessageKind,
   PerMessageProfileView,
+  PersonaView,
   TimelineItemView,
   UrlPreviewView,
 } from '#src/generated/protocol';
@@ -36,6 +37,7 @@ import {
 } from '#lib/personas/persona.js';
 import type { PersonaStore } from '#lib/personas/personas.svelte.js';
 import type { RoomTimeline } from '#lib/rooms/timeline.svelte.js';
+import { stateEventText } from '#lib/features/room/timeline/state-event-text.js';
 import { isMessageRow } from '#lib/features/room/timeline/timeline-format.js';
 import { preferences } from '#lib/settings/preferences.svelte.js';
 
@@ -48,6 +50,7 @@ export type ConversationDeps = {
   personas: PersonaStore;
   timeline: RoomTimeline;
   roomId: () => string;
+  spaceIds?: (roomId: string) => readonly string[];
   encrypted?: () => boolean | null;
   beforeSend?: () => Promise<void>;
   threadRoot?: string | null;
@@ -62,11 +65,13 @@ function failed(action: string): (error: unknown) => void {
 export class Conversation {
   context = $state<ComposerContext | null>(null);
   scheduledRevision = $state(0);
+  forumTitle = $state('');
 
   readonly #core: CoreClient;
   readonly #personas: PersonaStore;
   readonly #timeline: RoomTimeline;
   readonly #roomId: () => string;
+  readonly #spaceIds: (roomId: string) => readonly string[];
   readonly #encrypted: () => boolean | null;
   readonly #threadRoot: string | null;
   readonly #beforeSend: () => Promise<void>;
@@ -78,6 +83,7 @@ export class Conversation {
     personas,
     timeline,
     roomId,
+    spaceIds = () => [],
     encrypted,
     beforeSend = () => Promise.resolve(),
     threadRoot = null,
@@ -86,6 +92,7 @@ export class Conversation {
     this.#personas = personas;
     this.#timeline = timeline;
     this.#roomId = roomId;
+    this.#spaceIds = spaceIds;
     this.#encrypted = encrypted ?? (() => null);
     this.#threadRoot = threadRoot;
     this.#beforeSend = beforeSend;
@@ -114,7 +121,7 @@ export class Conversation {
     imageSourcePacks: ImageSourcePackReferenceView[] = []
   ): Promise<ConversationSendResult | undefined> => {
     const pending = this.context;
-    if (body === '') return;
+    if (body === '' && !(pending?.kind === 'edit' && pending.mediaCaption)) return;
 
     if (pending?.kind === 'edit') {
       const edited = this.#timeline.items.find(
@@ -135,9 +142,11 @@ export class Conversation {
           kind: editedKind(edited),
           mediaCaption: pending.mediaCaption,
           threadRoot: this.#threadRoot,
-          persona: edited?.per_message_profile ?? null,
+          persona: pending.persona ?? null,
+          forumTitle: this.forumTitle,
         }
       );
+      this.forumTitle = '';
       this.context = null;
       return;
     }
@@ -170,6 +179,7 @@ export class Conversation {
       outcome.body,
       untouched ? (outcome.formatted ?? formatted) : (outcome.formatted ?? null)
     );
+    if (outgoing.body === '') return;
     const linkPreviews = await this.#bundledLinkPreviews(outgoing.formatted);
     await this.#core.commands.sendMessage(targetRoomId, outgoing.body, {
       inReplyTo: pending?.eventId ?? null,
@@ -181,7 +191,9 @@ export class Conversation {
       persona: outgoing.persona,
       linkPreviews,
       imageSourcePacks,
+      forumTitle: this.#threadRoot === null && !pending?.eventId ? this.forumTitle : null,
     });
+    this.forumTitle = '';
     this.context = null;
   };
 
@@ -209,14 +221,20 @@ export class Conversation {
     options: SendAttachmentOptions = {}
   ): Promise<void> => {
     await this.#beforeSend();
-    const persona = this.#personaFor(targetRoomId, '', null).persona;
+    const outgoing = this.#personaFor(
+      targetRoomId,
+      options.caption ?? '',
+      options.formattedCaption ?? null
+    );
     const reply = this.#consumeReply();
     await this.#core.commands.sendAttachment(targetRoomId, file, {
       ...options,
+      caption: options.caption == null ? options.caption : outgoing.body,
+      formattedCaption: outgoing.formatted,
       inReplyTo: reply?.eventId ?? null,
       silentReply: reply?.silentReply ?? options.silentReply ?? false,
       threadRoot: this.#threadRoot,
-      persona,
+      persona: outgoing.persona,
     });
   };
 
@@ -443,7 +461,8 @@ export class Conversation {
       eventId,
       key,
       this.#threadRoot,
-      mine ? null : sourcePack
+      mine ? null : sourcePack,
+      this.#timeline.subscriptionId
     );
   }
 
@@ -477,7 +496,7 @@ export class Conversation {
       eventId,
       sender: item.per_message_profile?.display_name ?? item.sender_name ?? item.sender,
       silentReply: item.sender === this.#core.session?.user_id || !preferences.mentionInReplies,
-      body: version?.body ?? replyPreviewBody(item.content),
+      body: version?.body ?? (replyPreviewBody(item.content) || stateEventText(item, t)),
       html: version?.html ?? (item.content.kind === 'message' ? item.content.html : null),
     };
   };
@@ -486,6 +505,15 @@ export class Conversation {
     if (eventId === null) this.context = null;
     else if (this.context?.kind !== 'reply' || this.context.eventId !== eventId)
       this.reply(eventId);
+  };
+
+  readonly setEditPersona = (persona: PersonaView | null): void => {
+    const pending = this.context;
+    if (pending?.kind !== 'edit') return;
+    this.context = {
+      ...pending,
+      persona: persona ? projectPersona(persona, preferences.personaFallback) : null,
+    };
   };
 
   readonly toggleSilentReply = (): void => {
@@ -503,7 +531,16 @@ export class Conversation {
     const item = this.#timeline.items.find(
       (entry) => entry.event_id === eventId || entry.transaction_id === eventId
     );
-    this.context = { kind: 'edit', eventId, timelineItemId: item?.id, body, html, mediaCaption };
+    this.forumTitle = item?.forum_title ?? '';
+    this.context = {
+      kind: 'edit',
+      eventId,
+      timelineItemId: item?.id,
+      body,
+      html,
+      mediaCaption,
+      persona: item?.per_message_profile ?? null,
+    };
   };
 
   #editTimelineItem(item: TimelineItemView, itemId: string): boolean {
@@ -605,12 +642,12 @@ export class Conversation {
     formatted: string | null
   ): { body: string; formatted: string | null; persona: PerMessageProfileView | null } {
     const personas = this.#personas;
-    if (personas.disabledIn(targetRoomId)) return { body, formatted, persona: null };
     const proxied = preferences.personaProxying ? resolveProxy(personas.personas, body) : undefined;
     const persona = resolvePersona({
       personas: personas.personas,
       proxied: proxied?.persona,
-      room: personas.selectionFor(targetRoomId) ?? undefined,
+      room: personas.associationFor(targetRoomId),
+      spaces: this.#spaceIds(targetRoomId).map((id) => personas.associationFor(id)),
       account: personas.selectionFor(null) ?? undefined,
       now: Date.now(),
     });

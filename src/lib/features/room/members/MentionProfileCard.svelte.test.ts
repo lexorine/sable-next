@@ -47,7 +47,7 @@ vi.mock('#lib/rooms/presence.svelte.js', async () => {
   const actual = await vi.importActual<typeof import('#lib/rooms/presence.svelte.js')>(
     '#lib/rooms/presence.svelte.js'
   );
-  return { ...actual, usePresenceStore: () => ({ get: () => null }) };
+  return { ...actual, usePresenceStore: () => ({ get: () => null, peek: () => null }) };
 });
 
 import { preferences } from '#lib/settings/preferences.svelte.js';
@@ -70,6 +70,7 @@ const emptyProfile: ProfileView = {
   name_color_dark: null,
   animal: null,
   extra: [],
+  supporter_awards: null,
   legacy_fields: [],
 };
 

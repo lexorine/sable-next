@@ -1,5 +1,4 @@
 import { createContext } from 'svelte';
-import { SvelteMap } from 'svelte/reactivity';
 import type { CoreEvent, PronounView, SenderCosmeticsView } from '#src/generated/protocol';
 
 import type { CoreCommands } from '#lib/core/commands.svelte.js';
@@ -14,14 +13,31 @@ export interface SenderCosmetics {
 interface CosmeticsCore {
   commands: Pick<CoreCommands, 'roomCosmetics'>;
   subscribeEvents: (onEvent: (event: CoreEvent) => void) => () => void;
+  userProfile?: (userId: string) => Promise<ProfileIdentity | null>;
 }
 
+export interface ShownIdentity {
+  name: string | null;
+  avatar: string | null;
+}
+
+interface ProfileIdentity {
+  display_name: string | null;
+  avatar_url: string | null;
+}
+
+const PROFILE_LOAD_ATTEMPTS = 4;
+const PROFILE_RETRY_MS = 2000;
+
 export class RoomCosmetics {
-  readonly #users = new SvelteMap<string, SenderCosmeticsView>();
+  /* eslint-disable svelte/prefer-svelte-reactivity */
+  #users = $state.raw(new Map<string, SenderCosmeticsView>());
   #spaceId = $state.raw<string | null>(null);
+  #profiles = $state.raw(new Map<string, ProfileIdentity>());
   #roomId: string | null = null;
   #requestedSpace: string | null = null;
   #generation = 0;
+  #wanted = new Set<string>();
 
   constructor(private readonly core: CosmeticsCore) {}
 
@@ -38,7 +54,7 @@ export class RoomCosmetics {
 
   async load(roomId: string, spaceId: string | null): Promise<void> {
     if (this.#roomId !== roomId) {
-      this.#users.clear();
+      this.#users = new Map();
       this.#spaceId = null;
     }
     this.#roomId = roomId;
@@ -53,16 +69,66 @@ export class RoomCosmetics {
     try {
       const found = await this.core.commands.roomCosmetics(roomId, this.#requestedSpace);
       if (generation !== this.#generation) return;
-      this.#users.clear();
-      for (const user of found.users) this.#users.set(user.user_id, user);
+      this.#users = new Map(found.users.map((user) => [user.user_id, user]));
       this.#spaceId = found.space_id;
     } catch (error) {
       console.debug('[sable room] cosmetics unavailable', error);
     }
   }
 
+  #want(userId: string): void {
+    if (this.#wanted.has(userId) || !this.core.userProfile) return;
+    this.#wanted.add(userId);
+    const generation = this.#generation;
+    queueMicrotask(() => {
+      void this.#loadProfile(userId, generation);
+    });
+  }
+
+  async #loadProfile(userId: string, generation: number): Promise<void> {
+    try {
+      for (let attempt = 0; attempt < PROFILE_LOAD_ATTEMPTS; attempt += 1) {
+        if (attempt > 0) {
+          await new Promise((resolve) => setTimeout(resolve, PROFILE_RETRY_MS * attempt));
+        }
+        if (generation !== this.#generation) return;
+        const profile = await this.core.userProfile?.(userId).catch(() => null);
+        if (generation !== this.#generation) return;
+        if (profile) {
+          const profiles = new Map(this.#profiles);
+          profiles.set(userId, profile);
+          this.#profiles = profiles;
+          return;
+        }
+      }
+    } finally {
+      this.#wanted.delete(userId);
+    }
+  }
+  /* eslint-enable svelte/prefer-svelte-reactivity */
+
   stored(userId: string | null | undefined): SenderCosmeticsView | undefined {
     return userId ? this.#users.get(userId) : undefined;
+  }
+
+  identity(userId: string | null | undefined, own: ShownIdentity): ShownIdentity {
+    const found = this.stored(userId);
+    if (!userId || !found) return own;
+    const profile = this.#profiles.get(userId);
+    if (!profile) {
+      if (found.space_display_name !== null || found.space_avatar_url !== null) this.#want(userId);
+      return own;
+    }
+    return {
+      name:
+        found.space_display_name !== null && own.name === profile.display_name
+          ? found.space_display_name
+          : own.name,
+      avatar:
+        found.space_avatar_url !== null && own.avatar === profile.avatar_url
+          ? found.space_avatar_url
+          : own.avatar,
+    };
   }
 
   for(userId: string | null | undefined): SenderCosmetics | null {

@@ -21,6 +21,7 @@ vi.mock('#lib/rooms/room-list.svelte.js', () => ({
 import {
   backToRoomList,
   contextSearchPath,
+  goToPage,
   leaveRoomView,
   scopedSearchPath,
   searchInRoom,
@@ -46,21 +47,21 @@ test.each([
   ['/space/space/room', { spaceId: '!space' }, '/space/param:!space'],
   ['/space/space/room', {}, '/rooms'],
   ['/rooms/room', {}, '/rooms'],
-])('leaving %s returns to its section', (pathname, params, expected) => {
+])('leaving %s returns to its section', async (pathname, params, expected) => {
   page.url = new URL(`https://app.test${pathname}`);
   page.params = params;
 
-  leaveRoomView();
+  await leaveRoomView();
 
   expect(goto).toHaveBeenCalledWith(expected);
 });
 
-test('leaving a space room on desktop opens the lobby rather than the index', () => {
+test('leaving a space room on desktop opens the lobby rather than the index', async () => {
   vi.stubGlobal('window', { matchMedia: () => ({ matches: true }) });
   page.url = new URL('https://app.test/space/space/room');
   page.params = { spaceId: '!space' };
 
-  leaveRoomView();
+  await leaveRoomView();
 
   expect(goto).toHaveBeenCalledWith('/space/param:!space/lobby');
 });
@@ -102,22 +103,22 @@ test('searching from a room scopes to it, from a space to the space, and elsewhe
   expect(contextSearchPath(rooms, undefined, undefined)).toBe('/search');
 });
 
-test('a room opened from its list goes back through history, so the back gesture animates', () => {
+test('a room opened from its list goes back through history, so the back gesture animates', async () => {
   page.url = new URL('https://app.test/rooms/room');
   enter('/rooms');
 
-  leaveRoomView();
+  await leaveRoomView();
 
   expect(mocks.back).toHaveBeenCalledOnce();
   expect(goto).not.toHaveBeenCalled();
 });
 
-test('a room reached by going back, or from elsewhere, navigates to its list', () => {
+test('a room reached by going back, or from elsewhere, navigates to its list', async () => {
   page.url = new URL('https://app.test/rooms/room');
   enter('/rooms', 'popstate', -1);
-  leaveRoomView();
+  await leaveRoomView();
   enter('/search');
-  leaveRoomView();
+  await leaveRoomView();
 
   expect(mocks.back).not.toHaveBeenCalled();
   expect(goto).toHaveBeenCalledTimes(2);
@@ -132,6 +133,31 @@ test('the back arrow on a phone opens the drawer over the room rather than leavi
   expect(mocks.back).not.toHaveBeenCalled();
   expect(goto).toHaveBeenCalledExactlyOnceWith('', {
     shallow: true,
+    replace: true,
     state: { mobileDrawer: 'open' },
   });
+});
+
+test.each([
+  ['/rooms/other', true],
+  ['/direct/other', true],
+  ['/space/space/other', true],
+  ['/space/space/lobby', false],
+  ['/rooms', false],
+])('on a phone, opening %s from a room replaces the entry: %s', (href, replaced) => {
+  page.url = new URL('https://app.test/rooms/room');
+  page.params = { roomId: 'room' };
+
+  goToPage(href);
+
+  expect(goto).toHaveBeenLastCalledWith(href, { replace: replaced });
+});
+
+test('on a phone, opening a room from the room list pushes', () => {
+  page.url = new URL('https://app.test/rooms');
+  page.params = {};
+
+  goToPage('/rooms/other');
+
+  expect(goto).toHaveBeenLastCalledWith('/rooms/other', { replace: false });
 });

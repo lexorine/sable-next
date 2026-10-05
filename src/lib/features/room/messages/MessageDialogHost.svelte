@@ -40,6 +40,7 @@
     members?: readonly MemberView[];
     currentUserId?: string | null;
     readers?: (item: TimelineItemView) => readonly string[];
+    receiptTimestamps?: (item: TimelineItemView) => Readonly<Record<string, number>>;
     canRedactOwn?: boolean;
     canRedactOthers?: boolean;
     onMatrixLink?: (link: MatrixLink, anchor: HTMLAnchorElement) => void;
@@ -65,6 +66,7 @@
     members = [],
     currentUserId = null,
     readers = (item) => item.read_by,
+    receiptTimestamps = (item) => item.read_timestamps,
     canRedactOwn = true,
     canRedactOthers = false,
     onMatrixLink,
@@ -203,14 +205,19 @@
       bind:open={() => true, setOpen}
       active={entry.active}
       reactions={item.reactions}
+      eventId={item.event_id}
       {roomId}
       {members}
+      {currentUserId}
+      {canRedactOwn}
+      {canRedactOthers}
       onMemberProfile={onSenderProfile}
     />
   {:else if entry.kind === 'receipts'}
     <ReceiptsDialog
       bind:open={() => true, setOpen}
       readers={readers(item).filter((readerId) => readerId !== currentUserId)}
+      timestamps={receiptTimestamps(item)}
       {members}
       onMemberProfile={onSenderProfile}
     />

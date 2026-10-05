@@ -10,6 +10,7 @@ use matrix_sdk::ruma::{OwnedDeviceId, OwnedRoomId, OwnedUserId, TransactionId};
 use matrix_sdk::{Client, Room};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{Mutex, Notify};
 
 use super::keys::{self, KeyDistributor, Rolled};
@@ -248,6 +249,9 @@ async fn discover(
             tracing::warn!("sticky call membership sync is unavailable");
         }
     }
+    for event in sticky::live_events(room) {
+        sticky_members.apply(&event, keys::now_ms());
+    }
     let slot_closed = sticky_sync.is_some() && super::slot_closed(room).await;
     let mut members = membership::active_members(room).await;
     if !slot_closed {
@@ -266,18 +270,10 @@ async fn discover(
     };
     let mode = select_mode(requested, &members, sticky_sync.is_some())?;
     members.sort_by_key(|member| member.created_ts);
-    let focus_members = if mode == CallMode::Legacy {
-        members.as_slice()
-    } else {
-        &[]
-    };
-    let service = match core.resolve_focus(focus_members, configured, room).await {
-        Some(service) => service,
-        None => core
-            .resolve_focus(&members, None, room)
-            .await
-            .ok_or(CommandErr::NoCallFocus)?,
-    };
+    let service = core
+        .resolve_focus(&members, configured, room)
+        .await
+        .ok_or(CommandErr::NoCallFocus)?;
     let member_id = if mode == CallMode::Matrix2 {
         TransactionId::new().to_string()
     } else {
@@ -414,7 +410,11 @@ async fn publish_elsewhere(
         return None;
     }
     let moved = CallMember {
-        mode: CallMode::Compatibility,
+        mode: if own.mode == CallMode::Legacy {
+            CallMode::Compatibility
+        } else {
+            own.mode
+        },
         foci: vec![service.clone()],
         ..own.clone()
     };
@@ -422,7 +422,18 @@ async fn publish_elsewhere(
         tracing::warn!(%error, "could not move the call membership to our own focus");
         return None;
     }
-    match sfu::provision(room, &service, &moved.device_id).await {
+    let provisioned = if moved.mode == CallMode::Matrix2 {
+        sfu::provision_matrix2(
+            room,
+            &service,
+            &moved.device_id,
+            moved.member_id.as_deref().unwrap_or(&moved.identity),
+        )
+        .await
+    } else {
+        sfu::provision(room, &service, &moved.device_id).await
+    };
+    match provisioned {
         Ok(provision) if provision.identity == moved.identity && provision.can_publish => {
             Some((moved, provision))
         }
@@ -448,7 +459,6 @@ async fn publish_where_allowed(
     let service = own.foci.first().cloned().ok_or(CommandErr::NoCallFocus)?;
     let mut published = publish(core, room, &own, &service, encrypted, intent).await?;
     if !published.provision.can_publish
-        && own.mode == CallMode::Legacy
         && let Some((moved, provision)) =
             publish_elsewhere(core, room, &own, configured, intent).await
     {
@@ -456,12 +466,7 @@ async fn publish_where_allowed(
         published.provision = provision;
     }
     if !published.provision.can_publish {
-        drop(published.postpone);
-        retract(core, room, &own, published.delay).await;
-        return Err(core.failed(
-            "join_call",
-            "the call's focus does not let this account publish",
-        ));
+        tracing::warn!("no focus lets this account publish, joining listen-only");
     }
     state.lock().await.own = own.clone();
     Ok((own, published))
@@ -629,6 +634,7 @@ pub(super) async fn join(
         identity: provision.identity,
         encrypt_media,
         mode,
+        can_publish: provision.can_publish,
         publisher_id,
         backends,
     })
@@ -771,6 +777,7 @@ async fn provision_missing(
             &service,
             &own.device_id,
             own.member_id.as_deref().unwrap_or(&own.identity),
+            own.mode == CallMode::Matrix2,
         )
         .await
         {
@@ -1083,11 +1090,17 @@ fn updates(
 ) -> crate::Task {
     spawn(async move {
         let mut renewed = keys::now_ms();
+        let mut sdk_sticky = room.sticky_events().subscribe();
+        let mut sdk_sticky_open = true;
         loop {
             if let Some(sync) = sync.as_mut() {
                 let synced = tokio::select! {
                     synced = sync.sync(&room, UPDATE_INTERVAL) => Some(synced),
                     () = wake.notified() => None,
+                    update = sdk_sticky.recv(), if sdk_sticky_open => {
+                        sdk_sticky_open = !matches!(update, Err(RecvError::Closed));
+                        None
+                    }
                 };
                 match synced {
                     Some(Ok(events)) => {
@@ -1113,6 +1126,15 @@ fn updates(
                 tokio::select! {
                     () = matrix_sdk::sleep::sleep(UPDATE_INTERVAL) => {}
                     () = wake.notified() => {}
+                    update = sdk_sticky.recv(), if sdk_sticky_open => {
+                        sdk_sticky_open = !matches!(update, Err(RecvError::Closed));
+                    }
+                }
+            }
+            {
+                let mut state = state.lock().await;
+                for event in sticky::live_events(&room) {
+                    state.sticky.apply(&event, keys::now_ms());
                 }
             }
             if core.session_generation.load(Ordering::SeqCst) != generation {

@@ -963,6 +963,258 @@ test('failed profile lookups cool down across repeated timeline mounts and retry
   }
 });
 
+test('a profile change drops the cached profile and tells listeners once', async () => {
+  vi.useFakeTimers();
+  const fake = fakeTransport();
+  const core = createCoreClient(() => fake.transport);
+  fake.send
+    .mockResolvedValueOnce({ profile: { display_name: 'old' } })
+    .mockResolvedValueOnce({ profile: { display_name: 'new' } });
+  const listener = vi.fn();
+  try {
+    core.onProfileChanged(listener);
+    await core.userProfile('@remote:example.org');
+    await core.userProfile('@remote:example.org');
+    expect(fake.send).toHaveBeenCalledTimes(1);
+
+    const change = { type: 'profile_changed', user_id: '@remote:example.org' } as CoreEvent;
+    fake.emit(change);
+    fake.emit(change);
+    expect(listener).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(listener).toHaveBeenCalledExactlyOnceWith('@remote:example.org');
+
+    await expect(core.userProfile('@remote:example.org')).resolves.toEqual({
+      display_name: 'new',
+    });
+  } finally {
+    core.stop();
+    vi.useRealTimers();
+  }
+});
+
+test('a lookup in flight when the profile changes does not refill the cache', async () => {
+  vi.useFakeTimers();
+  const fake = fakeTransport();
+  const core = createCoreClient(() => fake.transport);
+  fake.send
+    .mockResolvedValueOnce({ profile: { display_name: 'stale' } })
+    .mockResolvedValueOnce({ profile: { display_name: 'fresh' } });
+  try {
+    const stale = core.userProfile('@remote:example.org');
+    fake.emit({ type: 'profile_changed', user_id: '@remote:example.org' });
+    await vi.advanceTimersByTimeAsync(0);
+    await stale;
+    const fresh = core.userProfile('@remote:example.org');
+    await vi.advanceTimersByTimeAsync(150);
+    await expect(fresh).resolves.toEqual({ display_name: 'fresh' });
+  } finally {
+    core.stop();
+    vi.useRealTimers();
+  }
+});
+
+test('profile lookups run a bounded number at a time', async () => {
+  vi.useFakeTimers();
+  const fake = fakeTransport();
+  const core = createCoreClient(() => fake.transport);
+  const release: (() => void)[] = [];
+  fake.send.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        release.push(() => {
+          resolve({ profile: {} });
+        });
+      })
+  );
+  try {
+    const lookups = Array.from({ length: 26 }, (_, index) =>
+      core.userProfile(`@user${index}:example.org`)
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fake.send).toHaveBeenCalledTimes(24);
+    for (const resolve of release.splice(0)) resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fake.send).toHaveBeenCalledTimes(26);
+    for (const resolve of release.splice(0)) resolve();
+    await Promise.all(lookups);
+  } finally {
+    core.stop();
+    vi.useRealTimers();
+  }
+});
+
+test('the newest queued profile lookup runs first', async () => {
+  vi.useFakeTimers();
+  const fake = fakeTransport();
+  const core = createCoreClient(() => fake.transport);
+  const release: (() => void)[] = [];
+  fake.send.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        release.push(() => {
+          resolve({ profile: {} });
+        });
+      })
+  );
+  try {
+    for (let index = 0; index < 24; index += 1) void core.userProfile(`@old${index}:example.org`);
+    void core.userProfile('@older:example.org');
+    void core.userProfile('@newest:example.org');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fake.send).toHaveBeenCalledTimes(24);
+    release.shift()?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fake.send).toHaveBeenCalledTimes(25);
+    expect(fake.send.mock.calls[24]?.[0]).toMatchObject({ user_id: '@newest:example.org' });
+  } finally {
+    core.stop();
+    vi.useRealTimers();
+  }
+});
+
+test('a cancelled queued profile lookup is never sent', async () => {
+  vi.useFakeTimers();
+  const fake = fakeTransport();
+  const core = createCoreClient(() => fake.transport);
+  const release: (() => void)[] = [];
+  fake.send.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        release.push(() => {
+          resolve({ profile: {} });
+        });
+      })
+  );
+  try {
+    for (let index = 0; index < 24; index += 1) void core.userProfile(`@busy${index}:example.org`);
+    const cancelled = new AbortController();
+    const kept = new AbortController();
+    const first = core.userProfile('@shared:example.org', false, cancelled.signal);
+    const second = core.userProfile('@shared:example.org', false, kept.signal);
+    const alone = new AbortController();
+    const lonely = core.userProfile('@alone:example.org', false, alone.signal);
+    await vi.advanceTimersByTimeAsync(0);
+    cancelled.abort();
+    alone.abort();
+    await expect(first).rejects.toMatchObject({ name: 'AbortError' });
+    await expect(lonely).rejects.toMatchObject({ name: 'AbortError' });
+    for (const resolve of release.splice(0)) resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    const requested = fake.send.mock.calls.map(
+      ([command]) => (command as unknown as { user_id: string }).user_id
+    );
+    expect(requested).toContain('@shared:example.org');
+    expect(requested).not.toContain('@alone:example.org');
+    for (const resolve of release.splice(0)) resolve();
+    await expect(second).resolves.toEqual({});
+  } finally {
+    core.stop();
+    vi.useRealTimers();
+  }
+});
+
+test('an urgent profile lookup skips the queue', async () => {
+  vi.useFakeTimers();
+  const fake = fakeTransport();
+  const core = createCoreClient(() => fake.transport);
+  fake.send.mockImplementation(() => new Promise(() => {}));
+  try {
+    for (let index = 0; index < 26; index += 1) void core.userProfile(`@user${index}:example.org`);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fake.send).toHaveBeenCalledTimes(24);
+    void core.userProfile('@card:example.org', true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fake.send).toHaveBeenCalledTimes(25);
+  } finally {
+    core.stop();
+    vi.useRealTimers();
+  }
+});
+
+test('a rate-limited profile lookup waits out the hint and retries', async () => {
+  vi.useFakeTimers();
+  const fake = fakeTransport();
+  const core = createCoreClient(() => fake.transport);
+  fake.send
+    .mockRejectedValueOnce(new CoreError({ code: 'rate_limited', retry_after_ms: 1000 }))
+    .mockResolvedValueOnce({ profile: { user_id: '@remote:example.org' } });
+  try {
+    const lookup = core.userProfile('@remote:example.org');
+    await vi.advanceTimersByTimeAsync(999);
+    expect(fake.send).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(lookup).resolves.toEqual({ user_id: '@remote:example.org' });
+    expect(fake.send).toHaveBeenCalledTimes(2);
+  } finally {
+    core.stop();
+    vi.useRealTimers();
+  }
+});
+
+test('a profile lookup that stayed rate limited is not remembered as failed', async () => {
+  vi.useFakeTimers();
+  const fake = fakeTransport();
+  const core = createCoreClient(() => fake.transport);
+  const limited = new CoreError({ code: 'rate_limited', retry_after_ms: 1000 });
+  fake.send
+    .mockRejectedValueOnce(limited)
+    .mockRejectedValueOnce(limited)
+    .mockResolvedValueOnce({ profile: { user_id: '@remote:example.org' } });
+  try {
+    const first = core.userProfile('@remote:example.org');
+    const failed = expect(first).rejects.toBe(limited);
+    await vi.advanceTimersByTimeAsync(5000);
+    await failed;
+    await expect(core.userProfile('@remote:example.org')).resolves.toEqual({
+      user_id: '@remote:example.org',
+    });
+  } finally {
+    core.stop();
+    vi.useRealTimers();
+  }
+});
+
+test('a rate limit without a hint pauses every lookup for a second', async () => {
+  vi.useFakeTimers();
+  const fake = fakeTransport();
+  const core = createCoreClient(() => fake.transport);
+  fake.send
+    .mockRejectedValueOnce(new CoreError({ code: 'rate_limited', retry_after_ms: null }))
+    .mockResolvedValue({ profile: {} });
+  try {
+    const first = core.userProfile('@a:example.org');
+    await vi.advanceTimersByTimeAsync(0);
+    const second = core.userProfile('@b:example.org');
+    await vi.advanceTimersByTimeAsync(999);
+    expect(fake.send).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await Promise.all([first, second]);
+    expect(fake.send).toHaveBeenCalledTimes(3);
+  } finally {
+    core.stop();
+    vi.useRealTimers();
+  }
+});
+
+test('a rate-limit hint longer than 30s is capped', async () => {
+  vi.useFakeTimers();
+  const fake = fakeTransport();
+  const core = createCoreClient(() => fake.transport);
+  fake.send
+    .mockRejectedValueOnce(new CoreError({ code: 'rate_limited', retry_after_ms: 3_600_000 }))
+    .mockResolvedValueOnce({ profile: {} });
+  try {
+    const lookup = core.userProfile('@remote:example.org');
+    await vi.advanceTimersByTimeAsync(30_000);
+    await lookup;
+    expect(fake.send).toHaveBeenCalledTimes(2);
+  } finally {
+    core.stop();
+    vi.useRealTimers();
+  }
+});
+
 test('a sign-in the core cannot reach but the page can blames the local network', async () => {
   localNetwork.gated = true;
   vi.stubGlobal(
@@ -1098,4 +1350,44 @@ test('a stale login callback that fails does not discard the first status read',
   expect(core.deviceList).toEqual([device]);
   expect(core.status).toBe('ready');
   core.stop();
+});
+
+test('refreshing a profile skips the cached copy and refills it', async () => {
+  const fake = fakeTransport();
+  const core = createCoreClient(() => fake.transport);
+  fake.send
+    .mockResolvedValueOnce({ profile: { display_name: 'stale' } })
+    .mockResolvedValueOnce({ profile: { display_name: 'live' } });
+  try {
+    await core.userProfile('@remote:example.org');
+    await expect(core.refreshUserProfile('@remote:example.org')).resolves.toEqual({
+      display_name: 'live',
+    });
+    await expect(core.userProfile('@remote:example.org')).resolves.toEqual({
+      display_name: 'live',
+    });
+    expect(fake.send).toHaveBeenCalledTimes(2);
+  } finally {
+    core.stop();
+  }
+});
+
+test('writing a profile field invalidates the cached profile', async () => {
+  vi.useFakeTimers();
+  const fake = fakeTransport({ restore: { session }, list_accounts: { accounts: [session] } });
+  const core = createCoreClient(() => fake.transport);
+  const listener = vi.fn();
+  try {
+    await core.start();
+    core.onProfileChanged(listener);
+    await core.userProfile(session.user_id);
+    await core.setProfileField('displayname', 'new');
+    await vi.advanceTimersByTimeAsync(500);
+    expect(listener).toHaveBeenCalledExactlyOnceWith(session.user_id);
+    await core.userProfile(session.user_id);
+    expect(fake.sent.filter((command) => command.type === 'user_profile')).toHaveLength(2);
+  } finally {
+    core.stop();
+    vi.useRealTimers();
+  }
 });

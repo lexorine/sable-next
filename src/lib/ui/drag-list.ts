@@ -36,6 +36,7 @@ export function dropInstructionAt(
 
 export interface DropTargetOptions<T> {
   allowInto?: boolean;
+  axis?: 'vertical' | 'horizontal';
   onState: (state: DropState<T> | null) => void;
   onDrop: (source: T, target: T, instruction: DropInstruction) => void;
 }
@@ -50,6 +51,7 @@ export function createDragList<T>(equals: (left: T, right: T) => boolean): DragL
   let dragged: T | null = null;
   let hovered: T | null = null;
   let stopDocumentEnd: (() => void) | null = null;
+  let finishDrag: (() => void) | null = null;
 
   return {
     draggable(item, onDragging) {
@@ -57,17 +59,26 @@ export function createDragList<T>(equals: (left: T, right: T) => boolean): DragL
         const start = (event: DragEvent): void => {
           dragged = item;
           stopDocumentEnd?.();
-          stopDocumentEnd = on(document, 'dragend', end, { capture: true });
+          stopDocumentEnd = listen(
+            on(document, 'dragend', end, { capture: true }),
+            on(document, 'pointermove', resumed, { capture: true })
+          );
+          finishDrag = end;
           onDragging(item);
           event.dataTransfer?.setData('text/plain', '');
           event.dataTransfer?.setData(REORDER_DRAG_TYPE, '');
           if (event.dataTransfer !== null) event.dataTransfer.effectAllowed = 'move';
+        };
+        const resumed = (event: Event): void => {
+          if (event instanceof PointerEvent && event.buttons !== 0) return;
+          end();
         };
         const end = (): void => {
           if (dragged === null || !equals(dragged, item)) return;
 
           stopDocumentEnd?.();
           stopDocumentEnd = null;
+          finishDrag = null;
           dragged = null;
           hovered = null;
           onDragging(null);
@@ -84,23 +95,29 @@ export function createDragList<T>(equals: (left: T, right: T) => boolean): DragL
       };
     },
 
-    dropTarget(item, { allowInto = false, onState, onDrop }) {
+    dropTarget(item, { allowInto = false, axis = 'vertical', onState, onDrop }) {
       return (node) => {
-        const instructionAt = (clientY: number): DropInstruction => {
+        const instructionAt = (event: DragEvent): DropInstruction => {
           const box = node.getBoundingClientRect();
-
-          return dropInstructionAt(clientY - box.top, box.height, allowInto);
+          if (axis === 'horizontal') {
+            return dropInstructionAt(event.clientX - box.left, box.width, allowInto);
+          }
+          return dropInstructionAt(event.clientY - box.top, box.height, allowInto);
         };
 
         const over = (event: DragEvent): void => {
-          if (dragged === null || equals(dragged, item)) return;
+          if (dragged === null) return;
 
           event.preventDefault();
+          if (equals(dragged, item)) {
+            event.stopPropagation();
+            return;
+          }
           event.stopPropagation();
           if (event.dataTransfer !== null) event.dataTransfer.dropEffect = 'move';
 
           hovered = item;
-          onState({ item, instruction: instructionAt(event.clientY) });
+          onState({ item, instruction: instructionAt(event) });
         };
 
         const leave = (): void => {
@@ -112,13 +129,14 @@ export function createDragList<T>(equals: (left: T, right: T) => boolean): DragL
 
         const drop = (event: DragEvent): void => {
           const source = dragged;
-          if (source === null || equals(source, item)) return;
+          if (source === null) return;
 
           event.preventDefault();
           event.stopPropagation();
           hovered = null;
           onState(null);
-          onDrop(source, item, instructionAt(event.clientY));
+          if (!equals(source, item)) onDrop(source, item, instructionAt(event));
+          finishDrag?.();
         };
 
         return listen(

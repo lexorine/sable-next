@@ -33,6 +33,7 @@ use matrix_sdk::ruma::events::room::message::{
 use matrix_sdk::ruma::events::{
     AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent, Mentions,
     SyncMessageLikeEvent, room::redaction::SyncRoomRedactionEvent,
+    sticker::OriginalSyncStickerEvent,
 };
 use matrix_sdk::ruma::room_version_rules::RedactionRules;
 use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId};
@@ -53,6 +54,8 @@ const BODY_FIELD_COUNT: usize = 1;
 const BODY_FIELD_BOOST: [f64; BODY_FIELD_COUNT] = [1.0];
 const EVENTS_PER_INGEST_YIELD: usize = 16;
 const DOCUMENTS_PER_RESTORE_YIELD: usize = 256;
+const INGEST_WAIT: Duration = Duration::from_millis(25);
+const INGEST_WAIT_ATTEMPTS: usize = 200;
 const RETIRED_KEYS_BEFORE_VACUUM: usize = 64;
 
 const MEMORY_BUDGET: usize = 64 * 1024 * 1024;
@@ -368,6 +371,7 @@ struct RoomIndex {
     pending_redactions: HashSet<OwnedEventId>,
     pending_edits: HashMap<OwnedEventId, Document>,
     floor: u64,
+    rederive_from: u64,
 }
 
 impl RoomIndex {
@@ -403,6 +407,7 @@ impl RoomIndex {
             pending_redactions: HashSet::new(),
             pending_edits: HashMap::new(),
             floor: 0,
+            rederive_from: 0,
         }
     }
 
@@ -412,6 +417,7 @@ impl RoomIndex {
             loaded,
             legacy,
         } = restored;
+        let stale = manifest.derived < persist::DERIVATION;
         let documents = loaded
             .iter()
             .map(|(_, stored)| stored.documents.len())
@@ -478,7 +484,13 @@ impl RoomIndex {
         if legacy {
             misplaced.extend(index.chunks.values().copied());
         }
-        index.dirty = !misplaced.is_empty()
+        index.rederive_from = if stale {
+            now_ms().saturating_sub(crawl::CRAWL_MAX_AGE_MS).max(1)
+        } else {
+            manifest.rederive_from
+        };
+        index.dirty = stale
+            || !misplaced.is_empty()
             || !index.pending_redactions.is_empty()
             || !index.pending_edits.is_empty();
         index.dirty_chunks = misplaced;
@@ -710,6 +722,7 @@ impl RoomIndex {
                 .collect(),
             self.floor,
         );
+        manifest.rederive_from = self.rederive_from;
         manifest.pending_redactions = self.pending_redactions.iter().cloned().collect();
         manifest.pending_edits = self.pending_edits.values().cloned().collect();
 
@@ -1296,6 +1309,7 @@ impl MessageIndex {
                         start: *start,
                         room_id: room_id.clone(),
                         chunk: *chunk,
+                        skip: 0,
                     })
             })
             .collect();
@@ -1303,6 +1317,10 @@ impl MessageIndex {
         queue
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one sequential scan kept in a single function"
+    )]
     fn scan_cold(
         &self,
         room_id: &OwnedRoomId,
@@ -1310,10 +1328,15 @@ impl MessageIndex {
         query: &str,
         filter: &SearchFilter,
         terms: &FoldedTerms,
-        context: usize,
-    ) -> Vec<Hit> {
+        window: ColdWindow,
+    ) -> (Vec<Hit>, usize) {
+        let ColdWindow {
+            skip,
+            take,
+            context,
+        } = window;
         let Some(index) = self.rooms.get(room_id) else {
-            return Vec::new();
+            return (Vec::new(), 0);
         };
         let mut documents: Vec<Document> = stored
             .documents
@@ -1333,7 +1356,7 @@ impl MessageIndex {
             document.folded = document.body.to_lowercase();
         }
 
-        let matched: Vec<(usize, f64)> = if query.is_empty() {
+        let mut matched: Vec<(usize, f64)> = if query.is_empty() {
             documents
                 .iter()
                 .enumerate()
@@ -1368,6 +1391,20 @@ impl MessageIndex {
                 .collect()
         };
 
+        matched.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    let id = |position: &usize| {
+                        documents.get(*position).map(|document| &document.event_id)
+                    };
+                    id(&left.0).cmp(&id(&right.0))
+                })
+        });
+        let total = matched.len();
+
         let line = |document: &Document| {
             (!document.body.is_empty() && !filter.not_senders.contains(&document.sender)).then(
                 || ContextLine {
@@ -1378,8 +1415,10 @@ impl MessageIndex {
                 },
             )
         };
-        matched
+        let hits = matched
             .into_iter()
+            .skip(skip)
+            .take(take)
             .filter_map(|(position, score)| {
                 let document = documents.get(position)?;
                 let mut before: Vec<ContextLine> = documents
@@ -1409,7 +1448,8 @@ impl MessageIndex {
                     after,
                 })
             })
-            .collect()
+            .collect();
+        (hits, total)
     }
 
     fn materialize(&self, ranked: Vec<Ranked<'_>>) -> Vec<Hit> {
@@ -1473,13 +1513,36 @@ impl MessageIndex {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(crate) async fn ingest(
         &mut self,
         room_id: &OwnedRoomId,
         events: Vec<TimelineEvent>,
         cache: &RoomEventCache,
         rules: &RedactionRules,
+    ) -> usize {
+        self.ingest_with(room_id, events, cache, rules, false).await
+    }
+
+    pub(super) fn finish_rederive(&mut self, room_id: &OwnedRoomId) {
+        if let Some(index) = self.rooms.get_mut(room_id)
+            && index.rederive_from != 0
+        {
+            index.rederive_from = 0;
+            index.dirty = true;
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one sequential flow kept in a single function"
+    )]
+    pub(super) async fn ingest_with(
+        &mut self,
+        room_id: &OwnedRoomId,
+        events: Vec<TimelineEvent>,
+        cache: &RoomEventCache,
+        rules: &RedactionRules,
+        rederive: bool,
     ) -> usize {
         self.rooms
             .entry(room_id.clone())
@@ -1502,7 +1565,12 @@ impl MessageIndex {
                 continue;
             };
 
-            if index.already_classified(event_id) {
+            let rederiving = rederive
+                && index.rederive_from != 0
+                && event
+                    .timestamp_raw()
+                    .is_some_and(|ts| u64::from(ts.get()) >= index.rederive_from);
+            if index.already_classified(event_id) && !rederiving {
                 continue;
             }
             fresh += 1;
@@ -1531,6 +1599,15 @@ impl MessageIndex {
             if let Some(document) = poll_start_document(&message) {
                 if !index.redacted.contains(&document.event_id) {
                     index.upsert(document);
+                }
+                continue;
+            }
+
+            if let AnySyncMessageLikeEvent::Sticker(SyncMessageLikeEvent::Original(sticker)) =
+                &message
+            {
+                if !index.redacted.contains(&sticker.event_id) {
+                    index.upsert(sticker_document(sticker));
                 }
                 continue;
             }
@@ -1608,6 +1685,7 @@ struct OlderCursor {
     start: u64,
     room_id: OwnedRoomId,
     chunk: ChunkId,
+    skip: usize,
 }
 
 impl OlderCursor {
@@ -1620,19 +1698,42 @@ impl OlderCursor {
     }
 
     fn encode(&self) -> String {
-        format!("{}:{}:{}", self.start, self.chunk, self.room_id)
+        format!(
+            "{}:{}:{}:{}",
+            self.start, self.chunk, self.skip, self.room_id
+        )
     }
 
     fn decode(cursor: &str) -> Option<Self> {
-        let mut parts = cursor.splitn(3, ':');
+        let mut parts = cursor.splitn(4, ':');
         let start = parts.next()?.parse().ok()?;
         let chunk = parts.next()?.parse().ok()?;
+        let skip = parts.next()?.parse().ok()?;
         let room_id = OwnedRoomId::try_from(parts.next()?).ok()?;
         Some(Self {
             start,
             room_id,
             chunk,
+            skip,
         })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ColdWindow {
+    skip: usize,
+    take: usize,
+    context: usize,
+}
+
+impl ColdWindow {
+    #[cfg(test)]
+    const fn all(context: usize) -> Self {
+        Self {
+            skip: 0,
+            take: usize::MAX,
+            context,
+        }
     }
 }
 
@@ -2022,13 +2123,23 @@ fn indexable_body(body: &str) -> String {
 
 fn message_text(msgtype: &MessageType) -> String {
     let body = indexable_body(msgtype.body());
-    let MessageType::Gallery(gallery) = msgtype else {
-        return body;
+    let filenames = match msgtype {
+        MessageType::Gallery(gallery) => crate::view::gallery_filenames(gallery),
+        MessageType::Image(image) => vec![image.filename()],
+        MessageType::Video(video) => vec![video.filename()],
+        MessageType::Audio(audio) => vec![audio.filename()],
+        MessageType::File(file) => vec![file.filename()],
+        _ => return body,
     };
     std::iter::once(body.as_str())
-        .chain(crate::view::gallery_filenames(gallery))
+        .chain(filenames)
         .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
+        .fold(Vec::<&str>::new(), |mut lines, text| {
+            if !lines.contains(&text) {
+                lines.push(text);
+            }
+            lines
+        })
         .join("\n")
 }
 
@@ -2104,6 +2215,17 @@ fn poll_start_document(message: &AnySyncMessageLikeEvent) -> Option<Document> {
         }
         _ => None,
     }
+}
+
+fn sticker_document(sticker: &OriginalSyncStickerEvent) -> Document {
+    let mut document = poll_document(
+        sticker.event_id.clone(),
+        sticker.sender.clone(),
+        sticker.origin_server_ts.get().into(),
+        std::iter::once(sticker.content.body.as_str()),
+    );
+    document.attachments = Vec::new();
+    document
 }
 
 fn poll_document<'text>(
@@ -2404,9 +2526,13 @@ impl Core {
         for _ in 0..COLD_CHUNKS_PER_PAGE {
             let queue = self.search_index.lock().await.cold_queue(&filter);
             let mut remaining = queue.into_iter().filter(|candidate| {
-                after.as_ref().is_none_or(|after| {
-                    OlderCursor::order(after, candidate) == std::cmp::Ordering::Less
-                })
+                after
+                    .as_ref()
+                    .is_none_or(|after| match OlderCursor::order(after, candidate) {
+                        std::cmp::Ordering::Less => true,
+                        std::cmp::Ordering::Equal => after.skip > 0,
+                        std::cmp::Ordering::Greater => false,
+                    })
             });
             let Some(position) = remaining.next() else {
                 next = None;
@@ -2419,14 +2545,36 @@ impl Core {
                     persist::StoredChunk::new(Vec::new(), Vec::new())
                 }
             };
-            hits.extend(self.search_index.lock().await.scan_cold(
+            let skip = after
+                .as_ref()
+                .filter(|after| OlderCursor::order(after, &position) == std::cmp::Ordering::Equal)
+                .map_or(0, |after| after.skip);
+            let room = limit.saturating_sub(hits.len()).max(1);
+            let (found, total) = self.search_index.lock().await.scan_cold(
                 &position.room_id,
                 &stored,
                 query,
                 &filter,
                 &terms,
-                context,
-            ));
+                ColdWindow {
+                    skip,
+                    take: room,
+                    context,
+                },
+            );
+            let consumed = skip + room;
+            if consumed < total {
+                hits.extend(found);
+                next = Some(
+                    OlderCursor {
+                        skip: consumed,
+                        ..position
+                    }
+                    .encode(),
+                );
+                break;
+            }
+            hits.extend(found);
             next = remaining.next().map(|_| position.encode());
             after = Some(position);
             if next.is_none()
@@ -2514,8 +2662,14 @@ impl Core {
         let mut opened = Vec::new();
         for room_id in rooms {
             match persist::open(client, &room_id).await {
-                persist::Opened::Manifest(manifest) => opened.push((room_id, manifest)),
+                persist::Opened::Manifest(manifest) => {
+                    if manifest.derived < persist::DERIVATION {
+                        self.search_crawl.lock().await.discard(room_id.clone());
+                    }
+                    opened.push((room_id, manifest));
+                }
                 persist::Opened::Legacy(restored) => {
+                    self.search_crawl.lock().await.discard(room_id.clone());
                     self.search_index
                         .lock()
                         .await
@@ -2780,7 +2934,13 @@ impl Core {
         );
     }
 
-    #[cfg_attr(not(target_family = "wasm"), allow(unused_variables))]
+    #[cfg_attr(
+        not(target_family = "wasm"),
+        expect(
+            unused_variables,
+            reason = "only the WASM build reads the index handle"
+        )
+    )]
     pub(crate) fn watch_search_index(
         self: &Arc<Self>,
         client: &matrix_sdk::Client,
@@ -2835,6 +2995,12 @@ impl Core {
         use tokio::sync::broadcast::error::TryRecvError;
 
         let room_id = room.room_id().to_owned();
+        for _ in 0..INGEST_WAIT_ATTEMPTS {
+            if !self.search_crawl.lock().await.is_ingesting(&room_id) {
+                break;
+            }
+            matrix_sdk::sleep::sleep(INGEST_WAIT).await;
+        }
         if self.search_crawl.lock().await.is_ingesting(&room_id) {
             return;
         }
@@ -2875,7 +3041,6 @@ impl Core {
 }
 
 #[cfg(test)]
-#[allow(clippy::large_futures)]
 mod tests {
     use matrix_sdk::ruma::room_version_rules::RedactionRules;
     use matrix_sdk::ruma::{
@@ -3024,6 +3189,49 @@ mod tests {
         ));
 
         (index, room)
+    }
+
+    #[test]
+    fn a_sticker_is_searchable_by_its_description() {
+        let sticker: super::OriginalSyncStickerEvent = serde_json::from_value(json!({
+            "type": "m.sticker",
+            "event_id": "$sticker:localhost",
+            "sender": "@ginger:localhost",
+            "origin_server_ts": 1,
+            "content": {
+                "body": "moai",
+                "info": {},
+                "url": "mxc://localhost/moai"
+            }
+        }))
+        .unwrap();
+
+        let document = super::sticker_document(&sticker);
+        assert_eq!(document.body, "moai");
+        assert!(document.attachments.is_empty());
+    }
+
+    #[test]
+    fn single_media_is_searchable_by_its_filename() {
+        use matrix_sdk::ruma::{
+            OwnedMxcUri,
+            events::room::message::{
+                FileMessageEventContent, ImageMessageEventContent, MessageType,
+            },
+        };
+
+        let url = OwnedMxcUri::from("mxc://localhost/a");
+
+        let mut captioned =
+            ImageMessageEventContent::plain("Sunset at the pier".to_owned(), url.clone());
+        captioned.filename = Some("holiday-2026.jpg".to_owned());
+        assert_eq!(
+            super::message_text(&MessageType::Image(captioned)),
+            "Sunset at the pier\nholiday-2026.jpg"
+        );
+
+        let bare = FileMessageEventContent::plain("report.pdf".to_owned(), url);
+        assert_eq!(super::message_text(&MessageType::File(bare)), "report.pdf");
     }
 
     fn picture(seed: &str, sender: &str, ts: u64) -> super::Document {
@@ -4581,6 +4789,88 @@ mod tests {
         assert!(next.is_none());
     }
 
+    #[tokio::test]
+    async fn test_an_older_page_is_capped_and_resumes_inside_the_chunk() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let core = logged_in(&server, &client, "search-older-cap").await;
+        let rooms = [
+            room_id!("!older-cap-a:localhost").to_owned(),
+            room_id!("!older-cap-b:localhost").to_owned(),
+        ];
+        {
+            let mut index = core.search_index.lock().await;
+            *index = MessageIndex::with_budgets(usize::MAX, usize::MAX);
+            for (offset, room) in rooms.iter().enumerate() {
+                let mut room_index = super::RoomIndex::new();
+                for seed in 0..3_000_u64 {
+                    room_index.upsert(document(
+                        &format!("{offset}c{seed}"),
+                        &format!("archive entry w{seed}x"),
+                        "@erwan:localhost",
+                        seed * 2 + offset as u64,
+                        None,
+                        Vec::new(),
+                    ));
+                }
+                index.rooms.insert(room.clone(), room_index);
+            }
+        }
+        core.flush_search_index(&client).await;
+        let mut cold = 0;
+        {
+            let mut index = core.search_index.lock().await;
+            for room in &rooms {
+                let room_index = index.rooms.get_mut(room).expect("room");
+                let chunks: Vec<_> = room_index.chunks.values().copied().collect();
+                for chunk in chunks.iter().take(chunks.len() - 1) {
+                    room_index.unload(*chunk);
+                }
+                cold += room_index.documents.len();
+            }
+        }
+        let on_disk = 6_000 - cold;
+        assert!(on_disk > 100);
+
+        for (query, scope) in [
+            ("", vec![rooms[0].clone()]),
+            ("", rooms.to_vec()),
+            ("archive", vec![rooms[0].clone()]),
+            ("archive", Vec::new()),
+        ] {
+            for order in [
+                super::SearchOrder::Rank,
+                super::SearchOrder::Recent,
+                super::SearchOrder::Oldest,
+            ] {
+                let filter = super::SearchFilter {
+                    rooms: scope.clone(),
+                    ..super::SearchFilter::default()
+                };
+                let mut cursor = core.older_start(&filter).await.expect("a cold chunk");
+                let mut seen = std::collections::HashSet::new();
+                loop {
+                    let (page, next) = core
+                        .search_older(query, &filter, order, 30, &cursor, 0)
+                        .await;
+                    assert!(page.len() <= 30, "{query:?} {order:?}: {} hits", page.len());
+                    for hit in &page {
+                        assert!(
+                            seen.insert(hit.event_id.clone()),
+                            "{query:?} {order:?}: {} repeated",
+                            hit.event_id
+                        );
+                    }
+                    let Some(next) = next else { break };
+                    cursor = next;
+                }
+                let expected =
+                    on_disk / 2 * scope.len().max(1) * if scope.is_empty() { 2 } else { 1 };
+                assert_eq!(seen.len(), expected, "{query:?} {order:?} {}", scope.len());
+            }
+        }
+    }
+
     #[test]
     fn test_the_disk_budget_drops_the_oldest_chunk_and_raises_the_floor() {
         let room = matrix_sdk::ruma::RoomId::parse("!disk:localhost").expect("room id");
@@ -4789,7 +5079,8 @@ mod tests {
         let room_id = room_id!("!resume:localhost").to_owned();
         let factory = EventFactory::new()
             .room(&room_id)
-            .sender(user_id!("@erwan:localhost"));
+            .sender(user_id!("@erwan:localhost"))
+            .server_ts(super::now_ms());
 
         server.mock_room_state_encryption().plain().mount().await;
         let room = server
@@ -4892,7 +5183,8 @@ mod tests {
         let room_id = room_id!("!crawl:localhost").to_owned();
         let factory = EventFactory::new()
             .room(&room_id)
-            .sender(user_id!("@erwan:localhost"));
+            .sender(user_id!("@erwan:localhost"))
+            .server_ts(super::now_ms());
 
         server.mock_room_state_encryption().plain().mount().await;
         let room = server
@@ -5060,6 +5352,363 @@ mod tests {
         assert_eq!(restored.len(), 3_000);
         assert!(restored.already_classified(event_id!("$reaction")));
         assert!(!restored.dirty);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one sequential corpus kept in a single function"
+    )]
+    fn test_ingest_output_matches_the_golden_corpus() {
+        use matrix_sdk::ruma::{
+            events::{AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent},
+            serde::Raw,
+        };
+        use serde_json::json;
+
+        let encrypted = json!({
+            "hashes": { "sha256": "LddWbhqio1QFowJZotQFXzsDBdJpipd5OhiY1jKLv0M" },
+            "iv": "38FDuSh6tsgAAAAAAAAAAA",
+            "key": {
+                "alg": "A256CTR",
+                "ext": true,
+                "k": "iClvSnBe_h01iKMzGdeyDrWSmSZ0Omhy-9tc5m7Ra6s",
+                "key_ops": ["decrypt", "encrypt"],
+                "kty": "oct"
+            },
+            "url": "mxc://localhost/statuts",
+            "v": "v2"
+        });
+        let messages = [
+            json!({
+                "msgtype": "m.text",
+                "body": "see https://example.org/a now",
+                "m.mentions": { "user_ids": ["@erwan:localhost"] }
+            }),
+            json!({
+                "msgtype": "m.image",
+                "body": "beach.png",
+                "url": "mxc://localhost/beach",
+                "info": { "mimetype": "image/png", "w": 640, "h": 480, "size": 1024 },
+                "page.codeberg.everypizza.msc4193.spoiler": true
+            }),
+            json!({
+                "msgtype": "m.file",
+                "body": "notes.pdf",
+                "url": "mxc://localhost/notes",
+                "info": { "mimetype": "application/pdf", "size": 4096 }
+            }),
+            json!({
+                "msgtype": "m.audio",
+                "body": "memo.ogg",
+                "url": "mxc://localhost/memo",
+                "info": { "mimetype": "audio/ogg", "size": 2048 }
+            }),
+            json!({
+                "msgtype": "m.text",
+                "body": "> <@erwan:localhost> see https://example.org/a now\n\nreply text",
+                "m.relates_to": {
+                    "rel_type": "m.thread",
+                    "event_id": "$golden0",
+                    "m.in_reply_to": { "event_id": "$golden0" },
+                    "is_falling_back": true
+                }
+            }),
+            json!({
+                "msgtype": "dm.filament.gallery",
+                "body": "",
+                "itemtypes": [
+                    { "itemtype": "m.image", "body": "dune.png", "url": "mxc://localhost/dune" },
+                    {
+                        "itemtype": "m.file",
+                        "body": "statuts.pdf",
+                        "info": { "mimetype": "application/pdf", "size": 86253 },
+                        "file": encrypted
+                    }
+                ]
+            }),
+        ];
+        let event = |position: usize, kind: &str, content: serde_json::Value| {
+            let raw: Raw<AnySyncTimelineEvent> = serde_json::from_value(json!({
+                "type": kind,
+                "event_id": format!("$golden{position}"),
+                "sender": "@erwan:localhost",
+                "origin_server_ts": 1_000 + position,
+                "content": content,
+            }))
+            .expect("event");
+            matrix_sdk::deserialized_responses::TimelineEvent::from_plaintext(raw)
+        };
+
+        let mut documents: Vec<serde_json::Value> = messages
+            .into_iter()
+            .enumerate()
+            .map(|(position, content)| {
+                let event = event(position, "m.room.message", content);
+                let (message, content) = super::room_message(&event).expect("a room message");
+                serde_json::to_value(super::document_of(&message, content.as_ref()))
+                    .expect("document json")
+            })
+            .collect();
+
+        let original = event(
+            0,
+            "m.room.message",
+            json!({ "msgtype": "m.text", "body": "see" }),
+        );
+        let (original, original_content) = super::room_message(&original).expect("an original");
+        let edit = event(
+            6,
+            "m.room.message",
+            json!({
+                "msgtype": "m.text",
+                "body": "* see https://example.org/b",
+                "m.new_content": {
+                    "msgtype": "m.text",
+                    "body": "see https://example.org/b",
+                    "m.mentions": { "user_ids": ["@alice:localhost"] }
+                },
+                "m.relates_to": { "rel_type": "m.replace", "event_id": "$golden0" }
+            }),
+        );
+        let (edit, edit_content) = super::room_message(&edit).expect("an edit");
+        let replacement = super::replacement_of(&edit).expect("a replacement");
+        documents.push(
+            serde_json::to_value(super::with_edit(
+                super::document_of(&original, original_content.as_ref()),
+                &edit,
+                replacement,
+                edit_content.as_ref(),
+            ))
+            .expect("edit json"),
+        );
+        documents.push(
+            serde_json::to_value(super::provisional_edit(
+                &edit,
+                event_id!("$golden0").to_owned(),
+            ))
+            .expect("provisional json"),
+        );
+
+        let poll: AnySyncMessageLikeEvent = serde_json::from_value(json!({
+            "type": "org.matrix.msc3381.poll.start",
+            "event_id": "$golden8",
+            "sender": "@erwan:localhost",
+            "origin_server_ts": 1_008,
+            "content": {
+                "org.matrix.msc3381.poll.start": {
+                    "question": { "org.matrix.msc1767.text": "Lunch spot?" },
+                    "kind": "org.matrix.msc3381.poll.disclosed",
+                    "max_selections": 1,
+                    "answers": [
+                        { "id": "a", "org.matrix.msc1767.text": "Ramen" },
+                        { "id": "b", "org.matrix.msc1767.text": "Tacos" }
+                    ]
+                },
+                "org.matrix.msc1767.text": "Lunch spot?\n1. Ramen\n2. Tacos"
+            }
+        }))
+        .expect("a poll start");
+        documents.push(
+            serde_json::to_value(super::poll_start_document(&poll).expect("a poll document"))
+                .expect("poll json"),
+        );
+
+        let sticker: super::OriginalSyncStickerEvent = serde_json::from_value(json!({
+            "type": "m.sticker",
+            "event_id": "$golden9",
+            "sender": "@erwan:localhost",
+            "origin_server_ts": 1_009,
+            "content": { "body": "moai", "info": {}, "url": "mxc://localhost/moai" }
+        }))
+        .expect("a sticker");
+        documents
+            .push(serde_json::to_value(super::sticker_document(&sticker)).expect("sticker json"));
+
+        let topic =
+            json!({ "topic": "Design crew", "m.topic": { "m.text": [{ "body": "ignored" }] } });
+        let state: AnySyncStateEvent = serde_json::from_value(json!({
+            "type": "m.room.topic",
+            "event_id": "$golden10",
+            "state_key": "",
+            "sender": "@erwan:localhost",
+            "origin_server_ts": 1_010,
+            "content": topic
+        }))
+        .expect("a state event");
+        documents.push(
+            serde_json::to_value(super::state_document(&state, Some(&topic))).expect("state json"),
+        );
+
+        let expected: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("golden_documents.json")).expect("golden json");
+        assert_eq!(
+            documents, expected,
+            "document_of changed what it stores: update golden_documents.json and bump persist::DERIVATION"
+        );
+    }
+
+    #[async_test]
+    async fn test_a_stale_derivation_keeps_documents_and_opens_a_rederive_window() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!derived:localhost").to_owned();
+        server.mock_room_state_encryption().plain().mount().await;
+        let room = server
+            .sync_room(&client, JoinedRoomBuilder::new(&room_id))
+            .await;
+
+        let mut index = chunked_room(10);
+        let mut flush = index.take_flush();
+        flush.manifest.derived = 0;
+        assert!(super::persist::list_room(&client, &room_id).await);
+        for (chunk, stored) in &flush.chunks {
+            assert!(
+                super::persist::write_chunk(&client, &room_id, *chunk, stored)
+                    .await
+                    .is_some()
+            );
+        }
+        assert!(super::persist::write_manifest(&client, &room_id, &flush.manifest).await);
+
+        let (core, _events) = crate::Core::new(
+            "search-derived",
+            Box::new(crate::store::MemorySessionStore::default()),
+        );
+        core.restore_persisted_index(&client).await;
+
+        {
+            let index = core.search_index.lock().await;
+            assert_eq!(in_room(&index, &room_id, "message", 50, 0).len(), 10);
+            assert!(index.rooms[&room_id].rederive_from > 0);
+            assert!(index.rooms[&room_id].dirty);
+        }
+
+        let mut progress = core.search_crawl.lock().await;
+        progress.restore(std::collections::BTreeMap::from([(
+            room_id.clone(),
+            super::persist::StoredCrawlRoom {
+                token: None,
+                reached_start: true,
+            },
+        )]));
+        assert!(!progress.checkpoints().contains_key(&room_id));
+        drop(progress);
+
+        core.flush_search_index(&client).await;
+        let super::persist::Opened::Manifest(reopened) =
+            super::persist::open(&client, &room_id).await
+        else {
+            panic!("the migrated room should be stored as a manifest");
+        };
+        assert_eq!(reopened.derived, super::persist::DERIVATION);
+        assert!(reopened.rederive_from > 0);
+
+        core.search_index.lock().await.finish_rederive(&room_id);
+        core.flush_search_index(&client).await;
+        let super::persist::Opened::Manifest(finished) =
+            super::persist::open(&client, &room_id).await
+        else {
+            panic!("the finished room should be stored as a manifest");
+        };
+        assert_eq!(finished.rederive_from, 0);
+
+        drop(room);
+    }
+
+    #[async_test]
+    async fn test_only_the_crawl_rederives_classified_documents() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        client.event_cache().subscribe().expect("event cache");
+
+        let room_id = room_id!("!rederive:localhost").to_owned();
+        server.mock_room_state_encryption().plain().mount().await;
+        let room = server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(&room_id).add_timeline_event(
+                    serde_json::from_value::<
+                        matrix_sdk::ruma::serde::Raw<
+                            matrix_sdk::ruma::events::AnySyncTimelineEvent,
+                        >,
+                    >(serde_json::json!({
+                        "type": "m.room.message",
+                        "event_id": "$gallery",
+                        "sender": "@erwan:localhost",
+                        "origin_server_ts": 5_000,
+                        "content": {
+                            "msgtype": "dm.filament.gallery",
+                            "body": "",
+                            "itemtypes": [{
+                                "itemtype": "m.file",
+                                "body": "notes.pdf",
+                                "url": "mxc://localhost/notes"
+                            }]
+                        }
+                    }))
+                    .expect("gallery event"),
+                ),
+            )
+            .await;
+        let (cache, _drop_handles) = client
+            .event_cache()
+            .room(&room_id)
+            .await
+            .expect("room event cache");
+        let events = cache.events().await.expect("cached events");
+
+        let mut index = MessageIndex::new();
+        index
+            .ingest(&room_id, events.clone(), &cache, &RedactionRules::V11)
+            .await;
+        let stale = |index: &mut MessageIndex| {
+            let room_index = index.rooms.get_mut(&room_id).expect("room");
+            let mut document = room_index
+                .document(&event_id!("$gallery").to_owned())
+                .cloned()
+                .expect("the gallery document");
+            document.media = Vec::new();
+            document.attachments = Vec::new();
+            room_index.upsert(document);
+        };
+        let media = |index: &MessageIndex| {
+            index.rooms[&room_id]
+                .document(&event_id!("$gallery").to_owned())
+                .map_or(0, |document| document.media.len())
+        };
+
+        stale(&mut index);
+        index
+            .ingest_with(&room_id, events.clone(), &cache, &RedactionRules::V11, true)
+            .await;
+        assert_eq!(media(&index), 0);
+
+        index.rooms.get_mut(&room_id).expect("room").rederive_from = 1;
+        index
+            .ingest_with(
+                &room_id,
+                events.clone(),
+                &cache,
+                &RedactionRules::V11,
+                false,
+            )
+            .await;
+        assert_eq!(media(&index), 0);
+
+        index
+            .ingest_with(&room_id, events.clone(), &cache, &RedactionRules::V11, true)
+            .await;
+        assert_eq!(media(&index), 1);
+
+        index.finish_rederive(&room_id);
+        stale(&mut index);
+        index
+            .ingest_with(&room_id, events, &cache, &RedactionRules::V11, true)
+            .await;
+        assert_eq!(media(&index), 0);
+
+        drop(room);
     }
 
     #[async_test]
@@ -5426,7 +6075,8 @@ mod tests {
         let room_id = room_id!("!walked:localhost").to_owned();
         let factory = EventFactory::new()
             .room(&room_id)
-            .sender(user_id!("@erwan:localhost"));
+            .sender(user_id!("@erwan:localhost"))
+            .server_ts(super::now_ms());
 
         server.mock_room_state_encryption().plain().mount().await;
         let room = server
@@ -6673,8 +7323,9 @@ mod stress {
                         &super::SearchFilter::default(),
                         std::collections::HashSet::new(),
                     ),
-                    1,
+                    super::ColdWindow::all(1),
                 )
+                .0
                 .len()
         });
         let cold_scan = started.elapsed();

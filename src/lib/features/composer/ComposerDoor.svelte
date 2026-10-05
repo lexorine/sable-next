@@ -1,12 +1,15 @@
 <script lang="ts">
   import '#lib/ui/primitives/menu.css';
   import { DropdownMenu } from 'bits-ui';
+  import CameraIcon from 'phosphor-svelte/lib/CameraIcon';
   import ImageIcon from 'phosphor-svelte/lib/ImageIcon';
   import ChartBarIcon from 'phosphor-svelte/lib/ChartBarIcon';
+  import ClockIcon from 'phosphor-svelte/lib/ClockIcon';
   import MapPinIcon from 'phosphor-svelte/lib/MapPinIcon';
   import MicrophoneIcon from 'phosphor-svelte/lib/MicrophoneIcon';
   import PaperclipIcon from 'phosphor-svelte/lib/PaperclipIcon';
   import PlusIcon from 'phosphor-svelte/lib/PlusIcon';
+  import VideoCameraIcon from 'phosphor-svelte/lib/VideoCameraIcon';
 
   import { i18n } from '#lib/i18n.js';
   import BottomSheet from '#lib/ui/primitives/BottomSheet.svelte';
@@ -18,8 +21,10 @@
     desktop: boolean;
     disabled?: boolean;
     onPick: (accept: string) => void;
+    onCapture?: (accept: string) => void;
     onPoll?: () => void;
     onLocation?: () => void;
+    onSchedule?: () => void;
     onVoice?: () => void;
     onBeforeOpen?: () => void;
   }
@@ -28,8 +33,10 @@
     desktop,
     disabled = false,
     onPick,
+    onCapture,
     onPoll,
     onLocation,
+    onSchedule,
     onVoice,
     onBeforeOpen,
   }: Props = $props();
@@ -79,6 +86,12 @@
           <PaperclipIcon />
           {$i18n.t('composer.attachFile')}
         </DropdownMenu.Item>
+        {#if onVoice}
+          <DropdownMenu.Item class="menu-item" onclick={onVoice}>
+            <MicrophoneIcon />
+            {$i18n.t('composer.voiceRecord')}
+          </DropdownMenu.Item>
+        {/if}
         {#if onPoll}
           <DropdownMenu.Item class="menu-item" onclick={onPoll}>
             <ChartBarIcon />
@@ -91,10 +104,10 @@
             {$i18n.t('composer.location')}
           </DropdownMenu.Item>
         {/if}
-        {#if onVoice}
-          <DropdownMenu.Item class="menu-item" onclick={onVoice}>
-            <MicrophoneIcon />
-            {$i18n.t('composer.voiceMessage')}
+        {#if onSchedule}
+          <DropdownMenu.Item class="menu-item" onclick={onSchedule}>
+            <ClockIcon />
+            {$i18n.t('composer.scheduleMessage')}
           </DropdownMenu.Item>
         {/if}
       </DropdownMenu.Content>
@@ -131,6 +144,30 @@
         <ImageIcon />
         {$i18n.t('composer.photoOrVideo')}
       </Button>
+      {#if onCapture}
+        <Button
+          variant="ghost"
+          class="door-action"
+          onclick={() => {
+            open = false;
+            onCapture('image/*');
+          }}
+        >
+          <CameraIcon />
+          {$i18n.t('composer.takePhoto')}
+        </Button>
+        <Button
+          variant="ghost"
+          class="door-action"
+          onclick={() => {
+            open = false;
+            onCapture('video/*');
+          }}
+        >
+          <VideoCameraIcon />
+          {$i18n.t('composer.recordVideo')}
+        </Button>
+      {/if}
       <Button
         variant="ghost"
         class="door-action"
@@ -142,6 +179,19 @@
         <PaperclipIcon />
         {$i18n.t('composer.attachFile')}
       </Button>
+      {#if onVoice}
+        <Button
+          variant="ghost"
+          class="door-action"
+          onclick={() => {
+            open = false;
+            onVoice();
+          }}
+        >
+          <MicrophoneIcon />
+          {$i18n.t('composer.voiceRecord')}
+        </Button>
+      {/if}
       {#if onPoll}
         <Button
           variant="ghost"
@@ -168,17 +218,17 @@
           {$i18n.t('composer.location')}
         </Button>
       {/if}
-      {#if onVoice}
+      {#if onSchedule}
         <Button
           variant="ghost"
           class="door-action"
           onclick={() => {
             open = false;
-            onVoice();
+            onSchedule();
           }}
         >
-          <MicrophoneIcon />
-          {$i18n.t('composer.voiceMessage')}
+          <ClockIcon />
+          {$i18n.t('composer.scheduleMessage')}
         </Button>
       {/if}
     </div>
@@ -204,8 +254,14 @@
     width: 100%;
   }
 
-  :global(.door-action:hover:not(:disabled)) {
-    background: var(--surface-container-hover);
+  @media (any-hover: hover) and (any-pointer: fine) {
+    :global(.door-action:hover:not(:disabled)) {
+      background: var(--surface-container-hover);
+    }
+
+    :global(.composer-door:hover) {
+      background: var(--surface-container-hover);
+    }
   }
 
   :global(.door-action svg) {
@@ -219,7 +275,7 @@
     background: transparent;
     border: 0;
     border-radius: var(--radius);
-    color: var(--primary-main);
+    color: var(--surface-var-on-container);
     cursor: pointer;
     display: flex;
     flex: 0 0 auto;
@@ -234,10 +290,6 @@
     content: '';
     inset: calc((var(--target) - var(--target-hit)) / 2);
     position: absolute;
-  }
-
-  :global(.composer-door:hover) {
-    background: var(--surface-container-hover);
   }
 
   :global(.composer-door:disabled) {

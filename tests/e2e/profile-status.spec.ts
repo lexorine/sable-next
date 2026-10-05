@@ -94,6 +94,7 @@ for (const mobile of [false, true]) {
           localStorage.setItem('sable-preferences', JSON.stringify({ sendPresence }));
           (window as unknown as { __e2eProfilePatch: object }).__e2eProfilePatch = {
             status: { text: 'Working on Sable', emoji: '🚀' },
+            supporter_awards: null,
             legacy_fields: ['chat.commet.profile_status'],
           };
         }, sendPresence);
@@ -153,7 +154,7 @@ for (const mobile of [false, true]) {
       await installRoomCore('ready');
       await app.openRoom('!room:example.test');
       await page.getByRole('button', { name: "Open Alice's profile" }).last().click();
-      const status = page.locator('.profile-card-status');
+      const status = page.locator('.profile-card-status-text');
       await expect(status).toBeVisible();
 
       expect(await status.evaluate((element) => element.scrollHeight)).toBeGreaterThan(

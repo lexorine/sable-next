@@ -24,6 +24,7 @@
     stripReplyFallback,
   } from '../members/members.js';
   import { previewableLinks } from '../media/link-preview.js';
+  import { stateEventText } from './state-event-text';
   import LinkEmbed from '../media/embeds/LinkEmbed.svelte';
   import { MessageSwipe } from '../messages/message-swipe.svelte.js';
   import { i18n } from '#lib/i18n.js';
@@ -32,6 +33,7 @@
   import { preferences, type TimelineLayout } from '#lib/settings/preferences.svelte.js';
   import Avatar from '#lib/ui/primitives/Avatar.svelte';
   import Skeleton from '#lib/ui/primitives/Skeleton.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
   import { nameColorOnDark, nameColorOnLight } from '#lib/ui/primitives/readable-color.js';
   import PencilSimpleIcon from 'phosphor-svelte/lib/PencilSimpleIcon';
   import ReplyIcon from 'phosphor-svelte/lib/ArrowBendUpLeftIcon';
@@ -43,6 +45,7 @@
   import TimelineNotice from './TimelineNotice.svelte';
   import type { TimelineEventIndex } from './timeline-event-index';
   import MessageActions from '../messages/MessageActions.svelte';
+  import type { MessageActions as MessageActionSet } from '../messages/message-menu-items.js';
 
   import ThreadIcon from 'phosphor-svelte/lib/ChatCircleDotsIcon';
   import { useBookmarks } from '#lib/rooms/bookmarks.svelte.js';
@@ -174,11 +177,15 @@
       ? findMember(members, item.sender)
       : undefined
   );
+  let roomIdentity = $derived({
+    name: item.sender_name ?? senderMember?.display_name ?? null,
+    avatar: item.sender_avatar ?? senderMember?.avatar_url ?? null,
+  });
+  let spaceIdentity = $derived(roomCosmetics?.identity(item.sender, roomIdentity) ?? roomIdentity);
   let accountName = $derived(
     profileOverrides.name(
       item.sender ?? '',
-      item.sender_name ??
-        senderMember?.display_name ??
+      spaceIdentity.name ??
         profile?.display_name ??
         item.sender ??
         $i18n.t('timeline.unknownSender')
@@ -191,14 +198,11 @@
       : { name: persona?.display_name ?? accountName, pronouns: [] }
   );
   let senderName = $derived(senderIdentity.name);
+  let emoteName = $derived(splitDisplayNamePronouns(senderName).name);
   let senderAvatar = $derived(
     persona?.avatar_url === ''
       ? null
-      : (persona?.avatar_url ??
-          profileOverrides.avatar(
-            item.sender ?? '',
-            item.sender_avatar ?? senderMember?.avatar_url ?? null
-          ))
+      : (persona?.avatar_url ?? profileOverrides.avatar(item.sender ?? '', spaceIdentity.avatar))
   );
   let personaTint = $derived(personaWithColor(persona));
   let pronouns = $derived(
@@ -213,21 +217,41 @@
         )
       : []
   );
+  let replyIdentity = $derived.by(() => {
+    const own = {
+      name:
+        item.in_reply_to?.sender_name ??
+        findMember(members, item.in_reply_to?.sender)?.display_name ??
+        null,
+      avatar: null,
+    };
+    return roomCosmetics?.identity(item.in_reply_to?.sender, own) ?? own;
+  });
   let replyNameBase = $derived(
     replyPersona?.display_name ??
       profileOverrides.name(
         item.in_reply_to?.sender ?? '',
-        item.in_reply_to?.sender_name ??
-          findMember(members, item.in_reply_to?.sender)?.display_name ??
-          item.in_reply_to?.sender ??
-          $i18n.t('timeline.unknownSender')
+        replyIdentity.name ?? item.in_reply_to?.sender ?? $i18n.t('timeline.unknownSender')
       )
   );
   let replyIsPinged = $derived(item.in_reply_to?.sender_mentioned ?? false);
   let replyName = $derived(
     replyIsPinged && !replyNameBase.startsWith('@') ? `@${replyNameBase}` : replyNameBase
   );
-  let replyBody = $derived(stripReplyFallback(item.in_reply_to?.body ?? '', replyPersona));
+  let replyBody = $derived.by(() => {
+    const target = item.in_reply_to ? events?.get(item.in_reply_to.event_id) : null;
+    const kind = target?.content.kind;
+    if (
+      target &&
+      (kind === 'membership' ||
+        kind === 'profile_change' ||
+        kind === 'state_event' ||
+        kind === 'hidden_event')
+    ) {
+      return stateEventText(target, $i18n.t);
+    }
+    return stripReplyFallback(item.in_reply_to?.body ?? '', replyPersona);
+  });
   let replyCosmetics = $derived(
     replyPersona ? null : (roomCosmetics?.for(item.in_reply_to?.sender) ?? null)
   );
@@ -369,13 +393,33 @@
       stalled === null
   );
 
-  let trailingReceiptBadge = $derived(actionable && showReceiptBadge && !receiptsInline);
+  let receiptsVisible = $derived(showReceiptBadge && (actionable || preview));
+  let trailingReceiptBadge = $derived(receiptsVisible && !receiptsInline);
+
+  function selectedText(): string {
+    const selection = getSelection();
+    if (!selection || selection.isCollapsed || !messageRow) return '';
+    if (!messageRow.contains(selection.anchorNode) || !messageRow.contains(selection.focusNode)) {
+      return '';
+    }
+    return selection.toString();
+  }
+
+  function withSelectedText(base: MessageActionSet, text: string): MessageActionSet {
+    if (!text) return base;
+    return {
+      ...base,
+      onCopyText: () => void navigator.clipboard.writeText(text),
+      copyTextLabel: 'timeline.copySelection',
+    };
+  }
 
   const rowPress = new LongPress({
     enabled: () => actionable,
     onPress: () => {
       openMessageMenu.set(item.id, false);
-      dialogs.open(item, { kind: 'sheet', actions: () => actions });
+      const selected = selectedText();
+      dialogs.open(item, { kind: 'sheet', actions: () => withSelectedText(actions, selected) });
     },
   });
 
@@ -435,8 +479,9 @@
       event.target instanceof Element
         ? event.target.closest<HTMLAnchorElement>('a[href]')?.href
         : null;
+    const selected = selectedText();
     openMessageMenu.open(item.id, { x: event.clientX, y: event.clientY }, () => ({
-      ...actions,
+      ...withSelectedText(actions, selected),
       onCopyLink: link ? () => void navigator.clipboard.writeText(link) : actions.onCopyLink,
       copyLinkLabel: link ? 'timeline.copyLink' : undefined,
     }));
@@ -475,8 +520,10 @@
   <span class="receipt-slot" bind:clientWidth={receiptWidth}>
     <ReadReceiptStack
       readers={receiptReaders}
+      timestamps={item.read_timestamps}
       {members}
       expanded={dialogs.isOpen(item, 'receipts')}
+      onProfile={onSenderProfile}
       onOpen={() => {
         dialogs.open(item, { kind: 'receipts' });
       }}
@@ -673,7 +720,16 @@
               onViaProfile={openSenderAccountProfileAt}
             />
             {#if senderRoleIcon}
-              <RoleTagIcon icon={senderRoleIcon} />
+              {#if preferences.showRoleTooltip && senderRole?.name}
+                <Tooltip label={senderRole.name}>
+                  {#snippet trigger({ props })}
+                    <span {...props} class="sender-role"><RoleTagIcon icon={senderRoleIcon} /></span
+                    >
+                  {/snippet}
+                </Tooltip>
+              {:else}
+                <RoleTagIcon icon={senderRoleIcon} />
+              {/if}
             {/if}
           {/if}
           <div class="message-details">
@@ -729,20 +785,17 @@
           </div>
         {/if}
         {#if item.content.kind === 'message' && item.content.emote}
-          {@const inlineReceipts = actionable && showReceiptBadge && receiptsInline}
+          {@const inlineReceipts = receiptsVisible && receiptsInline}
           <div
             class={['emote', { 'has-receipts': inlineReceipts }]}
             style:--receipt-reserve={inlineReceipts ? `${String(receiptWidth)}px` : undefined}
             {@attach inlineReceipts ? receiptReserve : undefined}
           >
             * <SenderName
-              displayName={senderName}
-              accountName={persona ? accountName : undefined}
+              displayName={emoteName}
               colors={senderColors}
-              {pronouns}
               onMention={nameMentions ? mentionSender : undefined}
               onProfile={nameOpensProfile ? openSenderProfileAt : undefined}
-              onViaProfile={persona ? openSenderProfileAt : undefined}
             />
             <FormattedBody html={item.content.html} {senderTimezone} {onMatrixLink} />
             {#if inlineReceipts}
@@ -751,7 +804,7 @@
             {/if}
           </div>
         {:else if item.content.kind === 'message'}
-          {@const inlineReceipts = actionable && showReceiptBadge && receiptsInline}
+          {@const inlineReceipts = receiptsVisible && receiptsInline}
           <div
             class={[
               jumbo === null ? undefined : `jumbo jumbo-${String(jumbo)}`,
@@ -780,7 +833,7 @@
             {/each}
           {/if}
         {:else if item.content.kind === 'redacted'}
-          {@const inlineReceipts = actionable && showReceiptBadge && receiptsInline}
+          {@const inlineReceipts = receiptsVisible && receiptsInline}
           <div
             class={{ 'content-bubble': layout === 'bubble', 'has-receipts': inlineReceipts }}
             style:--receipt-reserve={inlineReceipts ? `${String(receiptWidth)}px` : undefined}
@@ -1099,14 +1152,27 @@
       -webkit-touch-callout: none;
       user-select: none;
     }
+
+    .message :global(.formatted-body),
+    .message :global(pre),
+    .message :global(code) {
+      user-select: none;
+    }
   }
 
   .message {
     display: flex;
     gap: var(--timeline-row-gap);
+    margin-inline: calc(-1 * var(--page-gutter));
     overflow-wrap: anywhere;
-    padding: var(--timeline-row-padding) 0;
+    padding: var(--timeline-row-padding) var(--page-gutter);
     position: relative;
+  }
+
+  @media (any-pointer: fine) {
+    .message {
+      user-select: text;
+    }
   }
 
   .message:not(.layout-compact) > :global(.avatar-button),
@@ -1197,7 +1263,7 @@
   }
 
   .message.collapsed {
-    padding-left: calc(var(--avatar-size-small) + var(--timeline-row-gap));
+    padding-left: calc(var(--page-gutter) + var(--avatar-size-small) + var(--timeline-row-gap));
     padding-top: 0;
   }
 
@@ -1289,22 +1355,7 @@
     color: var(--primary-on-container);
   }
 
-  @media (width >= 48rem) and (hover: hover) and (pointer: fine) {
-    .message {
-      margin-inline: calc(-1 * var(--page-gutter));
-      padding-inline: var(--page-gutter);
-    }
-
-    .message.collapsed {
-      padding-left: calc(var(--page-gutter) + var(--avatar-size-small) + var(--timeline-row-gap));
-    }
-
-    /* `:root` outranks the layout block at the end of the file, which carries
-       the same three classes and would otherwise win on source order. */
-    :root .message.layout-compact.collapsed {
-      padding-inline: var(--page-gutter);
-    }
-
+  @media (width >= 48rem) and (any-hover: hover) and (any-pointer: fine) {
     /* Matches the base mention rule's specificity, so the gutter the row's
        negative margin assumes survives. */
     .message.mention-silent,
@@ -1398,6 +1449,10 @@
     display: flex;
     gap: var(--space-200);
     min-width: 0;
+  }
+
+  .sender-role {
+    display: inline-flex;
   }
 
   .message header :global(.sender-identity) {
@@ -1617,6 +1672,13 @@
     white-space: nowrap;
   }
 
+  /* WebKit uses a clipped inline-block's bottom as its baseline. */
+  :global(.reply-name) {
+    display: inline-block;
+    overflow: clip;
+    vertical-align: top;
+  }
+
   .reply-compact {
     gap: var(--space-100);
     padding: 0;
@@ -1748,7 +1810,7 @@
   }
 
   .message.layout-compact.collapsed {
-    padding-inline: 0;
+    padding-inline: var(--page-gutter);
   }
 
   .compact-gutter {
@@ -1781,7 +1843,7 @@
   }
 
   .message.layout-bubble .message-main > * {
-    max-width: 100%;
+    max-width: min(50rem, 100%);
     min-width: 0;
   }
 
@@ -1817,6 +1879,10 @@
     padding-inline-end: calc(var(--receipt-reserve) + var(--space-200));
   }
 
+  .message.layout-bubble .has-receipts:not(.content-bubble) {
+    max-width: min(100%, calc(50rem + var(--receipt-reserve) + var(--space-200)));
+  }
+
   .message.layout-bubble .has-receipts :global(.formatted-body) {
     display: inline-block;
   }
@@ -1844,6 +1910,7 @@
   .message:not(.layout-bubble.own.align-own)
     .message-main:has(> .receipt-tail)
     > :global(.reactions):nth-last-child(2) {
+    flex-basis: calc(100% - var(--receipt-reserve) - var(--space-200));
     max-width: calc(100% - var(--receipt-reserve) - var(--space-200));
   }
 
@@ -1857,6 +1924,15 @@
     .message-main:has(> .receipt-tail)
     > :nth-last-child(2) {
     margin-inline-end: calc(var(--receipt-reserve) + var(--space-200));
+  }
+
+  .message.layout-bubble.own.align-own
+    .message-main:has(> .receipt-tail)
+    > :global(*):nth-last-child(2) {
+    margin-inline-end: max(
+      0,
+      calc(var(--receipt-reserve) + var(--space-200) - var(--avatar-size-small) - var(--space-250))
+    );
   }
 
   .message.layout-bubble.own.align-own .has-edited {

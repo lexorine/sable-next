@@ -31,6 +31,7 @@ import 'prosemirror-gapcursor/style/gapcursor.css';
 
 import type { PackImageView } from '#src/generated/protocol';
 
+import { enterInsertsNewline } from '#lib/settings/enter-key.svelte.js';
 import { preferences } from '#lib/settings/preferences.svelte.js';
 import type { AutocompleteQuery } from '../autocomplete';
 import { filesFrom } from '../composer-files';
@@ -477,12 +478,71 @@ function insideFence(state: EditorState): boolean {
   return fences.length % 2 === 1;
 }
 
+function codeLineStarts(state: EditorState): number[] {
+  const { $from, $to } = state.selection;
+  const text = $from.parent.textContent;
+  const base = $from.start();
+  const starts = [text.lastIndexOf('\n', $from.parentOffset - 1) + 1];
+  for (
+    let next = text.indexOf('\n', starts[0]);
+    next >= 0 && next + 1 <= $to.parentOffset;
+    next = text.indexOf('\n', next + 1)
+  ) {
+    starts.push(next + 1);
+  }
+  return starts.map((offset) => base + offset);
+}
+
 function indentCode(markdown: boolean): Command {
   return (state, dispatch) => {
-    const inCode = state.selection.$from.parent.type.spec.code === true;
+    const { $from, $to, empty } = state.selection;
+    const inCode = $from.parent.type.spec.code === true;
     if (!inCode && !(markdown && insideFence(state))) return false;
+    if (inCode && !empty && $from.parent === $to.parent && $from.parent.textContent) {
+      const starts = codeLineStarts(state);
+      if (starts.length > 1) {
+        if (dispatch) {
+          const tr = state.tr;
+          for (const start of starts.slice().reverse()) tr.insertText(INDENT, start);
+          tr.setSelection(
+            TextSelection.create(tr.doc, tr.mapping.map($from.pos, -1), tr.mapping.map($to.pos))
+          );
+          dispatch(tr.scrollIntoView());
+        }
+        return true;
+      }
+    }
     dispatch?.(state.tr.insertText(INDENT));
     return true;
+  };
+}
+
+const outdentCode: Command = (state, dispatch) => {
+  const { $from, $to } = state.selection;
+  if ($from.parent.type !== composerSchema.nodes.code_block || $from.parent !== $to.parent) {
+    return false;
+  }
+  if (dispatch) {
+    const tr = state.tr;
+    for (const start of codeLineStarts(state).slice().reverse()) {
+      const lead = /^( {1,4}|\t)/.exec(
+        state.doc.textBetween(start, Math.min(start + INDENT.length, $from.end()))
+      );
+      if (lead) tr.delete(start, start + lead[0].length);
+    }
+    dispatch(tr.scrollIntoView());
+  }
+  return true;
+};
+
+function leaveCodeBlock(direction: -1 | 1): Command {
+  return (state, dispatch, view) => {
+    const { $from, empty } = state.selection;
+    if (!empty || $from.parent.type !== composerSchema.nodes.code_block) return false;
+    if ($from.parentOffset !== (direction < 0 ? 0 : $from.parent.content.size)) return false;
+    if ($from.depth !== 1) return false;
+    if ($from.index(0) !== (direction < 0 ? 0 : state.doc.childCount - 1)) return false;
+    return escapeCodeBlock(direction)(state, dispatch, view);
   };
 }
 
@@ -588,7 +648,7 @@ export class ComposerEditor {
     chainCommands(openFence, openHorizontalRule, closeFence)(state, dispatch, view);
 
   private shiftEnter: Command = (state, dispatch, view) =>
-    preferences.enterForNewline
+    enterInsertsNewline()
       ? this.submit()
       : this.blockBreak(state, dispatch, view) || softBreak(state, dispatch, view);
 
@@ -604,7 +664,7 @@ export class ComposerEditor {
     if (newlineInCode(state, dispatch, view)) return true;
     if (splitListEntry(state, dispatch, view)) return true;
     if (insideListItem(state) && liftEmptyBlock(state, dispatch, view)) return true;
-    if (!preferences.enterForNewline) return this.submit();
+    if (!enterInsertsNewline()) return this.submit();
     return rich
       ? chainCommands(liftEmptyBlock, softBreak)(state, dispatch, view)
       : insertHardBreak(state, dispatch, view);
@@ -622,7 +682,7 @@ export class ComposerEditor {
       /* No `aria-multiline`: it is a textbox property, invalid on a combobox. */
       spellcheck: 'true',
       autocapitalize: 'sentences',
-      enterkeyhint: preferences.enterForNewline ? 'enter' : 'send',
+      enterkeyhint: !enterInsertsNewline() ? 'send' : 'enter',
       ...(this.options.describedBy ? { 'aria-describedby': this.options.describedBy } : {}),
     };
   }
@@ -672,15 +732,20 @@ export class ComposerEditor {
           headingToParagraphBackward
         ),
         ArrowUp: (state, dispatch, view) =>
-          this.options.onNavigate('ArrowUp') || moveToDocumentEdge('up')(state, dispatch, view),
+          this.options.onNavigate('ArrowUp') ||
+          leaveCodeBlock(-1)(state, dispatch, view) ||
+          moveToDocumentEdge('up')(state, dispatch, view),
         ArrowDown: (state, dispatch, view) =>
-          this.options.onNavigate('ArrowDown') || moveToDocumentEdge('down')(state, dispatch, view),
+          this.options.onNavigate('ArrowDown') ||
+          leaveCodeBlock(1)(state, dispatch, view) ||
+          moveToDocumentEdge('down')(state, dispatch, view),
         'Shift-ArrowUp': chainCommands(escapeCodeBlock(-1), enterCodeBlock(-1)),
         'Shift-ArrowDown': chainCommands(escapeCodeBlock(1), enterCodeBlock(1)),
         Tab: (state, dispatch, view) =>
           this.options.onNavigate('Tab') ||
           indentCode(this.markdownMode())(state, dispatch, view) ||
           sinkListEntry(state, dispatch, view),
+        'Shift-Tab': outdentCode,
         Escape: () => this.options.onNavigate('Escape'),
         Enter: this.enter,
         'Shift-Enter': this.shiftEnter,
@@ -744,10 +809,11 @@ export class ComposerEditor {
             this.pasteAsText(pasteView, event),
           transformPastedHTML: lineDivsAsBreaks,
           transformPasted: (slice, pasteView) => this.pastedMentions(pasteView.state, slice),
-          clipboardTextParser: (text, _context, plain) =>
-            plain || this.source || !preferences.richTextComposer
+          clipboardTextParser: (text, _context, plain) => {
+            return plain || this.source || !preferences.richTextComposer
               ? textSlice(text)
-              : markdownSlice(text),
+              : markdownSlice(text);
+          },
           handleTextInput: (inputView, from, to, text) => {
             const end = inputView.state.doc.content.size;
             if (from < 0 || to < from || to > end) {
@@ -776,7 +842,7 @@ export class ComposerEditor {
                 event.cancelable &&
                 hasIosKeyboardContextQuirk() &&
                 (event.inputType === 'insertParagraph' || event.inputType === 'insertLineBreak') &&
-                !(this.iosEnter?.shift && preferences.enterForNewline) &&
+                !(this.iosEnter?.shift && enterInsertsNewline()) &&
                 (this.blockBreak(view.state, view.dispatch, view) ||
                   (this.iosEnter?.shift
                     ? newlineInCode
@@ -892,7 +958,7 @@ export class ComposerEditor {
   }
 
   syncKeyHint(): void {
-    void preferences.enterForNewline;
+    void enterInsertsNewline();
     this.view?.setProps({});
   }
 
@@ -909,6 +975,16 @@ export class ComposerEditor {
   atBottomEdge(): boolean {
     const view = this.view;
     return view ? atDocumentEdge('down')(view.state, undefined, view) : false;
+  }
+
+  isPristine(): boolean {
+    const doc = this.doc();
+    return (
+      !doc ||
+      (doc.childCount === 1 &&
+        doc.firstChild?.content.size === 0 &&
+        doc.firstChild.type === composerSchema.nodes.paragraph)
+    );
   }
 
   isEmpty(): boolean {

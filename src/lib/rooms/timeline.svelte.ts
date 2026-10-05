@@ -20,6 +20,7 @@ const PAGINATION_DIFF_SETTLE_TIMEOUT = 2_000;
 const RESUME_PAGE_SIZE = 25;
 const MAX_EMPTY_RESUME_PAGES = 5;
 const MAX_EMPTY_THREAD_PAGES = 5;
+const MAX_CACHED_UNREAD_PAGES = 4;
 
 const sharedTimelines = new WeakMap<CoreClient, ActiveRoomTimeline>();
 
@@ -121,6 +122,7 @@ export class RoomTimeline {
   loading = $state(false);
   resumingLive = $state(false);
   hasSnapshot = $state(false);
+  readMarkerEventId = $state<string | null>(null);
   forwardPagination = $state<ForwardPaginationState>('idle');
   error = $state<string | null>(null);
   mode = $state<TimelineMode>({ kind: 'live' });
@@ -170,6 +172,7 @@ export class RoomTimeline {
   private forwardPaginationStartLastEventId: string | null = null;
   private forwardPaginationSettleTimer: ReturnType<typeof setTimeout> | null = null;
   private resumePromise: Promise<void> | null = null;
+  private cachedUnreadEventId: string | null = null;
   private stagedItems: TimelineItemView[] | null = null;
   private stagedAggregations: TimelineItemView[] | null = null;
   constructor(private readonly core: CoreClient) {}
@@ -303,6 +306,8 @@ export class RoomTimeline {
       this.stagedAggregations = [];
     }
     this.mode = mode;
+    if (mode.kind === 'unread') this.readMarkerEventId = mode.eventId;
+    this.forwardPagination = mode.kind === 'thread' ? 'end' : 'idle';
     this.loading = true;
     this.error = null;
     const promise = this.startSubscription(roomId, mode, hiddenEvents, unread);
@@ -310,12 +315,40 @@ export class RoomTimeline {
 
     try {
       await promise;
+      const cachedUnread = this.cachedUnreadEventId;
+      this.cachedUnreadEventId = null;
+      if (
+        cachedUnread !== null &&
+        session === this.session &&
+        request === this.startRequest &&
+        !(await this.pageToEvent(cachedUnread, session))
+      ) {
+        if (session === this.session && request === this.startRequest) {
+          await this.open(roomId, { kind: 'unread', eventId: cachedUnread }, hiddenEvents);
+        }
+      }
     } catch {
       if (session === this.session) this.error = 'load_failed';
     } finally {
       if (this.startPromise === promise) this.startPromise = null;
       if (session === this.session) this.loading = false;
     }
+  }
+
+  private async pageToEvent(eventId: string, session: number): Promise<boolean> {
+    const loaded = () => this.items.some((item) => item.event_id === eventId);
+    for (let page = 0; page < MAX_CACHED_UNREAD_PAGES; page++) {
+      if (session !== this.session || this.error !== null) return false;
+      if (loaded()) return true;
+      if (this.backwardPagination === 'end') return false;
+      try {
+        await this.paginateBackward(RESUME_PAGE_SIZE);
+      } catch {
+        return false;
+      }
+      await this.backwardPaginationSettled();
+    }
+    return session === this.session && loaded();
   }
 
   async paginateBackward(count: number): Promise<boolean> {
@@ -370,7 +403,12 @@ export class RoomTimeline {
 
   async paginateForward(count: number): Promise<boolean> {
     const subscription = this.subscription;
-    if (this.mode.kind === 'live' || subscription === null || this.forwardPagination !== 'idle') {
+    if (
+      this.mode.kind === 'live' ||
+      this.mode.kind === 'thread' ||
+      subscription === null ||
+      this.forwardPagination !== 'idle'
+    ) {
       return true;
     }
 
@@ -418,6 +456,7 @@ export class RoomTimeline {
       this.replyFallbacks.clear();
       this.aggregations = [];
       this.hasSnapshot = false;
+      this.readMarkerEventId = null;
       this.resumingLive = false;
     }
     this.stagedItems = null;
@@ -542,8 +581,18 @@ export class RoomTimeline {
         session === this.session &&
         !response.items.some((item) => item.content.kind === 'read_marker')
       ) {
-        const eventId = await this.unloadedReadMarker(roomId, response.items);
-        if (session === this.session && eventId !== null) {
+        const marker = await this.readMarker(roomId);
+        if (session === this.session) this.readMarkerEventId = marker;
+        const eventId =
+          marker !== null && !response.items.some((item) => item.event_id === marker)
+            ? marker
+            : null;
+        const cached =
+          eventId !== null &&
+          (await this.core.commands.eventCached(roomId, eventId).catch(() => false));
+        if (session === this.session && cached) {
+          this.cachedUnreadEventId = eventId;
+        } else if (session === this.session && eventId !== null) {
           await this.core.commands.unsubscribe(response.subscription);
           if (session !== this.session) {
             stopEvents();
@@ -625,18 +674,8 @@ export class RoomTimeline {
     return true;
   }
 
-  private async unloadedReadMarker(
-    roomId: string,
-    items: readonly TimelineItemView[]
-  ): Promise<string | null> {
-    const content = await this.core.commands
-      .roomAccountData(roomId, 'm.fully_read')
-      .catch(() => null);
-    const eventId = (content as { event_id?: unknown } | null)?.event_id;
-    if (typeof eventId !== 'string' || items.some((item) => item.event_id === eventId)) {
-      return null;
-    }
-    return eventId;
+  private readMarker(roomId: string): Promise<string | null> {
+    return this.core.commands.readMarker(roomId).catch(() => null);
   }
 
   private async subscribeUnreadContext(

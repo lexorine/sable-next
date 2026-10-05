@@ -145,6 +145,25 @@ test('holding an anchor skips rows the caller cannot restore', async () => {
   expect(window.anchorKey((value) => value !== 80)).toBe('81');
 });
 
+test('a jump that clamps to the end re-pins when the offset rounds down to a whole pixel', async () => {
+  const { window, viewport, resizeViewport } = fixture();
+  await window.update(entries(10));
+  viewport.scrollTop = 0;
+  viewport.dispatchEvent(new Event('scroll'));
+  await vi.advanceTimersByTimeAsync(200);
+  resizeViewport(300.25, false);
+  let offset = viewport.scrollTop;
+  Object.defineProperty(viewport, 'scrollTop', {
+    get: () => offset,
+    set: (value: number) => {
+      offset = Math.floor(value);
+    },
+  });
+  await window.jumpTo('9', 'start');
+  expect(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop).toBeGreaterThan(0.5);
+  expect(window.state.pinned).toBe(true);
+});
+
 test('the end of a historical snapshot preserves the reader when newer pages append', async () => {
   const { window, content } = fixture(undefined, undefined, () => false);
   await window.update(entries(2));
@@ -407,6 +426,32 @@ test('backgrounding an interrupted touch settles queued updates without moving t
   }
 });
 
+test('layout preserves scrolling before the native scroll event arrives', async () => {
+  const { window, viewport, content, resize } = fixture();
+  await window.update(entries(1000));
+  await window.jumpTo('500', 'start');
+  await vi.advanceTimersByTimeAsync(200);
+  const anchor = content.querySelector<HTMLElement>('[data-timeline-key="500"]');
+  if (!anchor) throw new Error('Missing reader anchor');
+  const top = anchor.getBoundingClientRect().top;
+
+  viewport.scrollTop -= 45;
+  resize(50);
+
+  expect(anchor.getBoundingClientRect().top).toBe(top + 45);
+});
+
+test('an idle pinned layout stays at latest when rows resize before a scroll event', async () => {
+  const { window, viewport, content, resize } = fixture();
+  await window.update(entries(1000));
+  viewport.scrollTop -= 0.75;
+
+  resize(25);
+
+  expect(window.state.pinned).toBe(true);
+  expect(content.lastElementChild?.getBoundingClientRect().bottom).toBe(viewport.clientHeight);
+});
+
 test('a subpixel native bottom still follows an appended message', async () => {
   const { window, viewport } = fixture();
   await window.update(entries(10));
@@ -649,14 +694,16 @@ test('renders a bounded latest window and jumps to a stable key', async () => {
   expect(window.state.pinned).toBe(true);
 });
 
-test('a distant jump requested as smooth moves directly to its rendered destination', async () => {
+test('a distant smooth jump animates the last viewport into its rendered destination', async () => {
   const { window, viewport } = fixture();
   const animate = vi.spyOn(viewport, 'scrollTo').mockImplementation(() => {});
   await window.update(entries(1000));
   await window.jumpTo('20');
   await window.jumpTo(null, 'start', true);
-  expect(animate).not.toHaveBeenCalled();
-  expect(window.state.lastVisible).toBe(999);
+  const end = viewport.scrollHeight - viewport.clientHeight;
+  expect(viewport.scrollTop).toBe(end - viewport.clientHeight);
+  expect(animate).toHaveBeenCalledExactlyOnceWith({ top: end, behavior: 'smooth' });
+  expect(window.state.firstVisible).toBeGreaterThan(900);
 });
 
 test('continuous upward scrolling reaches older rows whose measured heights exceed estimates', async () => {
