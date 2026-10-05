@@ -201,7 +201,7 @@ nixpkgs:
                   src = finalAttrs.src;
                   pnpm = pkgs.pnpm_12;
                   fetcherVersion = 4;
-                  hash = "sha256-z0uqPv9hTQvq5I+sdd4fvUA8ZXN/IwCq7Yo6v0PrtWo=";
+                  hash = "sha256-a9rmsWRLL8GEzrtW0AwpbcNnC5Ct2h7FeE2uBfoQaUE=";
                 };
 
                 # fetch-deepfilternet.mjs would pull these from the network at

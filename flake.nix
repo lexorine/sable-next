@@ -29,9 +29,19 @@
       # Resets whenever pnpm-lock.yaml changes — the renovate "update npm"
       # bumps move dependency versions without touching this file, so a stale
       # hash here surfaces only as "hash mismatch in fixed-output derivation"
-      # deep inside the pnpm fetch. Re-derive it with
-      #   nix build --no-link .#web-build 2>&1 | grep 'got: sha256'
-      pnpmDepsHash = "sha256-z0uqPv9hTQvq5I+sdd4fvUA8ZXN/IwCq7Yo6v0PrtWo=";
+      # deep inside the pnpm fetch.
+      #
+      # IMPORTANT: this hash covers the *whole* source tree, not just the npm
+      # manifests. Any file the derivation copies — including scripts/build-wasm.mjs
+      # — changes it. So re-derive it from a CLEAN checkout of the tree you are
+      # committing, never from a dirty one, or the value you record is the one
+      # for your local edits and CI will not reproduce it:
+      #
+      #   git -C . stash -u            # or work from a fresh worktree
+      #   nix build --no-link .#default 2>&1 | grep 'got: sha256'
+      #
+      # Use `.#default` (the Tauri shell), not `.#web-build`: CI builds that one.
+      pnpmDepsHash = "sha256-a9rmsWRLL8GEzrtW0AwpbcNnC5Ct2h7FeE2uBfoQaUE=";
 
       version = "0.1.0";
 
