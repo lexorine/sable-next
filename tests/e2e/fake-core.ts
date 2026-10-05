@@ -1169,6 +1169,10 @@ export async function installFakeCore(page: Page, mode: WorkerMode): Promise<voi
       ignored_users: () => ({ type: 'ignored_users', users: [] }),
       invite_triage: () => ({ type: 'invite_triage', invites: [] }),
       bulk_redact: () => ({ type: 'bulk_redact', redacted: 0 }),
+      redacted_content: () => ({
+        type: 'redacted_content',
+        content: { content: null, per_message_profile: null },
+      }),
       delete_thread: () => ({ type: 'delete_thread' }),
       pinned_events: () => ({ type: 'pinned_events', event_ids: [] }),
       reaction_shortcodes: () => ({ type: 'reaction_shortcodes', shortcodes: [] }),
