@@ -16,6 +16,9 @@ on:
   push:
     branches: [main]
     paths:
+      # tauri-packages.nix is what `default` (and therefore this whole job)
+      # builds, so a change to it has to trigger the build like flake.nix does.
+      - tauri-packages.nix
       - flake.nix
       - flake.lock
       - Cargo.toml
@@ -23,6 +26,7 @@ on:
       - crates/**
       - src-tauri/**
       - scripts/build-wasm.mjs
+      - scripts/fetch-deepfilternet.mjs
       - .github/workflows/nix-cachix.yml
   workflow_dispatch:
 

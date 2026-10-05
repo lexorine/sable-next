@@ -26,44 +26,49 @@
       ];
       forAllSystems = lib.genAttrs systems;
 
-      pnpmDepsHash = "sha256-c8KPyvK0m78O9ih0U+U0ts9jHEiLTcIO5uu3YtdotlI=";
+      # Resets whenever pnpm-lock.yaml changes — the renovate "update npm"
+      # bumps move dependency versions without touching this file, so a stale
+      # hash here surfaces only as "hash mismatch in fixed-output derivation"
+      # deep inside the pnpm fetch. Re-derive it with
+      #   nix build --no-link .#web-build 2>&1 | grep 'got: sha256'
+      pnpmDepsHash = "sha256-z0uqPv9hTQvq5I+sdd4fvUA8ZXN/IwCq7Yo6v0PrtWo=";
 
       version = "0.1.0";
 
-      # package.json pins `packageManager: pnpm@12.4.1`; nixpkgs' pnpm_12 is
+      # package.json pins `packageManager: pnpm@12.7.0`; nixpkgs' pnpm_12 is
       # 12.3.4. That mismatch is not a warning — pnpm honours the pin and tries
-      # to *download and signature-verify* 12.4.1 at first run, which fails in
+      # to *download and signature-verify* 12.7.0 at first run, which fails in
       # the sandbox:
       #
       #   Error: ERR_PNPM_PNPM_ENGINE_IDENTITY_UNVERIFIABLE
-      #   Refusing to run pnpm@12.4.1: its npm registry signature could not be
-      #   verified (@pnpm/exe.linux-x64@12.4.1: … error sending request)
+      #   Refusing to run pnpm@12.7.0: its npm registry signature could not be
+      #   verified (@pnpm/exe.linux-x64@12.7.0: … error sending request)
       #
-      # (npmjs has no @pnpm/exe-linux-x64 12.4.1 tarball at all, so there is no
+      # (npmjs has no @pnpm/exe-linux-x64 12.7.0 tarball at all, so there is no
       # registry artefact to verify even with network access.)
       #
       # Neither `manage-package-manager-versions=false` nor COREPACK settings
       # stop it — verified against pnpm 12.3.4 directly. The upstream standalone
       # release binary is used instead: it is a self-contained musl executable
-      # that is simply 12.4.1, so there is nothing to provision and nothing to
+      # that is simply 12.7.0, so there is nothing to provision and nothing to
       # verify.
       pnpmPinned =
         { pkgs, muslArch }:
         pkgs.stdenvNoCC.mkDerivation {
           pname = "pnpm";
-          version = "12.4.1";
+          version = "12.7.0";
 
           src = pkgs.fetchurl {
             url =
               if muslArch == "x86_64" then
-                "https://github.com/pnpm/pnpm/releases/download/v12.4.1/pnpm-linux-x64-musl.tar.gz"
+                "https://github.com/pnpm/pnpm/releases/download/v12.7.0/pnpm-linux-x64-musl.tar.gz"
               else
-                "https://github.com/pnpm/pnpm/releases/download/v12.4.1/pnpm-linux-arm64-musl.tar.gz";
+                "https://github.com/pnpm/pnpm/releases/download/v12.7.0/pnpm-linux-arm64-musl.tar.gz";
             hash =
               if muslArch == "x86_64" then
-                "sha256-tyz8IUDi8zgOJlVaR0+OCRpEMTdPrOYwpQsA5NuZLds="
+                "sha256-GCAp6RLFmU/tHqpxWjjrPG6ktCvK53DFKFKlSGKhPB0="
               else
-                lib.fakeHash;
+                "sha256-SbjSLhQSDnFvc1t9uaAycP+MwoT40knl9bw04mNhuco=";
           };
 
           dontUnpack = true;
@@ -81,7 +86,7 @@
           '';
 
           meta = {
-            description = "pnpm 12.4.1 (matches package.json's packageManager pin)";
+            description = "pnpm 12.7.0 (matches package.json's packageManager pin)";
             homepage = "https://pnpm.io";
             license = lib.licenses.mit;
             platforms = lib.platforms.linux;
@@ -89,22 +94,22 @@
         };
 
       # scripts/build-wasm.mjs aborts unless `wasm-bindgen --version` equals the
-      # wasm-bindgen in Cargo.lock — 0.2.128. nixpkgs 26.11 ships 0.2.127, so the
+      # wasm-bindgen in Cargo.lock — 0.2.129. nixpkgs 26.11 ships 0.2.127, so the
       # upstream release build is used rather than editing the lockfile or
       # bypassing the assertion.
       wasmBindgenCli =
         { pkgs, muslArch }:
         pkgs.stdenvNoCC.mkDerivation {
           pname = "wasm-bindgen-cli";
-          version = "0.2.128";
+          version = "0.2.129";
 
           src = pkgs.fetchurl {
-            url = "https://github.com/rustwasm/wasm-bindgen/releases/download/0.2.128/wasm-bindgen-0.2.128-${muslArch}-unknown-linux-musl.tar.gz";
+            url = "https://github.com/rustwasm/wasm-bindgen/releases/download/0.2.129/wasm-bindgen-0.2.129-${muslArch}-unknown-linux-musl.tar.gz";
             hash =
               if muslArch == "x86_64" then
-                "sha256-tR8CCP3/g1FaeHvYq5rFhl7YTau2bQxwmVe7WXk8ZF8="
+                "sha256-gtEruUDi1OcuDVYFOH/BuMoXkETgErYg8M5OdEDoMg4="
               else
-                "sha256-B5cx3RvHeYwe+k8I/MRRMIJ8vMn/YKC0xgR9ZPxv0lw=";
+                "sha256-LtQ1HDXdlEAwi7sCdn1H6ieO/oUaUkZTAPPJT1tsKoc=";
           };
 
           dontUnpack = true;
@@ -119,7 +124,7 @@
           '';
 
           meta = {
-            description = "wasm-bindgen CLI 0.2.128 (matches Cargo.lock)";
+            description = "wasm-bindgen CLI 0.2.129 (matches Cargo.lock)";
             license = lib.licenses.mit;
             platforms = lib.platforms.linux;
           };
@@ -632,7 +637,7 @@
               # The pinned pnpm, not pkgs.pnpm_12 — the same pin the package
               # build uses. `nix develop` must be able to run
               # `pnpm wasm:build`, and pnpm 12.3.4 refuses to honour
-              # packageManager: pnpm@12.4.1 without network access.
+              # packageManager: pnpm@12.7.0 without network access.
               (pnpmPinned {
                 inherit pkgs muslArch;
               })
@@ -649,7 +654,7 @@
               pkgs.rust-analyzer
               pkgs.lld
 
-              # wasm-bindgen-cli, at the version Cargo.lock pins (0.2.128).
+              # wasm-bindgen-cli, at the version Cargo.lock pins (0.2.129).
               # build-wasm.mjs refuses to run on a mismatch, and nixpkgs ships
               # 0.2.127.
               (wasmBindgenCli {

@@ -64,19 +64,19 @@ nixpkgs:
           muslArch = if system == "x86_64-linux" then "x86_64" else "aarch64";
 
           # scripts/build-wasm.mjs aborts unless `wasm-bindgen --version` equals
-          # the wasm-bindgen in Cargo.lock — 0.2.128. nixpkgs 26.11 ships
+          # the wasm-bindgen in Cargo.lock — 0.2.129. nixpkgs 26.11 ships
           # wasm-bindgen-cli 0.2.127, so the upstream release tarball is used
           # rather than editing the lockfile or bypassing the assertion.
-          wasm-bindgen-cli-0-2-128 = pkgs.stdenvNoCC.mkDerivation {
+          wasm-bindgen-cli-0-2-129 = pkgs.stdenvNoCC.mkDerivation {
             pname = "wasm-bindgen-cli";
-            version = "0.2.128";
+            version = "0.2.129";
             src = pkgs.fetchurl {
-              url = "https://github.com/rustwasm/wasm-bindgen/releases/download/0.2.128/wasm-bindgen-0.2.128-${muslArch}-unknown-linux-musl.tar.gz";
+              url = "https://github.com/rustwasm/wasm-bindgen/releases/download/0.2.129/wasm-bindgen-0.2.129-${muslArch}-unknown-linux-musl.tar.gz";
               hash =
                 if muslArch == "x86_64" then
-                  "sha256-tR8CCP3/g1FaeHvYq5rFhl7YTau2bQxwmVe7WXk8ZF8="
+                  "sha256-gtEruUDi1OcuDVYFOH/BuMoXkETgErYg8M5OdEDoMg4="
                 else
-                  "sha256-B5cx3RvHeYwe+k8I/MRRMIJ8vMn/YKC0xgR9ZPxv0lw=";
+                  "sha256-LtQ1HDXdlEAwi7sCdn1H6ieO/oUaUkZTAPPJT1tsKoc=";
             };
             dontUnpack = true;
             dontConfigure = true;
@@ -88,7 +88,7 @@ nixpkgs:
               runHook postInstall
             '';
             meta = {
-              description = "wasm-bindgen CLI 0.2.128 (matches Cargo.lock)";
+              description = "wasm-bindgen CLI 0.2.129 (matches Cargo.lock)";
               license = lib.licenses.mit;
               platforms = lib.platforms.linux;
             };
@@ -151,7 +151,7 @@ nixpkgs:
               nativeBuildInputs =
                 [
                   pkgs.cargo
-                  wasm-bindgen-cli-0-2-128
+                  wasm-bindgen-cli-0-2-129
                   pkgs.binaryen
                   pkgs.nodejs_24
                   pkgs.pnpm_12
@@ -201,7 +201,7 @@ nixpkgs:
                   src = finalAttrs.src;
                   pnpm = pkgs.pnpm_12;
                   fetcherVersion = 4;
-                  hash = "sha256-c8KPyvK0m78O9ih0U+U0ts9jHEiLTcIO5uu3YtdotlI=";
+                  hash = "sha256-z0uqPv9hTQvq5I+sdd4fvUA8ZXN/IwCq7Yo6v0PrtWo=";
                 };
 
                 # fetch-deepfilternet.mjs would pull these from the network at
