@@ -17,28 +17,27 @@ nixpkgs:
       ];
       forAllSystems = lib.genAttrs systems;
 
-      # Cargo.lock resolves 13 crates out of five git repositories.
+      # Cargo.lock resolves 25 crates out of six git repositories.
       # importCargoLock keys its `outputHashes` on *name-version*, not on the
       # commit, and every entry it is given must correspond to a git dependency
       # or evaluation fails ("a hash was specified … but there is no
-      # corresponding git dependency"). Hashes below were produced by running
-      # fetchgit with lib.fakeHash, one per repository; several keys share a
-      # repository's hash, which is what importCargoLock expects.
+      # corresponding git dependency"). Hashes are of the locked Git checkout trees,
+      # one per repository; importCargoLock reuses each hash for all crates
+      # from the same revision.
       gitOutputHashes = {
-        # matrix-rust-sdk 0.19.1, rev bc2502ee…. The root Cargo.toml also
-        # carries [patch] entries pointing matrix-sdk, -crypto and -indexeddb at
-        # the vendor/ tree, and vendor/ is on the workspace exclude list. Those
-        # three resolve from the checkout; the crates below are not patched and
-        # still come from git, so the fetch remains necessary.
-        "matrix-sdk-base-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-        "matrix-sdk-common-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-        "matrix-sdk-qrcode-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-        "matrix-sdk-sqlite-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-        "matrix-sdk-store-encryption-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-        "matrix-sdk-test-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-        "matrix-sdk-test-macros-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-        "matrix-sdk-test-utils-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-        "matrix-sdk-ui-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
+        # ruma 0.17.0, rev 2d8f3b44…. One hash covers all crates in this repo.
+        "ruma-0.17.0" = "sha256-ecTSzXfZok72PPh+xVjkchqqCNb3NjYnOtHcgTXQnG8=";
+
+        # matrix-rust-sdk 0.19.1, rev 4aea59dd….
+        "matrix-sdk-base-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+        "matrix-sdk-common-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+        "matrix-sdk-qrcode-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+        "matrix-sdk-sqlite-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+        "matrix-sdk-store-encryption-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+        "matrix-sdk-test-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+        "matrix-sdk-test-macros-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+        "matrix-sdk-test-utils-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+        "matrix-sdk-ui-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
 
         # tauri-plugin-notifications 0.5.0, SableClient fork (UnifiedPush/VAPID).
         "tauri-plugin-notifications-0.5.0" = "sha256-IRjkPyK7F5I5LlPprTp1qjVvtaFPsBoArT8mLxjPN+Q=";
@@ -50,10 +49,9 @@ nixpkgs:
         # pulls a CEF download, so the default `wry` build never touches it.
         "tauri-runtime-cef-0.1.0" = "sha256-d+m6Bh6PMj82qOtHWGmjUai0aApBiIkndUhK+vp/p6w=";
 
-        # tauri-plugin-livekit-mobile 0.2.0, android/ios only. Its Cargo.toml
-        # asks for rev ca97b1ec… but the locked commit is 92ddc076…, so the hash
-        # is for that tree.
-        "tauri-plugin-livekit-mobile-0.2.0" = "sha256-5QB7wu2js4JLkJWiJ6YgR7QpLzuVpm49PmKnO9tNm94=";
+        # tauri-plugin-livekit-mobile 0.2.0, android/ios only.
+        # Hash of the locked revision b18b6822….
+        "tauri-plugin-livekit-mobile-0.2.0" = "sha256-le7NYu9zRZWKO/fXF0r7tNJZvD0UG6VNE2hzJls/6us=";
       };
     in
     {

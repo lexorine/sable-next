@@ -134,7 +134,7 @@
       webBuild =
         { pkgs, src, muslArch }:
         let
-          # The wasm build is a real cargo invocation, so it needs the five git
+          # The wasm build is a real cargo invocation, so it needs the six git
           # repositories Cargo.lock pins, vendored — the sandbox has no network.
           # importCargoLock fetches them as fixed-output derivations.
           #
@@ -144,16 +144,19 @@
           cargoGitDeps = pkgs.rustPlatform.importCargoLock {
             lockFile = ./Cargo.lock;
             outputHashes = {
-              # matrix-rust-sdk 0.19.1, rev bc2502ee….
-              "matrix-sdk-base-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-common-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-qrcode-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-sqlite-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-store-encryption-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-test-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-test-macros-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-test-utils-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-ui-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
+              # ruma 0.17.0, rev 2d8f3b44…. One hash covers all crates in this repo.
+              "ruma-0.17.0" = "sha256-ecTSzXfZok72PPh+xVjkchqqCNb3NjYnOtHcgTXQnG8=";
+
+              # matrix-rust-sdk 0.19.1, rev 4aea59dd….
+              "matrix-sdk-base-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+              "matrix-sdk-common-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+              "matrix-sdk-qrcode-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+              "matrix-sdk-sqlite-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+              "matrix-sdk-store-encryption-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+              "matrix-sdk-test-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+              "matrix-sdk-test-macros-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+              "matrix-sdk-test-utils-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+              "matrix-sdk-ui-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
 
               # tauri-plugin-notifications 0.5.0, SableClient fork (UnifiedPush/VAPID).
               "tauri-plugin-notifications-0.5.0" = "sha256-IRjkPyK7F5I5LlPprTp1qjVvtaFPsBoArT8mLxjPN+Q=";
@@ -165,10 +168,9 @@
               # which pulls a CEF download, so the default build never touches it.
               "tauri-runtime-cef-0.1.0" = "sha256-d+m6Bh6PMj82qOtHWGmjUai0aApBiIkndUhK+vp/p6w=";
 
-              # tauri-plugin-livekit-mobile 0.2.0, android/ios only. Its
-              # Cargo.toml asks for rev ca97b1ec… but the locked commit is
-              # 92ddc076…, so the hash is for that tree.
-              "tauri-plugin-livekit-mobile-0.2.0" = "sha256-5QB7wu2js4JLkJWiJ6YgR7QpLzuVpm49PmKnO9tNm94=";
+              # tauri-plugin-livekit-mobile 0.2.0, android/ios only.
+              # Hash of the locked revision b18b6822….
+              "tauri-plugin-livekit-mobile-0.2.0" = "sha256-le7NYu9zRZWKO/fXF0r7tNJZvD0UG6VNE2hzJls/6us=";
             };
           };
         in
@@ -472,22 +474,25 @@
 
           cargoLock = {
             lockFile = ./Cargo.lock;
-            # Cargo.lock resolves 13 crates from five git repositories.
+            # Cargo.lock resolves 25 crates from six git repositories.
             # importCargoLock keys these on *name-version*, not on the commit,
             # and every entry must correspond to a git dependency or evaluation
-            # fails. Produced by running fetchgit with lib.fakeHash, one per
-            # repository; entries sharing a repository share its hash.
+            # fails. Hashes are of the locked Git checkout trees; entries
+            # sharing a repository share its hash.
             outputHashes = {
-              # matrix-rust-sdk 0.19.1, rev bc2502ee….
-              "matrix-sdk-base-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-common-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-qrcode-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-sqlite-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-store-encryption-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-test-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-test-macros-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-test-utils-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
-              "matrix-sdk-ui-0.19.1" = "sha256-VF2son9vPfS10Lvm2GnnJatepTw/RODCimXaPv2RWd0=";
+              # ruma 0.17.0, rev 2d8f3b44…. One hash covers all crates in this repo.
+              "ruma-0.17.0" = "sha256-ecTSzXfZok72PPh+xVjkchqqCNb3NjYnOtHcgTXQnG8=";
+
+              # matrix-rust-sdk 0.19.1, rev 4aea59dd….
+              "matrix-sdk-base-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+              "matrix-sdk-common-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+              "matrix-sdk-qrcode-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+              "matrix-sdk-sqlite-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+              "matrix-sdk-store-encryption-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+              "matrix-sdk-test-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+              "matrix-sdk-test-macros-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+              "matrix-sdk-test-utils-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
+              "matrix-sdk-ui-0.19.1" = "sha256-OXVeGa4mGiTX4pr+DFXSJLgtXA7qKE9AYmbdhun/b2E=";
 
               # tauri-plugin-notifications 0.5.0, SableClient fork (UnifiedPush/VAPID).
               "tauri-plugin-notifications-0.5.0" = "sha256-IRjkPyK7F5I5LlPprTp1qjVvtaFPsBoArT8mLxjPN+Q=";
@@ -499,10 +504,9 @@
               # which pulls a CEF download, so the default build never touches it.
               "tauri-runtime-cef-0.1.0" = "sha256-d+m6Bh6PMj82qOtHWGmjUai0aApBiIkndUhK+vp/p6w=";
 
-              # tauri-plugin-livekit-mobile 0.2.0, android/ios only. Its
-              # Cargo.toml asks for rev ca97b1ec… but the locked commit is
-              # 92ddc076…, so the hash is for that tree.
-              "tauri-plugin-livekit-mobile-0.2.0" = "sha256-5QB7wu2js4JLkJWiJ6YgR7QpLzuVpm49PmKnO9tNm94=";
+              # tauri-plugin-livekit-mobile 0.2.0, android/ios only.
+              # Hash of the locked revision b18b6822….
+              "tauri-plugin-livekit-mobile-0.2.0" = "sha256-le7NYu9zRZWKO/fXF0r7tNJZvD0UG6VNE2hzJls/6us=";
             };
           };
 
