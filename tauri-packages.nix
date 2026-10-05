@@ -119,11 +119,26 @@ nixpkgs:
               src = ./.;
 
               # The binary crate is `app`; the library target is `app_lib`.
+              #
+              # --no-default-features --features cef,geolocation,custom-protocol
+              # matches what upstream's own Linux release build passes
+              # (src-tauri/Cargo.toml: "Exactly one must be on. The Linux
+              # release build passes `--no-default-features --features cef`").
+              # `geolocation` is carried over from `default` because the app
+              # registers the geolocation plugin unconditionally.
+              #
+              # custom-protocol is the load-bearing one: without it Tauri does
+              # not embed `frontendDist` and falls back to `devUrl`
+              # (http://localhost:3000), so the packaged app renders
+              # "Could not connect to localhost: Connection refused".
               cargoBuildFlags = [
                 "-p"
                 "app"
                 "--bin"
                 "app"
+                "--no-default-features"
+                "--features"
+                "cef,geolocation,custom-protocol"
               ];
 
               # The repo has no `cargo test` suite wired into the build; the
@@ -158,6 +173,12 @@ nixpkgs:
                   pkgs.pnpmConfigHook
                   pkgs.pkg-config
                   pkgs.makeWrapper
+
+                  # scripts/cef/copy-libs.sh uses find(1) to locate
+                  # target/**/release/build/cef_linux_*/ and `strings` + `strip`
+                  # from binutils on libcef.so, libEGL.so and libGLESv2.so.
+                  pkgs.findutils
+                  pkgs.binutils
                 ]
                 ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [
                   pkgs.perl
@@ -198,6 +219,29 @@ nixpkgs:
                   pipewire
                   webkitgtk_4_1
                   xdotool
+
+                  # CEF's own runtime dependencies. libcef.so is a Chromium
+                  # build and links NSS, the GL/EGL stack, xkbcommon and ALSA;
+                  # it dlopens them, so a missing one is a startup abort with no
+                  # useful message rather than a link error. These are the same
+                  # set upstream declares in packaging/aur/sable-bin.PKGBUILD
+                  # for its CEF build. Nothing here is needed by the wry path,
+                  # and all of it is on cache.nixos.org.
+                  alsa-lib
+                  at-spi2-atk
+                  cups
+                  libdrm
+                  libGL
+                  libx11
+                  libxcomposite
+                  libxdamage
+                  libxext
+                  libxfixes
+                  libxkbcommon
+                  libxrandr
+                  mesa
+                  nspr
+                  nss
                 ])
                 ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux (
                   with pkgs; [ libayatana-appindicator ]
@@ -275,6 +319,29 @@ nixpkgs:
                   exit 1
                 fi
                 install -Dm755 "$app_bin" "$out/bin/sable"
+
+                # The CEF runtime, staged next to the binary. CEF is dlopened,
+                # not linked, and resolves its .pak/.dat/locales relative to the
+                # executable's own directory — so libcef.so and the resources
+                # have to stay in $out/bin, beside `sable`, exactly as
+                # upstream's own package builds them. Moving them elsewhere
+                # makes the app abort at startup with no useful message.
+                #
+                # copy-libs.sh also strips libcef.so from 1.3 GB to ~241 MB and
+                # trims the locale set to en-US alone.
+                bash scripts/cef/copy-libs.sh release "$out/bin"
+
+                # copy-libs.sh copies from the read-only store, so the staged
+                # files are not writable and strip/RPATH fixups cannot apply.
+                chmod -R u+w "$out"
+
+                # libcef.so is dlopened by path, so the dynamic loader needs to
+                # be told where it is. wrapProgram rather than patchelf: the
+                # binary is already in $out/bin, and a wrapper keeps the store
+                # path self-describing.
+                wrapProgram "$out/bin/sable" \
+                  --prefix LD_LIBRARY_PATH : "$out/bin" \
+                  --prefix LOCALE : "$out/bin/locales"
 
                 runHook postInstall
               '';
