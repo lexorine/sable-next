@@ -120,16 +120,22 @@ nixpkgs:
 
               # The binary crate is `app`; the library target is `app_lib`.
               #
-              # --no-default-features --features cef,geolocation,custom-protocol
-              # matches what upstream's own Linux release build passes
+              # `--no-default-features --features cef,geolocation` matches what
+              # upstream's own Linux release build passes
               # (src-tauri/Cargo.toml: "Exactly one must be on. The Linux
               # release build passes `--no-default-features --features cef`").
               # `geolocation` is carried over from `default` because the app
               # registers the geolocation plugin unconditionally.
               #
-              # custom-protocol is the load-bearing one: without it Tauri does
-              # not embed `frontendDist` and falls back to `devUrl`
-              # (http://localhost:3000), so the packaged app renders
+              # `tauri/custom-protocol` is the load-bearing one, and it is
+              # namespaced: `app` only declares wry/geolocation/cef, so a bare
+              # `custom-protocol` fails with "the package 'app' does not
+              # contain this feature". The `dep/feat` prefix is how a package
+              # enables one of its dependency's features without the dependency
+              # re-exporting it.
+              #
+              # Without it Tauri does not embed `frontendDist` and falls back to
+              # `devUrl` (http://localhost:3000), so the packaged app renders
               # "Could not connect to localhost: Connection refused".
               cargoBuildFlags = [
                 "-p"
@@ -138,7 +144,7 @@ nixpkgs:
                 "app"
                 "--no-default-features"
                 "--features"
-                "cef,geolocation,custom-protocol"
+                "cef,geolocation,tauri/custom-protocol"
               ];
 
               # The repo has no `cargo test` suite wired into the build; the
