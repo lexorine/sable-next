@@ -164,19 +164,19 @@ nixpkgs:
                   url =
                     "https://cef-builds.spotifycdn.com/" +
                     top +
-                    ".tar.bz2";
-                  # Recorded from the archive itself, not the CDN's index, so
-                  # the two agreeing is a real check rather than a copied field.
-                  hash = "sha256-auCv4+H0qdE08eH0MU4h301eWwn8NNn/IjC0JmRF/hc=";
+                    "_minimal.tar.bz2";
+                  # Recorded from the archive itself, not the CDN's index, so the
+                  # two agreeing is a real check rather than a copied field.
+                  # 314776103 bytes, sha256-QO9hPkVcrNB6p8gfQl76qLb3frg/E8wo1HDuuk5h+Y8=.
+                  hash = "sha256-QO9hPkVcrNB6p8gfQl76qLb3frg/E8wo1HDuuk5h+Y8=";
 
                   # Spotify's CDN violates HTTP/2 framing rules part-way through
-                  # these 668 MB downloads and curl aborts with:
+                  # these downloads and curl aborts with:
                   #   curl: (92) [HTTP2] [3] received invalid frame:
                   #     FRAME[DATA, len=0, eos=1, ...], error -532: Violation in
                   #     HTTP messaging rule
-                  # It retries three times and still dies, so the build fails
-                  # with "cannot download ... from any mirror". HTTP/1.1 avoids
-                  # it: verified to pull 30 MB cleanly where HTTP/2 died at ~25.
+                  # It retries three times and still dies, so the build fails with
+                  # "cannot download ... from any mirror". HTTP/1.1 avoids it.
                   curlOpts = "--http1.1";
                 };
 
@@ -200,12 +200,34 @@ nixpkgs:
                   mv Release/* "$out/cef_linux_${arch}/"
                   mv Resources/* "$out/cef_linux_${arch}/"
 
-                  cat > "$out/cef_linux_${arch}/archive.json" <<EOF
-                  {"type":"standard",
-                   "name":"${top}.tar.bz2",
+                  # CMakeLists.txt, cmake/ and include/ have to move in too:
+                  # build.rs runs cmake::Config::new(&cef_dir) against that
+                  # directory, so a CEF_PATH without them dies with
+                  # "CMake must be installed to run" or a missing-project error.
+                  for extra in CMakeLists.txt cmake include LICENSE.txt; do
+                    [ -e "$extra" ] && mv "$extra" "$out/cef_linux_${arch}/"
+                  done
+                  true
+
+                  # archive.json belongs at the CEF_PATH *root*, not inside
+                  # cef_linux_<arch>/: build.rs calls check_archive(&configured_path)
+                  # and archive_json_path() is location.join("archive.json"), where
+                  # location is CEF_PATH itself. Placing it one level down leaves
+                  # check_archive_json unable to open the file, which sends
+                  # build.rs down the download branch all over again.
+                  #
+                  # Its `name` is parsed with ^cef_binary_([^+]+), so the version
+                  # read back is 150.0.14 -- equal to the crate's, which passes.
+                  # `sha1` is never read, but serde requires the field to exist.
+                  cat > "$out/archive.json" <<EOF
+                  {"type":"minimal",
+                   "name":"${top}_minimal.tar.bz2",
                    "sha1":"${cefSha1.${arch}}"}
                   EOF
 
+                  # No CEF_PATH/<version>/ directory: if it exists, build.rs takes
+                  # the resolve_from_versioned path and expects a nested
+                  # cef_linux_* inside it instead.
                   runHook postInstall
                 '';
 
@@ -290,6 +312,17 @@ nixpkgs:
                   pkgs.pnpmConfigHook
                   pkgs.pkg-config
                   pkgs.makeWrapper
+
+                  # cef-dll-sys's build.rs drives the CEF wrapper project's build
+                  # through the cmake crate:
+                  #     cmake::Config::new(&cef_dir).generator("Ninja")
+                  # The `cmake` *crate* is a Cargo build-dep and is in the closure
+                  # already, but that is not the CMake binary -- nixpkgs' stdenv
+                  # puts no cmake and no ninja on PATH, so the build dies right
+                  # after the prefetch with "CMake must be installed to run".
+                  # Both are needed: the generator is hardcoded to Ninja.
+                  pkgs.cmake
+                  pkgs.ninja
 
                   # scripts/cef/copy-libs.sh uses find(1) to locate
                   # target/**/release/build/cef_linux_*/ and `strings` + `strip`
@@ -481,9 +514,15 @@ nixpkgs:
                                 # the copies, and strip needs to rewrite the result.
                                 chmod -R u+w "$out"
 
+                                # `strip -s` rewrites in place but leaves the original behind as
+                                # <name>.stripped on some binutils versions; either way, any
+                                # leftover costs ~1.4 GB in the store and in every Cachix push.
                                 for lib in "$out/bin/libcef.so" "$out/bin/libEGL.so" \
                                   "$out/bin/libGLESv2.so"; do
-                                  [ -f "$lib" ] && strip -s "$lib" 2>/dev/null || true
+                                  if [ -f "$lib" ]; then
+                                    strip -s "$lib" 2>/dev/null || true
+                                    rm -f "$lib.stripped" "$lib.orig"
+                                  fi
                                 done
 
                                 # libcef.so is dlopened by path, so the dynamic loader needs to be
