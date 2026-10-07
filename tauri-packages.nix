@@ -313,16 +313,23 @@ nixpkgs:
                   pkgs.pkg-config
                   pkgs.makeWrapper
 
-                  # cef-dll-sys's build.rs drives the CEF wrapper project's build
-                  # through the cmake crate:
+                  # cef-dll-sys's build.rs drives the CEF wrapper project through
+                  # the cmake crate:
                   #     cmake::Config::new(&cef_dir).generator("Ninja")
-                  # The `cmake` *crate* is a Cargo build-dep and is in the closure
-                  # already, but that is not the CMake binary -- nixpkgs' stdenv
-                  # puts no cmake and no ninja on PATH, so the build dies right
-                  # after the prefetch with "CMake must be installed to run".
-                  # Both are needed: the generator is hardcoded to Ninja.
+                  # That is the cmake *crate* (a Cargo build-dep, already in the
+                  # closure), not the CMake binary -- nixpkgs' stdenv puts no
+                  # cmake on PATH, so the build would die right after the
+                  # prefetch with "CMake must be installed to run". cmake is
+                  # therefore needed.
+                  #
+                  # Do NOT add pkgs.ninja alongside it. The `cmake` crate invokes
+                  # plain `ninja`, but in a nixpkgs build that name is already
+                  # the stdenv's *wrapper* for the derivation's own build.ninja
+                  # generator, which stdenv puts first on PATH. Prepending real
+                  # ninja shadows the wrapper, and the build dies instantly:
+                  #     build flags: -j4
+                  #     ninja: error: loading 'build.ninja': No such file or directory
                   pkgs.cmake
-                  pkgs.ninja
 
                   # scripts/cef/copy-libs.sh uses find(1) to locate
                   # target/**/release/build/cef_linux_*/ and `strings` + `strip`
