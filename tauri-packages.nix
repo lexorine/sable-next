@@ -106,139 +106,6 @@ nixpkgs:
             hash = "sha256-yU2R9wkRAByUbg+rtKqa3DcEX0WgO1YAjLDIJEy2NhY=";
           };
 
-          # The CEF runtime, fetched as a fixed-output derivation.
-          #
-          # cef-dll-sys's build script downloads a ~668 MB binary from
-          # cef-builds.spotifycdn.com unless CEF_PATH points at one that is
-          # already there. A Nix sandbox has no network, so without this the
-          # build dies 25 minutes in with:
-          #
-          #   error: failed to run custom build command for `cef-dll-sys`
-          #     Error: HTTP request error: io: failed to lookup address
-          #     information: Temporary failure in name resolution
-          #
-          # So fetch it here, lay it out the way cef-dll-sys expects, and pass
-          # CEF_PATH. Its layout is produced by download_cef::extract_target_archive:
-          # the archive holds <name>/Release and <name>/Resources, and those are
-          # merged into a single cef_linux_<arch>/ directory.
-          #
-          # archive.json is what makes cef-dll-sys trust the directory and skip
-          # the download: check_archive_json reads it, and only downloads when
-          # that read or the version check fails. Its `name` must match
-          # `^cef_binary_([^+]+)` with a version no newer than 150.0.14; the
-          # `sha1` field is not read but serde still requires it to be present.
-          cefVersion = "150.0.14+g7c1aa68+chromium-150.0.7871.129";
-          cefSha1 = {
-            x86_64 = "d34827597239c647f2502d6ce5f8534a95407c30";
-            aarch64 = "8003e8288c5092e0f11227e1878dcfb5a2e71f87";
-          };
-
-          cefRuntime =
-            {
-              pkgs,
-              system,
-            }:
-            let
-              # The CDN names its archives by platform as `linux64` /
-              # `linuxarm64`, which is *not* the same token cef-dll-sys uses
-              # internally (`x86_64`/`aarch64`, giving cef_linux_x86_64).
-              arch = if system == "x86_64-linux" then "x86_64" else "aarch64";
-              cdnArch = if system == "x86_64-linux" then "linux64" else "linuxarm64";
-              top = "cef_binary_${cefVersion}_${cdnArch}";
-            in
-            # x86_64-linux only, deliberately. CI builds that platform and
-            # nothing else. aarch64 would need its own 668 MB archive fetched
-            # and hashed on a machine that can build it, and before this
-            # derivation existed aarch64 could not build at all: cef-dll-sys
-            # tried to download its runtime inside a network-less sandbox.
-            # So aarch64 stays broken rather than becoming broken *and*
-            # unbuildable for everyone who runs nix flake check --all-systems.
-            if system != "x86_64-linux" then
-              throw "sable-next's Tauri package (with CEF) is x86_64-linux only for now: the CEF runtime for ${system} has no hashed fetchurl in this flake."
-            else
-              pkgs.stdenvNoCC.mkDerivation {
-                pname = "cef-binary";
-                version = cefVersion;
-
-                src = pkgs.fetchurl {
-                  url =
-                    "https://cef-builds.spotifycdn.com/" +
-                    top +
-                    "_minimal.tar.bz2";
-                  # Recorded from the archive itself, not the CDN's index, so the
-                  # two agreeing is a real check rather than a copied field.
-                  # 314776103 bytes, sha256-QO9hPkVcrNB6p8gfQl76qLb3frg/E8wo1HDuuk5h+Y8=.
-                  hash = "sha256-QO9hPkVcrNB6p8gfQl76qLb3frg/E8wo1HDuuk5h+Y8=";
-
-                  # Spotify's CDN violates HTTP/2 framing rules part-way through
-                  # these downloads and curl aborts with:
-                  #   curl: (92) [HTTP2] [3] received invalid frame:
-                  #     FRAME[DATA, len=0, eos=1, ...], error -532: Violation in
-                  #     HTTP messaging rule
-                  # It retries three times and still dies, so the build fails with
-                  # "cannot download ... from any mirror". HTTP/1.1 avoids it.
-                  curlOpts = "--http1.1";
-                };
-
-                dontPatch = true;
-                dontConfigure = true;
-
-                # bzip2 and tar only; nothing is compiled here.
-                nativeBuildInputs = [
-                  pkgs.bzip2
-                  pkgs.coreutils
-                ];
-
-                installPhase = ''
-                  runHook preInstall
-
-                  tar xjf "$src" --strip-components=1 -C .
-
-                  # Merge Release/ and Resources/ into the one directory
-                  # cef-dll-sys links against, mirroring extract_target_archive.
-                  mkdir -p "$out/cef_linux_${arch}"
-                  mv Release/* "$out/cef_linux_${arch}/"
-                  mv Resources/* "$out/cef_linux_${arch}/"
-
-                  # CMakeLists.txt, cmake/ and include/ have to move in too:
-                  # build.rs runs cmake::Config::new(&cef_dir) against that
-                  # directory, so a CEF_PATH without them dies with
-                  # "CMake must be installed to run" or a missing-project error.
-                  for extra in CMakeLists.txt cmake include LICENSE.txt; do
-                    [ -e "$extra" ] && mv "$extra" "$out/cef_linux_${arch}/"
-                  done
-                  true
-
-                  # archive.json belongs at the CEF_PATH *root*, not inside
-                  # cef_linux_<arch>/: build.rs calls check_archive(&configured_path)
-                  # and archive_json_path() is location.join("archive.json"), where
-                  # location is CEF_PATH itself. Placing it one level down leaves
-                  # check_archive_json unable to open the file, which sends
-                  # build.rs down the download branch all over again.
-                  #
-                  # Its `name` is parsed with ^cef_binary_([^+]+), so the version
-                  # read back is 150.0.14 -- equal to the crate's, which passes.
-                  # `sha1` is never read, but serde requires the field to exist.
-                  cat > "$out/archive.json" <<EOF
-                  {"type":"minimal",
-                   "name":"${top}_minimal.tar.bz2",
-                   "sha1":"${cefSha1.${arch}}"}
-                  EOF
-
-                  # No CEF_PATH/<version>/ directory: if it exists, build.rs takes
-                  # the resolve_from_versioned path and expects a nested
-                  # cef_linux_* inside it instead.
-                  runHook postInstall
-                '';
-
-                meta = {
-                  description = "CEF ${cefVersion} binary distribution for linux/${arch}";
-                  homepage = "https://cef-builds.spotifycdn.com/";
-                  license = lib.licenses.bsd3;
-                  platforms = [ "x86_64-linux" ];
-                };
-              };
-
           # The Tauri desktop shell. sable-wasm is deliberately absent: it only
           # compiles for wasm32-unknown-unknown (its session store holds JS
           # functions, so it is not Send) and is produced as a wasm32 artefact in
@@ -252,32 +119,31 @@ nixpkgs:
               src = ./.;
 
               # The binary crate is `app`; the library target is `app_lib`.
+              # `tauri/custom-protocol` is a feature of the *tauri dependency*,
+              # not of the `app` package -- `app` only declares `wry`,
+              # `geolocation` and `cef`, so the namespaced `dep/feature` syntax
+              # is required here:
+              #     error: the package 'app' does not contain this feature: custom-protocol
               #
-              # `--no-default-features --features cef,geolocation` matches what
-              # upstream's own Linux release build passes
-              # (src-tauri/Cargo.toml: "Exactly one must be on. The Linux
-              # release build passes `--no-default-features --features cef`").
-              # `geolocation` is carried over from `default` because the app
-              # registers the geolocation plugin unconditionally.
+              # Without it Tauri honours `devUrl: "http://localhost:3000"`
+              # (src-tauri/tauri.conf.json) even in a release build, and the
+              # packaged binary dies with "Could not connect to localhost:
+              # Connection refused" inside WebKitGTK. Turning it on is what makes
+              # Tauri embed `frontendDist: "../dist"` instead, and preBuild
+              # already generates that directory before cargo runs.
               #
-              # `tauri/custom-protocol` is the load-bearing one, and it is
-              # namespaced: `app` only declares wry/geolocation/cef, so a bare
-              # `custom-protocol` fails with "the package 'app' does not
-              # contain this feature". The `dep/feat` prefix is how a package
-              # enables one of its dependency's features without the dependency
-              # re-exporting it.
-              #
-              # Without it Tauri does not embed `frontendDist` and falls back to
-              # `devUrl` (http://localhost:3000), so the packaged app renders
-              # "Could not connect to localhost: Connection refused".
+              # Deliberately NOT `--no-default-features --features cef`: enabling
+              # CEF pulls in cef-dll-sys, whose build.rs needs a network-fetched
+              # CEF distribution inside the sandbox. That never built. Default
+              # features keep wry/WebKitGTK, which is the last configuration
+              # known to compile and push to Cachix.
               cargoBuildFlags = [
                 "-p"
                 "app"
                 "--bin"
                 "app"
-                "--no-default-features"
                 "--features"
-                "cef,geolocation,tauri/custom-protocol"
+                "tauri/custom-protocol"
               ];
 
               # The repo has no `cargo test` suite wired into the build; the
@@ -312,30 +178,6 @@ nixpkgs:
                   pkgs.pnpmConfigHook
                   pkgs.pkg-config
                   pkgs.makeWrapper
-
-                  # cef-dll-sys's build.rs drives the CEF wrapper project through
-                  # the cmake crate:
-                  #     cmake::Config::new(&cef_dir).generator("Ninja")
-                  # That is the cmake *crate* (a Cargo build-dep, already in the
-                  # closure), not the CMake binary -- nixpkgs' stdenv puts no
-                  # cmake on PATH, so the build would die right after the
-                  # prefetch with "CMake must be installed to run". cmake is
-                  # therefore needed.
-                  #
-                  # Do NOT add pkgs.ninja alongside it. The `cmake` crate invokes
-                  # plain `ninja`, but in a nixpkgs build that name is already
-                  # the stdenv's *wrapper* for the derivation's own build.ninja
-                  # generator, which stdenv puts first on PATH. Prepending real
-                  # ninja shadows the wrapper, and the build dies instantly:
-                  #     build flags: -j4
-                  #     ninja: error: loading 'build.ninja': No such file or directory
-                  pkgs.cmake
-
-                  # scripts/cef/copy-libs.sh uses find(1) to locate
-                  # target/**/release/build/cef_linux_*/ and `strings` + `strip`
-                  # from binutils on libcef.so, libEGL.so and libGLESv2.so.
-                  pkgs.findutils
-                  pkgs.binutils
                 ]
                 ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [
                   pkgs.perl
@@ -376,29 +218,6 @@ nixpkgs:
                   pipewire
                   webkitgtk_4_1
                   xdotool
-
-                  # CEF's own runtime dependencies. libcef.so is a Chromium
-                  # build and links NSS, the GL/EGL stack, xkbcommon and ALSA;
-                  # it dlopens them, so a missing one is a startup abort with no
-                  # useful message rather than a link error. These are the same
-                  # set upstream declares in packaging/aur/sable-bin.PKGBUILD
-                  # for its CEF build. Nothing here is needed by the wry path,
-                  # and all of it is on cache.nixos.org.
-                  alsa-lib
-                  at-spi2-atk
-                  cups
-                  libdrm
-                  libGL
-                  libx11
-                  libxcomposite
-                  libxdamage
-                  libxext
-                  libxfixes
-                  libxkbcommon
-                  libxrandr
-                  mesa
-                  nspr
-                  nss
                 ])
                 ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux (
                   with pkgs; [ libayatana-appindicator ]
@@ -423,14 +242,6 @@ nixpkgs:
                 # No Sentry credentials in a Nix build, so the frontend must not
                 # attempt a source-map upload.
                 SENTRY_AUTH_TOKEN = "";
-
-                # Points cef-dll-sys at the runtime fetched above instead of
-                # letting its build script download one. Must name the parent of
-                # cef_linux_<arch>/, not the directory itself: with CEF_PATH set
-                # to a path that exists, the script joins the version onto it
-                # only when a versioned subdirectory is absent, and otherwise
-                # checks archive.json in the directory named here.
-                CEF_PATH = cefRuntime { inherit pkgs system; };
               };
 
               # `app` embeds ../dist and the wasm bindings, and tauri-build panics
@@ -485,61 +296,8 @@ nixpkgs:
                 fi
                 install -Dm755 "$app_bin" "$out/bin/sable"
 
-                                # The CEF runtime, staged next to the binary. CEF is dlopened,
-                                # not linked, and tauri-runtime-cef resolves its .pak/.dat/locales
-                                # relative to the executable's own directory — so libcef.so and
-                                # the resources have to sit in $out/bin, beside `sable`, exactly
-                                # as upstream's own package builds them. Elsewhere, the app
-                                # aborts at startup with no useful message.
-                                #
-                                # NOT scripts/cef/copy-libs.sh: it locates the runtime with
-                                # `find target -name cef_linux_* -path "*/release/build/*"`,
-                                # which only holds when cef-dll-sys downloaded and unpacked the
-                                # distribution itself. With CEF_PATH set, its build script copies
-                                # the runtime to target/<triple>/release/ instead, so that find
-                                # matches nothing and the script exits 1.
-                                #
-                                # Same two things copy-libs.sh would do: strip libcef.so (1.3 GB
-                                # -> ~241 MB) and keep only the en-US locale (220 .pak files ->
-                                # one).
-                                cef_dir=$(echo "$CEF_PATH"/cef_linux_*)
-                                if [ ! -d "$cef_dir" ]; then
-                                  echo "install: no cef_linux_* under CEF_PATH=$CEF_PATH" >&2
-                                  ls -l "$CEF_PATH" >&2
-                                  exit 1
-                                fi
-
-                                mkdir -p "$out/bin/locales"
-                                cp -f "$cef_dir"/*.so* "$out/bin/" 2>/dev/null || true
-                                cp -f "$cef_dir"/v8_context_snapshot.bin "$out/bin/" 2>/dev/null || true
-                                cp -f "$cef_dir"/*.pak "$cef_dir"/*.dat "$cef_dir"/*.bin \
-                                  "$cef_dir"/*.json "$out/bin/" 2>/dev/null || true
-                                cp -f "$cef_dir/locales/en-US.pak" "$out/bin/locales/" 2>/dev/null || true
-                                cp -f packaging/licenses/CEF-LICENSE.txt "$out/bin/CEF-LICENSE.txt"
-
-                                # cp without --no-preserve carries the store's read-only mode onto
-                                # the copies, and strip needs to rewrite the result.
-                                chmod -R u+w "$out"
-
-                                # `strip -s` rewrites in place but leaves the original behind as
-                                # <name>.stripped on some binutils versions; either way, any
-                                # leftover costs ~1.4 GB in the store and in every Cachix push.
-                                for lib in "$out/bin/libcef.so" "$out/bin/libEGL.so" \
-                                  "$out/bin/libGLESv2.so"; do
-                                  if [ -f "$lib" ]; then
-                                    strip -s "$lib" 2>/dev/null || true
-                                    rm -f "$lib.stripped" "$lib.orig"
-                                  fi
-                                done
-
-                                # libcef.so is dlopened by path, so the dynamic loader needs to be
-                                # told where it is.
-                                wrapProgram "$out/bin/sable" \
-                                  --prefix LD_LIBRARY_PATH : "$out/bin" \
-                                  --prefix LOCALE : "$out/bin/locales"
-
-                                runHook postInstall
-                              '';
+                runHook postInstall
+              '';
 
               meta = {
                 description = "Sable Next — a Matrix client (Tauri desktop shell, CI-ONLY)";
