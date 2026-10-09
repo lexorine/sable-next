@@ -627,22 +627,24 @@
           # and the Cachix workflow's `.#packages.<system>.default` both mean.
           # `sable-web` stays reachable by name for the browser-only artefact.
           #
-          # `default` is the HERMETIC build: wry/WebKitGTK, no CEF, no
-          # `__noChroot`, fully reproducible from declared inputs.
+          # `default` is the chromium-cef build. It needs `__noChroot`, because
+          # cef-dll-sys downloads its CEF distribution during the build and the Nix
+          # sandbox has no network. That makes it non-reproducible, and it is
+          # `default` anyway: CEF is the webview sable actually ships. Upstream
+          # builds it the same way for the same reason -- their
+          # .forgejo/workflows/tauri-build.yml runs `pnpm tauri:cef build` on a
+          # plain runner, no Nix involved.
           #
-          # `sable-cef` is the chromium-cef build. It is deliberately NOT the
-          # default: cef-dll-sys downloads its CEF distribution during the build,
-          # which the Nix sandbox forbids, so that derivation sets `__noChroot`
-          # and cannot be reproduced byte-for-byte. Upstream makes the same
-          # choice -- their .forgejo tauri-build.yml builds CEF with a plain
-          # `pnpm tauri:cef build` on a normal runner, no Nix involved, and their
-          # flake.nix keeps CEF out of the Nix build entirely ("the default build
-          # never touches it").
+          # `wry` is the lighter hermetic fallback (no `__noChroot`, ~115 MB
+          # smaller). Reach it by name:
+          #   nix run github:lexorine/sable-next#wry
+          # `sable-cef` is an alias for `default` -- same derivation.
           #
           # Note `sable-web` is a bare attribute, not a `let`-bound name, so it
           # is NOT visible as .#sable-web on the command line; BUILD-NIX.md says
           # so. Do not assume `inherit`-style reachability here.
           default = (import ./tauri-packages.nix nixpkgs).packages.${system}.default;
+          wry = (import ./tauri-packages.nix nixpkgs).packages.${system}.wry;
           sable-cef = (import ./tauri-packages.nix nixpkgs).packages.${system}.sable-cef;
         }
       );

@@ -37,10 +37,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # `default` is the chromium-cef build (see tauri-packages.nix), so this job is
+  # the CEF job: longer timeout, and it asserts the CEF runtime layout.
   build-x86_64:
-    name: Build x86_64-linux, push to sable-cachix
+    name: Build default (CEF), push to sable-cachix
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 180
     permissions:
       contents: read
     steps:
@@ -75,6 +77,30 @@ jobs:
       - name: Build default package (x86_64-linux)
         run: nix build '.#packages.x86_64-linux.default' --print-build-logs -L
 
+      # A green build is not a working app: libcef.so is dlopened and resolves its
+      # .pak/locales relative to the executable, so a missing file is a startup
+      # abort with no message rather than a link error.
+      - name: Assert the CEF runtime landed beside the binary
+        run: |
+          set -eu
+          out="$(nix path-info '.#packages.x86_64-linux.default')"
+          echo "  output: $out"
+          test -x "$out/bin/sable"
+          for f in libcef.so libEGL.so libGLESv2.so; do
+            test -f "$out/bin/$f" || { echo "MISSING $f" >&2; exit 1; }
+          done
+          test -f "$out/bin/locales/en-US.pak"
+          test -f "$out/bin/CEF-LICENSE.txt"
+          ls -lh "$out/bin/libcef.so" | awk '{print "  libcef.so: " $5}'
+          # strip runs as `|| true`, so a silent failure shows up ONLY as size.
+          # Unstripped libcef.so is ~1.4 GB.
+          size=$(stat -c%s "$out/bin/libcef.so")
+          if [ "$size" -gt 400000000 ]; then
+            echo "libcef.so is $size bytes -- strip did not run (expect ~241 MB)" >&2
+            exit 1
+          fi
+          echo "  CEF runtime OK"
+
   # The chromium-cef build, kept in a SEPARATE job on purpose.
   #
   # It is not `default` and it is not added to the job above, for three reasons:
@@ -92,12 +118,13 @@ jobs:
   #
   # Because `concurrency.cancel-in-progress` is shared, a push to main cancels
   # both. That is intentional: only one CEF build should ever be racing for disk.
-  build-cef-x86_64:
-    name: Build x86_64-linux (CEF), push to sable-cachix
+  # The wry/WebKitGTK fallback. `default` is CEF now, so this job is what keeps
+  # the hermetic build compiling and cached -- it is the fallback consumers use
+  # when they want reproducibility more than the CEF runtime.
+  build-wry-x86_64:
+    name: Build x86_64-linux (wry), push to sable-cachix
     runs-on: ubuntu-24.04
-    # Longer than the wry job: the Chromium build script unpacks a ~1.4 GB
-    # libcef.so and the wrapper crates compile slowly.
-    timeout-minutes: 180
+    timeout-minutes: 120
     permissions:
       contents: read
     steps:
@@ -120,64 +147,8 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v25
 
-      # The CEF derivation sets `__noChroot`, which on Linux means the sandbox is
-      # off for it -- but the rest of the graph still wants one, and nix build
-      # needs a writable TMPDIR for the unpacked runtime.
-      - name: Show store capacity
-        run: df -h /nix /tmp | sed 's/^/  /'
 
-      - name: Set up Cachix (sable-cachix)
-        uses: cachix/cachix-action@v16
-        with:
-          name: sable-cachix
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - name: Build wry package (x86_64-linux)
+        run: nix build '.#packages.x86_64-linux.wry' --print-build-logs -L
 
-      # cef-dll-sys's build.rs polls https://cef-builds.spotifycdn.com during the
-      # build, so the sable-cef derivation sets `__noChroot`. Nix refuses to
-      # build a derivation that asks for that while sandboxing is on:
-      #   error: derivation '/nix/store/...-sable-next-cef-0.1.0.drv' has
-      #   '__noChroot' set, but that's not allowed when 'sandbox' is 'true'
-      # `relaxed` is the documented middle setting: sandboxing stays on for
-      # every other derivation, and only ones that opt in with `__noChroot` run
-      # without it. It is a *daemon* setting, so it goes in the system config and
-      # the daemon is restarted to pick it up -- a client-side
-      # `--option sandbox relaxed` is a restricted setting and the daemon ignores
-      # it from an untrusted user (`warning: ignoring the client-specified
-      # setting 'sandbox'`), exactly like the flake's substituters below.
-      - name: Allow the CEF derivation to build without a sandbox
-        run: |
-          set -euo pipefail
-          sudo sed -i '/^[[:space:]]*sandbox[[:space:]]*=/d' /etc/nix/nix.conf
-          echo 'sandbox = relaxed' | sudo tee -a /etc/nix/nix.conf
-          sudo systemctl restart nix-daemon || sudo pkill -f 'nix-daemon' || true
-          grep -E '^[[:space:]]*sandbox' /etc/nix/nix.conf
-
-      - name: Build sable-cef package (x86_64-linux)
-        run: nix build '.#packages.x86_64-linux.sable-cef' --print-build-logs -L
-
-      # A green build is not the same as a working app: CEF dlopens libcef.so
-      # and resolves its .pak/locales relative to the executable, so a missing
-      # file is a startup abort with no useful message rather than a link error.
-      # Assert the layout the runtime actually requires, cheaply, before this is
-      # treated as done.
-      - name: Assert the CEF runtime landed beside the binary
-        run: |
-          set -eu
-          out="$(nix path-info '.#packages.x86_64-linux.sable-cef')"
-          echo "  output: $out"
-          test -x "$out/bin/sable"
-          for f in libcef.so libEGL.so libGLESv2.so; do
-            test -f "$out/bin/$f" || { echo "MISSING $f" >&2; exit 1; }
-          done
-          test -f "$out/bin/locales/en-US.pak"
-          test -f "$out/bin/CEF-LICENSE.txt"
-          # The strip pass is `|| true`, so a silent failure shows up only as a
-          # size here. Unstripped libcef.so is ~1.4 GB.
-          ls -lh "$out/bin/libcef.so" | awk '{print "  libcef.so: " $5}'
-          size=$(stat -c%s "$out/bin/libcef.so")
-          if [ "$size" -gt 400000000 ]; then
-            echo "libcef.so is $size bytes -- strip did not run (expect ~241 MB)" >&2
-            exit 1
-          fi
-          echo "  CEF runtime OK"
 
