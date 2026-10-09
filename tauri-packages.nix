@@ -129,6 +129,48 @@ nixpkgs:
               pname,
               cef,
             }:
+            let
+              # The shared libraries libcef.so dlopens. Upstream states this as
+              # runtime `depends` in packaging/aur/sable-bin.PKGBUILD (`nss`,
+              # `nspr`, `mesa`, `libdrm`, `libxkbcommon`, `alsa-lib`, `libcups`,
+              # `gtk3`, `at-spi2-*`) and does NOT bundle them: the AppImage
+              # ships only CEF's own files -- scripts/cef/copy-libs.sh copies
+              # `*.so*` out of the CEF distribution directory and nothing else
+              # -- and its AppRun merely adds $APPDIR to LD_LIBRARY_PATH. That
+              # works on Arch because `depends` are already installed. Copying
+              # that list verbatim would not fix a NixOS system profile, which
+              # usually has none of them.
+              cefRuntimeLibs = with pkgs; [
+                alsa-lib
+                at-spi2-atk
+                at-spi2-core
+                cups
+                # No libGLESv2 / libEGL: the CEF distribution ships its own and
+                # installPhase stages them into $out/bin, so declaring nixpkgs'
+                # would only put a second unused copy in the closure. (There is
+                # no `libGLESv2` attribute in nixpkgs in any case; the GLESv2
+                # runtime arrives inside libGL.)
+                libGL
+                libdrm
+                libgbm
+                libxkbcommon
+                mesa
+                nspr
+                nss
+                pango
+                xorg.libX11
+                xorg.libXcomposite
+                xorg.libXdamage
+                xorg.libXext
+                xorg.libXfixes
+                xorg.libXrandr
+              ];
+
+              # rpath for both the binary and libcef.so. Nix records an rpath as
+              # a closure reference, so the libraries travel with the package
+              # and the loader never consults the host for them.
+              cefLibPath = lib.makeLibraryPath cefRuntimeLibs;
+            in
             pkgs.rustPlatform.buildRustPackage (
               finalAttrs:
               {
@@ -240,6 +282,11 @@ nixpkgs:
                   pkgs.pnpmConfigHook
                   pkgs.pkg-config
                   pkgs.makeWrapper
+                  # installPhase calls `patchelf --set-rpath` on libcef.so so
+                  # the CEF runtime resolves its own DT_NEEDED from $out/lib
+                  # instead of from the host. stdenv's patchPhase would only
+                  # ever touch the *linked* binary; libcef.so is dlopened.
+                  pkgs.patchelf
                 ]
                 ++ lib.optionals cef [
                   # cef-dll-sys's build.rs runs
@@ -311,38 +358,23 @@ nixpkgs:
                 )
                 # libcef.so is dlopened at runtime rather than linked, so its
                 # dependencies are not caught by the link step -- they surface as a
-                # startup abort with no useful message. These are the same set
-                # upstream declares in packaging/aur/sable-bin.PKGBUILD, minus the
-                # X libs, which are only needed as build-time headers: the Nix
-                # attribute names are top-level (libX11, libxkbcommon), NOT
-                # xorg.libX11, which is deprecated.
-                ++ lib.optionals cef (
-                  with pkgs; [
-                    alsa-lib
-                    at-spi2-atk
-                    at-spi2-core
-                    cups
-                    # No libGLESv2 / libEGL: the CEF distribution ships its own
-                    # copies and installPhase stages them into $out/bin, so
-                    # declaring nixpkgs' would only put a second, unused copy in
-                    # the closure. (There is no `libGLESv2` attribute in nixpkgs
-                    # in any case; the GLESv2 runtime arrives inside libGL.)
-                    libGL
-                    libdrm
-                    libgbm
-                    libxkbcommon
-                    mesa
-                    nspr
-                    nss
-                    pango
-                    xorg.libX11
-                    xorg.libXcomposite
-                    xorg.libXdamage
-                    xorg.libXext
-                    xorg.libXfixes
-                    xorg.libXrandr
-                  ]
-                );
+                # startup abort with no useful message.
+                #
+                # Every shared library the CEF runtime dlopens. Upstream states this as
+                # runtime `depends` in packaging/aur/sable-bin.PKGBUILD (`nss`,
+                # `nspr`, `mesa`, `libdrm`, `libxkbcommon`, `alsa-lib`,
+                # `libcups`, `gtk3`, ...) rather than bundling it -- the AppImage
+                # ships only CEF's *own* files (scripts/cef/copy-libs.sh copies
+                # *.so* from the CEF dir, nothing else) and its AppRun just adds
+                # $APPDIR to LD_LIBRARY_PATH. On Arch that works because the
+                # depends are already installed; on a NixOS system profile they
+                # usually are not, and the loader aborts at startup with
+                #   libnspr4.so: cannot open shared object file
+                # with no way to tell which library is next. So we copy them into
+                # $out/lib and put that on the wrapper's LD_LIBRARY_PATH: the
+                # package then carries its own runtime and does not care what
+                # the host has.
+                ++ lib.optionals cef cefRuntimeLibs;
 
               env = {
                 pnpmDeps = pkgs.fetchPnpmDeps {
@@ -465,10 +497,38 @@ nixpkgs:
                     fi
                   done
 
+                  # Bundle every shared library libcef.so needs into $out/lib.
+                  #
+                  # The Nix link step only records an rpath for the *linked*
+                  # binary. libcef.so is an upstream Chromium build with no
+                  # Nix rpath at all, and it is dlopened at runtime, so the
+                  # loader resolves its DT_NEEDED entries from whatever the host
+                  # happens to have. On a NixOS system profile that is usually
+                  # nothing, and the app aborts at startup with
+                  #   error while loading shared libraries: libnspr4.so
+                  # and no hint as to which library is next. Copying the .so
+                  # files in and setting an rpath on libcef.so makes the
+                  # package self-contained.
+                  mkdir -p "$out/lib"
+                  for lib_ in $cefLibPath; do
+                    [ -d "$lib_" ] || continue
+                    cp -aL "$lib_"/*.so* "$out/lib/" 2>/dev/null || true
+                  done
+
+                  # Same rpath on libcef.so, for the dlopen path. Recorded as a
+                  # closure reference, so these libraries stay reachable after
+                  # GC even if $out/lib is not the one consulted.
+                  for l in "$out/bin/libcef.so" "$out/bin/sable"; do
+                    [ -f "$l" ] || continue
+                    patchelf --set-rpath "$cefLibPath:$out/lib:$out/bin" "$l" \
+                      || echo "warning: could not set rpath on $l" >&2
+                  done
+
                   # libcef.so is dlopened by path and resolves its .pak/.dat/
                   # locales relative to the executable's own directory, so it has
                   # to sit in $out/bin next to the binary.
-                  wrapProgram "$out/bin/sable" --prefix LD_LIBRARY_PATH : "$out/bin"
+                  wrapProgram "$out/bin/sable" \
+                    --prefix LD_LIBRARY_PATH : "$out/bin:$out/lib"
                 ''}runHook postInstall
               '';
 
