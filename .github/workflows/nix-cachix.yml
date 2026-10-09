@@ -74,6 +74,28 @@ jobs:
           name: sable-cachix
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
+      # The CEF derivation sets `__noChroot`, and Nix refuses to build a
+      # derivation that asks for it while sandboxing is on:
+      #   error: derivation '/nix/store/...-sable-next-0.1.0.drv' has
+      #   '__noChroot' set, but that's not allowed when 'sandbox' is 'true'
+      # This is the SAME failure the sable-cef job hit in #13; it came back when
+      # #14 made `default` the CEF build and rewrote this job.
+      #
+      # `relaxed` is the documented middle setting: sandboxing stays on for
+      # every other derivation, and only ones that opt in with `__noChroot` run
+      # without it. It is a *daemon* setting, so it goes in the system config and
+      # the daemon is restarted to pick it up -- a client-side
+      # `--option sandbox relaxed` is a restricted setting and the daemon ignores
+      # it from an untrusted user (`warning: ignoring the client-specified
+      # setting 'sandbox'`), exactly like the flake's substituters.
+      - name: Allow the CEF derivation to build without a sandbox
+        run: |
+          set -euo pipefail
+          sudo sed -i '/^[[:space:]]*sandbox[[:space:]]*=/d' /etc/nix/nix.conf
+          echo 'sandbox = relaxed' | sudo tee -a /etc/nix/nix.conf
+          sudo systemctl restart nix-daemon || sudo pkill -f 'nix-daemon' || true
+          grep -E '^[[:space:]]*sandbox' /etc/nix/nix.conf
+
       - name: Build default package (x86_64-linux)
         run: nix build '.#packages.x86_64-linux.default' --print-build-logs -L
 
@@ -147,6 +169,15 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v25
 
+      # #14 rewrote this job and dropped this step, so the wry build succeeded
+      # but pushed nothing: its narinfo 404s on sable-cachix even though the
+      # job is green. cachix-action only registers paths built AFTER it runs,
+      # so this step has to stay ABOVE `nix build`.
+      - name: Set up Cachix (sable-cachix)
+        uses: cachix/cachix-action@v16
+        with:
+          name: sable-cachix
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Build wry package (x86_64-linux)
         run: nix build '.#packages.x86_64-linux.wry' --print-build-logs -L
