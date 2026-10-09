@@ -132,7 +132,7 @@ nixpkgs:
             pkgs.rustPlatform.buildRustPackage (
               finalAttrs:
               {
-                inherit pname cef;
+                inherit pname;
 
                 version = "0.1.0";
 
@@ -194,13 +194,19 @@ nixpkgs:
               # Do NOT "fix" this by re-adding a CEF prefetch on top; the two
               # approaches conflict.
               #
-              # `__noChroot` is passed straight through to the derivation env and
-              # read by the Nix *builder*, not by stdenv -- there is no
-              # `dontChroot` attribute for this. nixpkgs itself sets it that way,
-              # e.g. pkgs/tools/nix/info/relaxedsandbox.nix and
-              # generic-stack-builder.nix. On darwin `__noChroot` is a no-op
-              # (there is no chroot), so gate it on Linux.
-              __noChroot = cef && pkgs.stdenv.hostPlatform.isLinux;
+              # `__noChroot` is NOT set here on purpose; see the `// lib.optionalAttrs`
+              # merge at the end of this attrset. `__noChroot = cef && ...` would
+              # evaluate to the boolean `false` for default, and Nix serialises a
+              # boolean attrset value straight into the derivation env (`false`
+              # becomes the empty string, `true` becomes "1"). default's drv would
+              # then carry a `__noChroot = ""` entry that the pre-refactor drv
+              # (4jrfhwhic59y8…) did not have, making the claim "the refactor did
+              # not touch default" unprovable by diffing the two derivations.
+              # It is not a *build* hazard -- both Nix 2.19.2, which is what CI
+              # installs (see parsed-derivations.cc `getBoolAttr`: `return i->second
+              # == "1"`), and Lix read any value other than "1" as false, so the
+              # sandbox still applies -- but it is real derivation drift and it
+              # must be absent for default to stay provably hermetic.
 
               # The repo has no `cargo test` suite wired into the build; the
               # release build already type-checks every crate. Without this,
@@ -463,9 +469,7 @@ nixpkgs:
                   # locales relative to the executable's own directory, so it has
                   # to sit in $out/bin next to the binary.
                   wrapProgram "$out/bin/sable" --prefix LD_LIBRARY_PATH : "$out/bin"
-                ''}
-
-                runHook postInstall
+                ''}runHook postInstall
               '';
 
               meta = {
@@ -475,6 +479,20 @@ nixpkgs:
                 mainProgram = "sable";
                 platforms = lib.platforms.linux;
               };
+            }
+            // lib.optionalAttrs cef {
+              # Only the cef build carries these two keys. At cef = false the
+              # merge operand is `{}`, so default's attrset (and therefore its
+              # derivation env) is byte-identical to the pre-refactor one.
+              #
+              # `cef` in env is what a reader greps for to tell the variants
+              # apart; `__noChroot` is read by the Nix *builder*, not stdenv --
+              # there is no `dontChroot` attribute for it. nixpkgs sets it the
+              # same way (pkgs/tools/nix/info/relaxedsandbox.nix,
+              # generic-stack-builder.nix). On darwin there is no chroot at all,
+              # so it is gated on Linux.
+              inherit cef;
+              __noChroot = pkgs.stdenv.hostPlatform.isLinux;
             }
           );
 
