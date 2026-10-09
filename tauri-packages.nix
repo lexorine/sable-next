@@ -505,15 +505,43 @@ nixpkgs:
           # Both are exported from the `in` block below.
         in
         {
-          # Plain bindings, not `inherit`: the names here are what the flake
-          # exposes as .#sable-cef.
-          sable-cef = mkSable {
-            pname = "sable-next-cef";
-            cef = true;
-          };
+          # Plain bindings, not `inherit`: these names are what the flake exposes.
+
+          # `default` is the chromium-cef build. CEF is the webview sable actually
+          # ships; wry/WebKitGTK is the lighter fallback, kept reachable by name.
+          #
+          # It is `default` even though it needs `__noChroot`, i.e. is not
+          # hermetic. The trade is deliberate: a reproducible wry build that is
+          # not what the project ships, versus a non-reproducible build of the
+          # real thing. Upstream builds CEF the same way and for the same reason --
+          # their .forgejo tauri-build.yml runs `pnpm tauri:cef build` on a plain
+          # runner because cef-dll-sys downloads its distribution at build time,
+          # and their Nix build deliberately never touched it.
           default = mkSable {
             pname = "sable-next";
+            cef = true;
+          };
+
+          # wry/WebKitGTK. Still hermetic (`__noChroot` absent), still builds, and
+          # ~115 MB smaller. Name it explicitly:
+          #   nix run github:lexorine/sable-next#wry
+          wry = mkSable {
+            pname = "sable-next-wry";
             cef = false;
+          };
+
+          # `sable-cef` has meant the CEF build since PR #13, and it still does --
+          # it now resolves to the same derivation as `default`. Kept as an
+          # explicit alias because published Cachix paths and consumer scripts
+          # reference it. Prefer `default` or `wry`.
+          #
+          # Written as the mkSable call, not `= default;`: inside an attrset a
+          # sibling key is NOT in scope, so `default` here is an undefined
+          # variable:
+          #     error: undefined variable 'default'
+          sable-cef = mkSable {
+            pname = "sable-next";
+            cef = true;
           };
         }
       );
