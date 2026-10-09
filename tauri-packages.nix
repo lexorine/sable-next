@@ -106,17 +106,37 @@ nixpkgs:
             hash = "sha256-yU2R9wkRAByUbg+rtKqa3DcEX0WgO1YAjLDIJEy2NhY=";
           };
 
-          # The Tauri desktop shell. sable-wasm is deliberately absent: it only
-          # compiles for wasm32-unknown-unknown (its session store holds JS
-          # functions, so it is not Send) and is produced as a wasm32 artefact in
-          # preBuild, never as a native library.
-          sable = pkgs.rustPlatform.buildRustPackage (
-            finalAttrs:
+          # The Tauri desktop shell, built two ways. They share one definition so
+          # the wry and cef builds cannot drift apart; only the runtime-specific
+          # bits differ.
+          #
+          #   sable      — wry/WebKitGTK. The default, and the only variant the
+          #                 upstream Nix CI ever built. Fully hermetic: CEF is
+          #                 simply not enabled, so no build script needs network.
+          #   sable-cef  — chromium-cef. cef-dll-sys's build.rs downloads the CEF
+          #                 distribution at build time, which the Nix sandbox
+          #                 forbids, so this derivation sets __noChroot. That is a
+          #                 deliberate hermeticity trade-off and the reason it is a
+          #                 separate attribute rather than a feature flag on
+          #                 `default`: `default` stays reproducible.
+          #
+          # sable-wasm is deliberately absent everywhere: it only compiles for
+          # wasm32-unknown-unknown (its session store holds JS functions, so it is
+          # not Send) and is produced as a wasm32 artefact in preBuild, never as a
+          # native library.
+          mkSable =
             {
-              pname = "sable-next";
-              version = "0.1.0";
+              pname,
+              cef,
+            }:
+            pkgs.rustPlatform.buildRustPackage (
+              finalAttrs:
+              {
+                inherit pname cef;
 
-              src = ./.;
+                version = "0.1.0";
+
+                src = ./.;
 
               # The binary crate is `app`; the library target is `app_lib`.
               # `tauri/custom-protocol` is a feature of the *tauri dependency*,
@@ -132,19 +152,55 @@ nixpkgs:
               # Tauri embed `frontendDist: "../dist"` instead, and preBuild
               # already generates that directory before cargo runs.
               #
-              # Deliberately NOT `--no-default-features --features cef`: enabling
-              # CEF pulls in cef-dll-sys, whose build.rs needs a network-fetched
-              # CEF distribution inside the sandbox. That never built. Default
-              # features keep wry/WebKitGTK, which is the last configuration
-              # known to compile and push to Cachix.
-              cargoBuildFlags = [
-                "-p"
-                "app"
-                "--bin"
-                "app"
-                "--features"
-                "tauri/custom-protocol"
-              ];
+              # wry: default features, which is wry + geolocation.
+              # cef: --no-default-features plus cef, matching upstream's own
+              #   scripts/tauri.js, which expands `pnpm tauri:cef build` to
+              #     tauri build --no-bundle --features cef -- --no-default-features
+              # `tauri/custom-protocol` is required in both: it is a feature of the
+              # *tauri dependency*, not of `app` (which declares only wry,
+              # geolocation and cef), so the namespaced dep/feature syntax is
+              # required. Without it Tauri honours devUrl http://localhost:3000
+              # even in a release build and the packaged binary dies with
+              # "Could not connect to localhost: Connection refused".
+              cargoBuildFlags =
+                [
+                  "-p"
+                  "app"
+                  "--bin"
+                  "app"
+                  "--features"
+                  (if cef then "tauri/custom-protocol,cef,geolocation" else "tauri/custom-protocol")
+                ]
+                ++ lib.optionals cef [
+                  "--no-default-features"
+                ];
+
+              # cef-dll-sys's build.rs downloads the CEF binary from
+              # https://cef-builds.spotifycdn.com at build time and the Nix
+              # sandbox has no network, so the build died ~18 min in with
+              #   Error: HTTP request error: ... Temporary failure in name resolution
+              # which reads like an unrelated DNS flake. Prefetching the
+              # distribution hermetically was attempted and abandoned: it needs
+              # cmake (absent from stdenv), and adding cmake plus ninja to
+              # nativeBuildInputs is not clean -- ninja's setup hook claims
+              # buildPhase and the cargo build dies instantly with
+              # "ninja: error: loading 'build.ninja': No such file or directory".
+              # So the CEF variant runs unsandboxed, which is also how upstream
+              # builds it: their .forgejo tauri-build.yml runs
+              # `pnpm tauri:cef build` on a plain runner with no Nix involved,
+              # and their flake.nix deliberately leaves CEF out with the comment
+              # "the default build never touches it".
+              #
+              # Do NOT "fix" this by re-adding a CEF prefetch on top; the two
+              # approaches conflict.
+              #
+              # `__noChroot` is passed straight through to the derivation env and
+              # read by the Nix *builder*, not by stdenv -- there is no
+              # `dontChroot` attribute for this. nixpkgs itself sets it that way,
+              # e.g. pkgs/tools/nix/info/relaxedsandbox.nix and
+              # generic-stack-builder.nix. On darwin `__noChroot` is a no-op
+              # (there is no chroot), so gate it on Linux.
+              __noChroot = cef && pkgs.stdenv.hostPlatform.isLinux;
 
               # The repo has no `cargo test` suite wired into the build; the
               # release build already type-checks every crate. Without this,
@@ -178,6 +234,31 @@ nixpkgs:
                   pkgs.pnpmConfigHook
                   pkgs.pkg-config
                   pkgs.makeWrapper
+                ]
+                ++ lib.optionals cef [
+                  # cef-dll-sys's build.rs runs
+                  #   cmake::Config::new(&cef_dir).generator("Ninja")
+                  # so the real CMake *binary* must be on PATH; stdenv ships
+                  # neither cmake nor ninja. Only cmake is added -- adding ninja
+                  # as well makes nixpkgs' ninja setup hook claim buildPhase ahead
+                  # of cargo-build-hook, and the build dies instantly with
+                  #   ninja: error: loading 'build.ninja': No such file or directory
+                  # The `cmake` *crate* is a Cargo build-dep and is NOT the binary.
+                  #
+                  # cmake is safe by accident: the derivation already sets
+                  # configurePhase, so cmake's own setup hook (which checks
+                  # `if [ -z "$dontUseCmakeConfigure" ] && [ -z "$configurePhase" ]`)
+                  # never claims the phase. Dropping configurePhase would let cmake
+                  # hijack it, exactly as ninja hijacks buildPhase.
+                  pkgs.cmake
+
+                  # strip(1) for the libcef.so pass in installPhase. It is in no
+                  # other closure entry here, and the call site is
+                  # `strip -s ... 2>/dev/null || true` -- so a missing strip fails
+                  # SILENTLY and ships an unstripped ~1.4 GB libcef.so to Cachix on
+                  # every run. The only symptom is FileSize on the pushed narinfo,
+                  # so it is easy to miss. Do not remove it.
+                  pkgs.binutils
                 ]
                 ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [
                   pkgs.perl
@@ -221,6 +302,40 @@ nixpkgs:
                 ])
                 ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux (
                   with pkgs; [ libayatana-appindicator ]
+                )
+                # libcef.so is dlopened at runtime rather than linked, so its
+                # dependencies are not caught by the link step -- they surface as a
+                # startup abort with no useful message. These are the same set
+                # upstream declares in packaging/aur/sable-bin.PKGBUILD, minus the
+                # X libs, which are only needed as build-time headers: the Nix
+                # attribute names are top-level (libX11, libxkbcommon), NOT
+                # xorg.libX11, which is deprecated.
+                ++ lib.optionals cef (
+                  with pkgs; [
+                    alsa-lib
+                    at-spi2-atk
+                    at-spi2-core
+                    cups
+                    # No libGLESv2 / libEGL: the CEF distribution ships its own
+                    # copies and installPhase stages them into $out/bin, so
+                    # declaring nixpkgs' would only put a second, unused copy in
+                    # the closure. (There is no `libGLESv2` attribute in nixpkgs
+                    # in any case; the GLESv2 runtime arrives inside libGL.)
+                    libGL
+                    libdrm
+                    libgbm
+                    libxkbcommon
+                    mesa
+                    nspr
+                    nss
+                    pango
+                    xorg.libX11
+                    xorg.libXcomposite
+                    xorg.libXdamage
+                    xorg.libXext
+                    xorg.libXfixes
+                    xorg.libXrandr
+                  ]
                 );
 
               env = {
@@ -296,6 +411,60 @@ nixpkgs:
                 fi
                 install -Dm755 "$app_bin" "$out/bin/sable"
 
+                ${lib.optionalString cef ''
+                  # cef-dll-sys's build.rs copies the CEF runtime to
+                  # target/<triple>/release/ when it downloads it itself, and it
+                  # does NOT create a cef_linux_<arch>/ directory there.
+                  # scripts/cef/copy-libs.sh looks for exactly that directory
+                  # (`find target -type d -name cef_linux_$CEF_ARCH -path
+                  # "*/$PROFILE/build/*"`) and exits 1 when it is absent:
+                  #   cef_linux_x86_64 not found under target/**/release/build
+                  #   -- build with --features cef first
+                  # So find the runtime where build.rs actually put it rather
+                  # than calling the script blindly.
+                  cef_dir=$(find target -type d -name 'cef_linux_*' -print -quit 2>/dev/null || true)
+                  if [ -z "$cef_dir" ]; then
+                    # Fallback: build.rs may have copied the files flat into the
+                    # target dir instead of creating the directory.
+                    if [ -f "target/$host_triple/release/libcef.so" ]; then
+                      cef_dir="target/$host_triple/release"
+                    else
+                      echo "install: no CEF runtime found under target/" >&2
+                      find target -maxdepth 3 -name 'libcef.so*' >&2
+                      exit 1
+                    fi
+                  fi
+
+                  cp -f "$cef_dir"/*.so* "$out/bin/" 2>/dev/null || true
+                  mkdir -p "$out/bin/locales"
+                  # The full locale set is 49 MB against 570 KB for en-US alone,
+                  # so ship only the one the app actually selects.
+                  cp -f "$cef_dir/locales/en-US.pak" "$out/bin/locales/" 2>/dev/null || true
+                  cp -f packaging/licenses/CEF-LICENSE.txt "$out/bin/CEF-LICENSE.txt"
+
+                  # libcef.so is 1399 MB unstripped against ~241 MB stripped.
+                  #
+                  # strip needs a WRITABLE file: `cp -f` preserves the source's
+                  # mode, and anything coming out of target/ is read-only here, so
+                  # strip exits 1 with "unable to copy file ... Permission
+                  # denied" -- which `2>/dev/null || true` swallows. The result is
+                  # a silent ~1.4 GB output that then gets pushed to Cachix on
+                  # every run. Hence chmod before strip, not after.
+                  chmod -R u+w "$out"
+                  for lib in "$out/bin/libcef.so" "$out/bin/libEGL.so" "$out/bin/libGLESv2.so"; do
+                    if [ -f "$lib" ]; then
+                      strip -s "$lib" 2>/dev/null || true
+                      # Some binutils versions leave the original behind.
+                      rm -f "$lib.stripped" "$lib.orig"
+                    fi
+                  done
+
+                  # libcef.so is dlopened by path and resolves its .pak/.dat/
+                  # locales relative to the executable's own directory, so it has
+                  # to sit in $out/bin next to the binary.
+                  wrapProgram "$out/bin/sable" --prefix LD_LIBRARY_PATH : "$out/bin"
+                ''}
+
                 runHook postInstall
               '';
 
@@ -308,10 +477,26 @@ nixpkgs:
               };
             }
           );
+
+          # Two builds of the same shell:
+          #   sable     — wry/WebKitGTK, hermetic. `default`, and the one the
+          #               Cachix push points at.
+          #   sable-cef — chromium-cef. Needs `__noChroot`, because cef-dll-sys
+          #               downloads its distribution at build time, so it cannot be
+          #               reproduced from a declared input set the way `sable` can.
+          # Both are exported from the `in` block below.
         in
         {
-          inherit sable;
-          default = sable;
+          # Plain bindings, not `inherit`: the names here are what the flake
+          # exposes as .#sable-cef.
+          sable-cef = mkSable {
+            pname = "sable-next-cef";
+            cef = true;
+          };
+          default = mkSable {
+            pname = "sable-next";
+            cef = false;
+          };
         }
       );
 
