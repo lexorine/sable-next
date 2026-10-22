@@ -3,7 +3,7 @@
   import CheckIcon from 'phosphor-svelte/lib/CheckIcon';
   import XIcon from 'phosphor-svelte/lib/XIcon';
 
-  import type { RoomSummary } from '#src/generated/protocol';
+  import type { RoomListItemView } from '#src/generated/protocol';
 
   import { useCoreClient } from '#lib/core/context.js';
   import { inviter, senderName } from '#lib/features/inbox/inbox.js';
@@ -11,9 +11,10 @@
   import { InviteActions } from '#lib/rooms/invites.svelte.js';
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
   import Avatar from '#lib/ui/primitives/Avatar.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
 
   interface Props {
-    invites: readonly RoomSummary[];
+    invites: readonly RoomListItemView[];
     collapsed?: boolean;
   }
 
@@ -25,7 +26,7 @@
 {#if invites.length > 0 && !collapsed}
   <section class="invites" aria-labelledby={headingId}>
     <h3 id={headingId}>
-      {$i18n.t('room.invitesTitle')}
+      {i18n.t('room.invitesTitle')}
       <span class="count">{invites.length}</span>
     </h3>
     <ul>
@@ -41,36 +42,53 @@
             {name}
           />
           <span class="invite-text">
-            <span class="invite-name" title={name}>{name}</span>
+            <Tooltip label={name}>
+              {#snippet trigger({ props })}
+                <span {...props} class="invite-name">{name}</span>
+              {/snippet}
+            </Tooltip>
             {#if from}
-              <span class="invite-from" title={from}>
-                {$i18n.t('inbox.invitedBy', { name: senderName(from) })}
-              </span>
+              {@const invitedBy = i18n.t('inbox.invitedBy', { name: senderName(from) })}
+              <Tooltip label={from}>
+                {#snippet trigger({ props })}
+                  <span {...props} class="invite-from">{invitedBy}</span>
+                {/snippet}
+              </Tooltip>
             {/if}
           </span>
           <div class="invite-actions">
-            <IconButton
-              variant="ghost"
-              size="medium"
-              disabled={busy}
-              label={$i18n.t('room.inviteAcceptLabel', { room: name })}
-              onclick={() => {
-                void answers.accept(invite);
-              }}
-            >
-              <CheckIcon />
-            </IconButton>
-            <IconButton
-              variant="ghost"
-              size="medium"
-              disabled={busy}
-              label={$i18n.t('room.inviteDeclineLabel', { room: name })}
-              onclick={() => {
-                answers.decline(invite);
-              }}
-            >
-              <XIcon />
-            </IconButton>
+            <Tooltip label={i18n.t('room.inviteAcceptLabel', { room: name })}>
+              {#snippet trigger({ props })}
+                <IconButton
+                  {...props}
+                  variant="ghost"
+                  size="small"
+                  disabled={busy}
+                  label={i18n.t('room.inviteAcceptLabel', { room: name })}
+                  onclick={() => {
+                    void answers.accept(invite);
+                  }}
+                >
+                  <CheckIcon />
+                </IconButton>
+              {/snippet}
+            </Tooltip>
+            <Tooltip label={i18n.t('room.inviteDeclineLabel', { room: name })}>
+              {#snippet trigger({ props })}
+                <IconButton
+                  {...props}
+                  variant="ghost"
+                  size="small"
+                  disabled={busy}
+                  label={i18n.t('room.inviteDeclineLabel', { room: name })}
+                  onclick={() => {
+                    answers.decline(invite);
+                  }}
+                >
+                  <XIcon />
+                </IconButton>
+              {/snippet}
+            </Tooltip>
           </div>
         </li>
       {/each}
@@ -80,22 +98,39 @@
 
 <style>
   .invites {
-    padding: 0 var(--space-200) var(--space-200);
+    background: var(--surface-var-container);
+    border-radius: var(--radius-inner);
+    margin-bottom: var(--space-200);
+    padding: var(--space-200);
   }
 
   h3 {
     align-items: center;
+    color: var(--bg-on-container);
     display: flex;
-    font-size: var(--font-size-small);
+    font-size: var(--font-size-label);
     font-weight: var(--font-weight-500);
     gap: var(--space-200);
     margin: 0;
+    opacity: var(--opacity-p300);
     padding: 0 var(--space-200);
-    text-transform: uppercase;
   }
 
   .count {
+    align-items: center;
+    background: var(--success-main);
+    border-radius: var(--radii-pill);
+    box-sizing: border-box;
+    color: var(--success-on-main);
+    display: inline-flex;
+    font-size: var(--font-size-small);
     font-variant-numeric: tabular-nums;
+    font-weight: var(--font-weight-medium);
+    height: var(--size-x50);
+    justify-content: center;
+    line-height: var(--size-x50);
+    min-width: var(--size-x50);
+    padding: 0 var(--space-100);
   }
 
   ul {
@@ -126,15 +161,23 @@
     gap: var(--space-200);
   }
 
+  .invite-actions :global(.icon-button:hover) {
+    background: var(--surface-container-hover);
+    color: var(--surface-on-container);
+  }
+
   :global(.avatar-root.invite-icon) {
-    --avatar-size: 1.75rem;
+    --avatar-size: 1.5rem;
 
     font-size: var(--font-size-small);
   }
 
   .invite-text {
-    display: grid;
+    display: flex;
     flex: 1;
+    flex-flow: column nowrap;
+    gap: var(--space-100);
+    justify-content: center;
     min-width: 0;
   }
 
@@ -145,8 +188,15 @@
     white-space: nowrap;
   }
 
+  .invite-name {
+    font-size: var(--font-size-label);
+    font-weight: var(--font-weight-500);
+    line-height: 1;
+  }
+
   .invite-from {
     color: var(--surface-var-on-container);
     font-size: var(--font-size-small);
+    line-height: 1;
   }
 </style>

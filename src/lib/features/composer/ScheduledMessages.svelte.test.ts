@@ -10,7 +10,7 @@ vi.mock('#lib/core/context.js');
 import { core } from '#lib/core/__mocks__/context.js';
 import { toasts } from '#lib/ui/toasts.svelte.js';
 
-import { adoptQueue, scheduledQueue } from './scheduled-queue.svelte.js';
+import { adoptQueue, scheduledQueue } from '#lib/composer/scheduled-queue.svelte.js';
 import ScheduledMessages from './ScheduledMessages.svelte';
 
 const ROOM = '!room:example.org';
@@ -18,7 +18,11 @@ const ROOM = '!room:example.org';
 const scheduledMessages = vi.fn();
 const cancelScheduledMessage = vi.fn();
 const sendScheduledMessage = vi.fn();
-Object.assign(core, { scheduledMessages, cancelScheduledMessage, sendScheduledMessage });
+Object.assign(core.rpc.messages, {
+  scheduled: scheduledMessages,
+  cancelScheduled: cancelScheduledMessage,
+  sendScheduled: sendScheduledMessage,
+});
 
 afterEach(() => {
   for (const toast of toasts.items) toasts.dismiss(toast.id);
@@ -66,7 +70,7 @@ test('deleting waits for the toast to close before cancelling on the server', as
   const toast = toasts.items.at(-1);
   if (toast) toasts.dismiss(toast.id);
   await vi.waitFor(() => {
-    expect(cancelScheduledMessage).toHaveBeenCalledWith('d1');
+    expect(cancelScheduledMessage).toHaveBeenCalledWith({ delay_id: 'd1' });
   });
 });
 
@@ -109,7 +113,7 @@ test('a failed send-now puts the message back and says so', async () => {
 test('sending a queued message now takes it off the queue, and a failure puts it back', async () => {
   scheduledMessages.mockResolvedValue([]);
   const sendMessage = vi.fn().mockRejectedValue(new Error('offline'));
-  Object.assign(core, { sendMessage });
+  Object.assign(core.rpc.messages, { send: sendMessage });
   const queued = {
     id: 'q1',
     roomId: ROOM,
@@ -124,7 +128,9 @@ test('sending a queued message now takes it off the queue, and a failure puts it
   await choose('queued', 'Send now');
 
   expect(await screen.findByRole('alert')).toBeInTheDocument();
-  expect(sendMessage).toHaveBeenCalledWith(ROOM, 'queued', { formatted: null });
+  expect(sendMessage).toHaveBeenCalledWith(
+    expect.objectContaining({ room_id: ROOM, body: 'queued', formatted: null })
+  );
   expect(scheduledQueue()).toEqual([queued]);
 });
 

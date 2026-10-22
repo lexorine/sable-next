@@ -1,17 +1,17 @@
 <script lang="ts">
+  import { MediaQuery } from 'svelte/reactivity';
   import { Select as BitsSelect } from 'bits-ui';
   import CaretDownIcon from 'phosphor-svelte/lib/CaretDownIcon';
   import CheckIcon from 'phosphor-svelte/lib/CheckIcon';
   import type { ClassValue } from 'svelte/elements';
-  import { getContext } from 'svelte';
   import { i18n } from '#lib/i18n.js';
   import { BREAKPOINTS } from '#lib/ui/breakpoints.js';
-  import { createMediaQuery } from '#lib/ui/media-query.svelte.js';
   import { overlayLayer } from '#lib/ui/overlay-layer.js';
   import BottomSheet from './BottomSheet.svelte';
-  import Switcher, { settingsChoices } from './Switcher.svelte';
+  import Switcher, { getSettingsChoices, hasSettingsChoices } from './Switcher.svelte';
   import './form-control.css';
   import './menu.css';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
 
   type Item = {
     value: string;
@@ -50,8 +50,8 @@
     onValueChange,
   }: Props = $props();
 
-  const appLayout = createMediaQuery(BREAKPOINTS.appLayout);
-  const inlineChoices = getContext<boolean>(settingsChoices) ?? false;
+  const appLayout = new MediaQuery(BREAKPOINTS.appLayout);
+  const inlineChoices = hasSettingsChoices() ? getSettingsChoices() : false;
   const useSwitcher = $derived(
     !forceDropdown &&
       inlineChoices &&
@@ -95,7 +95,7 @@
     {disabled}
     {onValueChange}
   />
-{:else if !appLayout.matches}
+{:else if !appLayout.current}
   <button
     type="button"
     {id}
@@ -108,7 +108,7 @@
       sheetOpen = true;
     }}
   >
-    <span class="select-text" class:select-placeholder={selectedLabel === undefined}
+    <span class={['select-text', { 'select-placeholder': selectedLabel === undefined }]}
       >{selectedLabel ?? placeholder ?? ''}</span
     >
     <CaretDownIcon class="select-caret" aria-hidden="true" />
@@ -117,7 +117,7 @@
   <BottomSheet
     bind:open={sheetOpen}
     label={ariaLabel ?? placeholder ?? ''}
-    closeLabel={$i18n.t('settings.close')}
+    closeLabel={i18n.t('common.close')}
   >
     <div class="select-sheet" role="radiogroup" aria-label={ariaLabel}>
       {#if ariaLabel}<p class="select-sheet-title">{ariaLabel}</p>{/if}
@@ -148,7 +148,7 @@
     </BitsSelect.Trigger>
     <BitsSelect.Portal>
       <BitsSelect.Content sideOffset={4} class="menu-surface select-content" {...overlayLayer()}>
-        <BitsSelect.Viewport>
+        <BitsSelect.Viewport class="menu-scroll-content" {@attach scrollHint}>
           {#each items as item (item.value)}
             <BitsSelect.Item
               value={item.value}
@@ -222,9 +222,10 @@
     width: 48px;
   }
 
+  /* Real text, not ::placeholder, so it needs 4.5:1; the shared 0.5 gives 2.7:1. */
   :global(.select-placeholder) {
     color: inherit;
-    opacity: var(--opacity-placeholder);
+    opacity: 0.8;
   }
 
   .select-sheet {
@@ -253,7 +254,6 @@
 
   :global(.menu-surface.select-content) {
     --menu-max-height: min(20rem, var(--bits-select-content-available-height));
-    --menu-min-width: var(--bits-select-anchor-width);
 
     width: var(--bits-select-anchor-width);
   }

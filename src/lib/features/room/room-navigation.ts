@@ -1,9 +1,10 @@
 import { afterNavigate, goto } from '$app/navigation';
 import { afterOverlayPops } from '#lib/platform/overlay-back.svelte.js';
+import { setPageState } from '#lib/platform/page-state.js';
 import { resolve } from '$app/paths';
 import { page } from '$app/state';
 
-import type { RoomSummary } from '#src/generated/protocol';
+import type { RoomListItemView } from '#src/generated/protocol';
 
 import { findRoomByPathId, roomPathParamFromId } from '#lib/rooms/room-list.svelte.js';
 import { BREAKPOINTS } from '#lib/ui/breakpoints.js';
@@ -36,6 +37,7 @@ export async function leaveRoomView(): Promise<void> {
     history.back();
     return;
   }
+  // eslint-disable-next-line svelte/no-navigation-without-resolve -- roomListPath() resolves the route itself
   await goto(target);
 }
 
@@ -44,11 +46,7 @@ export function backToRoomList(): void {
     void leaveRoomView();
     return;
   }
-  void goto('', {
-    shallow: true,
-    replace: true,
-    state: { ...page.state, mobileDrawer: 'open' },
-  });
+  void setPageState({ ...page.state, mobileDrawer: 'open' }, true);
 }
 
 const ROOM_PATH =
@@ -67,19 +65,16 @@ export function isRoomSwitch(href: string): boolean {
 export function goToPage(href: string): void {
   const samePage = new URL(href, page.url.href).pathname === page.url.pathname;
   if (samePage && !window.matchMedia(BREAKPOINTS.appLayout).matches) {
-    void goto('', {
-      shallow: true,
-      replace: true,
-      state: { ...page.state, mobileDrawer: 'closed' },
-    });
+    void setPageState({ ...page.state, mobileDrawer: 'closed' }, true);
     return;
   }
+  // eslint-disable-next-line svelte/no-navigation-without-resolve -- callers pass a resolved href
   void goto(href, { replace: isRoomSwitch(href) });
 }
 
 export function scopedSearchQuery(
   operator: 'in' | 'space',
-  room: RoomSummary | undefined,
+  room: RoomListItemView | undefined,
   roomId: string
 ): string {
   const label = room?.canonical_alias ?? room?.name ?? roomId;
@@ -89,14 +84,14 @@ export function scopedSearchQuery(
 
 export function scopedSearchPath(
   operator: 'in' | 'space',
-  room: RoomSummary | undefined,
+  room: RoomListItemView | undefined,
   roomId: string
 ): string {
   return `${resolve('/(app)/search')}?q=${encodeURIComponent(scopedSearchQuery(operator, room, roomId))}`;
 }
 
 export function contextSearchPath(
-  rooms: readonly RoomSummary[],
+  rooms: readonly RoomListItemView[],
   roomPathId: string | undefined,
   spacePathId: string | undefined
 ): string {
@@ -107,10 +102,11 @@ export function contextSearchPath(
   return resolve('/(app)/search');
 }
 
-export function searchInRoom(room: RoomSummary | undefined, roomId: string): void {
+export function searchInRoom(room: RoomListItemView | undefined, roomId: string): void {
   const target = scopedSearchPath('in', room, roomId);
 
-  goto(target).catch(() => {
-    window.location.assign(target);
+  // eslint-disable-next-line svelte/no-navigation-without-resolve -- scopedSearchPath() resolves the route itself
+  goto(target).catch((error: unknown) => {
+    console.debug('[sable room] search navigation failed', error);
   });
 }

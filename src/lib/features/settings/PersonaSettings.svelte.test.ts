@@ -12,7 +12,11 @@ const mocks = vi.hoisted(() => ({
   uploadMedia: vi.fn<() => Promise<string>>(),
   save: vi.fn<(persona: PersonaView, previousId: string | null) => Promise<void>>(),
   load: vi.fn<(force?: boolean) => Promise<void>>(),
+  removeAll: vi.fn<() => Promise<void>>(),
+  list: [] as PersonaView[],
   accountData: vi.fn<(eventType: string) => Promise<unknown>>(),
+  checkPersonaBackup: vi.fn<(params: { backup: string }) => Promise<null>>(),
+  restorePersonaBackup: vi.fn<(params: { backup: string }) => Promise<null>>(),
   setAccountData: vi.fn<(eventType: string, content: unknown) => Promise<void>>(),
 }));
 
@@ -25,13 +29,14 @@ vi.mock('#lib/core/context.js');
 
 import { core } from '#lib/core/__mocks__/context.js';
 
-Object.assign(core, {
-  uploadMedia: mocks.uploadMedia,
-  accountData: mocks.accountData,
-  setAccountData: mocks.setAccountData,
+Object.assign(core, { uploadMedia: mocks.uploadMedia });
+Object.assign(core.rpc.account, { data: mocks.accountData, setData: mocks.setAccountData });
+Object.assign(core.rpc.personas, {
+  checkBackup: mocks.checkPersonaBackup,
+  restoreBackup: mocks.restorePersonaBackup,
 });
 vi.mock('#lib/personas/personas.svelte.js', () => ({
-  usePersonaStore: () => ({ personas: [], loading: false, error: null, ...mocks }),
+  usePersonaStore: () => ({ personas: mocks.list, loading: false, error: null, ...mocks }),
 }));
 
 import PersonaSettings from './PersonaSettings.svelte';
@@ -42,6 +47,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.clearAllMocks();
   mocks.isTauri.mockReturnValue(false);
+  mocks.list = [];
 });
 
 test.each([
@@ -77,7 +83,7 @@ test.each([
     );
   });
   if (failed) {
-    expect(await screen.findByText(/pictures could not be fetched/)).toBeInTheDocument();
+    expect(await screen.findByText(/picture could not be fetched/)).toBeInTheDocument();
   }
   if (native) {
     expect(mocks.invoke).toHaveBeenCalledWith('import_persona_avatar', { url: avatar });
@@ -112,7 +118,7 @@ test('imports the members of a PluralKit export file', async () => {
       null
     );
   });
-  expect(await screen.findByText('Imported 1 members.')).toBeInTheDocument();
+  expect(await screen.findByText('Imported 1 member.')).toBeInTheDocument();
 });
 
 test('reports an export file that holds no members', async () => {
@@ -126,13 +132,14 @@ test('reports an export file that holds no members', async () => {
 
 test('restores a backup only after confirmation', async () => {
   mocks.load.mockResolvedValue();
-  mocks.setAccountData.mockResolvedValue();
-  const catalog = { profiles: [{ id: 'kris' }] };
+  mocks.checkPersonaBackup.mockResolvedValue(null);
+  mocks.restorePersonaBackup.mockResolvedValue(null);
+  const backup = JSON.stringify({ catalog: true });
   render(PersonaSettings);
-  await choose(1, JSON.stringify({ 'fi.mau.msc4461.per_message_profiles.v3': catalog }));
+  await choose(1, backup);
 
   const dialog = await screen.findByRole('dialog');
-  expect(mocks.setAccountData).not.toHaveBeenCalled();
+  expect(mocks.restorePersonaBackup).not.toHaveBeenCalled();
 
   const [confirm] = within(dialog)
     .getAllByRole('button')
@@ -141,18 +148,42 @@ test('restores a backup only after confirmation', async () => {
   await vi.waitFor(() => {
     expect(mocks.load).toHaveBeenCalledWith(true);
   });
-  expect(mocks.setAccountData).toHaveBeenCalledWith(
-    'fi.mau.msc4461.per_message_profiles.v3',
-    catalog
-  );
+  expect(mocks.restorePersonaBackup).toHaveBeenCalledWith({ backup });
 });
 
-test('rejects a backup without the v3 catalog', async () => {
+test('a file the core refuses is reported before anything is asked', async () => {
   mocks.load.mockResolvedValue();
+  mocks.checkPersonaBackup.mockRejectedValueOnce(new Error('invalid_backup'));
   render(PersonaSettings);
-  await choose(1, JSON.stringify({ 'fi.mau.msc4461.per_message_profiles.v2': { profiles: [] } }));
+  await choose(1, '{}');
 
   expect(await screen.findByText(/not a per-message profile backup/)).toBeInTheDocument();
   expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
-  expect(mocks.setAccountData).not.toHaveBeenCalled();
+  expect(mocks.restorePersonaBackup).not.toHaveBeenCalled();
+});
+
+test('deletes every profile only after confirmation', async () => {
+  mocks.load.mockResolvedValue();
+  mocks.removeAll.mockResolvedValue();
+  mocks.list = [{ id: 'kris', display_name: 'Kris', pronouns: [], triggers: [] } as never];
+  render(PersonaSettings);
+
+  await userEvent.click(screen.getByRole('button', { name: 'Delete all profiles' }));
+  const dialog = await screen.findByRole('dialog');
+  expect(mocks.removeAll).not.toHaveBeenCalled();
+
+  const [confirm] = within(dialog)
+    .getAllByRole('button')
+    .filter((button) => button.classList.contains('btn-danger'));
+  await userEvent.click(confirm);
+  await vi.waitFor(() => {
+    expect(mocks.removeAll).toHaveBeenCalledOnce();
+  });
+});
+
+test('offers no bulk delete without profiles', () => {
+  mocks.load.mockResolvedValue();
+  render(PersonaSettings);
+
+  expect(screen.getByRole('button', { name: 'Delete all profiles' })).toBeDisabled();
 });

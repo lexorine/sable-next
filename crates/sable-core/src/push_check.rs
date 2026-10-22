@@ -1,7 +1,7 @@
 use crate::errors::CoreError;
 use matrix_sdk::Client;
 use matrix_sdk::ruma::TransactionId;
-use serde_json::{Value, json};
+use serde::Serialize;
 
 #[cfg(not(target_family = "wasm"))]
 use std::future::Future;
@@ -18,16 +18,51 @@ const PING_PUSHKEY: &str = "sable-diagnostic-ping";
 #[cfg(not(target_family = "wasm"))]
 const NOTIFY_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(250), Duration::from_millis(750)];
 
+#[derive(Serialize)]
+pub struct NotifyBodyOut {
+    notification: NotificationOut,
+}
+
+#[derive(Serialize)]
+struct NotificationOut {
+    event_id: String,
+    room_id: &'static str,
+    prio: PrioOut,
+    devices: [DeviceOut; 1],
+}
+
+#[derive(Serialize)]
+enum PrioOut {
+    #[serde(rename = "high")]
+    High,
+}
+
+#[derive(Serialize)]
+struct DeviceOut {
+    app_id: String,
+    pushkey: String,
+    data: serde_json::Map<String, serde_json::Value>,
+}
+
 #[must_use]
-pub fn notify_body(event_id: &str, app_id: &str, pushkey: &str, data: &Value) -> Value {
-    json!({
-        "notification": {
-            "event_id": event_id,
-            "room_id": DIAGNOSTIC_ROOM,
-            "prio": "high",
-            "devices": [{ "app_id": app_id, "pushkey": pushkey, "data": data }],
-        }
-    })
+pub fn notify_body(
+    event_id: &str,
+    app_id: &str,
+    pushkey: &str,
+    data: serde_json::Map<String, serde_json::Value>,
+) -> NotifyBodyOut {
+    NotifyBodyOut {
+        notification: NotificationOut {
+            event_id: event_id.to_owned(),
+            room_id: DIAGNOSTIC_ROOM,
+            prio: PrioOut::High,
+            devices: [DeviceOut {
+                app_id: app_id.to_owned(),
+                pushkey: pushkey.to_owned(),
+                data,
+            }],
+        },
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -55,7 +90,7 @@ where
 }
 
 #[cfg(not(target_family = "wasm"))]
-async fn notify(url: &str, body: &Value) -> Result<Option<Vec<String>>, CoreError> {
+async fn notify(url: &str, body: &impl Serialize) -> Result<Option<Vec<String>>, CoreError> {
     #[derive(serde::Deserialize)]
     struct NotifyResponse {
         #[serde(default)]
@@ -65,7 +100,7 @@ async fn notify(url: &str, body: &Value) -> Result<Option<Vec<String>>, CoreErro
     let http = crate::tls::apply(matrix_sdk::reqwest::Client::builder())
         .build()
         .map_err(CoreError::backend)?;
-    let body = body.to_string();
+    let body = serde_json::to_string(body).map_err(CoreError::backend)?;
     let response = retry_transient(
         || async {
             http.post(url)
@@ -87,17 +122,27 @@ async fn notify(url: &str, body: &Value) -> Result<Option<Vec<String>>, CoreErro
 }
 
 #[cfg(target_family = "wasm")]
-async fn notify(url: &str, body: &Value) -> Result<Option<Vec<String>>, CoreError> {
-    let http = crate::tls::apply(matrix_sdk::reqwest::Client::builder())
-        .build()
-        .map_err(CoreError::backend)?;
-    http.post(url)
-        .header(matrix_sdk::reqwest::header::CONTENT_TYPE, "text/plain")
-        .body(body.to_string())
-        .fetch_mode_no_cors()
-        .send()
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = fetch)]
+    fn js_fetch(request: &web_sys::Request) -> js_sys::Promise;
+}
+
+/// Not reqwest: it parses the response URL with `expect_throw`, and a no-cors
+/// response is opaque with an empty one.
+#[cfg(target_family = "wasm")]
+async fn notify(url: &str, body: &impl Serialize) -> Result<Option<Vec<String>>, CoreError> {
+    let js_error = |error: wasm_bindgen::JsValue| CoreError::from(format!("{error:?}"));
+    let init = web_sys::RequestInit::new();
+    init.set_method("POST");
+    init.set_mode(web_sys::RequestMode::NoCors);
+    init.set_body(&wasm_bindgen::JsValue::from_str(
+        &serde_json::to_string(body).map_err(CoreError::backend)?,
+    ));
+    let request = web_sys::Request::new_with_str_and_init(url, &init).map_err(js_error)?;
+    wasm_bindgen_futures::JsFuture::from(js_fetch(&request))
         .await
-        .map_err(CoreError::backend)?;
+        .map_err(js_error)?;
     Ok(None)
 }
 
@@ -109,7 +154,7 @@ pub async fn ping_gateway(url: &str) -> Option<bool> {
         &format!("{DIAGNOSTIC_EVENT_PREFIX}ping"),
         PING_APP_ID,
         PING_PUSHKEY,
-        &json!({}),
+        serde_json::Map::new(),
     );
     match notify(&url, &body).await {
         Ok(Some(_)) => Some(true),
@@ -187,7 +232,7 @@ pub async fn send_diagnostic_push(
     };
     let url = crate::notifications::gateway(&url)?;
     let event_id = format!("{DIAGNOSTIC_EVENT_PREFIX}{}", TransactionId::new());
-    let body = notify_body(&event_id, app_id, pushkey, &Value::Object(pusher.data));
+    let body = notify_body(&event_id, app_id, pushkey, pusher.data);
     Ok(delivery(notify(&url, &body).await?, pushkey, event_id))
 }
 
@@ -255,8 +300,12 @@ mod tests {
             &format!("{DIAGNOSTIC_EVENT_PREFIX}abc"),
             "moe.sable.app",
             "key",
-            &json!({"url": "https://push.example/_matrix/push/v1/notify", "format": "event_id_only"}),
+            json!({"url": "https://push.example/_matrix/push/v1/notify", "format": "event_id_only"})
+                .as_object()
+                .cloned()
+                .unwrap(),
         );
+        let body = serde_json::to_value(body).unwrap();
 
         assert_eq!(body["notification"]["event_id"], "$sable-diagnostic-abc");
         assert_eq!(body["notification"]["devices"][0]["pushkey"], "key");
@@ -285,7 +334,10 @@ mod tests {
     #[tokio::test]
     async fn a_gateway_request_retries_transient_connection_failures() {
         let attempts = Arc::new(AtomicUsize::new(0));
-        let client = matrix_sdk::reqwest::Client::new();
+        let client = matrix_sdk::reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
         let result = retry_transient(
             || {
                 let attempt = attempts.fetch_add(1, Ordering::Relaxed);

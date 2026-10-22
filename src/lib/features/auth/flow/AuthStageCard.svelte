@@ -1,5 +1,6 @@
 <script lang="ts">
   import LockSimpleIcon from 'phosphor-svelte/lib/LockSimpleIcon';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
   import type { Snippet } from 'svelte';
 
   interface Props {
@@ -32,14 +33,18 @@
 </script>
 
 <div
-  class="auth-card"
-  class:active
-  class:muted={!active}
-  class:unavailable={!active && !reachable}
-  class:before
-  class:after
-  class:entering
-  class:removing
+  class={[
+    'auth-card',
+    {
+      active,
+      muted: !active,
+      unavailable: !active && !reachable,
+      before,
+      after,
+      entering,
+      removing,
+    },
+  ]}
   onanimationend={(event) => {
     if (event.currentTarget === event.target) onMotionComplete?.();
   }}
@@ -50,21 +55,24 @@
   }}
 >
   <button
-    class="stage-activation"
-    class:active
+    class={['stage-activation', { active }]}
     type="button"
     onclick={onActivate}
     aria-label={accessibilityLabel}
-    aria-hidden={active}
+    aria-hidden="true"
     disabled={!reachable}
-    tabindex={active || !reachable ? -1 : 0}
+    tabindex="-1"
   ></button>
   {#if !active && !reachable && unavailableLabel}
-    <span class="unavailable-cue" role="img" title={unavailableLabel} aria-label={unavailableLabel}>
-      <LockSimpleIcon aria-hidden="true" />
-    </span>
+    <Tooltip label={unavailableLabel}>
+      {#snippet trigger({ props })}
+        <span {...props} class="unavailable-cue" tabindex="-1" aria-hidden="true">
+          <LockSimpleIcon aria-hidden="true" />
+        </span>
+      {/snippet}
+    </Tooltip>
   {/if}
-  <div class="card-content" inert={!active}>
+  <div class="card-content" inert={!active} aria-hidden={!active}>
     {@render children()}
   </div>
 </div>

@@ -1,5 +1,4 @@
 <script lang="ts">
-  import type { TimelineItemView } from '#src/generated/protocol';
   import { useCoreClient } from '#lib/core/context.js';
   import { Bookmarks, provideBookmarks } from '#lib/rooms/bookmarks.svelte.js';
   import {
@@ -15,6 +14,7 @@
     providePinnedEvents,
   } from '#lib/features/room/timeline/pinned-events.svelte.js';
   import TimelineItem from '#lib/features/room/timeline/TimelineItem.svelte';
+  import { previewMessage } from '#lib/features/room/timeline/preview-message.js';
   import { i18n } from '#lib/i18n.js';
   import { PersonaStore, providePersonaStore } from '#lib/personas/personas.svelte.js';
   import { RoomList, provideRoomList } from '#lib/rooms/room-list.svelte.js';
@@ -32,8 +32,8 @@
   const core = useCoreClient();
   providePersonaStore(new PersonaStore(core));
   provideRoomList(new RoomList(core));
-  providePinnedEvents(new PinnedEvents(core.commands));
-  provideBookmarks(new Bookmarks(core.commands));
+  providePinnedEvents(new PinnedEvents(core.rpc.timeline));
+  provideBookmarks(new Bookmarks(core.rpc.account));
   provideMessageDialogs(new MessageDialogs());
   provideMessageMenu(new OpenMessageMenu());
 
@@ -49,108 +49,74 @@
     compact: 'settings.replyPreviewStyleCompact',
     expanded: 'settings.replyPreviewStyleExpanded',
   } as const;
-  const message: TimelineItemView = {
-    id: 'setup-preview',
-    event_id: null,
-    transaction_id: null,
-    send_state: null,
+  const message = previewMessage('setup-preview', 'See you at six?', {
     sender: '@alex:preview.invalid',
     sender_name: 'Alex',
-    sender_avatar: null,
     timestamp: Date.now(),
-    content: {
-      kind: 'message',
-      body: 'See you at six?',
-      html: 'See you at six?',
-      emote: false,
-      notice: false,
-      edited: false,
-    },
-    in_reply_to: null,
-    thread_root: null,
-    thread_summary: null,
-    reactions: [],
-    is_own: false,
-    read_by: [],
-    read_timestamps: {},
-    per_message_profile: null,
-    bundled_link_previews: [],
-    link_previews_removed: null,
-    mention: 'none',
-    forwarded: null,
-    forum_title: null,
-  };
-  const reply: TimelineItemView = {
-    ...message,
-    id: 'setup-reply-preview',
+  });
+  const reply = previewMessage('setup-reply-preview', 'Sounds good!', {
     sender: '@sam:preview.invalid',
     sender_name: 'Sam',
-    content: {
-      kind: 'message',
-      body: 'Sounds good!',
-      html: 'Sounds good!',
-      emote: false,
-      notice: false,
-      edited: false,
-    },
+    timestamp: message.timestamp,
     in_reply_to: {
       event_id: '$setup-preview',
       sender: '@alex:preview.invalid',
       sender_mentioned: false,
       sender_name: 'Alex',
       body: 'See you at six?',
+      fallback: null,
     },
-  };
+  });
 </script>
 
 <div class="chat-style-card auth-card-surface">
-  <AuthField labelId="chat-style-title" label={$i18n.t('setup.layoutTitle')}>
-    <p class="hint">{$i18n.t('setup.layoutDescription')}</p>
+  <AuthField labelId="chat-style-title" label={i18n.t('setup.layoutTitle')}>
+    <p class="hint">{i18n.t('setup.layoutDescription')}</p>
   </AuthField>
 
   <TooltipProvider>
     <fieldset>
-      <legend>{$i18n.t('settings.layout')}</legend>
+      <legend>{i18n.t('settings.layout')}</legend>
       <div class="sample" inert aria-hidden="true">
         <TimelineItem item={message} collapsed={false} layout={preferences.layout} preview />
       </div>
       <div class="choices">
         {#each layouts as value (value)}
-          <label class:selected={preferences.layout === value}>
+          <label class={{ selected: preferences.layout === value }}>
             <input
               type="radio"
               name="setup-layout"
               checked={preferences.layout === value}
               onchange={() => setPreference('layout', value)}
             />
-            {$i18n.t(layoutLabels[value])}
+            {i18n.t(layoutLabels[value])}
           </label>
         {/each}
       </div>
     </fieldset>
 
     <fieldset>
-      <legend>{$i18n.t('settings.replyPreviewStyle')}</legend>
+      <legend>{i18n.t('settings.replyPreviewStyle')}</legend>
       <div class="sample" inert aria-hidden="true">
         <TimelineItem item={reply} collapsed={false} layout={preferences.layout} preview />
       </div>
       <div class="choices">
         {#each replies as value (value)}
-          <label class:selected={preferences.replyPreviewStyle === value}>
+          <label class={{ selected: preferences.replyPreviewStyle === value }}>
             <input
               type="radio"
               name="setup-reply"
               checked={preferences.replyPreviewStyle === value}
               onchange={() => setPreference('replyPreviewStyle', value)}
             />
-            {$i18n.t(replyLabels[value])}
+            {i18n.t(replyLabels[value])}
           </label>
         {/each}
       </div>
     </fieldset>
   </TooltipProvider>
 
-  <Button variant="primary" block onclick={onComplete}>{$i18n.t('auth.continue')}</Button>
+  <Button variant="primary" block onclick={onComplete}>{i18n.t('auth.continue')}</Button>
 </div>
 
 <style>

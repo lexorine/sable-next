@@ -1,6 +1,9 @@
 import type { CoreClient } from '#lib/core/client.svelte.js';
 
+import { readJson, removeLocalValue, writeJson } from '#lib/platform/local-json.js';
+
 import { fingerprint } from './fingerprint.js';
+import { setAccountData, setSealedAccountData } from '#lib/core/api/account.svelte.js';
 
 export const ACCOUNT_DATA_KEY_TYPE = 'dev.zirco.msc4483.account_data.key';
 
@@ -9,6 +12,7 @@ export type AccountSyncStatus = 'idle' | 'syncing' | 'partial' | 'error';
 export interface SyncedSnapshot {
   content: unknown;
   partial?: boolean;
+  skipped?: string[];
 }
 
 export interface SyncedDocument {
@@ -18,11 +22,13 @@ export interface SyncedDocument {
   enabled?: () => boolean;
   snapshot: () => SyncedSnapshot;
   adopt: (content: unknown) => boolean;
+  merge?: (base: unknown, local: unknown, remote: unknown) => unknown;
   legacy?: { eventType: string; convert: (content: unknown) => unknown };
 }
 
 interface DocumentState {
   pending: SyncedSnapshot | null;
+  base: unknown;
   remote: string | null;
   pulled: boolean;
   locked: boolean;
@@ -31,6 +37,7 @@ interface DocumentState {
 }
 
 const DEFAULT_DEBOUNCE_MS = 2000;
+const BASE_KEY_PREFIX = 'sable-sync-base';
 
 function detach(snapshot: SyncedSnapshot): SyncedSnapshot {
   return { ...snapshot, content: $state.snapshot(snapshot.content) };
@@ -39,6 +46,7 @@ function detach(snapshot: SyncedSnapshot): SyncedSnapshot {
 export class AccountSync {
   status = $state<AccountSyncStatus>('idle');
   lastSyncedAt = $state<number | null>(null);
+  skipped = $state.raw<string[]>([]);
 
   #core: CoreClient | null = null;
   #generation = 0;
@@ -63,6 +71,9 @@ export class AccountSync {
       state.pulled = false;
       state.locked = false;
       state.status = 'idle';
+      if (document.merge && state.base === null) {
+        state.base = readJson(this.#baseKey(document), (value) => value, null);
+      }
     }
     this.#refresh();
 
@@ -102,6 +113,7 @@ export class AccountSync {
 
     const state: DocumentState = {
       pending: null,
+      base: null,
       remote: null,
       pulled: false,
       locked: false,
@@ -138,7 +150,7 @@ export class AccountSync {
     let migrated = false;
     try {
       if (document.sealed) {
-        const sealed = await core.commands.sealedAccountData(document.eventType);
+        const sealed = await core.rpc.account.sealedData({ event_type: document.eventType });
         if (generation !== this.#generation) return;
         state.locked = sealed.state === 'locked';
         if (state.locked) {
@@ -150,9 +162,11 @@ export class AccountSync {
         content = sealed.content;
         unsealed = sealed.state === 'plain' && sealed.can_seal && sealed.content !== null;
       } else {
-        content = await core.commands.accountData(document.eventType);
+        content = await core.rpc.account.data({ event_type: document.eventType });
         if (content === null && document.legacy) {
-          const legacy = await core.commands.accountData(document.legacy.eventType);
+          const legacy = await core.rpc.account.data({
+            event_type: document.legacy.eventType,
+          });
           if (generation !== this.#generation) return;
           content = document.legacy.convert(legacy);
           migrated = content !== null;
@@ -167,6 +181,20 @@ export class AccountSync {
     }
     if (generation !== this.#generation) return;
 
+    if (state.base !== null) state.pending ??= detach(document.snapshot());
+    if (this.#ahead(state)) {
+      state.pulled = true;
+      const merged =
+        content === null ? null : document.merge?.(state.base, state.pending?.content, content);
+      if (merged !== null && merged !== undefined && document.adopt(merged)) {
+        state.pending = detach(document.snapshot());
+        this.#rebase(document, state, content);
+        state.remote = fingerprint(content);
+      }
+      this.#schedule(document, state);
+      return;
+    }
+
     state.pulled = true;
     if (!document.adopt(content)) {
       state.pending ??= detach(document.snapshot());
@@ -176,11 +204,33 @@ export class AccountSync {
 
     const next = detach(document.snapshot());
     state.pending = next;
+    this.#rebase(document, state, next.content);
     state.remote = unsealed || migrated ? null : fingerprint(content ?? next.content);
     state.status = next.partial === true ? 'partial' : 'idle';
     this.lastSyncedAt = Date.now();
     this.#refresh();
     this.#schedule(document, state);
+  }
+
+  #baseKey(document: SyncedDocument): string {
+    return `${BASE_KEY_PREFIX}:${this.#accountId ?? ''}:${document.eventType}`;
+  }
+
+  #rebase(document: SyncedDocument, state: DocumentState, base: unknown): void {
+    state.base = base;
+    if (!document.merge) return;
+
+    const key = this.#baseKey(document);
+    removeLocalValue(key);
+    writeJson(key, base, '[sable settings] sync base not persisted');
+  }
+
+  #ahead(state: DocumentState): boolean {
+    return (
+      state.base !== null &&
+      state.pending !== null &&
+      fingerprint(state.pending.content) !== fingerprint(state.base)
+    );
   }
 
   async #upload(document: SyncedDocument, generation: number): Promise<void> {
@@ -193,8 +243,8 @@ export class AccountSync {
     this.#refresh();
     try {
       await (document.sealed
-        ? core.commands.setSealedAccountData(document.eventType, sent.content)
-        : core.commands.setAccountData(document.eventType, sent.content));
+        ? setSealedAccountData(core.rpc, document.eventType, sent.content)
+        : setAccountData(core.rpc, document.eventType, sent.content));
     } catch (error) {
       if (generation !== this.#generation) return;
       state.status = 'error';
@@ -204,6 +254,7 @@ export class AccountSync {
     }
     if (generation !== this.#generation) return;
 
+    this.#rebase(document, state, sent.content);
     state.remote = fingerprint(sent.content);
     state.status = sent.partial === true ? 'partial' : 'idle';
     this.lastSyncedAt = Date.now();
@@ -211,7 +262,11 @@ export class AccountSync {
   }
 
   #refresh(): void {
-    const statuses = [...this.#states.values()].map((state) => state.status);
+    const states = [...this.#states.values()];
+    this.skipped = states.flatMap((state) =>
+      state.status === 'partial' ? (state.pending?.skipped ?? []) : []
+    );
+    const statuses = states.map((state) => state.status);
     this.status =
       statuses.find((status) => status === 'error') ??
       statuses.find((status) => status === 'syncing') ??

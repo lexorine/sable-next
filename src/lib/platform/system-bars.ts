@@ -17,9 +17,7 @@ export function isLightColor(color: string): boolean {
   return 0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue) > 0.179;
 }
 
-// First non-transparent background painted at (x, y): the surface sitting under
-// a system bar is the one whose contrast the icons must match, and it is often
-// not the body's — a drawer or a sheet owns that strip instead.
+// First non-transparent background at (x, y): the surface under a bar sets the icon contrast, and may be a drawer or sheet.
 function readSurfaceColor(x: number, y: number): string | undefined {
   let el = document.elementFromPoint(x, y);
   while (el) {
@@ -64,7 +62,9 @@ function syncWindowBackground(color: string | undefined, last: string): string {
 
 export function setSystemBarsHidden(hidden: boolean): void {
   if (!isTauri() || (osType() !== 'android' && osType() !== 'ios')) return;
-  void invoke('set_system_bars_hidden', { hidden }).catch(() => undefined);
+  void invoke('set_system_bars_hidden', { hidden }).catch((error: unknown) => {
+    console.debug('[sable window] system bars not toggled', error);
+  });
 }
 
 const SAMPLE_INTERVAL_MS = 200;
@@ -85,12 +85,7 @@ function syncEdge(
 }
 
 /**
- * Android leaves the bars transparent and the webview paints under them, so the
- * colour is already whatever the page draws; only the icon contrast is ours to
- * set. `Window.setStatusBarColor` cannot help — it is a no-op from API 35.
- *
- * The two bars can sit over different surfaces, so each is sampled and pushed
- * on its own. Returns the cleanup for the observers and debounce timers.
+ * Samples each bar's surface and sets the icon contrast, since Android leaves the bars transparent. Returns the cleanup.
  */
 export function startSystemBarSync(): () => void {
   if (!isTauri() || osType() !== 'android') return () => {};

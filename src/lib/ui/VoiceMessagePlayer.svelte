@@ -1,10 +1,15 @@
 <script lang="ts">
   import PauseIcon from 'phosphor-svelte/lib/PauseIcon';
   import PlayIcon from 'phosphor-svelte/lib/PlayIcon';
+  import SpeakerHighIcon from 'phosphor-svelte/lib/SpeakerHighIcon';
+  import SpeakerLowIcon from 'phosphor-svelte/lib/SpeakerLowIcon';
+  import SpeakerXIcon from 'phosphor-svelte/lib/SpeakerXIcon';
 
   import { i18n } from '#lib/i18n.js';
   import { formatClockDuration } from '#lib/ui/clock-duration.js';
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
+  import Pill from '#lib/ui/primitives/Pill.svelte';
+  import { voicePlayback } from '#lib/ui/voice-playback.svelte.js';
 
   const SCRUB_RESOLUTION = 1000;
 
@@ -41,6 +46,17 @@
     currentTime = next;
   }
 
+  function setVolume(event: Event): void {
+    const input = event.currentTarget;
+    if (input instanceof HTMLInputElement) voicePlayback.setVolume(Number(input.value));
+  }
+
+  $effect(() => {
+    if (!audio) return;
+    audio.playbackRate = voicePlayback.speed;
+    audio.volume = voicePlayback.volume;
+  });
+
   function formatTime(seconds: number): string {
     return formatClockDuration(Math.max(0, Math.round(seconds)));
   }
@@ -51,7 +67,7 @@
     variant="ghost"
     size="small"
     class="voice-play"
-    label={playing ? $i18n.t('timeline.pauseVoiceMessage') : $i18n.t('timeline.playVoiceMessage')}
+    label={playing ? i18n.t('timeline.pauseVoiceMessage') : i18n.t('timeline.playVoiceMessage')}
     onclick={toggle}
   >
     {#if playing}
@@ -64,8 +80,7 @@
     <div class="voice-waveform" aria-hidden="true">
       {#each waveform as level, index (index)}
         <span
-          class="voice-bar"
-          class:played={index < activeBars}
+          class={['voice-bar', { played: index < activeBars }]}
           style:height={`${String(Math.max(0.12, level) * 100)}%`}
         ></span>
       {/each}
@@ -77,11 +92,36 @@
       max={SCRUB_RESOLUTION}
       value={Math.round(progress * SCRUB_RESOLUTION)}
       oninput={seek}
-      aria-label={$i18n.t('timeline.voiceMessagePosition')}
+      aria-label={i18n.t('timeline.voiceMessagePosition')}
       aria-valuetext={`${formatTime(currentTime)} / ${formatTime(duration)}`}
     />
   </div>
   <span class="voice-time">{formatTime(currentTime)}</span>
+  <Pill
+    class="voice-speed"
+    aria-label={i18n.t('timeline.voiceMessageSpeed', { speed: voicePlayback.speed })}
+    onclick={voicePlayback.cycleSpeed}
+  >
+    {voicePlayback.speed}×
+  </Pill>
+  <label class="voice-volume">
+    {#if voicePlayback.volume === 0}
+      <SpeakerXIcon />
+    {:else if voicePlayback.volume < 0.5}
+      <SpeakerLowIcon />
+    {:else}
+      <SpeakerHighIcon />
+    {/if}
+    <input
+      type="range"
+      min="0"
+      max="1"
+      step="0.05"
+      value={voicePlayback.volume}
+      oninput={setVolume}
+      aria-label={i18n.t('timeline.voiceMessageVolume')}
+    />
+  </label>
   <audio
     bind:this={audio}
     src={url}
@@ -148,6 +188,32 @@
     display: block;
     margin: 0;
     width: 100%;
+  }
+
+  .voice-message-player :global(.voice-speed) {
+    font-variant-numeric: tabular-nums;
+    min-width: 2.75rem;
+  }
+
+  .voice-volume {
+    align-items: center;
+    color: var(--surface-var-on-container);
+    display: flex;
+    flex: none;
+    gap: var(--space-100);
+  }
+
+  .voice-volume input {
+    accent-color: var(--primary-main);
+    margin: 0;
+    min-height: var(--control-height-small);
+    width: 4rem;
+  }
+
+  @media (pointer: coarse), (width <= 600px) {
+    .voice-volume {
+      display: none;
+    }
   }
 
   .voice-time {

@@ -1,5 +1,4 @@
 import type { Component } from 'svelte';
-import type { ImagePackView } from '#src/generated/protocol';
 
 import BookmarkIcon from 'phosphor-svelte/lib/BookmarkSimpleIcon';
 import CodeIcon from 'phosphor-svelte/lib/CodeIcon';
@@ -24,7 +23,6 @@ import TrashIcon from 'phosphor-svelte/lib/TrashIcon';
 import UserSwitchIcon from 'phosphor-svelte/lib/UserSwitchIcon';
 
 export type MessageActions = {
-  loadImagePacks?: (roomId: string) => Promise<ImagePackView[]>;
   roomId?: string;
   onReact?: (emoji: string) => void;
   onAddReaction?: () => void;
@@ -40,7 +38,7 @@ export type MessageActions = {
   onCopyText?: () => void;
   copyTextLabel?: string;
   onCopyLink?: () => void;
-  copyLinkLabel?: string;
+  onCopyHref?: () => void;
   onPin?: () => void;
   onBookmark?: () => void;
   onForward?: () => void;
@@ -53,6 +51,7 @@ export type MessageActions = {
   stealCount?: number;
   onReport?: () => void;
   onViewSource?: () => void;
+  onViewRedacted?: () => void;
   pinned?: boolean;
   bookmarked?: boolean;
 };
@@ -107,10 +106,18 @@ export function messageMenuRows(actions: MessageActions): MessageMenuRow[] {
       run: actions.onCopyText,
     });
   }
+  if (actions.onCopyHref) {
+    rows.push({
+      key: 'href',
+      label: 'timeline.copyLink',
+      icon: LinkIcon,
+      run: actions.onCopyHref,
+    });
+  }
   if (actions.onCopyLink) {
     rows.push({
       key: 'link',
-      label: actions.copyLinkLabel ?? 'timeline.copyMessageLink',
+      label: 'timeline.copyMessageLink',
       icon: LinkIcon,
       run: actions.onCopyLink,
     });
@@ -150,7 +157,7 @@ export function messageMenuRows(actions: MessageActions): MessageMenuRow[] {
   if (actions.onDownload) {
     rows.push({
       key: 'download',
-      label: 'timeline.downloadFile',
+      label: 'common.download',
       icon: DownloadIcon,
       run: actions.onDownload,
     });
@@ -199,7 +206,7 @@ export function messageMenuRows(actions: MessageActions): MessageMenuRow[] {
   if (actions.onReadReceipts) {
     rows.push({
       key: 'receipts',
-      label: 'timeline.readReceipts',
+      label: 'common.readReceipts',
       icon: ReceiptIcon,
       run: actions.onReadReceipts,
     });
@@ -215,9 +222,17 @@ export function messageMenuRows(actions: MessageActions): MessageMenuRow[] {
   if (actions.onViewSource) {
     rows.push({
       key: 'source',
-      label: 'timeline.viewSource',
+      label: 'common.viewSource',
       icon: CodeIcon,
       run: actions.onViewSource,
+    });
+  }
+  if (actions.onViewRedacted) {
+    rows.push({
+      key: 'view-redacted',
+      label: 'timeline.viewRedacted',
+      icon: ReceiptIcon,
+      run: actions.onViewRedacted,
     });
   }
   if (actions.onReport) {

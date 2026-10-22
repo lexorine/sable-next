@@ -9,6 +9,7 @@
     RoomPermissionsView,
     MutualRoomView,
     ProfileFieldView,
+    PerMessageProfileView,
   } from '#src/generated/protocol';
   import IconContext from 'phosphor-svelte/lib/IconContext';
   import ArrowSquareOutIcon from 'phosphor-svelte/lib/ArrowSquareOutIcon';
@@ -37,7 +38,8 @@
   import { resolve } from '$app/paths';
   import { roomSectionPath } from '#lib/rooms/permalink.js';
   import { useRoomCosmetics } from '#lib/rooms/room-cosmetics.svelte.js';
-  import { roomPathParamFromId, useRoomList } from '#lib/rooms/room-list.svelte.js';
+  import { hasDirectRoom, roomPathParamFromId, useRoomList } from '#lib/rooms/room-list.svelte.js';
+  import { sendMessage } from '#lib/core/api/messages.svelte.js';
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
   import { preferences } from '#lib/settings/preferences.svelte.js';
@@ -52,9 +54,11 @@
   import ActionMenuSub from '#lib/ui/primitives/ActionMenuSub.svelte';
   import Alert from '#lib/ui/primitives/Alert.svelte';
   import Button from '#lib/ui/primitives/Button.svelte';
+  import ConfirmDialog from '#lib/ui/primitives/ConfirmDialog.svelte';
   import DialogFrame from '#lib/ui/primitives/DialogFrame.svelte';
   import FormField from '#lib/ui/primitives/FormField.svelte';
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
   import Pill from '#lib/ui/primitives/Pill.svelte';
   import ProfileCard from '#lib/ui/primitives/ProfileCard.svelte';
   import Skeleton from '#lib/ui/primitives/Skeleton.svelte';
@@ -67,7 +71,7 @@
   import type { MatrixLink } from '#lib/rooms/matrix-link.js';
   import { powerTag } from './power-tags.js';
   import RoleTagIcon from './RoleTagIcon.svelte';
-  import type { PowerLevelTagMap } from '../settings/power-level-tags.js';
+  import { FOUNDER_POWER_LEVEL, type PowerLevelTagMap } from '../settings/power-level-tags.js';
   import { senderColor } from '../timeline/timeline-format';
 
   import '#lib/ui/primitives/menu.css';
@@ -76,6 +80,7 @@
   import { MemberProfileRelations } from './member-profile-relations.svelte';
   import { MemberProfileActions, moderationErrorMessage } from './member-profile-actions';
   import UserSecurityDialog from './UserSecurityDialog.svelte';
+  import PersonaCard from './PersonaCard.svelte';
 
   interface Props {
     userId: string;
@@ -85,6 +90,9 @@
     permissions?: RoomPermissionsView | null;
     powerTags?: PowerLevelTagMap | null;
     profile: ProfileView | null;
+    pmp?: PerMessageProfileView | null;
+    onOpenAccount?: () => void;
+    onNestedMenuOpenChange?: (open: boolean) => void;
     onAvatarClick?: (source: string, displayName: string) => void;
     onMatrixLink?: (link: MatrixLink, anchor: HTMLAnchorElement) => void;
     onPowerLevelChange?: (roomId: string, userId: string, level: number) => void;
@@ -100,6 +108,9 @@
     permissions = null,
     powerTags = null,
     profile,
+    pmp = null,
+    onOpenAccount,
+    onNestedMenuOpenChange,
     onAvatarClick,
     onMatrixLink,
     onPowerLevelChange,
@@ -120,8 +131,8 @@
     invitedMember = null;
     if (member !== null || targetRoomId === '' || !(permissions?.can_kick ?? false)) return;
 
-    void core.commands
-      .roomMembers(targetRoomId, ['invite'])
+    void core.rpc.members
+      .list({ room_id: targetRoomId, memberships: ['invite'] })
       .then((members) => {
         if (request !== membershipRequest) return;
         invitedMember = members.find((entry) => entry.user_id === targetUserId) ?? null;
@@ -134,7 +145,7 @@
   let roomMember = $derived(member ?? invitedMember);
   let currentProfile = $derived(profile?.user_id === userId ? profile : null);
   let presence = $derived(presenceStore.get(userId));
-  let presenceLabel = $derived(presence ? $i18n.t(`presence.${presence.presence}`) : null);
+  let presenceLabel = $derived(presence ? i18n.t(`presence.${presence.presence}`) : null);
   let userStatus = $derived(resolveUserStatus(currentProfile, presence));
   let lastSeenText = $derived.by(() => {
     if (!presence || presence.presence !== 'offline') return null;
@@ -144,23 +155,22 @@
     const bucket = lastSeenBucket(ms);
     switch (bucket.kind) {
       case 'now':
-        return $i18n.t('presence.lastSeenNow');
+        return i18n.t('presence.lastSeenNow');
       case 'minutes':
-        return $i18n.t('presence.lastSeenMinutes', { count: bucket.count });
+        return i18n.t('presence.lastSeenMinutes', { count: bucket.count });
       case 'hours':
-        return $i18n.t('presence.lastSeenHours', { count: bucket.count });
+        return i18n.t('presence.lastSeenHours', { count: bucket.count });
       case 'days':
-        return $i18n.t('presence.lastSeenDays', { count: bucket.count });
+        return i18n.t('presence.lastSeenDays', { count: bucket.count });
     }
   });
 
   let ownIdentity = $derived({
-    name: roomMember?.display_name ?? currentProfile?.display_name ?? null,
-    avatar: roomMember?.avatar_url ?? currentProfile?.avatar_url ?? null,
+    name: roomMember ? roomMember.display_name : (currentProfile?.display_name ?? null),
+    avatar: roomMember ? roomMember.avatar_url : (currentProfile?.avatar_url ?? null),
   });
-  let shownIdentity = $derived(roomCosmetics?.identity(userId, ownIdentity) ?? ownIdentity);
-  let realName = $derived(shownIdentity.name ?? userId);
-  let realAvatar = $derived(shownIdentity.avatar);
+  let realName = $derived(ownIdentity.name ?? userId);
+  let realAvatar = $derived(ownIdentity.avatar);
   let displayName = $derived(profileOverrides.name(userId, realName));
   let avatarUrl = $derived(profileOverrides.avatar(userId, realAvatar));
   let overrideColors = $derived(profileOverrides.colors(userId));
@@ -169,10 +179,9 @@
   let securityOpen = $state(false);
   let color = $derived(currentProfile?.hero_color ?? senderColor(userId));
   let cosmetics = $derived(roomCosmetics?.for(userId) ?? null);
-  let pronounSets = $derived(
+  let pronouns = $derived(
     cosmetics?.pronouns.length ? cosmetics.pronouns : (currentProfile?.pronouns ?? [])
   );
-  let pronouns = $derived(preferences.showPronouns ? pronounSets : []);
   let localTime = $derived.by(() => {
     const timezone = currentProfile?.timezone;
     if (!timezone) return null;
@@ -194,18 +203,19 @@
 
     let identity: string;
     if (animal.is_animal && animal.has_animal) {
-      identity = $i18n.t('timeline.animalBoth', { is: animal.is_animal, has: animal.has_animal });
+      identity = i18n.t('timeline.animalBoth', { is: animal.is_animal, has: animal.has_animal });
     } else if (animal.is_animal) {
-      identity = $i18n.t('timeline.animalIs', { is: animal.is_animal });
+      identity = i18n.t('timeline.animalIs', { is: animal.is_animal });
     } else if (animal.has_animal) {
-      identity = $i18n.t('timeline.animalHas', { has: animal.has_animal });
+      identity = i18n.t('timeline.animalHas', { has: animal.has_animal });
     } else {
       return null;
     }
 
-    if (!animal.animal_need) return `${identity}!`;
+    const need = animal.animal_need ?? 'headpats';
+    if (!need) return `${identity}!`;
 
-    return $i18n.t('timeline.animalNeed', { identity, need: animal.animal_need });
+    return i18n.t('timeline.animalNeed', { identity, need });
   });
   let extra = $derived(
     (currentProfile?.extra ?? []).filter((field) => field.key !== SUPPORTER_BADGE_FIELD)
@@ -213,16 +223,18 @@
   let showFailure = $derived(failed && !currentProfile && roomMember === null);
   let profileLoading = $derived(!currentProfile && !failed);
   let isSelf = $derived(core.session?.user_id === userId);
+  let profileColors = $derived(isSelf || preferences.renderProfileColors ? currentProfile : null);
   let canMessage = $derived(core.session !== null && !isSelf);
-  let messageLabel = $derived($i18n.t('timeline.messageUser', { name: displayName }));
+  let messageLabel = $derived(i18n.t('timeline.messageUser', { name: displayName }));
   let draft = $state('');
   let hasDraft = $derived(draft.trim() !== '');
   let sending = $state(false);
   let sendFailed = $state<'send' | 'open' | null>(null);
+  let confirmingDirect = $state(false);
   let homeserver = $derived(userId.slice(userId.indexOf(':') + 1));
   let elevated = $derived(roomMember !== null && roomMember.power_level >= 50);
   let roleTag = $derived(
-    roomMember && powerTags !== null ? powerTag(roomMember.power_level, $i18n.t, powerTags) : null
+    roomMember && powerTags !== null ? powerTag(roomMember.power_level, i18n.t, powerTags) : null
   );
   let outranks = $derived(!isSelf && ownPowerLevel > (roomMember?.power_level ?? 0));
   let canKick = $derived(
@@ -242,18 +254,23 @@
     !isSelf && roomMember?.membership === 'ban' && (permissions?.can_ban ?? false)
   );
   let canSetPower = $derived(
-    !isSelf &&
-      (permissions?.can_change_power_levels ?? false) &&
-      ownPowerLevel > (roomMember?.power_level ?? 0)
+    (permissions?.can_change_power_levels ?? false) &&
+      (isSelf
+        ? ownPowerLevel < FOUNDER_POWER_LEVEL
+        : ownPowerLevel > (roomMember?.power_level ?? 0))
   );
+  let selfDemotion = $state<number | null>(null);
   // The spec caps what you may grant at your own level.
   let powerRoles = $derived(
-    [
-      { level: 100, label: powerTag(100, $i18n.t, powerTags ?? {}).name },
-      { level: 50, label: powerTag(50, $i18n.t, powerTags ?? {}).name },
-      { level: 0, label: powerTag(0, $i18n.t, powerTags ?? {}).name },
-      { level: -1, label: powerTag(-1, $i18n.t, powerTags ?? {}).name },
-    ].filter((role) => role.level <= ownPowerLevel && role.level !== (roomMember?.power_level ?? 0))
+    [...new Set([100, 50, 0, -1, ...Object.keys(powerTags ?? {}).map(Number)])]
+      .filter(
+        (level) =>
+          level <= ownPowerLevel &&
+          level !== FOUNDER_POWER_LEVEL &&
+          level !== (roomMember?.power_level ?? 0)
+      )
+      .sort((left, right) => right - left)
+      .map((level) => ({ level, label: powerTag(level, i18n.t, powerTags ?? {}).name }))
   );
   let profileLink = $derived(`https://matrix.to/#/${userId}`);
   const canShareLink = typeof navigator !== 'undefined' && 'share' in navigator;
@@ -270,7 +287,7 @@
   let sharedGroups = $derived(
     sharedRooms.filter((room) => roomList.byId(room.room_id)?.is_direct !== true)
   );
-  let mutualLabel = $derived($i18n.t('timeline.profileMutualRooms', { count: mutualRooms.length }));
+  let mutualLabel = $derived(i18n.t('timeline.profileMutualRooms', { count: mutualRooms.length }));
   let hasMeta = $derived(Boolean(localTime || animalText || roleTag || lastSeenText));
   let activeExtra = $state<ProfileFieldView | null>(null);
 
@@ -309,9 +326,9 @@
     }
   }
 
-  function moderate(action: (roomId: string, userId: string) => Promise<void>): () => void {
+  function moderate(action: (roomId: string, userId: string) => Promise<unknown>): () => void {
     return () => {
-      void action.call(core, roomId, userId).catch((error: unknown) => {
+      void action(roomId, userId).catch((error: unknown) => {
         console.warn('[sable profile] moderation action failed', error);
       });
     };
@@ -355,18 +372,24 @@
   }
 
   function setPowerLevel(level: number): void {
+    if (isSelf && selfDemotion === null) {
+      selfDemotion = level;
+      return;
+    }
+    selfDemotion = null;
     const target = roomId;
     const user = userId;
     void profileActions.setPowerLevel(target, user, level).then(
       () => onPowerLevelChange?.(target, user, level),
       (error: unknown) => {
         console.warn('[sable profile] power level change failed', error);
-        toasts.error($i18n.t('errors.actionFailed'));
+        toasts.error(i18n.t('errors.actionFailed'));
       }
     );
   }
 
   function openRoom(target: string): void {
+    // eslint-disable-next-line svelte/no-navigation-without-resolve -- roomSectionPath() resolves the route itself
     void goto(roomSectionPath(roomList.rooms, target));
   }
 
@@ -377,10 +400,10 @@
     sending = true;
     sendFailed = null;
     try {
-      const dmId = await core.commands.createDm(userId);
+      const dmId = await core.rpc.rooms.createDm({ user_id: userId, encrypted: null });
       if (body) {
         step = 'send';
-        await core.commands.sendMessage(dmId, body);
+        await sendMessage(core.rpc, dmId, body);
         draft = '';
         step = 'open';
       }
@@ -391,6 +414,11 @@
     } finally {
       sending = false;
     }
+  }
+
+  function messageUser(): void {
+    if (hasDirectRoom(roomList.rooms, userId)) void openDirectMessage('');
+    else confirmingDirect = true;
   }
 
   function sendDirectMessage(event: SubmitEvent): void {
@@ -426,7 +454,7 @@
     </span>
   {/if}
   {#if roleTag}
-    <span class="profile-meta-item" class:profile-meta-elevated={elevated}>
+    <span class={['profile-meta-item', { 'profile-meta-elevated': elevated }]}>
       <ShieldIcon />
       {#if roleTag.icon}<RoleTagIcon icon={roleTag.icon} class="profile-role-icon" />{/if}
       {roleTag.name}
@@ -438,24 +466,33 @@
 {/snippet}
 
 {#snippet actionRow()}
-  <ActionMenu label={$i18n.t('timeline.profileShare')} align="start">
-    {#snippet trigger({ props })}
-      <Pill {...props}>
-        <ShareNetworkIcon size={14} />
-        {$i18n.t('timeline.profileShare')}
-      </Pill>
-    {/snippet}
-    <IconContext values={{ 'aria-hidden': 'true' }}>
-      <ActionMenuItem onSelect={copyUserId}>
-        {$i18n.t('timeline.profileCopyId')}
-      </ActionMenuItem>
-      <ActionMenuItem onSelect={copyProfileLink}>
-        {$i18n.t('timeline.profileCopyLink')}
-      </ActionMenuItem>
-    </IconContext>
-  </ActionMenu>
+  {#if pmp && onOpenAccount}
+    <Pill onclick={onOpenAccount}>{i18n.t('timeline.openAccount')}</Pill>
+  {:else}
+    <ActionMenu label={i18n.t('common.share')} align="start" onOpenChange={onNestedMenuOpenChange}>
+      {#snippet trigger({ props })}
+        <Pill {...props}>
+          <ShareNetworkIcon size={14} />
+          {i18n.t('common.share')}
+        </Pill>
+      {/snippet}
+      <IconContext values={{ 'aria-hidden': 'true' }}>
+        <ActionMenuItem onSelect={copyUserId}>
+          {i18n.t('timeline.profileCopyId')}
+        </ActionMenuItem>
+        <ActionMenuItem onSelect={copyProfileLink}>
+          {i18n.t('timeline.profileCopyLink')}
+        </ActionMenuItem>
+      </IconContext>
+    </ActionMenu>
+  {/if}
   {#if !isSelf}
-    <ActionMenu label={mutualLabel} class="profile-mutual-menu" align="start">
+    <ActionMenu
+      label={mutualLabel}
+      class="profile-mutual-menu"
+      align="start"
+      onOpenChange={onNestedMenuOpenChange}
+    >
       {#snippet trigger({ props })}
         <Pill {...props}>
           <ChatsIcon size={14} />
@@ -471,51 +508,57 @@
       {@render mutualRoomRows()}
     </ActionMenu>
   {/if}
-  <ActionMenu label={$i18n.t('timeline.profileMoreActions')}>
+  <ActionMenu label={i18n.t('timeline.moreActions')} onOpenChange={onNestedMenuOpenChange}>
     {#snippet trigger({ props })}
-      <Pill {...props} iconOnly aria-label={$i18n.t('timeline.profileMoreActions')}>
+      <Pill {...props} iconOnly aria-label={i18n.t('timeline.moreActions')}>
         <DotsThreeIcon size={14} />
       </Pill>
     {/snippet}
     <IconContext values={{ 'aria-hidden': 'true' }}>
       <ActionMenuItem onSelect={copyServer}>
         <CopyIcon />
-        {$i18n.t('timeline.profileCopyServer')}
+        {i18n.t('timeline.profileCopyServer')}
       </ActionMenuItem>
       <ActionMenuItem onSelect={openServer}>
         <ArrowSquareOutIcon />
-        {$i18n.t('timeline.profileOpenServer')}
+        {i18n.t('timeline.profileOpenServer')}
       </ActionMenuItem>
       {#if canShareLink}
         <ActionMenuItem onSelect={shareProfileLink}>
           <ShareNetworkIcon />
-          {$i18n.t('timeline.profileShareLink')}
+          {i18n.t('timeline.profileShareLink')}
         </ActionMenuItem>
       {/if}
       {#if !isSelf}
         <ActionMenuSeparator />
         <ActionMenuItem onSelect={() => (securityOpen = true)}>
           <LockKeyIcon />
-          {$i18n.t('timeline.profileEncryption')}
+          {i18n.t('timeline.profileEncryption')}
         </ActionMenuItem>
       {/if}
       {#if canInvite}
-        <ActionMenuItem onSelect={moderate(core.commands.inviteUser)}>
+        <ActionMenuItem
+          onSelect={moderate((room_id, user_id) => core.rpc.rooms.invite({ room_id, user_id }))}
+        >
           <UserPlusIcon />
-          {$i18n.t('timeline.profileInvite')}
+          {i18n.t('timeline.profileInvite')}
         </ActionMenuItem>
       {/if}
       {#if canUnban}
-        <ActionMenuItem onSelect={moderate(core.commands.unbanUser)}>
+        <ActionMenuItem
+          onSelect={moderate((room_id, user_id) =>
+            core.rpc.members.unban({ room_id, user_id, reason: null })
+          )}
+        >
           <LockOpenIcon />
-          {$i18n.t('timeline.profileUnban')}
+          {i18n.t('timeline.profileUnban')}
         </ActionMenuItem>
       {/if}
       {#if canSetPower}
-        <ActionMenuSub label={$i18n.t('timeline.profileChangePower')}>
+        <ActionMenuSub label={i18n.t('timeline.profileChangePower')}>
           {#snippet trigger()}
             <ShieldIcon />
-            {$i18n.t('timeline.profileChangePower')}
+            {i18n.t('timeline.profileChangePower')}
           {/snippet}
           <IconContext values={{ 'aria-hidden': 'true' }}>
             {#each powerRoles as role (role.level)}
@@ -539,7 +582,7 @@
           }}
         >
           <SignOutIcon />
-          {$i18n.t('timeline.profileKick')}
+          {i18n.t('timeline.profileKick')}
         </ActionMenuItem>
       {/if}
       {#if canBan}
@@ -550,7 +593,7 @@
           }}
         >
           <GavelIcon />
-          {$i18n.t('timeline.profileBan')}
+          {i18n.t('timeline.profileBan')}
         </ActionMenuItem>
       {/if}
       {#if !isSelf}
@@ -559,16 +602,16 @@
         {/if}
         <ActionMenuItem onSelect={() => (overrideOpen = true)}>
           <PencilSimpleIcon />
-          {$i18n.t('timeline.profileOverride')}
+          {i18n.t('timeline.profileOverride')}
         </ActionMenuItem>
         <ActionMenuSeparator />
         <ActionMenuItem destructive onSelect={toggleIgnored}>
           <ProhibitIcon />
-          {ignored ? $i18n.t('timeline.profileUnblock') : $i18n.t('timeline.profileBlock')}
+          {ignored ? i18n.t('timeline.profileUnblock') : i18n.t('timeline.profileBlock')}
         </ActionMenuItem>
         <ActionMenuItem destructive onSelect={() => (reportOpen = true)}>
           <FlagIcon />
-          {$i18n.t('timeline.profileReport')}
+          {i18n.t('timeline.profileReport')}
         </ActionMenuItem>
       {/if}
     </IconContext>
@@ -576,9 +619,9 @@
 {/snippet}
 
 {#snippet messageAction()}
-  <Pill variant="primary" onclick={() => void openDirectMessage('')}>
+  <Pill variant="primary" onclick={messageUser}>
     <ChatCircleIcon size={14} weight="fill" />
-    {$i18n.t('timeline.profileMessage')}
+    {i18n.t('timeline.profileMessage')}
   </Pill>
 {/snippet}
 
@@ -597,11 +640,12 @@
 
 {#snippet bioPanel()}
   {#if showFailure}
-    <Alert variant="warning" role="status">{$i18n.t('timeline.profileUnavailable')}</Alert>
+    <Alert variant="warning" role="status">{i18n.t('timeline.profileUnavailable')}</Alert>
   {:else if currentProfile?.bio}
     <FormattedBody
       html={currentProfile.bio}
       senderTimezone={currentProfile.timezone}
+      keepMentionText
       {onMatrixLink}
     />
   {/if}
@@ -642,24 +686,28 @@
       aria-label={messageLabel}
       disabled={sending}
     />
-    <IconButton
-      label={hasDraft ? $i18n.t('timeline.sendMessage') : $i18n.t('timeline.openChat')}
-      title={hasDraft ? undefined : $i18n.t('timeline.openChat')}
-      variant={hasDraft ? 'primary' : 'secondary'}
-      size="small"
-      type="submit"
-      disabled={sending}
-    >
-      {#if hasDraft}
-        <PaperPlaneRightIcon />
-      {:else}
-        <ChatCircleIcon />
-      {/if}
-    </IconButton>
+    <Tooltip label={i18n.t('timeline.openChat')} disabled={hasDraft}>
+      {#snippet trigger({ props })}
+        <IconButton
+          {...props}
+          label={hasDraft ? i18n.t('timeline.sendMessage') : i18n.t('timeline.openChat')}
+          variant={hasDraft ? 'primary' : 'secondary'}
+          size="small"
+          type="submit"
+          disabled={sending}
+        >
+          {#if hasDraft}
+            <PaperPlaneRightIcon />
+          {:else}
+            <ChatCircleIcon />
+          {/if}
+        </IconButton>
+      {/snippet}
+    </Tooltip>
   </form>
   {#if sendFailed}
     <p class="profile-composer-error" role="status">
-      {sendFailed === 'send' ? $i18n.t('timeline.sendFailed') : $i18n.t('timeline.openChatFailed')}
+      {sendFailed === 'send' ? i18n.t('timeline.sendFailed') : i18n.t('timeline.openChatFailed')}
     </p>
   {/if}
 {/snippet}
@@ -680,11 +728,11 @@
       {#if activeExtra}
         {activeExtra.key}
       {:else}
-        {$i18n.t('timeline.profileHideMiscData', { count: extra.length })}
+        {i18n.t('timeline.profileHideMiscData', { count: extra.length })}
       {/if}
     {:else}
       <CaretRightIcon />
-      {$i18n.t('timeline.profileMiscData', { count: extra.length })}
+      {i18n.t('timeline.profileMiscData', { count: extra.length })}
     {/if}
   </Button>
   {#if miscOpen}
@@ -728,50 +776,68 @@
   {/if}
 {/snippet}
 
-<ProfileCard
-  {displayName}
-  {userId}
-  {avatarUrl}
-  avatarLabel={$i18n.t('timeline.profileAvatar', { name: displayName })}
-  {onAvatarClick}
-  {color}
-  heroColor={currentProfile?.hero_color}
-  heroBrightness={currentProfile?.hero_brightness}
-  bannerUrl={currentProfile?.banner_url}
-  status={userStatus?.text}
-  statusEmoji={userStatus?.emoji}
-  presence={presence?.presence}
-  presenceLabel={presenceLabel ?? ''}
-  nameColorLight={overrideColors === null
-    ? null
-    : (overrideColors?.light ??
-      cosmetics?.colorOnLight ??
-      currentProfile?.name_color_light ??
-      roleTag?.color)}
-  nameColorDark={overrideColors === null
-    ? null
-    : (overrideColors?.dark ??
-      cosmetics?.colorOnDark ??
-      currentProfile?.name_color_dark ??
-      roleTag?.color)}
-  meta={profileLoading ? metaPlaceholder : hasMeta ? metaRow : undefined}
-  below={profileBelow}
-  pronouns={pronounRow}
-  children={showFailure || currentProfile?.bio ? bioPanel : undefined}
-  footer={extra.length > 0 ? miscData : undefined}
-  headerAction={variant === 'popover' && canMessage ? messageAction : undefined}
-  composer={variant === 'sheet' && canMessage ? composer : undefined}
-  insetBody
-  {variant}
-/>
+{#if pmp}
+  <PersonaCard
+    profile={pmp}
+    accountId={userId}
+    accountName={realName}
+    accountProfile={currentProfile}
+    member={roomMember}
+    {powerTags}
+    {onAvatarClick}
+    {variant}
+    below={profileBelow}
+    headerAction={variant === 'popover' && canMessage ? messageAction : undefined}
+    composer={variant === 'sheet' && canMessage ? composer : undefined}
+  />
+{:else}
+  <ProfileCard
+    {displayName}
+    {userId}
+    {avatarUrl}
+    avatarLabel={i18n.t('timeline.profileAvatar', { name: displayName })}
+    {onAvatarClick}
+    {color}
+    heroColor={currentProfile?.hero_color}
+    heroBrightness={currentProfile?.hero_brightness}
+    bannerUrl={currentProfile?.banner_url}
+    status={userStatus?.text}
+    statusEmoji={userStatus?.emoji}
+    presence={presence?.presence}
+    presenceLabel={presenceLabel ?? ''}
+    nameColorLight={overrideColors === null
+      ? null
+      : (overrideColors?.light ??
+        cosmetics?.colorOnLight ??
+        profileColors?.name_color_light ??
+        roleTag?.color)}
+    nameColorDark={overrideColors === null
+      ? null
+      : (overrideColors?.dark ??
+        cosmetics?.colorOnDark ??
+        profileColors?.name_color_dark ??
+        roleTag?.color)}
+    meta={profileLoading ? metaPlaceholder : hasMeta ? metaRow : undefined}
+    below={profileBelow}
+    pronouns={pronounRow}
+    children={showFailure || currentProfile?.bio ? bioPanel : undefined}
+    footer={extra.length > 0 ? miscData : undefined}
+    headerAction={variant === 'popover' && canMessage ? messageAction : undefined}
+    composer={variant === 'sheet' && canMessage ? composer : undefined}
+    insetBody
+    {variant}
+  />
+{/if}
 
 <MessageReportDialog
   bind:open={reportOpen}
-  title={$i18n.t('timeline.profileReportTitle', { name: displayName })}
-  hint={$i18n.t('timeline.profileReportHint')}
+  title={i18n.t('timeline.profileReportTitle', { name: displayName })}
+  hint={i18n.t('timeline.profileReportHint')}
   onReport={(reason) => {
     const target = userId;
-    void sendReport(() => core.commands.reportUser(target, reason ?? ''));
+    void sendReport(async () => {
+      await core.rpc.account.reportUser({ user_id: target, reason: reason ?? '' });
+    });
   }}
 />
 
@@ -790,6 +856,34 @@
   onOpenChange={(next) => (securityOpen = next)}
 />
 
+<ConfirmDialog
+  bind:open={confirmingDirect}
+  title={i18n.t('direct.confirmTitle', { name: displayName })}
+  description={i18n.t('direct.confirmBody')}
+  confirmLabel={i18n.t('direct.submit')}
+  confirmVariant="primary"
+  onConfirm={() => {
+    confirmingDirect = false;
+    void openDirectMessage('');
+  }}
+/>
+
+<ConfirmDialog
+  open={selfDemotion !== null}
+  title={i18n.t('timeline.profileDemoteSelfTitle')}
+  description={i18n.t('timeline.profileDemoteSelfBody')}
+  confirmLabel={i18n.t('timeline.profileDemoteSelfConfirm')}
+  onOpenChange={(next: boolean) => {
+    if (!next) selfDemotion = null;
+  }}
+  onCancel={() => {
+    selfDemotion = null;
+  }}
+  onConfirm={() => {
+    if (selfDemotion !== null) setPowerLevel(selfDemotion);
+  }}
+/>
+
 <DialogFrame
   open={moderationAction !== null}
   onOpenChange={(next) => {
@@ -797,28 +891,28 @@
   }}
   variant="verification"
   label={moderationAction === 'ban'
-    ? $i18n.t('timeline.profileBan')
-    : $i18n.t('timeline.profileKick')}
+    ? i18n.t('timeline.profileBan')
+    : i18n.t('timeline.profileKick')}
 >
   {#if moderationAction}
     <div class="moderation">
       <h2>
         {moderationAction === 'ban'
-          ? $i18n.t('timeline.profileBanConfirm', { name: displayName })
-          : $i18n.t('timeline.profileKickConfirm', { name: displayName })}
+          ? i18n.t('timeline.profileBanConfirm', { name: displayName })
+          : i18n.t('timeline.profileKickConfirm', { name: displayName })}
       </h2>
       {#if moderationError}
         <Alert variant="critical" role="alert">{moderationError}</Alert>
       {/if}
-      <FormField fieldId={moderationFieldId} label={$i18n.t('timeline.deleteReason')}>
+      <FormField fieldId={moderationFieldId} label={i18n.t('timeline.deleteReason')}>
         <TextInput id={moderationFieldId} bind:value={moderationReason} autocomplete="off" />
       </FormField>
       <div class="moderation-actions">
-        <Button variant="ghost" onclick={cancelModeration}>{$i18n.t('timeline.cancel')}</Button>
+        <Button variant="ghost" onclick={cancelModeration}>{i18n.t('common.cancel')}</Button>
         <Button variant="danger" loading={moderationBusy} onclick={confirmModeration}>
           {moderationAction === 'ban'
-            ? $i18n.t('timeline.profileBan')
-            : $i18n.t('timeline.profileKick')}
+            ? i18n.t('timeline.profileBan')
+            : i18n.t('timeline.profileKick')}
         </Button>
       </div>
     </div>
@@ -962,6 +1056,7 @@
 
   .profile-extra-json {
     font-family: var(--font-family-mono);
+    font-variant-ligatures: none;
     margin: 0;
     overflow-wrap: anywhere;
     white-space: pre-wrap;

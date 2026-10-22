@@ -5,7 +5,7 @@
   import { i18n } from '#lib/i18n.js';
   import { formatClockDuration } from '#lib/ui/clock-duration.js';
 
-  import { objectSource, type PreviewKind } from './composer-files';
+  import { objectSource, type PreviewKind } from '#lib/composer/composer-files.js';
 
   interface Props {
     file: File;
@@ -21,10 +21,9 @@
 </script>
 
 <button
-  class="thumb"
-  class:thumb-spoiler={spoiler}
+  class={['thumb', { 'thumb-spoiler': spoiler }]}
   type="button"
-  aria-label={$i18n.t('composer.previewAttachment', { name: file.name })}
+  aria-label={i18n.t('composer.previewAttachment', { name: file.name })}
   onclick={onOpen}
 >
   {#if failed}

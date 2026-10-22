@@ -5,7 +5,12 @@ import { userEvent } from '@testing-library/user-event';
 import { tick } from 'svelte';
 import { describe, expect, test, vi } from 'vitest';
 
-import type { MemberView, MutualRoomView, ProfileView } from '#src/generated/protocol';
+import type {
+  MemberView,
+  MutualRoomView,
+  ProfileView,
+  RoomPermissionsView,
+} from '#src/generated/protocol';
 
 vi.mock('#lib/core/context.js');
 
@@ -14,16 +19,16 @@ import { CoreError } from '#src/transport';
 
 const core = Object.assign(baseCore, {
   session: { user_id: '@me:example.org' },
-  createDm: vi.fn<() => Promise<string>>(),
   userRelations: vi.fn<() => Promise<{ mutualRooms: MutualRoomView[]; ignored: boolean }>>(),
   setUserIgnored: vi.fn<() => Promise<void>>(),
-  sendMessage: vi.fn<() => Promise<void>>(),
-  kickUser: vi.fn<(roomId: string, userId: string, reason?: string | null) => Promise<void>>(),
-  banUser: vi.fn<(roomId: string, userId: string, reason?: string | null) => Promise<void>>(),
-  setUserPowerLevel: vi.fn<(roomId: string, userId: string, level: number) => Promise<void>>(),
-  roomMembers: vi.fn<(roomId: string, memberships?: readonly string[]) => Promise<MemberView[]>>(
-    () => Promise.resolve([])
-  ),
+});
+Object.assign(core.rpc.rooms, { createDm: vi.fn<() => Promise<string>>() });
+Object.assign(core.rpc.messages, { send: vi.fn<(params: unknown) => Promise<void>>() });
+Object.assign(core.rpc.members, {
+  kick: vi.fn<(params: object) => Promise<null>>(),
+  ban: vi.fn<(params: object) => Promise<null>>(),
+  setUserPowerLevel: vi.fn<(params: object) => Promise<null>>(),
+  list: vi.fn<(params: object) => Promise<MemberView[]>>(() => Promise.resolve([])),
 });
 
 vi.mock('$app/state', () => import('#lib/test-support/app-state.js'));
@@ -34,9 +39,17 @@ import { goto } from '#lib/test-support/app-navigation.js';
 const toastError = vi.hoisted(() => vi.fn());
 vi.mock('#lib/ui/toasts.svelte.js', () => ({ toasts: { error: toastError } }));
 
-vi.mock('#lib/rooms/room-list.svelte.js', () => ({
+const roomList = vi.hoisted(() => ({ rooms: [] as unknown[] }));
+vi.mock('#lib/rooms/room-list.svelte.js', async () => ({
+  hasDirectRoom: (
+    await vi.importActual<typeof import('#lib/rooms/room-list.svelte.js')>(
+      '#lib/rooms/room-list.svelte.js'
+    )
+  ).hasDirectRoom,
   useRoomList: () => ({
-    rooms: [],
+    get rooms() {
+      return roomList.rooms;
+    },
     byId: (roomId: string) =>
       roomId === '!dm:example.org' ? { room_id: roomId, is_direct: true } : undefined,
   }),
@@ -78,7 +91,7 @@ core.userRelations.mockResolvedValue({ mutualRooms: [], ignored: false });
 
 const user = userEvent.setup();
 
-test('hides sidebar pills without hiding profile pronouns', async () => {
+test('shows pronouns on the profile card but not in the member list', async () => {
   const profile = {
     ...emptyProfile,
     display_name: 'Alice',
@@ -93,18 +106,17 @@ test('hides sidebar pills without hiding profile pronouns', async () => {
     profile,
   });
   await vi.waitFor(() => {
-    expect(
-      document.querySelector('.member-identity-row .sender-identity-pronoun')
-    ).toHaveTextContent('they/them');
+    expect(document.querySelector('.member-identity-row')).toHaveTextContent('Alice');
   });
+  expect(document.querySelector('.sender-identity-pronoun')).toBeNull();
+  expect(document.querySelector('.profile-pronoun-pill')).toHaveTextContent('they/them');
 
   try {
-    preferences.showPronounPills = false;
+    preferences.showPronouns = false;
     await tick();
-    expect(document.querySelector('.member-identity-row .sender-identity-pronoun')).toBeNull();
     expect(document.querySelector('.profile-pronoun-pill')).toHaveTextContent('they/them');
   } finally {
-    preferences.showPronounPills = true;
+    preferences.showPronouns = true;
   }
 });
 
@@ -145,6 +157,51 @@ test('keeps the clicked room member identity when the global profile loads', asy
   expect(document.querySelector('.profile-card-name')?.textContent).toBe('Room Alice');
   expect(document.querySelector('.profile-card-bio strong')?.textContent).toBe('Global bio');
 });
+
+test.each(['New Alice', null])(
+  'keeps room identity when a stale profile loads (%s)',
+  async (display_name) => {
+    const member: MemberView = {
+      user_id: emptyProfile.user_id,
+      display_name,
+      avatar_url: null,
+      power_level: 0,
+      membership: 'join',
+      member_ts: null,
+      kicked: false,
+      service: false,
+    };
+    const request = Promise.withResolvers<ProfileView>();
+    core.userProfile.mockReturnValueOnce(request.promise);
+    render(MemberIdentityRow, { userId: member.user_id, members: [member] });
+    const props = { userId: member.user_id, roomId: '!room:example.org', member, profile: null };
+    const card = render(MentionProfileCard, props);
+    await tick();
+
+    const name = display_name ?? member.user_id;
+    expect(document.querySelector('.profile-card-name')).toHaveTextContent(name);
+    expect(document.querySelector('.member-name')).toHaveTextContent(name);
+    expect(document.querySelector('.avatar-root .media-image')).toBeNull();
+
+    const stale = {
+      ...emptyProfile,
+      display_name: 'Old Alice',
+      avatar_url: 'mxc://example.org/old-avatar',
+      bio: '<strong>Global bio</strong>',
+      pronouns: [{ summary: 'they/them', language: null }],
+    };
+    request.resolve(stale);
+    await card.rerender({ ...props, profile: stale });
+    await vi.waitFor(() => {
+      expect(document.querySelector('.member-identity-row')).toHaveTextContent(name);
+    });
+
+    expect(document.querySelector('.profile-card-name')).toHaveTextContent(name);
+    expect(document.querySelector('.member-name')).toHaveTextContent(name);
+    expect(document.querySelector('.avatar-root .media-image')).toBeNull();
+    expect(document.querySelector('.profile-card-bio strong')).toHaveTextContent('Global bio');
+  }
+);
 
 test('uses the room role name, emoji and colour when the profile has no name colour', async () => {
   render(MentionProfileCard, {
@@ -202,7 +259,7 @@ test('opens a profile avatar through viewer callback', async () => {
   });
   await tick();
 
-  const avatarButton = screen.getByRole('button', { name: "View Alice's avatar" });
+  const avatarButton = screen.getByRole('button', { name: 'View Alice’s avatar' });
   expect(avatarButton.querySelector('.avatar-root')).toHaveAttribute('aria-hidden', 'true');
   await user.click(avatarButton);
 
@@ -226,8 +283,8 @@ test('loads a member card avatar from the original media', async () => {
 });
 
 test('sends a direct message from the sheet composer', async () => {
-  core.createDm.mockResolvedValue('!dm:example.org');
-  core.sendMessage.mockResolvedValue(undefined);
+  core.rpc.rooms.createDm.mockResolvedValue('!dm:example.org');
+  core.rpc.messages.send.mockResolvedValue(null);
   render(MentionProfileCard, {
     props: {
       userId: '@alice:example.org',
@@ -241,17 +298,30 @@ test('sends a direct message from the sheet composer', async () => {
 
   await user.type(screen.getByRole('textbox'), 'hi there{Enter}');
   await vi.waitFor(() => {
-    expect(core.sendMessage).toHaveBeenCalledWith('!dm:example.org', 'hi there');
+    expect(core.rpc.messages.send).toHaveBeenCalledWith(
+      expect.objectContaining({ room_id: '!dm:example.org', body: 'hi there' })
+    );
   });
 
-  expect(core.createDm).toHaveBeenCalledWith('@alice:example.org');
+  expect(core.rpc.rooms.createDm).toHaveBeenCalledWith({
+    user_id: '@alice:example.org',
+    encrypted: null,
+  });
   await vi.waitFor(() => {
     expect(goto).toHaveBeenCalledWith(expect.stringContaining('/direct/'));
   });
 });
 
 test('opens the chat without sending from the Message button', async () => {
-  core.createDm.mockResolvedValue('!dm:example.org');
+  core.rpc.rooms.createDm.mockResolvedValue('!dm:example.org');
+  roomList.rooms = [
+    {
+      room_id: '!dm:example.org',
+      is_direct: true,
+      is_tombstoned: false,
+      direct_targets: ['@alice:example.org'],
+    },
+  ];
   render(MentionProfileCard, {
     props: {
       userId: '@alice:example.org',
@@ -267,8 +337,47 @@ test('opens the chat without sending from the Message button', async () => {
     expect(goto).toHaveBeenCalledWith(expect.stringContaining('/direct/'));
   });
 
-  expect(core.createDm).toHaveBeenCalledWith('@alice:example.org');
-  expect(core.sendMessage).not.toHaveBeenCalled();
+  expect(core.rpc.rooms.createDm).toHaveBeenCalledWith({
+    user_id: '@alice:example.org',
+    encrypted: null,
+  });
+  expect(core.rpc.messages.send).not.toHaveBeenCalled();
+  roomList.rooms = [];
+});
+
+test('asks before the Message button creates a new chat', async () => {
+  core.rpc.rooms.createDm.mockClear();
+  core.rpc.rooms.createDm.mockResolvedValue('!dm:example.org');
+  vi.mocked(goto).mockClear();
+  render(MentionProfileCard, {
+    props: {
+      userId: '@alice:example.org',
+      roomId: '!room:example.org',
+      member: null,
+      profile: emptyProfile,
+    },
+  });
+  await tick();
+
+  await user.click(screen.getByRole('button', { name: 'Message' }));
+  const dialog = await screen.findByRole('dialog');
+  await user.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+  await vi.waitFor(() => {
+    expect(document.body.style.pointerEvents).toBe('');
+  });
+  expect(core.rpc.rooms.createDm).not.toHaveBeenCalled();
+
+  await user.click(screen.getByRole('button', { name: 'Message' }));
+  await user.click(
+    within(await screen.findByRole('dialog')).getByRole('button', { name: 'Start chat' })
+  );
+  await vi.waitFor(() => {
+    expect(goto).toHaveBeenCalledWith(expect.stringContaining('/direct/'));
+  });
+  expect(core.rpc.rooms.createDm).toHaveBeenCalledWith({
+    user_id: '@alice:example.org',
+    encrypted: null,
+  });
 });
 
 function extraKeys(): string[] {
@@ -368,7 +477,7 @@ test('renders a flat map field as a collapsed key/value table and anything else 
   expect(document.querySelector('.profile-extra-open')?.textContent.trim()).toBe('{"a":{"b":"c"}}');
 });
 
-test('does not invent an animal need', async () => {
+test('an unset animal need defaults to headpats', async () => {
   render(MentionProfileCard, {
     props: {
       userId: '@alice:example.org',
@@ -383,7 +492,7 @@ test('does not invent an animal need', async () => {
   await tick();
 
   expect(document.querySelector('.profile-card-meta .profile-meta-item')?.textContent).toBe(
-    'Is cat!'
+    'Is cat, give headpats!'
   );
 });
 
@@ -427,7 +536,7 @@ test('keeps a failed profile silent when the room member still names the user', 
 });
 
 test('collects an optional reason before kicking a member', async () => {
-  core.kickUser.mockResolvedValue(undefined);
+  core.rpc.members.kick.mockResolvedValue(null);
   render(MentionProfileCard, {
     props: {
       userId: '@alice:example.org',
@@ -472,16 +581,16 @@ test('collects an optional reason before kicking a member', async () => {
   );
   await user.click(within(dialog).getByRole('button', { name: 'Remove from room' }));
   await vi.waitFor(() => {
-    expect(core.kickUser).toHaveBeenCalledWith(
-      '!room:example.org',
-      '@alice:example.org',
-      'spamming links'
-    );
+    expect(core.rpc.members.kick).toHaveBeenCalledWith({
+      room_id: '!room:example.org',
+      user_id: '@alice:example.org',
+      reason: 'spamming links',
+    });
   });
 });
 
 test('sends no reason when the moderation reason is left blank', async () => {
-  core.banUser.mockResolvedValue(undefined);
+  core.rpc.members.ban.mockResolvedValue(null);
   render(MentionProfileCard, {
     props: {
       userId: '@alice:example.org',
@@ -522,7 +631,11 @@ test('sends no reason when the moderation reason is left blank', async () => {
   const dialog = await screen.findByRole('dialog');
   await user.click(within(dialog).getByRole('button', { name: 'Ban from room' }));
   await vi.waitFor(() => {
-    expect(core.banUser).toHaveBeenCalledWith('!room:example.org', '@alice:example.org', null);
+    expect(core.rpc.members.ban).toHaveBeenCalledWith({
+      room_id: '!room:example.org',
+      user_id: '@alice:example.org',
+      reason: null,
+    });
   });
 });
 
@@ -559,7 +672,7 @@ test('hides the kick action while the target membership is unknown', async () =>
 });
 
 test('offers to remove a user whose pending invite is loaded from the room', async () => {
-  core.roomMembers.mockResolvedValueOnce([
+  core.rpc.members.list.mockResolvedValueOnce([
     {
       user_id: '@alice:example.org',
       display_name: 'Alice',
@@ -599,11 +712,14 @@ test('offers to remove a user whose pending invite is loaded from the room', asy
   await user.click(screen.getByRole('button', { name: 'More actions' }));
 
   expect(await screen.findByRole('menuitem', { name: /Remove from room/ })).toBeInTheDocument();
-  expect(core.roomMembers).toHaveBeenCalledWith('!room:example.org', ['invite']);
+  expect(core.rpc.members.list).toHaveBeenCalledWith({
+    room_id: '!room:example.org',
+    memberships: ['invite'],
+  });
 });
 
 test('does not load room membership outside a room profile', async () => {
-  core.roomMembers.mockClear();
+  core.rpc.members.list.mockClear();
   render(MentionProfileCard, {
     props: {
       userId: '@alice:example.org',
@@ -614,11 +730,11 @@ test('does not load room membership outside a room profile', async () => {
   });
   await tick();
 
-  expect(core.roomMembers).not.toHaveBeenCalled();
+  expect(core.rpc.members.list).not.toHaveBeenCalled();
 });
 
 test('shows a permission message when the kick is refused', async () => {
-  core.kickUser.mockRejectedValue(new CoreError({ code: 'denied' }));
+  core.rpc.members.kick.mockRejectedValue(new CoreError({ code: 'denied' }));
   render(MentionProfileCard, {
     props: {
       userId: '@alice:example.org',
@@ -659,12 +775,12 @@ test('shows a permission message when the kick is refused', async () => {
   const dialog = await screen.findByRole('dialog');
   await user.click(within(dialog).getByRole('button', { name: 'Remove from room' }));
   expect(await within(dialog).findByRole('alert')).toHaveTextContent(
-    "You don't have permission to do that in this room."
+    'You don’t have permission to do that in this room.'
   );
 });
 
 test('shows a generic message when the kick fails for another reason', async () => {
-  core.kickUser.mockRejectedValue(new CoreError({ code: 'failed', log_id: 'e1' }));
+  core.rpc.members.kick.mockRejectedValue(new CoreError({ code: 'failed', log_id: 'e1' }));
   render(MentionProfileCard, {
     props: {
       userId: '@alice:example.org',
@@ -709,9 +825,13 @@ test('shows a generic message when the kick fails for another reason', async () 
   );
 });
 
-async function changeRoleToModerator(onPowerLevelChange: () => void): Promise<void> {
+async function openRoleMenu(
+  onPowerLevelChange: () => void,
+  powerTags: Record<number, { name: string; color: null; icon: null }> = {}
+) {
   const instance = render(MentionProfileCard, {
     props: {
+      powerTags,
       userId: '@alice:example.org',
       roomId: '!room:example.org',
       ownPowerLevel: 100,
@@ -747,20 +867,25 @@ async function changeRoleToModerator(onPowerLevelChange: () => void): Promise<vo
   await tick();
 
   await chooseAction('Change role');
+  return instance;
+}
+
+async function changeRoleToModerator(onPowerLevelChange: () => void): Promise<void> {
+  const instance = await openRoleMenu(onPowerLevelChange);
   await user.click(await screen.findByRole('menuitem', { name: /Moderator/ }));
   await vi.waitFor(() => {
-    expect(core.setUserPowerLevel).toHaveBeenCalledWith(
-      '!room:example.org',
-      '@alice:example.org',
-      50
-    );
+    expect(core.rpc.members.setUserPowerLevel).toHaveBeenCalledWith({
+      room_id: '!room:example.org',
+      user_id: '@alice:example.org',
+      power_level: 50,
+    });
   });
   await Promise.resolve();
   instance.unmount();
 }
 
 test('reports a successful role change so the member list can follow it', async () => {
-  core.setUserPowerLevel.mockReset().mockResolvedValue(undefined);
+  core.rpc.members.setUserPowerLevel.mockReset().mockResolvedValue(null);
   toastError.mockClear();
   const onPowerLevelChange = vi.fn();
 
@@ -770,8 +895,17 @@ test('reports a successful role change so the member list can follow it', async 
   expect(toastError).not.toHaveBeenCalled();
 });
 
+test('offers the custom roles of the room when changing a role', async () => {
+  const instance = await openRoleMenu(vi.fn(), {
+    75: { name: 'Steward', color: null, icon: null },
+  });
+
+  expect(await screen.findByRole('menuitem', { name: /Steward/ })).toBeInTheDocument();
+  instance.unmount();
+});
+
 test('toasts a failed role change and reports nothing', async () => {
-  core.setUserPowerLevel.mockReset().mockRejectedValue(new Error('forbidden'));
+  core.rpc.members.setUserPowerLevel.mockReset().mockRejectedValue(new Error('forbidden'));
   toastError.mockClear();
   const onPowerLevelChange = vi.fn();
   vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -782,6 +916,47 @@ test('toasts a failed role change and reports nothing', async () => {
     expect(toastError).toHaveBeenCalled();
   });
   expect(onPowerLevelChange).not.toHaveBeenCalled();
+});
+
+test('asks before lowering your own role', async () => {
+  core.rpc.members.setUserPowerLevel.mockReset().mockResolvedValue(null);
+  render(MentionProfileCard, {
+    props: {
+      userId: '@me:example.org',
+      roomId: '!room:example.org',
+      ownPowerLevel: 100,
+      permissions: {
+        own_power_level: 100,
+        can_change_power_levels: true,
+      } as RoomPermissionsView,
+      member: {
+        user_id: '@me:example.org',
+        display_name: 'Me',
+        avatar_url: null,
+        power_level: 100,
+        membership: 'join',
+        member_ts: null,
+        kicked: false,
+        service: false,
+      },
+      profile: emptyProfile,
+    },
+  });
+  await tick();
+
+  await chooseAction('Change role');
+  await user.click(await screen.findByRole('menuitem', { name: /Moderator/ }));
+  const dialog = await screen.findByRole('dialog', { name: 'Give up your own role?' });
+  expect(core.rpc.members.setUserPowerLevel).not.toHaveBeenCalled();
+
+  await user.click(within(dialog).getByRole('button', { name: 'Lower my role' }));
+  await vi.waitFor(() => {
+    expect(core.rpc.members.setUserPowerLevel).toHaveBeenCalledWith({
+      room_id: '!room:example.org',
+      user_id: '@me:example.org',
+      power_level: 50,
+    });
+  });
 });
 
 test('lists mutual rooms in a menu of their own, with direct messages last', async () => {

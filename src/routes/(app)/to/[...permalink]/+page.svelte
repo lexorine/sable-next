@@ -51,6 +51,7 @@
       }
 
       const notified = page.url.searchParams.get('notified');
+      // eslint-disable-next-line svelte/no-navigation-without-resolve -- permalinkTarget() resolves the route through roomSectionPath()
       await goto(target.path, { replace: true, state: notified === null ? {} : { notified } });
     };
 
@@ -67,11 +68,11 @@
 {:else}
   <main class="permalink" aria-busy={!unresolved}>
     {#if unresolved}
-      <p role="alert">{$i18n.t('permalink.unresolved')}</p>
+      <p role="alert">{i18n.t('permalink.unresolved')}</p>
     {:else}
       <div role="status">
         <Spinner />
-        <p>{$i18n.t('permalink.opening')}</p>
+        <p>{i18n.t('permalink.opening')}</p>
       </div>
     {/if}
   </main>

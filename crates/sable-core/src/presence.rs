@@ -23,7 +23,7 @@ pub(crate) const fn view(state: &PresenceState) -> PresenceView {
         PresenceState::Online => PresenceView::Online,
         PresenceState::Offline => PresenceView::Offline,
         // `PresenceState` is non-exhaustive. Anything added later reads as
-        // away, not online.
+        // away.
         _ => PresenceView::Unavailable,
     }
 }
@@ -72,6 +72,7 @@ impl Core {
                 let mut since: Option<String> = None;
 
                 loop {
+                    core.wait_until_active().await;
                     let mut request = sync_events::v3::Request::new();
                     request.filter =
                         Some(sync_events::v3::Filter::FilterDefinition(presence_filter()));

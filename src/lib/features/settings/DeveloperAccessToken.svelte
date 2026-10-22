@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { copyText } from '#lib/platform/clipboard.js';
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
   import Button from '#lib/ui/primitives/Button.svelte';
@@ -12,9 +13,9 @@
 
   async function copyToken(): Promise<void> {
     try {
-      const token = await core.commands.accessToken();
+      const token = await core.rpc.session.accessToken();
       if (!token) throw new Error('No access token');
-      await navigator.clipboard.writeText(token);
+      await copyText(token);
       copied = true;
       error = false;
       setTimeout(() => {
@@ -28,21 +29,19 @@
 </script>
 
 <ul class="settings">
-  <SettingsRow id="access-token" title={$i18n.t('settings.developerAccessTokenTitle')}>
+  <SettingsRow id="access-token" title={i18n.t('settings.developerAccessTokenTitle')}>
     <Button
       variant="secondary"
       size="small"
       onclick={() => void copyToken()}
       disabled={!core.session}
     >
-      {$i18n.t(
-        copied ? 'settings.developerAccessTokenCopied' : 'settings.developerAccessTokenCopy'
-      )}
+      {i18n.t(copied ? 'common.copied' : 'settings.developerAccessTokenCopy')}
     </Button>
   </SettingsRow>
 </ul>
 {#if error}<div class="settings-form">
-    <Alert variant="critical">{$i18n.t('settings.developerAccessTokenFailed')}</Alert>
+    <Alert variant="critical">{i18n.t('settings.developerAccessTokenFailed')}</Alert>
   </div>{/if}
 
 <style>

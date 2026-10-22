@@ -1,12 +1,14 @@
-import type { CommandErr, CommandOk, CoreEvent } from '#src/generated/protocol';
+import { createRpc } from '#src/generated/protocol';
+import type { RpcError, RpcResult, CoreEvent, SubscriptionId, Rpc } from '#src/generated/protocol';
 import type { WorkerMessage, WorkerRequest } from './protocol';
 import { TimelineEventRouter } from './timeline-event-router';
 
 const logFlushMs = 250;
 const logBufferLimit = 500;
+const logLevelPrefix = /^\s*(TRACE|DEBUG|INFO|WARN|ERROR)\s/;
 
 export type WorkerCore = {
-  submitCommand(command: string): Promise<string>;
+  call(method: string, params: string): Promise<string>;
   fetchMedia(
     source: string,
     width: number,
@@ -17,6 +19,7 @@ export type WorkerCore = {
   sendAttachment(request: string, bytes: Uint8Array<ArrayBuffer>): Promise<void>;
   sendGallery(request: string, items: string): Promise<void>;
   uploadMedia(mime: string, bytes: Uint8Array<ArrayBuffer>): Promise<string>;
+  setActive(active: boolean): Promise<void>;
 };
 
 export type WorkerPort = {
@@ -26,11 +29,19 @@ export type WorkerPort = {
   start(): void;
 };
 
+/** The core rejects with the protocol payload: a bare string from the wasm build, an Error carrying it from the native one. */
+function rejectionPayload(cause: unknown): string {
+  if (cause instanceof Error) return cause.message;
+  return typeof cause === 'string' ? cause : '';
+}
+
 /** Owns page ports and enforces timeline subscription ownership at the worker boundary. */
 export function createCoreWorkerBoundary(
   core: Promise<WorkerCore>,
   setLogCapture: (enabled: boolean) => void = () => {},
-  terminate: () => void = () => {}
+  terminate: () => void = () => {},
+  setLogFilter: (filter: string) => void = () => {},
+  stop: () => Promise<void> = () => Promise.resolve()
 ) {
   const ports = new Set<WorkerPort>();
   const timelineEvents = new TimelineEventRouter<WorkerPort>();
@@ -38,6 +49,15 @@ export function createCoreWorkerBoundary(
   let logs: string[] = [];
   let droppedLogs = 0;
   let flushLogsTimer: ReturnType<typeof setTimeout> | undefined;
+
+  // Hiding never stops sync: background tabs must keep notifying (#1142).
+  function resumeSync(): void {
+    void core
+      .then((instance) => instance.setActive(true))
+      .catch((error: unknown) => {
+        console.debug('[sable worker] sync activity not applied', error);
+      });
+  }
 
   function closePort(port: WorkerPort): void {
     ports.delete(port);
@@ -47,9 +67,12 @@ export function createCoreWorkerBoundary(
     void core.then(async (instance) => {
       for (const subscription of subscriptions) {
         try {
-          await instance.submitCommand(JSON.stringify({ type: 'unsubscribe', subscription }));
-        } catch {
+          await createRpc(async (method, params) =>
+            instance.call(method, JSON.stringify(params))
+          ).timeline.unsubscribe({ subscription });
+        } catch (error) {
           // The owner is gone, so cleanup errors cannot be reported to a page.
+          console.debug('[sable worker] closed port subscription not released', error);
         }
       }
     });
@@ -67,7 +90,13 @@ export function createCoreWorkerBoundary(
 
   function handlePanic(message: string, stack?: string): void {
     panic ??= message;
-    broadcast({ panic: stack === undefined ? { message } : { message, stack } });
+    broadcast({
+      panic: stack === undefined ? { message } : { message, stack },
+    });
+  }
+
+  function handleSuperseded(): void {
+    broadcast({ superseded: true });
   }
 
   function flushLogs(): void {
@@ -84,13 +113,19 @@ export function createCoreWorkerBoundary(
   }
 
   function handleLog(text: string): void {
+    const entries: string[] = [];
     for (const line of text.split('\n')) {
       if (!line.trim()) continue;
+      const last = entries.length - 1;
+      if (last >= 0 && !logLevelPrefix.test(line)) entries[last] += `\n${line.trimEnd()}`;
+      else entries.push(line.trimEnd());
+    }
+    for (const entry of entries) {
       if (logs.length >= logBufferLimit) {
         droppedLogs += 1;
         continue;
       }
-      logs.push(line.trimEnd());
+      logs.push(entry);
     }
     flushLogsTimer ??= setTimeout(flushLogs, logFlushMs);
   }
@@ -136,11 +171,16 @@ export function createCoreWorkerBoundary(
         if (ports.size !== 1) {
           port.postMessage({
             id: request.id,
-            err: { code: 'failed', log_id: 'close other Sable tabs before resetting the cache' },
+            err: {
+              code: 'failed',
+              log_id: 'close other Sable tabs before resetting the cache',
+            },
           });
           return;
         }
         closePort(port);
+        // The page clears the stores once answered, so nothing may still write to them.
+        await stop();
         port.postMessage({ id: request.id, uri: null });
         terminate();
         return;
@@ -155,6 +195,14 @@ export function createCoreWorkerBoundary(
         }
         return;
       }
+      if ('visible' in request) {
+        if (request.visible) resumeSync();
+        return;
+      }
+      if ('logFilter' in request) {
+        setLogFilter(request.logFilter);
+        return;
+      }
       if ('ping' in request) {
         port.postMessage({ id: request.id, pong: true });
         return;
@@ -163,7 +211,10 @@ export function createCoreWorkerBoundary(
       let pendingTimeline = false;
 
       if (panic !== null) {
-        port.postMessage({ id, err: { code: 'failed', log_id: `core panicked: ${panic}` } });
+        port.postMessage({
+          id,
+          err: { code: 'failed', log_id: `core panicked: ${panic}` },
+        });
         return;
       }
 
@@ -272,54 +323,66 @@ export function createCoreWorkerBoundary(
           port.postMessage({ id, uri } satisfies WorkerMessage);
           return;
         }
-        if (
-          (request.command.type === 'paginate' || request.command.type === 'unsubscribe') &&
-          !timelineEvents.owns(request.command.subscription, port)
-        ) {
-          port.postMessage({ id, err: { code: 'denied' } } satisfies WorkerMessage);
-          return;
-        }
-
-        if (request.command.type === 'subscribe_timeline') {
-          for (let attempt = 0; attempt < 3; attempt += 1) {
-            if (!ports.has(port)) return;
-            timelineEvents.begin(port);
-            pendingTimeline = true;
-            const ok = JSON.parse(
-              await instance.submitCommand(JSON.stringify(request.command))
-            ) as CommandOk;
-            if (ok.type !== 'subscribe_timeline')
-              throw new Error('Invalid timeline subscription response');
-            const events = timelineEvents.claim(ok.subscription, port);
-            pendingTimeline = false;
-            if (events === null || events === 'overflow' || !ports.has(port)) {
-              await instance.submitCommand(
-                JSON.stringify({ type: 'unsubscribe', subscription: ok.subscription })
-              );
-              if (events === 'overflow' && ports.has(port)) continue;
+        if ('call' in request) {
+          const { method } = request.call;
+          const params = JSON.stringify(request.call.params);
+          if (method === 'timeline.paginate' || method === 'timeline.unsubscribe') {
+            const { subscription } = request.call.params as {
+              subscription: SubscriptionId;
+            };
+            if (!timelineEvents.owns(subscription, port)) {
+              port.postMessage({
+                id,
+                err: { code: 'denied' },
+              } satisfies WorkerMessage);
               return;
             }
-            port.postMessage({ id, ok });
-            if (events.length > 0) port.postMessage({ events });
-            return;
           }
-          throw new Error('Timeline startup overflowed; retry opening the room');
+
+          if (method === 'timeline.subscribe') {
+            for (let attempt = 0; attempt < 3; attempt += 1) {
+              if (!ports.has(port)) return;
+              timelineEvents.begin(port);
+              pendingTimeline = true;
+              const ok = JSON.parse(await instance.call(method, params)) as RpcResult<
+                Rpc['timeline']['subscribe']
+              >;
+              if (typeof ok.subscription !== 'number')
+                throw new Error('Invalid timeline subscription response');
+              const events = timelineEvents.claim(ok.subscription, port);
+              pendingTimeline = false;
+              if (events === null || events === 'overflow' || !ports.has(port)) {
+                await instance.call(
+                  'timeline.unsubscribe',
+                  JSON.stringify({ subscription: ok.subscription })
+                );
+                if (events === 'overflow' && ports.has(port)) continue;
+                return;
+              }
+              port.postMessage({ id, ok });
+              if (events.length > 0) port.postMessage({ events });
+              return;
+            }
+            throw new Error('Timeline startup overflowed; retry opening the room');
+          }
+          const ok: unknown = JSON.parse(await instance.call(method, params));
+          if (method === 'timeline.unsubscribe') {
+            timelineEvents.release(
+              (request.call.params as { subscription: SubscriptionId }).subscription
+            );
+          }
+          port.postMessage({ id, ok } satisfies WorkerMessage);
+          return;
         }
-        const ok = JSON.parse(
-          await instance.submitCommand(JSON.stringify(request.command))
-        ) as CommandOk;
-        if (request.command.type === 'unsubscribe') {
-          timelineEvents.release(request.command.subscription);
-        }
-        port.postMessage({ id, ok });
       } catch (cause) {
         if (pendingTimeline) {
           timelineEvents.cancelPending(port);
         }
-        let err: CommandErr = { code: 'failed', log_id: String(cause) };
-        if (typeof cause === 'string') {
+        const payload = rejectionPayload(cause);
+        let err: RpcError = { code: 'failed', log_id: payload || String(cause) };
+        if (payload) {
           try {
-            err = JSON.parse(cause) as CommandErr;
+            err = JSON.parse(payload) as RpcError;
           } catch {
             console.error('[sable worker] core rejected with a non-protocol error', cause);
           }
@@ -330,5 +393,12 @@ export function createCoreWorkerBoundary(
     port.start();
   }
 
-  return { connect, handleEvent, handleLog, handlePanic };
+  return {
+    connect,
+    handleEvent,
+    handleLog,
+    handlePanic,
+    handleSuperseded,
+    handleOnline: resumeSync,
+  };
 }

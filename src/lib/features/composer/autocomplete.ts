@@ -28,8 +28,7 @@ const sigils: [AutocompleteSigil, number][] = [
 const maxQueryLength = 32;
 
 /**
- * A sigil only opens a query at the start of the draft or after whitespace, so
- * an email address or a `http://` never turns into a picker.
+ * A sigil opens a query only at the start of the draft or after whitespace.
  */
 export function activeQuery(draft: string, caret: number): AutocompleteQuery | null {
   const upToCaret = draft.slice(0, caret);

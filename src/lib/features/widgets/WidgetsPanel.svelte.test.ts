@@ -12,6 +12,7 @@ import { core } from '#lib/core/__mocks__/context.js';
 
 core.session = { account_id: 'a', user_id: '@erwan:example.org', device_id: 'DEV' };
 
+import IntegrationManagerDialog from './IntegrationManagerDialog.svelte';
 import WidgetsPanel from './WidgetsPanel.svelte';
 import type { RoomWidget } from './widget-content.js';
 
@@ -191,8 +192,10 @@ test('a non-manager sees no add form', () => {
 
 test('the integration manager opens from the manager actions', async () => {
   const integrationManagerUrl = vi.fn().mockReturnValue(new Promise(() => undefined));
-  (core.commands as unknown as Record<string, unknown>).integrationManagerUrl =
-    integrationManagerUrl;
+  const integrationManagerTerms = vi.fn().mockResolvedValue([]);
+  (core as unknown as Record<string, unknown>).rpc = {
+    session: { integrationManagerUrl, integrationManagerTerms },
+  };
   renderWithTooltips(WidgetsPanel, {
     ...commonProps,
     widgets: [],
@@ -204,5 +207,85 @@ test('the integration manager opens from the manager actions', async () => {
 
   await user.click(screen.getByRole('button', { name: 'Integration manager' }));
 
-  expect(integrationManagerUrl).toHaveBeenCalledWith('!room:example.org');
+  await vi.waitFor(() => {
+    expect(integrationManagerUrl).toHaveBeenCalledWith({ room_id: '!room:example.org' });
+  });
+});
+
+test('the integration manager closes when its own origin asks to', async () => {
+  const integrationManagerUrl = vi.fn().mockResolvedValue('https://manager.example/open');
+  const integrationManagerTerms = vi.fn().mockResolvedValue([]);
+  (core as unknown as Record<string, unknown>).rpc = {
+    session: { integrationManagerUrl, integrationManagerTerms },
+  };
+  const onClose = vi.fn();
+  renderWithTooltips(IntegrationManagerDialog, {
+    open: true,
+    roomId: '!room:example.org',
+    onClose,
+  });
+  await vi.waitFor(() => {
+    expect(screen.getByTitle('Integration manager')).toBeInTheDocument();
+  });
+
+  const send = (origin: string) =>
+    window.dispatchEvent(new MessageEvent('message', { origin, data: { action: 'close_scalar' } }));
+  send('https://elsewhere.example');
+  expect(onClose).not.toHaveBeenCalled();
+  send('https://manager.example');
+  expect(onClose).toHaveBeenCalledOnce();
+});
+
+test('the integration manager asks for its terms before opening', async () => {
+  const integrationManagerUrl = vi.fn().mockResolvedValue('https://manager.example/open');
+  const integrationManagerTerms = vi
+    .fn()
+    .mockResolvedValue([{ url: 'https://manager.example/tos', name: 'Terms of Service' }]);
+  const acceptIntegrationManagerTerms = vi.fn().mockResolvedValue(null);
+  (core as unknown as Record<string, unknown>).rpc = {
+    session: { integrationManagerUrl, integrationManagerTerms, acceptIntegrationManagerTerms },
+  };
+  renderWithTooltips(IntegrationManagerDialog, {
+    open: true,
+    roomId: '!room:example.org',
+    onClose: vi.fn(),
+  });
+  const user = userEvent.setup();
+
+  expect(await screen.findByRole('link', { name: 'Terms of Service' })).toHaveAttribute(
+    'href',
+    'https://manager.example/tos'
+  );
+  expect(integrationManagerUrl).not.toHaveBeenCalled();
+
+  await user.click(screen.getByRole('button', { name: 'Accept' }));
+
+  expect(acceptIntegrationManagerTerms).toHaveBeenCalledWith({
+    urls: ['https://manager.example/tos'],
+  });
+  await vi.waitFor(() => {
+    expect(screen.getByTitle('Integration manager')).toBeInTheDocument();
+  });
+});
+
+test('the integration manager stays on its terms when accepting fails', async () => {
+  const integrationManagerUrl = vi.fn().mockResolvedValue('https://manager.example/open');
+  const integrationManagerTerms = vi
+    .fn()
+    .mockResolvedValue([{ url: 'https://manager.example/tos', name: 'Terms of Service' }]);
+  const acceptIntegrationManagerTerms = vi.fn().mockRejectedValue(new Error('refused'));
+  (core as unknown as Record<string, unknown>).rpc = {
+    session: { integrationManagerUrl, integrationManagerTerms, acceptIntegrationManagerTerms },
+  };
+  renderWithTooltips(IntegrationManagerDialog, {
+    open: true,
+    roomId: '!room:example.org',
+    onClose: vi.fn(),
+  });
+  const user = userEvent.setup();
+
+  await user.click(await screen.findByRole('button', { name: 'Accept' }));
+
+  expect(await screen.findByText('Could not record your acceptance. Try again.')).toBeVisible();
+  expect(integrationManagerUrl).not.toHaveBeenCalled();
 });

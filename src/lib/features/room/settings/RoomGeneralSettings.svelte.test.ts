@@ -7,7 +7,7 @@ import { afterEach, expect, test, vi } from 'vitest';
 import type {
   RoomPermissionsView,
   RoomPowerLevelsView,
-  RoomSummary,
+  RoomListItemView,
 } from '#src/generated/protocol';
 
 vi.mock('#lib/core/context.js');
@@ -18,18 +18,24 @@ vi.mock('#lib/rooms/room-list.svelte.js', async (importOriginal) => ({
 vi.mock('#lib/i18n.js', () => import('#lib/test-support/i18n.js'));
 
 import { core as baseCore } from '#lib/core/__mocks__/context.js';
+import { withCounts } from '#lib/rooms/summary-fixtures.js';
 
 import RoomGeneralSettings from './RoomGeneralSettings.svelte';
 
-const core = Object.assign(baseCore, {
+const spaces = Object.assign(baseCore.rpc.spaces, {
   roomHasSpaceParent: vi.fn<() => Promise<boolean>>(),
-  roomAliases: vi.fn<() => Promise<string[]>>(),
-  roomStateEventsRaw: vi.fn<() => Promise<unknown[]>>().mockResolvedValue([]),
-  roomDirectoryVisibility: vi.fn<() => Promise<boolean>>(),
-  setRoomJoinRule: vi.fn<() => Promise<void>>(),
+});
+const core = baseCore;
+Object.assign(core.rpc.rooms, {
+  aliases: vi.fn<() => Promise<string[]>>(),
+  directoryVisibility: vi.fn<() => Promise<boolean>>(),
+});
+Object.assign(core.rpc.room_state, {
+  eventsRaw: vi.fn<() => Promise<unknown[]>>().mockResolvedValue([]),
+  setJoinRule: vi.fn<() => Promise<void>>(),
 });
 
-const room: RoomSummary = {
+const room: RoomListItemView = withCounts({
   room_id: '!room:example.org',
   canonical_alias: null,
   name: 'Example room',
@@ -41,11 +47,10 @@ const room: RoomSummary = {
   tags: [],
   state: 'joined',
   encrypted: null,
-  is_space: false,
   is_tombstoned: false,
-  is_voice: false,
   call_participants: [],
-  room_type: null,
+  screen_sharers: [],
+  room_kind: 'text',
   supports_knock: true,
   supports_restricted: false,
   supports_knock_restricted: false,
@@ -55,7 +60,7 @@ const room: RoomSummary = {
   highlight: 0,
   marked_unread: false,
   latest_event: null,
-};
+});
 
 const permissions: RoomPermissionsView = {
   own_power_level: 50,
@@ -95,34 +100,39 @@ afterEach(() => {
 });
 
 test('saves an access change with join-rule permission alone', async () => {
-  core.roomHasSpaceParent.mockResolvedValue(false);
-  core.roomAliases.mockResolvedValue([]);
-  core.roomDirectoryVisibility.mockResolvedValue(false);
-  core.setRoomJoinRule.mockResolvedValue(undefined);
+  spaces.roomHasSpaceParent.mockResolvedValue(false);
+  core.rpc.rooms.aliases.mockResolvedValue([]);
+  core.rpc.rooms.directoryVisibility.mockResolvedValue(false);
+  core.rpc.room_state.setJoinRule.mockResolvedValue(null);
   const user = userEvent.setup();
   render(RoomGeneralSettings, { room, permissions, levels, onClose: () => {} });
 
   await user.click(await screen.findByRole('radio', { name: /room\.settingsJoinRulePublic/ }));
-  await user.click(screen.getByRole('button', { name: 'room.settingsSave' }));
+  await user.click(screen.getByRole('button', { name: 'common.save' }));
 
   await vi.waitFor(() => {
-    expect(core.setRoomJoinRule).toHaveBeenCalledWith('!room:example.org', 'public');
+    expect(core.rpc.room_state.setJoinRule).toHaveBeenCalledWith({
+      room_id: '!room:example.org',
+      rule: 'public',
+    });
   });
 });
 
 test('an unsaved change raises the save bar, and reset discards it', async () => {
-  core.roomHasSpaceParent.mockResolvedValue(false);
-  core.roomAliases.mockResolvedValue([]);
-  core.roomDirectoryVisibility.mockResolvedValue(false);
+  spaces.roomHasSpaceParent.mockResolvedValue(false);
+  core.rpc.rooms.aliases.mockResolvedValue([]);
+  core.rpc.rooms.directoryVisibility.mockResolvedValue(false);
   const user = userEvent.setup();
   render(RoomGeneralSettings, { room, permissions, levels, onClose: () => {} });
 
-  expect(screen.queryByText('room.settingsUnsaved')).not.toBeInTheDocument();
+  expect(screen.queryByText('common.unsavedChangesNotice')).not.toBeInTheDocument();
   await user.click(await screen.findByRole('radio', { name: /room\.settingsJoinRulePublic/ }));
-  expect(screen.getByText('room.settingsUnsaved').closest('.save-bar')).toHaveClass('pending');
+  expect(screen.getByText('common.unsavedChangesNotice').closest('.save-bar')).toHaveClass(
+    'pending'
+  );
 
-  await user.click(screen.getByRole('button', { name: 'room.settingsReset' }));
-  expect(screen.queryByText('room.settingsUnsaved')).not.toBeInTheDocument();
-  expect(screen.getByRole('button', { name: 'room.settingsSave' })).toBeDisabled();
-  expect(core.setRoomJoinRule).not.toHaveBeenCalled();
+  await user.click(screen.getByRole('button', { name: 'common.reset' }));
+  expect(screen.queryByText('common.unsavedChangesNotice')).not.toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'common.save' })).toBeDisabled();
+  expect(core.rpc.room_state.setJoinRule).not.toHaveBeenCalled();
 });

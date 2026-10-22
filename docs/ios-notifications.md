@@ -2,31 +2,68 @@
 
 `SableNotificationService` links `sable-push` and shares
 `group.<bundle identifier>/Sable` with the app, using a separate SDK lock owner.
+Neither process holds a file lock there. Each login's tokens live in their own file
+under `credentials/`, rewritten by whichever process refreshes them under the SDK's
+cross-process refresh lock; only the app writes the account registry.
 Decryption checks account/preview policy and times out after 20 seconds. Failure
-uses a generic alert, never older plaintext. All alerts follow the sound setting.
+uses a generic alert, never older plaintext. A push the extension never handles still
+reads "New message": `ios/Localization` maps Sygnal's alert keys to generic text.
+All alerts follow the sound setting.
+
+Alerts match Android: the room name (or sender) is the title and the body is
+`Sender: text`; hidden previews keep the title with a generic body. Messages use the
+`sable-message` category (Reply, Mark as read) and are donated as incoming
+`INSendMessageIntent`s for communication notifications, with the sender's avatar and,
+in group rooms, the room's. An image or video message attaches its thumbnail when
+previews are shown and the media preview setting allows it. Both are cached under
+`push-media` for a week. Invites read "New Invitation"
+with the `sable-invite` category (Accept, Decline). Both categories are declared in
+`plugins.notifications.actionTypes`. A push with `counts.unread == 0` closes the
+delivered alerts of its room, or of the account when it names no room, if "clear on
+read" is on.
 
 ## Setup (Apple account required)
 
 1. Register both bundle IDs with one team; enable app Push Notifications and a
-   shared App Group.
+   shared App Group. iOS builds use `moe.sable.app` (`src-tauri/tauri.ios.conf.json`),
+   so the IDs are `moe.sable.app` and `moe.sable.app.notifications`, and the group is
+   `group.moe.sable.app`. Android and desktop keep `moe.sable.next`.
 2. Configure gateway APNs credentials and `pushNotificationDetails.iosPushAppID`.
    Match the signing environment: TestFlight uses production, development uses sandbox.
+   Pushkeys are hex, so a Sygnal app needs `convert_device_token_to_hex: false`;
+   otherwise every push fails with `BadDeviceToken`.
 3. Send generic `aps.alert`, `aps.mutable-content: 1`, the Matrix event,
    recipient `user_id`, and `room_id`. Never send keys or plaintext to the gateway.
-   Omit `apns-collapse-id` or use an event-specific value.
-4. Install the Rust target matching the Xcode destination. Run `tauri ios init`
+   Omit `apns-collapse-id` or use an event-specific value. Read updates must also
+   be alerts (`apns-push-type: alert`); the extension drops them.
+   A stock Sygnal builds its own alert and forwards only `room_id` and `event_id`, so
+   the pusher's `default_payload` asks for `mutable-content` and the extension fetches
+   and decrypts the event as a separate SDK process, beside a running app. It restores
+   only the pushed room, with low-memory SQLite settings.
+4. Request the restricted `com.apple.developer.usernotifications.filtering`
+   entitlement (rings, read updates and pushes the rules silence are dropped with
+   empty content) and enable
+   Communication Notifications for both App IDs. Without filtering, the system
+   shows the generic alert instead. `src-tauri/ios-project.yml` leaves it out until
+   Apple grants it: signing fails while the profile lacks a requested entitlement.
+5. Calls ring from the extension through `CXProvider.reportNewIncomingVoIPPushPayload`,
+   which needs the filtering entitlement; until Apple grants it, a ring is a
+   "<caller> is calling" alert. There is no PushKit pusher: the homeserver sends every
+   notification to every pusher, and iOS must show each VoIP push as a call. The app
+   removes the one older builds registered.
+6. Install the Rust target matching the Xcode destination. Run `tauri ios init`
    after template changes; the extension build uses the workspace lockfile.
 
 Sign out before switching existing private sessions to shared storage. Without
 App Group access or the first unlock after reboot, the extension cannot decrypt.
-Missing keys produce generic alerts; the extension does not sync to recover them.
+Missing keys produce generic alerts.
 
 Messages group and clear by recipient/room. Duplicate checks also match event ID;
 replacements are silent. Cross-process deduplication is not atomic.
 
 ## Verification
 
-- `cargo test -p sable-push`: payloads, account binding and privacy.
+- `cargo nextest run -p sable-push`: payloads, account binding and privacy.
 - macOS: build simulator/device targets; inspect extension, entitlements and APNs environment.
 - iPhone: foreground/background/terminated/locked delivery, missing keys, timeout,
   hidden previews, logout, account switching, token rotation and duplicate alerts.

@@ -4,7 +4,7 @@ import { render, screen } from '@testing-library/svelte';
 import { userEvent } from '@testing-library/user-event';
 import { afterEach, expect, test, vi } from 'vitest';
 
-import type { RoomSummary } from '#src/generated/protocol';
+import type { RoomListItemView, RoomPowerLevelsView } from '#src/generated/protocol';
 
 const goto = vi.hoisted(() => vi.fn());
 
@@ -24,8 +24,9 @@ import { core as baseCore } from '#lib/core/__mocks__/context.js';
 
 import RoomSpacesSettings from './RoomSpacesSettings.svelte';
 
-const core = Object.assign(baseCore, {
-  roomStateEventsRaw: vi.fn<(...args: never[]) => Promise<unknown[]>>(() =>
+const core = baseCore;
+Object.assign(baseCore.rpc.room_state, {
+  eventsRaw: vi.fn<(...args: never[]) => Promise<unknown[]>>(() =>
     Promise.resolve([
       {
         state_key: '!joined:home.example',
@@ -34,12 +35,28 @@ const core = Object.assign(baseCore, {
       { state_key: '!other:far.example', content: { via: ['far.example'] } },
     ])
   ),
-  joinRoom: vi.fn<(...args: never[]) => Promise<string>>(() =>
-    Promise.resolve('!other:far.example')
-  ),
+});
+Object.assign(baseCore.rpc.room_state, {
+  sendEvent: vi.fn<(...args: never[]) => Promise<string>>(() => Promise.resolve('$sent')),
+});
+Object.assign(baseCore.rpc.rooms, {
+  join: vi.fn<(...args: never[]) => Promise<string>>(() => Promise.resolve('!other:far.example')),
 });
 
-const room = { room_id: '!room:home.example' } as RoomSummary;
+const room = { room_id: '!room:home.example' } as RoomListItemView;
+
+const levels: RoomPowerLevelsView = {
+  ban: 50,
+  kick: 50,
+  redact: 50,
+  invite: 0,
+  events_default: 0,
+  state_default: 50,
+  users_default: 0,
+  events: {},
+  users: {},
+  notifications_room: 50,
+};
 
 afterEach(() => {
   vi.clearAllMocks();
@@ -47,7 +64,7 @@ afterEach(() => {
 
 test('a joined parent space opens', async () => {
   const user = userEvent.setup();
-  render(RoomSpacesSettings, { room });
+  render(RoomSpacesSettings, { room, levels, ownPowerLevel: 0 });
 
   await user.click(await screen.findByRole('button', { name: 'room.spaceOpen' }));
 
@@ -56,10 +73,47 @@ test('a joined parent space opens', async () => {
 
 test('an unjoined parent space is joined through its via servers, then opened', async () => {
   const user = userEvent.setup();
-  render(RoomSpacesSettings, { room });
+  render(RoomSpacesSettings, { room, levels, ownPowerLevel: 0 });
 
-  await user.click(await screen.findByRole('button', { name: 'room.spaceJoin' }));
+  await user.click(await screen.findByRole('button', { name: 'common.join' }));
 
-  expect(core.joinRoom).toHaveBeenCalledWith('!other:far.example', ['far.example']);
+  expect(core.rpc.rooms.join).toHaveBeenCalledWith({
+    address: '!other:far.example',
+    via: ['far.example'],
+  });
   expect(goto).toHaveBeenCalledOnce();
+});
+
+test('making another parent canonical unsets the previous one', async () => {
+  const user = userEvent.setup();
+  render(RoomSpacesSettings, { room, levels, ownPowerLevel: 100 });
+
+  await user.click(await screen.findByRole('button', { name: 'room.spaceMakeCanonical' }));
+
+  expect(core.rpc.room_state.sendEvent.mock.calls).toEqual([
+    [
+      {
+        room_id: '!room:home.example',
+        event_type: 'm.space.parent',
+        state_key: '!other:far.example',
+        content: { via: ['far.example'], canonical: true },
+      },
+    ],
+    [
+      {
+        room_id: '!room:home.example',
+        event_type: 'm.space.parent',
+        state_key: '!joined:home.example',
+        content: { via: ['home.example'] },
+      },
+    ],
+  ]);
+});
+
+test('without the power to change parents there is no way to pick the canonical one', async () => {
+  render(RoomSpacesSettings, { room, levels, ownPowerLevel: 0 });
+
+  await screen.findByText('room.spaceCanonical');
+
+  expect(screen.queryByRole('button', { name: 'room.spaceMakeCanonical' })).toBeNull();
 });

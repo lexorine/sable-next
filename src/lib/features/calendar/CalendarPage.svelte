@@ -1,4 +1,5 @@
 <script module lang="ts">
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
   const remembered = { mode: 'agenda' as 'agenda' | 'month', monthStart: null as number | null };
 </script>
 
@@ -47,7 +48,6 @@
     type CalendarItem,
     type Occurrence,
     type RsvpStatus,
-    RSVP_EVENT,
     agenda,
     buildEvent,
     monthGrid,
@@ -55,7 +55,7 @@
     readEntries,
     startOfDay,
     tallyRsvps,
-  } from './calendar-events.js';
+  } from '#lib/calendar/calendar-events.js';
   import CalendarEventDialog from './CalendarEventDialog.svelte';
 
   const DAY = 86_400_000;
@@ -90,7 +90,7 @@
 
   let view = $state.raw<CalendarView | null>(null);
   let failed = $state(false);
-  let permissions = $state<RoomPermissionsView | null>(null);
+  let permissions = $state.raw<RoomPermissionsView | null>(null);
   let members = $state.raw<MemberView[]>([]);
   let showPast = $state(false);
   let mode = $state(remembered.mode);
@@ -163,12 +163,13 @@
   $effect(() => {
     const activeRoomId = resolvedRoomId;
     let current = true;
-    core.commands
-      .roomPermissions(activeRoomId)
+    core.rpc.members
+      .permissions({ room_id: activeRoomId })
       .then((next) => {
         if (current) permissions = next;
       })
-      .catch(() => {
+      .catch((error: unknown) => {
+        console.warn('[sable calendar] loading permissions failed', error);
         if (current) permissions = null;
       });
     return () => {
@@ -179,8 +180,8 @@
   $effect(() => {
     const activeRoomId = resolvedRoomId;
     let current = true;
-    core.commands
-      .roomMembers(activeRoomId)
+    core.rpc.members
+      .list({ room_id: activeRoomId, memberships: [] })
       .then((next) => {
         if (current) members = next;
       })
@@ -200,7 +201,7 @@
 
   async function load(activeRoomId: string): Promise<void> {
     try {
-      const next = await core.commands.calendarEntries(activeRoomId);
+      const next = await core.rpc.calendar.entries({ room_id: activeRoomId });
       if (activeRoomId !== resolvedRoomId) return;
       view = next;
       now = Date.now();
@@ -254,7 +255,7 @@
 
   function dayLabel(day: number, count: number): string {
     const date = new Date(day).toLocaleDateString(currentLocale(), { dateStyle: 'full' });
-    return count === 0 ? date : $i18n.t('calendar.dayEvents', { date, count });
+    return count === 0 ? date : i18n.t('calendar.dayEvents', { date, count });
   }
 
   function pickDay(day: number): void {
@@ -308,19 +309,28 @@
   }
 
   function markRead(): void {
-    void core.commands
-      .markRead(resolvedRoomId, null, readReceiptIsPrivate())
+    void core.rpc.timeline
+      .markRead({
+        room_id: resolvedRoomId,
+        event_id: null,
+        private_receipt: readReceiptIsPrivate(),
+        thread_root: null,
+        subscription: null,
+        fully_read: false,
+      })
       .catch((error: unknown) => {
         console.warn('[sable calendar] mark as read failed', error);
-        toasts.error($i18n.t('errors.actionFailed'));
+        toasts.error(i18n.t('errors.actionFailed'));
       });
   }
 
   function markUnread(): void {
-    void core.commands.markUnread(resolvedRoomId).catch((error: unknown) => {
-      console.warn('[sable calendar] mark as unread failed', error);
-      toasts.error($i18n.t('errors.actionFailed'));
-    });
+    void core.rpc.timeline
+      .markUnread({ room_id: resolvedRoomId, read_marker: null })
+      .catch((error: unknown) => {
+        console.warn('[sable calendar] mark as unread failed', error);
+        toasts.error(i18n.t('errors.actionFailed'));
+      });
   }
 
   function openEdit(item: CalendarItem): void {
@@ -338,7 +348,11 @@
       Date.now(),
       timeZone
     );
-    await core.commands.saveCalendarEvent(resolvedRoomId, event, base?.eventId ?? null);
+    await core.rpc.calendar.saveEvent({
+      room_id: resolvedRoomId,
+      event: $state.snapshot(event),
+      replaces: base?.event_id ?? null,
+    });
     await load(resolvedRoomId);
   }
 
@@ -346,12 +360,17 @@
     if (deleting === null) return;
     deleteBusy = true;
     try {
-      await core.commands.redact(resolvedRoomId, deleting.eventId);
+      await core.rpc.messages.redact({
+        room_id: resolvedRoomId,
+        event_id: deleting.event_id,
+        reason: null,
+        thread_root: null,
+      });
       deleting = null;
       await load(resolvedRoomId);
     } catch (error) {
       console.warn('[sable calendar] deleting an event failed', error);
-      toasts.error($i18n.t('errors.actionFailed'));
+      toasts.error(i18n.t('errors.actionFailed'));
     } finally {
       deleteBusy = false;
     }
@@ -360,25 +379,26 @@
   async function answer(occurrence: Occurrence, status: RsvpStatus): Promise<void> {
     const item = occurrence.item;
     try {
-      await core.commands.sendRawEvent(resolvedRoomId, RSVP_EVENT, {
+      await core.rpc.calendar.answerEvent({
+        room_id: resolvedRoomId,
+        calendar_event_id: item.event_id,
         uid: item.uid,
-        ...(occurrence.recurrenceId === null ? {} : { recurrenceId: occurrence.recurrenceId }),
+        recurrence_id: occurrence.recurrenceId,
         status,
-        'm.relates_to': { rel_type: 'm.reference', event_id: item.eventId },
       });
       await load(resolvedRoomId);
     } catch (error) {
       console.warn('[sable calendar] answering failed', error);
-      toasts.error($i18n.t('errors.actionFailed'));
+      toasts.error(i18n.t('errors.actionFailed'));
     }
   }
 
   function timeRange(occurrence: Occurrence): string {
-    if (occurrence.item.allDay) {
+    if (occurrence.item.all_day) {
       const last = occurrence.end - 1;
       return new Date(occurrence.start).toDateString() === new Date(last).toDateString()
-        ? $i18n.t('calendar.allDay')
-        : $i18n.t('calendar.allDayUntil', { date: formatDate(last) });
+        ? i18n.t('calendar.allDay')
+        : i18n.t('calendar.allDayUntil', { date: formatDate(last) });
     }
     const sameDay =
       new Date(occurrence.start).toDateString() === new Date(occurrence.end).toDateString();
@@ -393,10 +413,10 @@
   <title>{roomName}</title>
 </svelte:head>
 
-<main class="calendar-page" aria-label={$i18n.t('calendar.label')} data-inset-owner="top">
+<main class="calendar-page" aria-label={i18n.t('calendar.label')} data-inset-owner="top">
   <PanelHeader title={roomName} titleSize="h1">
     {#snippet prefix()}
-      <PanelHeaderButton label={$i18n.t('timeline.back')} onclick={backToRoomList}>
+      <PanelHeaderButton label={i18n.t('timeline.back')} onclick={backToRoomList}>
         <BackIcon />
       </PanelHeaderButton>
       <Avatar
@@ -409,8 +429,9 @@
     {#snippet suffix()}
       {#if preferences.developerTools}
         <PanelHeaderButton
-          label={$i18n.t('timeline.eventTimeline')}
+          label={i18n.t('timeline.eventTimeline')}
           onclick={() => {
+            // eslint-disable-next-line svelte/no-navigation-without-resolve -- eventTimelinePath() resolves the route itself
             void goto(eventTimelinePath(resolvedRoomId));
           }}
         >
@@ -418,7 +439,7 @@
         </PanelHeaderButton>
       {/if}
       {#if permissions?.can_post !== false}
-        <PanelHeaderButton label={$i18n.t('calendar.newTitle')} onclick={() => openNew()}>
+        <PanelHeaderButton label={i18n.t('calendar.newTitle')} onclick={() => openNew()}>
           <PlusIcon />
         </PanelHeaderButton>
       {/if}
@@ -438,35 +459,35 @@
   </PanelHeader>
   <RoomBannerStrip {roomId} />
 
-  <div class="calendar-content">
+  <div class="calendar-content" {@attach scrollHint}>
     <div class="calendar-range">
-      <div class="calendar-segment" role="group" aria-label={$i18n.t('calendar.view')}>
+      <div class="calendar-segment" role="group" aria-label={i18n.t('calendar.view')}>
         <Button
           size="small"
           variant={mode === 'agenda' ? 'primary' : 'ghost'}
           aria-pressed={mode === 'agenda'}
-          onclick={() => (mode = 'agenda')}>{$i18n.t('calendar.viewAgenda')}</Button
+          onclick={() => (mode = 'agenda')}>{i18n.t('calendar.viewAgenda')}</Button
         >
         <Button
           size="small"
           variant={mode === 'month' ? 'primary' : 'ghost'}
           aria-pressed={mode === 'month'}
-          onclick={() => (mode = 'month')}>{$i18n.t('calendar.viewMonth')}</Button
+          onclick={() => (mode = 'month')}>{i18n.t('calendar.viewMonth')}</Button
         >
       </div>
       {#if mode === 'agenda'}
-        <div class="calendar-segment" role="group" aria-label={$i18n.t('calendar.range')}>
+        <div class="calendar-segment" role="group" aria-label={i18n.t('calendar.range')}>
           <Button
             size="small"
             variant={showPast ? 'ghost' : 'primary'}
             aria-pressed={!showPast}
-            onclick={() => (showPast = false)}>{$i18n.t('calendar.upcoming')}</Button
+            onclick={() => (showPast = false)}>{i18n.t('calendar.upcoming')}</Button
           >
           <Button
             size="small"
             variant={showPast ? 'primary' : 'ghost'}
             aria-pressed={showPast}
-            onclick={() => (showPast = true)}>{$i18n.t('calendar.past')}</Button
+            onclick={() => (showPast = true)}>{i18n.t('calendar.past')}</Button
           >
         </div>
       {/if}
@@ -474,7 +495,7 @@
 
     {#if mode === 'month'}
       <div class="calendar-month-nav">
-        <PanelHeaderButton label={$i18n.t('calendar.previousMonth')} onclick={() => moveMonth(-1)}>
+        <PanelHeaderButton label={i18n.t('calendar.previousMonth')} onclick={() => moveMonth(-1)}>
           <BackIcon />
         </PanelHeaderButton>
         <h2 class="calendar-month-title">
@@ -483,10 +504,10 @@
             year: 'numeric',
           })}
         </h2>
-        <PanelHeaderButton label={$i18n.t('calendar.nextMonth')} onclick={() => moveMonth(1)}>
+        <PanelHeaderButton label={i18n.t('calendar.nextMonth')} onclick={() => moveMonth(1)}>
           <NextIcon />
         </PanelHeaderButton>
-        <Button size="small" variant="ghost" onclick={goToday}>{$i18n.t('calendar.today')}</Button>
+        <Button size="small" variant="ghost" onclick={goToday}>{i18n.t('common.today')}</Button>
       </div>
       <div
         class="calendar-grid"
@@ -512,9 +533,7 @@
               <button
                 type="button"
                 role="gridcell"
-                class="calendar-cell"
-                class:outside={!inMonth}
-                class:today={day === startOfDay(now)}
+                class={['calendar-cell', { outside: !inMonth, today: day === startOfDay(now) }]}
                 data-day={day}
                 tabindex={day === activeDay ? 0 : -1}
                 aria-selected={day === activeDay}
@@ -527,24 +546,24 @@
                 onkeydown={(event) => onGridKey(event, day)}
               >
                 <span class="calendar-cell-number">{new Date(day).getDate()}</span>
-                {#each found.slice(0, CHIPS) as entry (`${entry.item.eventId}:${String(entry.start)}`)}
-                  <span class="calendar-chip" class:declined={mineOn(entry) === 'declined'}>
-                    {#if !entry.item.allDay}<span class="calendar-chip-time"
+                {#each found.slice(0, CHIPS) as entry (`${entry.item.event_id}:${String(entry.start)}`)}
+                  <span class={['calendar-chip', { declined: mineOn(entry) === 'declined' }]}>
+                    {#if !entry.item.all_day}<span class="calendar-chip-time"
                         >{formatTime(entry.start)}</span
                       >{/if}
-                    {entry.item.title || $i18n.t('calendar.untitled')}
+                    {entry.item.title || i18n.t('calendar.untitled')}
                   </span>
                 {/each}
                 {#if found.length > 0}
                   <span class="calendar-dots" aria-hidden="true">
-                    {#each found.slice(0, DOTS) as entry (`${entry.item.eventId}:${String(entry.start)}`)}
+                    {#each found.slice(0, DOTS) as entry (`${entry.item.event_id}:${String(entry.start)}`)}
                       <span class="calendar-dot"></span>
                     {/each}
                   </span>
                 {/if}
                 {#if found.length > CHIPS}
                   <span class="calendar-more"
-                    >{$i18n.t('calendar.more', { count: found.length - CHIPS })}</span
+                    >{i18n.t('calendar.more', { count: found.length - CHIPS })}</span
                   >
                 {/if}
               </button>
@@ -557,10 +576,10 @@
     <div class="calendar-list" bind:this={listElement}>
       {#if view === null}
         {#if failed}
-          <EmptyState title={$i18n.t('calendar.loadFailed')}>
+          <EmptyState title={i18n.t('calendar.loadFailed')}>
             {#snippet actions()}
               <Button size="small" onclick={() => void load(resolvedRoomId)}>
-                {$i18n.t('calendar.retry')}
+                {i18n.t('common.tryAgain')}
               </Button>
             {/snippet}
           </EmptyState>
@@ -569,16 +588,16 @@
         {/if}
       {:else if days.length === 0}
         {#if mode === 'month'}
-          <p class="calendar-day-empty">{$i18n.t(emptyKey)}</p>
+          <p class="calendar-day-empty">{i18n.t(emptyKey)}</p>
         {:else}
-          <EmptyState title={$i18n.t(emptyKey)} />
+          <EmptyState title={i18n.t(emptyKey)} />
         {/if}
       {:else}
         {#each days as day (day.key)}
           <section class="calendar-day">
             <h2>{day.label}</h2>
             <ul>
-              {#each day.list as occurrence (`${occurrence.item.eventId}:${String(occurrence.start)}`)}
+              {#each day.list as occurrence (`${occurrence.item.event_id}:${String(occurrence.start)}`)}
                 {@const item = occurrence.item}
                 {@const tally = tallyRsvps(
                   view?.rsvps ?? [],
@@ -589,7 +608,7 @@
                 <li class="calendar-event">
                   <div class="calendar-event-time">{timeRange(occurrence)}</div>
                   <div class="calendar-event-body">
-                    <h3>{item.title || $i18n.t('calendar.untitled')}</h3>
+                    <h3>{item.title || i18n.t('calendar.untitled')}</h3>
                     {#if item.location}
                       <p class="calendar-event-location">{item.location}</p>
                     {/if}
@@ -601,7 +620,7 @@
                         {#each STATUSES as status (status)}
                           {#if tally.people[status].length > 0}
                             <div>
-                              <dt>{$i18n.t(`calendar.people.${status}`)}</dt>
+                              <dt>{i18n.t(`calendar.people.${status}`)}</dt>
                               <dd>{people(tally.people[status])}</dd>
                             </div>
                           {/if}
@@ -617,15 +636,15 @@
                           disabled={permissions?.can_post === false}
                           onclick={() => void answer(occurrence, status)}
                         >
-                          {$i18n.t(`calendar.rsvp.${status}`, { count: tally[status] })}
+                          {i18n.t(`calendar.rsvp.${status}`, { count: tally[status] })}
                         </Button>
                       {/each}
                       {#if canChange(item)}
                         <Button size="small" variant="ghost" onclick={() => openEdit(item)}>
-                          {$i18n.t('calendar.edit')}
+                          {i18n.t('common.edit')}
                         </Button>
                         <Button size="small" variant="ghost" onclick={() => (deleting = item)}>
-                          {$i18n.t('calendar.delete')}
+                          {i18n.t('common.delete')}
                         </Button>
                       {/if}
                     </div>
@@ -653,11 +672,11 @@
 />
 <MessageReportDialog
   bind:open={reportOpen}
-  title={$i18n.t('room.reportTitle')}
-  hint={$i18n.t('room.reportHint')}
+  title={i18n.t('room.menuReport')}
+  hint={i18n.t('room.reportHint')}
   onReport={(reason) => {
     const target = resolvedRoomId;
-    void sendReport(() => core.commands.reportRoom(target, reason ?? ''));
+    void sendReport(() => core.rpc.rooms.report({ room_id: target, reason: reason ?? '' }));
   }}
 />
 <LeaveRoomDialog
@@ -680,11 +699,11 @@
   onOpenChange={(open) => {
     if (!open) deleting = null;
   }}
-  title={$i18n.t('calendar.deleteTitle')}
-  description={$i18n.t('calendar.deleteExplain')}
-  confirmLabel={$i18n.t('calendar.delete')}
+  title={i18n.t('calendar.deleteTitle')}
+  description={i18n.t('calendar.deleteExplain')}
+  confirmLabel={i18n.t('common.delete')}
   confirmVariant="danger"
-  cancelLabel={$i18n.t('calendar.cancel')}
+  cancelLabel={i18n.t('common.cancel')}
   busy={deleteBusy}
   onConfirm={() => void remove()}
 />

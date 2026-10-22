@@ -1,8 +1,8 @@
 import * as Sentry from '@sentry/sveltekit';
 import { Channel, invoke } from '@tauri-apps/api/core';
 
-import type { Command, CommandErr, CoreEvent } from '#src/generated/protocol';
-import { CoreError, type ResponseFor, type Transport } from './index';
+import type { RpcError, CoreEvent } from '#src/generated/protocol';
+import { CoreError, type Transport } from './index';
 import { rawInvoke } from '#lib/platform/raw-invoke.js';
 import { resetWebStorage } from '#lib/platform/session-storage.js';
 import { migrateV1 } from '#lib/migrations/v1/migration.js';
@@ -15,13 +15,12 @@ async function carry<T>(
   try {
     return await rawInvoke<T>(command, bytes, headers);
   } catch (error) {
-    throw new CoreError(error as CommandErr);
+    throw new CoreError(error as RpcError);
   }
 }
 
 /**
- * The core runs in the Tauri process, so there is no serialisation boundary to
- * design: `invoke` is the command channel and `Channel` the event one.
+ * The core runs in the Tauri process: `invoke` carries commands and `Channel` events.
  */
 export function createTauriTransport(): Transport {
   const listeners = new Set<(event: CoreEvent) => void>();
@@ -45,13 +44,13 @@ export function createTauriTransport(): Transport {
   const ready = invoke<unknown>('subscribe_events', { channel });
 
   return {
-    async send<C extends Command>(command: C) {
+    async call(method, params) {
       await ready;
       await migrateV1();
       try {
-        return await invoke<ResponseFor<C['type']>>('submit_command', { command });
+        return await invoke<unknown>('call', { method, params });
       } catch (error) {
-        throw new CoreError(error as CommandErr);
+        throw new CoreError(error as RpcError);
       }
     },
 
@@ -66,7 +65,7 @@ export function createTauriTransport(): Transport {
         });
         return new Uint8Array(bytes);
       } catch (error) {
-        throw new CoreError(error as CommandErr);
+        throw new CoreError(error as RpcError);
       }
     },
 
@@ -74,39 +73,8 @@ export function createTauriTransport(): Transport {
       try {
         await invoke('forget_media', { source });
       } catch (error) {
-        throw new CoreError(error as CommandErr);
+        throw new CoreError(error as RpcError);
       }
-    },
-
-    async videoStreamMime() {
-      try {
-        return await invoke<string>('video_stream_mime');
-      } catch (error) {
-        throw new CoreError(error as CommandErr);
-      }
-    },
-
-    async streamVideo(source, id, onChunk) {
-      const chunks = new Channel<ArrayBuffer>();
-      let drained!: () => void;
-      // Chunks are still in flight when the command resolves, so the empty
-      // chunk the backend sends last is what marks the stream whole.
-      const complete = new Promise<void>((resolve) => {
-        drained = resolve;
-      });
-      chunks.onmessage = (chunk) => {
-        if (chunk.byteLength === 0) {
-          drained();
-          return;
-        }
-        onChunk(new Uint8Array(chunk));
-      };
-      try {
-        await invoke('stream_video', { source, id, chunks });
-      } catch (error) {
-        throw new CoreError(error as CommandErr);
-      }
-      await complete;
     },
 
     async sendAttachment({
@@ -169,7 +137,7 @@ export function createTauriTransport(): Transport {
           })),
         });
       } catch (error) {
-        throw new CoreError(error as CommandErr);
+        throw new CoreError(error as RpcError);
       }
     },
 
@@ -195,7 +163,7 @@ export function createTauriTransport(): Transport {
     async resetCaches(accountIds) {
       await ready;
       try {
-        await invoke('submit_command', { command: { type: 'reset_local_cache' } });
+        await invoke('call', { method: 'session.reset_local_cache', params: {} });
         await resetWebStorage(accountIds);
       } catch (error) {
         Sentry.captureException(error, { tags: { source: 'cache-reset' } });

@@ -3,19 +3,21 @@ mod membership;
 pub(crate) use membership::is_rtc_member_type;
 mod notify;
 
-pub(crate) use notify::is_call_event_type;
+pub(crate) use notify::{NOTIFICATION_EVENT_TYPE, is_call_event_type};
 mod runtime;
+pub(crate) use runtime::State as CallRuntimeState;
 mod sfu;
 pub(crate) mod sticky;
 
+use crate::api::calls::DeclineParams;
+use crate::api::calls::SetScreenSharingParams;
+use crate::api::calls::SupportParams;
 use std::sync::Arc;
 use std::time::Duration;
 
 use matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState;
 use matrix_sdk::executor::{JoinHandleExt, spawn};
-use matrix_sdk::ruma::api::client::delayed_events::{
-    DelayParameters, delayed_state_event, update_delayed_event,
-};
+use matrix_sdk::ruma::api::client::delayed_events::update_delayed_event::UpdateAction;
 use matrix_sdk::ruma::api::client::rtc::RtcTransport;
 use matrix_sdk::ruma::api::client::state::get_state_event_for_key;
 use matrix_sdk::ruma::api::error::ErrorKind;
@@ -24,11 +26,16 @@ use matrix_sdk::ruma::events::call::member::{CallMemberEventContent, CallMemberS
 use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::ruma::{DeviceId, EventId, OwnedRoomId, OwnedUserId, UserId};
 use matrix_sdk::{Client, Room};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_with::{DefaultOnError, serde_as};
 
 use crate::ResultExt;
+use crate::api::calls::JoinOk;
+use crate::delayed_events::{self, DelayedEvent, DelayedEventsSupport};
 use crate::protocol::{
-    CallMemberView, CallMode, CallSessionId, CallSupportView, CommandErr, CommandOk, CoreEvent,
+    CallCompatibilityView, CallMemberView, CallMode, CallSessionId, CallSupportView, CoreEvent,
+    RpcError, RtcTransportSource,
 };
 use crate::{CallSession, Core};
 
@@ -39,7 +46,7 @@ const HANGUP_DELAY: Duration = Duration::from_secs(20);
 const HANGUP_POSTPONE_INTERVAL: Duration = Duration::from_secs(5);
 const HANGUP_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 const HANGUP_RETRY_BUDGET: Duration = Duration::from_secs(12);
-const USE_KEY_DELAY: Duration = Duration::from_secs(1);
+const USE_KEY_DELAY: Duration = Duration::from_millis(keys::USE_KEY_DELAY_MS);
 
 const APPLICATION_SUFFIX: &str = "m.call";
 
@@ -89,13 +96,52 @@ async fn discovered_service_urls(client: &Client) -> Vec<String> {
 const SLOT_ID: &str = crate::view::CALL_SLOT_ID;
 const SLOT_TYPES: [&str; 2] = [crate::view::RTC_SLOT_TYPE, "m.rtc.slot"];
 
-fn slot_is_open(content: &Value) -> bool {
-    content.get("status").and_then(Value::as_str) == Some("open")
-        && content
-            .get("application")
-            .and_then(|application| application.get("type"))
-            .and_then(Value::as_str)
+#[serde_as]
+#[derive(Default, Deserialize)]
+struct SlotRead {
+    #[serde_as(deserialize_as = "DefaultOnError")]
+    #[serde(default)]
+    status: Option<String>,
+    #[serde_as(deserialize_as = "DefaultOnError")]
+    #[serde(default)]
+    application: Option<ApplicationRead>,
+    #[serde_as(deserialize_as = "DefaultOnError")]
+    #[serde(default)]
+    encryption: Option<EncryptionRead>,
+}
+
+#[serde_as]
+#[derive(Deserialize)]
+struct EncryptionRead {
+    #[serde_as(deserialize_as = "DefaultOnError")]
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+}
+
+#[serde_as]
+#[derive(Deserialize)]
+struct ApplicationRead {
+    #[serde_as(deserialize_as = "DefaultOnError")]
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+}
+
+fn read_slot(content: &Value) -> SlotRead {
+    SlotRead::deserialize(content).unwrap_or_default()
+}
+
+fn slot_is_open(slot: &SlotRead, encrypted: bool) -> bool {
+    slot.status.as_deref() == Some("open")
+        && slot
+            .application
+            .as_ref()
+            .and_then(|application| application.kind.as_deref())
             == Some(APPLICATION_SUFFIX)
+        && (!encrypted
+            || slot
+                .encryption
+                .as_ref()
+                .is_some_and(|encryption| encryption.kind.is_some()))
 }
 
 async fn stored_slot(room: &Room, event_type: &str) -> Option<Value> {
@@ -125,39 +171,81 @@ async fn fetched_slot(room: &Room, event_type: &str) -> Option<Value> {
     Some(value.get("content").cloned().unwrap_or(value))
 }
 
-async fn has_open_slot(room: &Room) -> bool {
+async fn has_open_slot(room: &Room, encrypted: bool) -> bool {
     for event_type in SLOT_TYPES {
         let content = match stored_slot(room, event_type).await {
             Some(content) => Some(content),
             None => fetched_slot(room, event_type).await,
         };
-        if content.is_some_and(|content| slot_is_open(&content)) {
+        if content.is_some_and(|content| slot_is_open(&read_slot(&content), encrypted)) {
             return true;
         }
     }
     false
 }
 
-pub(super) async fn slot_closed(room: &Room) -> bool {
+pub(super) async fn slot_closed(room: &Room, encrypted: bool) -> bool {
     let mut closed = false;
     for event_type in SLOT_TYPES {
         let content = match stored_slot(room, event_type).await {
             Some(content) => Some(content),
             None => fetched_slot(room, event_type).await,
         };
-        match content {
-            Some(content) if slot_is_open(&content) => return false,
-            Some(content) => {
-                closed |= content.get("status").and_then(Value::as_str) == Some("closed");
+        if let Some(content) = content {
+            let slot = read_slot(&content);
+            if slot_is_open(&slot, encrypted) {
+                return false;
             }
-            None => {}
+            closed |= matches!(slot.status.as_deref(), Some("closed" | "open"));
         }
     }
     closed
 }
 
+#[derive(Serialize)]
+enum SlotStatus {
+    #[serde(rename = "open")]
+    Open,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type")]
+enum SlotApplication {
+    #[serde(rename = "m.call")]
+    Call,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type")]
+enum SlotEncryption {
+    #[serde(rename = "org.matrix.msc4143.per_member")]
+    PerMember,
+}
+
+#[derive(Serialize)]
+pub(crate) struct OpenSlot {
+    status: SlotStatus,
+    application: SlotApplication,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encryption: Option<SlotEncryption>,
+}
+
+impl OpenSlot {
+    pub(crate) const fn new(encrypted: bool) -> Self {
+        Self {
+            status: SlotStatus::Open,
+            application: SlotApplication::Call,
+            encryption: if encrypted {
+                Some(SlotEncryption::PerMember)
+            } else {
+                None
+            },
+        }
+    }
+}
+
 pub(super) async fn ensure_open_slot(room: &Room, encrypted: bool) -> bool {
-    if has_open_slot(room).await {
+    if has_open_slot(room, encrypted).await {
         return true;
     }
     let client = room.client();
@@ -171,15 +259,7 @@ pub(super) async fn ensure_open_slot(room: &Room, encrypted: bool) -> bool {
     {
         return false;
     }
-    let mut content =
-        serde_json::json!({"status": "open", "application": {"type": APPLICATION_SUFFIX}});
-    if encrypted && let Some(slot) = content.as_object_mut() {
-        slot.insert(
-            "encryption".to_owned(),
-            serde_json::json!({"type": "org.matrix.msc4143.per_member"}),
-        );
-    }
-    let Ok(raw) = Raw::new(&content) else {
+    let Ok(raw) = Raw::new(&OpenSlot::new(encrypted)) else {
         return false;
     };
     room.send_state_event_raw(crate::view::RTC_SLOT_TYPE, SLOT_ID, raw.cast_unchecked())
@@ -211,6 +291,25 @@ fn left_membership() -> CallMemberEventContent {
     CallMemberEventContent::new_empty(None)
 }
 
+pub(crate) async fn screen_sharers(room: &Room) -> Vec<OwnedUserId> {
+    let mut members = membership::active_members(room).await;
+    let now = keys::now_ms();
+    let mut sticky = membership::StickyMemberships::default();
+    for event in sticky::live_events(room) {
+        sticky.apply(&event, now);
+    }
+    members.extend(sticky.members(now));
+    members.retain(|member| member.screen_sharing);
+    members.sort_by_key(|member| member.joined_ts);
+    let mut users = Vec::new();
+    for member in members {
+        if !users.contains(&member.user_id) {
+            users.push(member.user_id);
+        }
+    }
+    users
+}
+
 fn member_views(members: &[CallMember]) -> Vec<CallMemberView> {
     members
         .iter()
@@ -220,6 +319,7 @@ fn member_views(members: &[CallMember]) -> Vec<CallMemberView> {
             identity: member.identity.clone(),
             backend_id: None,
             joined_ts: member.joined_ts,
+            screen_sharing: member.screen_sharing,
         })
         .collect()
 }
@@ -231,20 +331,52 @@ impl Core {
         livekit_service_url: Option<String>,
         mode: Option<CallMode>,
         intent: Option<crate::protocol::CallIntent>,
-    ) -> Result<CommandOk, CommandErr> {
+    ) -> Result<JoinOk, RpcError> {
         runtime::join(self, room_id, livekit_service_url, mode, intent).await
+    }
+
+    pub(crate) async fn call_compatibility(&self) -> Result<CallCompatibilityView, RpcError> {
+        let client = self.client().await?;
+        let features = client
+            .unstable_features()
+            .await
+            .or_failed(self, "call_compatibility")?;
+        let endpoint = client
+            .discover_rtc_transports()
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|transports| !livekit_service_urls(transports).is_empty());
+        let rtc_transports = if endpoint {
+            RtcTransportSource::Endpoint
+        } else if client
+            .well_known_rtc_transports()
+            .await
+            .is_ok_and(|transports| !livekit_service_urls(transports).is_empty())
+        {
+            RtcTransportSource::WellKnown
+        } else {
+            RtcTransportSource::None
+        };
+        Ok(CallCompatibilityView {
+            sticky_events: features.contains(&"org.matrix.msc4354".into()),
+            delayed_events: DelayedEventsSupport::from_features(&features).any(),
+            rtc_transports,
+        })
     }
 
     pub(crate) async fn call_support(
         &self,
-        room_id: OwnedRoomId,
-        livekit_service_url: Option<String>,
-    ) -> Result<CommandOk, CommandErr> {
+        SupportParams {
+            room_id,
+            livekit_service_url,
+        }: SupportParams,
+    ) -> Result<CallSupportView, RpcError> {
         let room = self.room(&room_id).await?;
         let user_id = room
             .client()
             .user_id()
-            .ok_or(CommandErr::NotLoggedIn)?
+            .ok_or(RpcError::NotLoggedIn)?
             .to_owned();
 
         let members = membership::active_members(&room).await;
@@ -278,10 +410,10 @@ impl Core {
             levels.user_can_send_message(&user_id, membership::RTC_MEMBER_EVENT_TYPE.into()),
         );
 
-        Ok(CommandOk::CallSupport(CallSupportView {
+        Ok(CallSupportView {
             has_focus,
             can_join,
-        }))
+        })
     }
 
     async fn resolve_focus(
@@ -443,39 +575,35 @@ impl Core {
 
     pub(crate) async fn decline_call(
         &self,
-        room_id: OwnedRoomId,
-        notification_event_id: String,
-    ) -> Result<CommandOk, CommandErr> {
+        DeclineParams {
+            room_id,
+            notification_event_id,
+        }: DeclineParams,
+    ) -> Result<(), RpcError> {
         let event_id = EventId::parse(&notification_event_id).or_failed(self, "decline_call")?;
         let room = self.room(&room_id).await?;
         let content = notify::make_decline_event(&room, &event_id)
             .await
             .or_failed(self, "decline_call")?;
-        let mut content = serde_json::to_value(content).or_failed(self, "decline_call")?;
-        if let Some(object) = content.as_object_mut() {
-            object
-                .entry("m.mentions")
-                .or_insert_with(|| serde_json::json!({}));
-        }
-        let content =
-            Raw::<matrix_sdk::ruma::events::AnyMessageLikeEventContent>::from_json_string(
-                content.to_string(),
-            )
-            .or_failed(self, "decline_call")?
-            .cast_unchecked();
+        let content = Raw::new(&notify::DeclineOut {
+            content,
+            mentions: serde_json::Map::new(),
+        })
+        .or_failed(self, "decline_call")?
+        .cast_unchecked();
         room.send_raw(notify::DECLINE_EVENT_TYPE, content)
             .await
             .or_failed(self, "decline_call")?;
 
-        Ok(CommandOk::DeclineCall)
+        Ok(())
     }
 
-    fn provision_error(&self, service_url: &str, error: &ProvisionError) -> CommandErr {
+    fn provision_error(&self, service_url: &str, error: &ProvisionError) -> RpcError {
         match error {
-            ProvisionError::NotLoggedIn => CommandErr::NotLoggedIn,
+            ProvisionError::NotLoggedIn => RpcError::NotLoggedIn,
             ProvisionError::Unreachable | ProvisionError::OpenIdUnavailable => {
                 tracing::warn!(service_url, "{error}");
-                CommandErr::Unavailable
+                RpcError::Unavailable
             }
             ProvisionError::Refused(_) | ProvisionError::MalformedResponse => {
                 self.failed("join_call_provision", format!("{service_url}: {error}"))
@@ -483,7 +611,7 @@ impl Core {
         }
     }
 
-    pub(crate) async fn end_all_calls(&self) {
+    pub async fn end_all_calls(&self) {
         let calls: Vec<CallSession> = self
             .call_sessions
             .lock()
@@ -495,62 +623,92 @@ impl Core {
         for mut call in calls {
             drop(call.updates.take());
             drop(call.postpone.take());
-            let result = match call.delay_id.clone() {
-                Some(delay_id) => match self.fire_hangup(delay_id).await {
-                    Ok(result) => Ok(result),
-                    Err(_) => self.send_left_membership(&call).await,
-                },
-                None => self.send_left_membership(&call).await,
-            };
+            let result = self.hang_up(&call).await;
             if let Err(error) = result {
                 tracing::warn!(?error, room_id = %call.room_id, "could not hang up on session end");
             }
         }
     }
 
-    pub(crate) async fn leave_call(&self, session: CallSessionId) -> Result<CommandOk, CommandErr> {
+    pub(crate) async fn leave_call(
+        self: &Arc<Self>,
+        session: CallSessionId,
+    ) -> Result<(), RpcError> {
         let mut call = self
             .call_sessions
             .lock()
             .await
             .remove(&session)
-            .ok_or(CommandErr::UnknownCall)?;
+            .ok_or(RpcError::UnknownCall)?;
 
         drop(call.updates.take());
         drop(call.postpone.take());
-        match call.delay_id.clone() {
-            Some(delay_id) => match self.fire_hangup(delay_id).await {
-                Ok(result) => Ok(result),
-                Err(_) => self.send_left_membership(&call).await,
-            },
-            None => self.send_left_membership(&call).await,
+        let result = self.hang_up(&call).await;
+        // A call kept sync running past `Suspended`; stop it before the audio session ends.
+        self.apply_app_activity(false).await;
+        result
+    }
+
+    pub(crate) async fn set_call_screen_sharing(
+        &self,
+        SetScreenSharingParams { session, active }: SetScreenSharingParams,
+    ) -> Result<(), RpcError> {
+        let (room_id, state) = {
+            let calls = self.call_sessions.lock().await;
+            let call = calls.get(&session).ok_or(RpcError::UnknownCall)?;
+            (call.room_id.clone(), call.state.clone())
+        };
+        let room = self.room(&room_id).await?;
+        runtime::set_screen_sharing(&room, &state, active)
+            .await
+            .map_err(|error| self.room_error("set_call_screen_sharing", error))?;
+        Ok(())
+    }
+
+    async fn fire_hangup(&self, delay_id: String) -> Result<(), RpcError> {
+        delayed_events::update(&self.client().await?, delay_id, UpdateAction::Send)
+            .await
+            .or_failed(self, "leave_call")
+    }
+
+    async fn hang_up(&self, call: &CallSession) -> Result<(), RpcError> {
+        let slot_closed = call.state.lock().await.left_because_slot_closed();
+        let Some(delay_id) = call.delay_id.clone() else {
+            return self.send_left_membership(call, slot_closed).await;
+        };
+        if slot_closed {
+            let result = self.send_left_membership(call, true).await;
+            if let Ok(client) = self.client().await {
+                let _ = delayed_events::update(&client, delay_id, UpdateAction::Cancel).await;
+            }
+            return result;
+        }
+        match self.fire_hangup(delay_id).await {
+            Ok(result) => Ok(result),
+            Err(_) => self.send_left_membership(call, false).await,
         }
     }
 
-    async fn fire_hangup(&self, delay_id: String) -> Result<CommandOk, CommandErr> {
-        self.client()
-            .await?
-            .send(update_delayed_event::unstable_v1::Request::new(
-                delay_id,
-                update_delayed_event::UpdateAction::Send,
-            ))
-            .await
-            .or_failed(self, "leave_call")?;
-
-        Ok(CommandOk::LeaveCall)
-    }
-
-    async fn send_left_membership(&self, call: &CallSession) -> Result<CommandOk, CommandErr> {
+    async fn send_left_membership(
+        &self,
+        call: &CallSession,
+        slot_closed: bool,
+    ) -> Result<(), RpcError> {
         if let Some(member_id) = &call.sticky_member {
             let room = self.room(&call.room_id).await?;
+            let code = if slot_closed {
+                sticky::LeaveCode::SlotClosed
+            } else {
+                sticky::LeaveCode::Leave
+            };
             sticky::send(
                 &room.client(),
                 &room,
-                serde_json::json!({"msc4354_sticky_key": member_id}),
+                sticky::LeaveOut::new(Some(member_id.clone()), code),
             )
             .await
             .map_err(|error| self.room_error("leave_call", error))?;
-            return Ok(CommandOk::LeaveCall);
+            return Ok(());
         }
         self.room(&call.room_id)
             .await?
@@ -558,7 +716,7 @@ impl Core {
             .await
             .map_err(|error| self.room_error("leave_call", error))?;
 
-        Ok(CommandOk::LeaveCall)
+        Ok(())
     }
 
     async fn schedule_hangup(
@@ -566,21 +724,21 @@ impl Core {
         room_id: &OwnedRoomId,
         state_key: &CallMemberStateKey,
     ) -> Option<String> {
-        if !self.delayed_events_supported().await.ok()? {
+        let support = self.delayed_events_support().await.ok()?;
+        if !support.any() {
             return None;
         }
-        let request = delayed_state_event::unstable::Request::new(
-            room_id.clone(),
-            state_key.as_ref().to_owned(),
-            DelayParameters::Timeout {
-                timeout: HANGUP_DELAY,
-            },
-            &left_membership(),
-        )
-        .ok()?;
+        let event = DelayedEvent {
+            room_id: room_id.clone(),
+            event_type: StateEventType::CallMember.to_string(),
+            state_key: Some(state_key.as_ref().to_owned()),
+            content: serde_json::value::to_raw_value(&left_membership()).ok()?,
+            delay: HANGUP_DELAY,
+            sticky_duration_ms: None,
+        };
 
-        match self.client().await.ok()?.send(request).await {
-            Ok(response) => Some(response.delay_id),
+        match delayed_events::send(&self.client().await.ok()?, support, event).await {
+            Ok(delay_id) => Some(delay_id),
             Err(error) => {
                 tracing::warn!(
                     ?error,
@@ -600,12 +758,8 @@ impl Core {
                 return false;
             };
 
-            let Err(error) = client
-                .send(update_delayed_event::unstable_v1::Request::new(
-                    delay_id.to_owned(),
-                    update_delayed_event::UpdateAction::Restart,
-                ))
-                .await
+            let Err(error) =
+                delayed_events::update(&client, delay_id.to_owned(), UpdateAction::Restart).await
             else {
                 return true;
             };
@@ -677,6 +831,61 @@ mod tests {
     }
 
     #[test]
+    fn test_open_slot_serializes_with_optional_encryption() {
+        let slot = |encrypted: bool| serde_json::to_value(super::OpenSlot::new(encrypted)).unwrap();
+        assert_eq!(
+            slot(false),
+            serde_json::json!({"status": "open", "application": {"type": "m.call"}})
+        );
+        assert_eq!(
+            slot(true),
+            serde_json::json!({
+                "status": "open",
+                "application": {"type": "m.call"},
+                "encryption": {"type": "org.matrix.msc4143.per_member"},
+            })
+        );
+    }
+
+    #[test]
+    fn test_an_encrypted_room_needs_a_slot_with_encryption() {
+        let open = |content: serde_json::Value, encrypted| {
+            super::slot_is_open(&super::read_slot(&content), encrypted)
+        };
+        let plain = serde_json::json!({"status": "open", "application": {"type": "m.call"}});
+        let encrypted = serde_json::json!({
+            "status": "open",
+            "application": {"type": "m.call"},
+            "encryption": {"type": "org.matrix.msc4143.per_member"},
+        });
+        assert!(open(plain.clone(), false));
+        assert!(!open(plain, true));
+        assert!(open(encrypted.clone(), true));
+        assert!(open(encrypted, false));
+    }
+
+    #[test]
+    fn test_slot_reads_ignore_wrong_typed_fields() {
+        let open =
+            |content: serde_json::Value| super::slot_is_open(&super::read_slot(&content), false);
+        assert!(open(
+            serde_json::json!({"status": "open", "application": {"type": "m.call"}})
+        ));
+        assert!(!open(
+            serde_json::json!({"status": "open", "application": "m.call"})
+        ));
+        assert!(!open(
+            serde_json::json!({"status": 1, "application": {"type": "m.call"}})
+        ));
+        assert!(!open(
+            serde_json::json!({"status": "open", "application": {"type": 3}})
+        ));
+        assert!(!open(serde_json::json!("open")));
+        let closed = super::read_slot(&serde_json::json!({"status": "closed"}));
+        assert_eq!(closed.status.as_deref(), Some("closed"));
+    }
+
+    #[test]
     fn test_experimental_room_versions_use_namespaced_state_keys() {
         for version in ["org.matrix.msc3757", "org.matrix.msc3779.10"] {
             let key =
@@ -704,6 +913,7 @@ mod tests {
             joined_ts: 0,
             expires_at_ms: None,
             foci: Vec::new(),
+            screen_sharing: false,
         }]);
 
         assert_eq!(views[0].identity, "@erwan:localhost:LAPTOP");

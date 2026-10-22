@@ -4,7 +4,6 @@ import type { ImagePackView } from '#src/generated/protocol';
 
 import {
   isCustomReaction,
-  loadReactionEmotePacks,
   loadReactionShortcodes,
   reactionEmoteLabel,
   reactionShortcode,
@@ -34,33 +33,21 @@ test('recognises Matrix media reaction keys', () => {
 });
 
 test('uses the known custom emote shortcode instead of its media URI', () => {
-  expect(reactionEmoteLabel('mxc://example.org/neocat', imagePacks, 'Custom emote')).toBe(
+  expect(reactionEmoteLabel('mxc://example.org/neocat', imagePacks, 'custom emote')).toBe(
     ':neocat:'
   );
 });
 
 test('does not expose an unknown custom emote media URI', () => {
-  expect(reactionEmoteLabel('mxc://remote.example/unknown', imagePacks, 'Custom emote')).toBe(
-    'Custom emote'
+  expect(reactionEmoteLabel('mxc://remote.example/unknown', imagePacks, 'custom emote')).toBe(
+    'custom emote'
   );
-});
-
-test('retries a room pack read after a transient failure', async () => {
-  let attempts = 0;
-  const load = (): Promise<ImagePackView[]> => {
-    attempts += 1;
-    return attempts === 1 ? Promise.reject(new Error('offline')) : Promise.resolve(imagePacks);
-  };
-
-  await expect(loadReactionEmotePacks('!retry:example.org', load)).rejects.toThrow('offline');
-  await expect(loadReactionEmotePacks('!retry:example.org', load)).resolves.toBe(imagePacks);
-  expect(attempts).toBe(2);
 });
 
 test('prefers the shortcode the reaction was sent with over the local pack name', () => {
   const sent = new Map([['mxc://example.org/neocat', 'partycat']]);
 
-  expect(reactionEmoteLabel('mxc://example.org/neocat', imagePacks, 'Custom emote', sent)).toBe(
+  expect(reactionEmoteLabel('mxc://example.org/neocat', imagePacks, 'custom emote', sent)).toBe(
     ':partycat:'
   );
   expect(reactionShortcode('mxc://example.org/neocat', imagePacks, sent)).toBe(':partycat:');
@@ -69,7 +56,7 @@ test('prefers the shortcode the reaction was sent with over the local pack name'
 test('names an image from another pack by the shortcode it was sent with', () => {
   const sent = new Map([['mxc://remote.example/parrot', 'partyparrot']]);
 
-  expect(reactionEmoteLabel('mxc://remote.example/parrot', imagePacks, 'Custom emote', sent)).toBe(
+  expect(reactionEmoteLabel('mxc://remote.example/parrot', imagePacks, 'custom emote', sent)).toBe(
     ':partyparrot:'
   );
 });

@@ -30,10 +30,15 @@
     if (!sessionId || !sender || !roomId || retrying) return;
     retrying = true;
     try {
-      await core.commands.retryDecryption(roomId, sessionId, sender, threadRoot);
+      await core.rpc.timeline.retryDecryption({
+        room_id: roomId,
+        session_id: sessionId,
+        sender,
+        thread_root: threadRoot,
+      });
     } catch (error) {
       console.warn('[sable timeline] could not retry decryption', error);
-      toasts.error($i18n.t('errors.actionFailed'));
+      toasts.error(i18n.t('errors.actionFailed'));
     } finally {
       retrying = false;
     }
@@ -55,14 +60,14 @@
   });
 </script>
 
-<p class="undecryptable" class:waiting>
+<p class={['undecryptable', { waiting }]}>
   {#if waiting}
-    {$i18n.t('timeline.utdWaiting')}
+    {i18n.t('timeline.utdWaiting')}
   {:else}
-    {$i18n.t(utdCauseKey(cause))}
+    {i18n.t(utdCauseKey(cause))}
     {#if sessionId && sender && roomId}
       <button type="button" disabled={retrying} onclick={() => void retry()}>
-        {$i18n.t('timeline.retryDecryption')}
+        {i18n.t('timeline.retryDecryption')}
       </button>
     {/if}
     {#if utdIsRecoverable(cause)}
@@ -71,7 +76,7 @@
         draggable="false"
         data-settings-link={SETTINGS_DEVICES_SECTION}
       >
-        {$i18n.t('timeline.utdRecoverAction')}
+        {i18n.t('common.setUpRecovery')}
       </a>
     {/if}
   {/if}

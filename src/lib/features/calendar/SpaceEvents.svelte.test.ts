@@ -3,13 +3,17 @@
 import { render, screen } from '@testing-library/svelte';
 import { expect, test, vi } from 'vitest';
 
-import type { CalendarView, RoomSummary } from '#src/generated/protocol';
+import type { CalendarView, RoomListItemView } from '#src/generated/protocol';
 
 import { core as baseCore } from '#lib/core/__mocks__/context.js';
 
 import SpaceEvents from './SpaceEvents.svelte';
 
 vi.mock('#lib/core/context.js');
+vi.mock('#lib/rooms/room-list.svelte.js', async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  useRoomList: () => ({ rooms: [room] }),
+}));
 
 function local(at: Date, hour: string): string {
   const pad = (value: number) => String(value).padStart(2, '0');
@@ -20,9 +24,9 @@ const yesterday = new Date(Date.now() - 86_400_000);
 const tomorrow = new Date(Date.now() + 86_400_000);
 const today = new Date();
 
-Object.assign(baseCore, {
-  subscribeEvents: vi.fn(() => () => undefined),
-  calendarEntries: vi.fn((): Promise<CalendarView> =>
+Object.assign(baseCore, { subscribeEvents: vi.fn(() => () => undefined) });
+Object.assign(baseCore.rpc.calendar, {
+  entries: vi.fn((): Promise<CalendarView> =>
     Promise.resolve({
       entries: [
         {
@@ -66,7 +70,7 @@ Object.assign(baseCore, {
   ),
 });
 
-const room = { room_id: '!cal:x', name: 'Events' } as RoomSummary;
+const room = { room_id: '!cal:x', name: 'Events' } as RoomListItemView;
 
 test('lists the events that fall on today and leaves later days out', async () => {
   render(SpaceEvents, { spaceId: '!space:x', rooms: [room] });

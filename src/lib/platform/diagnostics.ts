@@ -49,7 +49,10 @@ async function webArchitecture(): Promise<string | undefined> {
 
   const values = await data
     .getHighEntropyValues(['architecture', 'bitness'])
-    .catch(() => undefined);
+    .catch((error: unknown) => {
+      console.debug('[sable diagnostics] architecture unavailable', error);
+      return undefined;
+    });
   if (!values?.architecture) return undefined;
   return values.bitness ? `${values.architecture} ${values.bitness}-bit` : values.architecture;
 }
@@ -65,4 +68,22 @@ export async function describePlatform(): Promise<string> {
     return `${platform()} ${version()} (${arch()})`;
   }
   return webPlatformLabel(navigator.userAgent, await webArchitecture());
+}
+
+const ISSUE_PLATFORMS: Record<string, string> = {
+  linux: 'Linux',
+  windows: 'Windows',
+  macos: 'macOS',
+  ios: 'iOS',
+  android: 'Android',
+};
+
+export function issuePlatformOption(nativePlatform: string | undefined): string {
+  return nativePlatform === undefined ? 'Web' : (ISSUE_PLATFORMS[nativePlatform] ?? '');
+}
+
+export async function issuePlatform(): Promise<string> {
+  if (!isTauri()) return issuePlatformOption(undefined);
+  const { platform } = await import('@tauri-apps/plugin-os');
+  return issuePlatformOption(platform());
 }

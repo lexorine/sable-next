@@ -6,6 +6,9 @@ import type {
   NodeViewConstructor,
 } from 'prosemirror-view';
 
+import { preferences } from '#lib/settings/preferences.svelte.js';
+import { holdStillFrame } from '#lib/ui/still-frame.js';
+
 import { emoticonLabel } from './schema';
 
 export interface EmoteMedia {
@@ -38,13 +41,15 @@ abstract class AtomNodeView implements NodeView {
 class MentionNodeView extends AtomNodeView {
   constructor(node: ProseMirrorNode, unlink: () => void) {
     super('span', 'composer-mention');
+    // Gboard recomposes real text inside a contenteditable=false node, so the
+    // label is drawn from an attribute instead.
     const label = document.createElement('span');
-    label.textContent = node.attrs.name as string;
+    label.className = 'composer-mention-label';
+    label.dataset.label = node.attrs.name as string;
 
     const remove = document.createElement('button');
     remove.type = 'button';
     remove.className = 'composer-mention-remove';
-    remove.textContent = '×';
     remove.title = 'Remove mention link';
     remove.setAttribute('aria-label', 'Remove mention link');
     remove.addEventListener('mousedown', (event) => {
@@ -84,7 +89,9 @@ abstract class MediaNodeView extends AtomNodeView {
       (src) => {
         if (!this.destroyed) this.paint(src, alt);
       },
-      () => {}
+      (error: unknown) => {
+        console.debug('[sable composer] inline image unavailable', error);
+      }
     );
   }
 
@@ -137,12 +144,17 @@ class EmoticonNodeView extends AtomNodeView {
       (src) => {
         if (!this.destroyed) this.paint(src, label);
       },
-      () => {}
+      (error: unknown) => {
+        console.debug('[sable composer] emoticon image unavailable', error);
+      }
     );
   }
 
   private paint(src: string, label: string): void {
     const image = document.createElement('img');
+    image.onload = () => {
+      holdStillFrame(image, !preferences.autoplayStickers);
+    };
     image.src = src;
     image.alt = label;
     this.dom.replaceChildren(image);
@@ -166,6 +178,13 @@ export function composerNodeViews(
       }),
     emoticon: (node) => new EmoticonNodeView(node, media),
     image: (node) => new ImageNodeView(node, media),
+    mfm_time: (node) => {
+      const dom = document.createElement('time');
+      dom.className = 'composer-time';
+      dom.dateTime = node.attrs.datetime as string;
+      dom.textContent = node.attrs.label as string;
+      return { dom };
+    },
   };
 }
 

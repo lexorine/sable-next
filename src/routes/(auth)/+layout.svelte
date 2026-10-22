@@ -1,6 +1,5 @@
 <script lang="ts">
   import { onMount, type Snippet } from 'svelte';
-  import { on } from 'svelte/events';
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
   import { page } from '$app/state';
@@ -32,26 +31,21 @@
     });
   });
 
-  onMount(() => {
-    const onClick = (event: MouseEvent): void => {
-      const anchor = event.target instanceof Element ? event.target.closest('a') : null;
-      if (anchor) followExternalLink(event, anchor);
-    };
-    const offClick = on(document, 'click', onClick);
-    const offAuxClick = on(document, 'auxclick', onClick);
-    return () => {
-      offClick();
-      offAuxClick();
-    };
-  });
+  const onClick = (event: MouseEvent): void => {
+    const anchor = event.target instanceof Element ? event.target.closest('a') : null;
+    if (anchor) followExternalLink(event, anchor);
+  };
 
   $effect(() => {
     if (core.status !== 'ready' || addingAccount) return;
     if (!authEntry || page.url.searchParams.has('addAccount')) {
+      // eslint-disable-next-line svelte/no-navigation-without-resolve -- takeAfterLogin() returns a resolved path
       void goto(takeAfterLogin(resolve('/(app)/rooms')), { replace: true });
     }
   });
 </script>
+
+<svelte:document onclick={onClick} onauxclick={onClick} />
 
 {#if authEntry}
   <AuthFlow />

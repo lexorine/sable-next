@@ -1,19 +1,18 @@
-import {
-  rememberScreenAudioChoice,
-  type ScreenAudioChoice,
-  screenAudioSupported,
-} from '#lib/platform/screen-audio.js';
+import { rememberScreenAudioChoice, screenAudioSupported } from '#lib/platform/screen-audio.js';
+import type { ScreenAudioChoice } from '#lib/platform/screen-audio-stream.js';
 import { createContext } from 'svelte';
 
 import { hdrShareSupported, listHdrMonitors, type HdrMonitor } from '#lib/platform/hdr-share.js';
 
 import type { CallMemberView, CoreEvent } from '#src/generated/protocol';
-import type { CallGrant, CoreClient } from '#lib/core/client.svelte.js';
+import type { CoreClient } from '#lib/core/client.svelte.js';
+import { joinCall, type CallGrant } from '#lib/core/api/calls.js';
 
 import type {
   CallEncryptionKey,
   CallParticipant,
   CallTransport,
+  CallTransportCapabilities,
   CallTransportState,
   ScreenSource,
 } from './call-transport';
@@ -24,11 +23,13 @@ import { createNativeTransport } from './native-transport';
 import { hasNativeCalls } from '#lib/platform/calls.js';
 import { commandErrorCode } from './command-error';
 import { CallTelemetry } from './call-telemetry';
+import { recordCallDebug } from './call-debug.svelte.js';
 import { cameraVisible, screenShareVisible, type CallPin } from './call-layout';
 import { participantKeys } from './participant-keys';
-import { setPreference } from '#lib/settings/preferences.svelte.js';
+import { preferences, setPreference } from '#lib/settings/preferences.svelte.js';
 import { DEVICE_PREFERENCE } from './devices';
-import type { CallBackendGrant, CallVideoOverlay } from './call-transport';
+import type { CallBackendGrant, CallRemoteVideoOverlay, CallVideoOverlay } from './call-transport';
+import { playSound } from '../notifications/sound';
 
 export type CallLifecycle = 'idle' | 'joining' | 'connecting' | 'active' | 'leaving' | 'failed';
 
@@ -109,8 +110,8 @@ export class CallSession {
   encryptsMedia = $state(false);
   deafened = $state(false);
   connectedAt = $state<number | null>(null);
-  layout: CallPin = { pinned: null, gridForced: false };
-  watchedScreenShareIds = $state<string[]>([]);
+  layout = $state.raw<CallPin>({ pinned: null, gridForced: false });
+  watchedScreenShareIds = $state.raw<string[]>([]);
   views = $state(0);
   deviceError = $state<CallDeviceError | null>(null);
   listenOnly = $state(false);
@@ -140,6 +141,7 @@ export class CallSession {
   #livekit = $state.raw<LivekitTransport | undefined>(undefined);
   #grant: CallGrant | undefined;
   #session: number | undefined;
+  #screenSharing = false;
   #lease: CallOwnerLease | undefined;
   #unsubscribe: (() => void) | undefined;
   #unsubscribeTransport: (() => void) | undefined;
@@ -196,6 +198,22 @@ export class CallSession {
     return this.#media?.capabilities.localVideo;
   }
 
+  get remoteVideo(): CallRemoteVideoOverlay | undefined {
+    return this.#media?.capabilities.remoteVideo;
+  }
+
+  get audioRoutes(): CallTransportCapabilities['audioRoutes'] {
+    return this.#media?.capabilities.audioRoutes;
+  }
+
+  get audioInputs(): CallTransportCapabilities['audioInputs'] {
+    return this.#media?.capabilities.audioInputs;
+  }
+
+  async selectAudioRoute(routeId: string): Promise<void> {
+    await this.#media?.capabilities.audioRoutes?.select(routeId);
+  }
+
   get canSwitchCamera(): boolean {
     return this.#media?.capabilities.camera !== undefined;
   }
@@ -220,6 +238,7 @@ export class CallSession {
 
     this.#lease = lease;
     this.#lastJoin = { roomId, media, serviceUrl };
+    setPreference('callMicrophoneMuted', !media.microphone);
     this.layout = { pinned: null, gridForced: false };
     this.watchedScreenShareIds = [];
     this.clearDeviceError();
@@ -242,15 +261,20 @@ export class CallSession {
 
     try {
       const grant = await telemetry.step('call.signaling.join', () =>
-        this.#client.commands.joinCall(
+        joinCall(
+          this.#client.rpc,
           roomId,
           serviceUrl,
-          hasNativeCalls() ? 'legacy' : null,
+          hasNativeCalls()
+            ? 'legacy'
+            : preferences.callMode === 'auto'
+              ? null
+              : preferences.callMode,
           media.camera ? 'video' : 'audio'
         )
       );
       if (attempt !== this.#attemptGeneration) {
-        await this.#client.commands.leaveCall(grant.session).catch(ignoreError);
+        await this.#client.rpc.calls.leave({ session: grant.session }).catch(ignoreError);
         return;
       }
       this.#session = grant.session;
@@ -289,18 +313,40 @@ export class CallSession {
       }
       this.#media = transport;
       this.#livekit = isLivekit(transport) ? transport : undefined;
+      const transportKind = this.#livekit
+        ? 'livekit-web'
+        : grant.backends?.length
+          ? 'livekit-multi'
+          : 'native';
+      recordCallDebug({
+        requested: preferences.callMode,
+        nativeForced: hasNativeCalls(),
+        mode: grant.mode ?? 'legacy',
+        reason: grant.modeReason,
+        stickyAvailable: grant.stickyAvailable,
+        peerModes: grant.peerModes ?? [],
+        transport: transportKind,
+        backendCount: grant.backends?.length ?? 0,
+        encrypted: grant.encryptMedia,
+      });
       telemetry.event('call.transport.selected', {
-        'call.transport': this.#livekit
-          ? 'livekit-web'
-          : grant.backends?.length
-            ? 'livekit-multi'
-            : 'native',
+        'call.transport': transportKind,
         'call.mode': grant.mode ?? 'legacy',
+        'call.mode_reason': grant.modeReason ?? 'unknown',
+        'call.sticky_available': grant.stickyAvailable ?? false,
+        'call.peer_modes': (grant.peerModes ?? []).join(',') || 'none',
         'call.backend_count': grant.backends?.length ?? 0,
         'call.encryption_requested': grant.encryptMedia,
       });
       this.#unsubscribeTransport = transport.subscribe((state) => {
         this.transport = state;
+        const sharing = state.connection === 'connected' && state.screenShareEnabled;
+        if (sharing !== this.#screenSharing && this.#session !== undefined) {
+          this.#screenSharing = sharing;
+          void this.#client.rpc.calls
+            .setScreenSharing({ session: this.#session, active: sharing })
+            .catch(ignoreError);
+        }
         if (state.connection !== this.#transportConnection) {
           this.#transportConnection = state.connection;
           telemetry.event('call.transport.state', { 'call.connection': state.connection });
@@ -379,6 +425,7 @@ export class CallSession {
 
       this.lifecycle = 'active';
       this.connectedAt = Date.now();
+      void playSound('call_join');
       telemetry.finish('connected');
     } catch (error) {
       if (attempt !== this.#attemptGeneration) return;
@@ -400,6 +447,7 @@ export class CallSession {
     this.roomId = null;
     this.connectedAt = null;
     this.clearDeviceError();
+    void playSound('call_leave');
   }
 
   clearFailure(): void {
@@ -441,7 +489,9 @@ export class CallSession {
       this.deafened = false;
       this.#micBeforeDeafen = undefined;
     }
+    setPreference('callMicrophoneMuted', !enabled);
     await this.#device('microphone', () => this.#media?.setMicrophoneEnabled(enabled));
+    void playSound(enabled ? 'mic_on' : 'mic_off');
   }
 
   async setParticipantVolume(identity: string, volume: number): Promise<void> {
@@ -452,6 +502,8 @@ export class CallSession {
     if (deafened === this.deafened) return;
     this.deafened = deafened;
     if (!this.#media) return;
+
+    void playSound(deafened ? 'deafen_on' : 'deafen_off');
     if (deafened) {
       this.#micBeforeDeafen = this.transport.microphoneEnabled;
       if (this.#micBeforeDeafen) {
@@ -480,16 +532,24 @@ export class CallSession {
 
   async setCameraEnabled(enabled: boolean): Promise<void> {
     await this.#device('camera', () => this.#media?.setCameraEnabled(enabled));
+    void playSound(enabled ? 'camera_on' : 'camera_off');
   }
 
   async toggleScreenShare(): Promise<void> {
     if (this.transport.screenShareEnabled) {
-      await this.setScreenShareEnabled(false);
+      await this.#stopScreenShare();
+      void playSound('screenshare_stop');
       return;
     }
-    const monitors = hdrShareSupported() ? await listHdrMonitors().catch(() => []) : [];
+    const monitors = hdrShareSupported()
+      ? await listHdrMonitors().catch((error: unknown) => {
+          console.debug('[sable call] could not list HDR monitors', error);
+          return [];
+        })
+      : [];
     if (monitors.length > 0) this.choosingScreenSource = monitors;
     else await this.shareScreenFrom(null);
+    void playSound('screenshare_start');
   }
 
   async shareScreenFrom(source: ScreenSource | null): Promise<void> {
@@ -516,10 +576,8 @@ export class CallSession {
     );
   }
 
-  async setScreenShareEnabled(enabled: boolean, audio?: ScreenAudioChoice): Promise<void> {
-    await this.#device('screen', () =>
-      this.#media?.capabilities.screenShare?.setEnabled(enabled, audio)
-    );
+  async #stopScreenShare(): Promise<void> {
+    await this.#device('screen', () => this.#media?.capabilities.screenShare?.setEnabled(false));
   }
 
   #classify(error: unknown): CallFailure {
@@ -689,18 +747,16 @@ export class CallSession {
       );
     } catch (error) {
       this.#telemetry?.failure('call.transport.disconnect', error);
-      ignoreError();
     }
 
     const session = this.#session;
     if (session !== undefined && !this.#backendEnded) {
       try {
         await this.#telemetry?.step('call.signaling.leave', () =>
-          this.#client.commands.leaveCall(session)
+          this.#client.rpc.calls.leave({ session })
         );
       } catch (error) {
         this.#telemetry?.failure('call.signaling.leave', error);
-        ignoreError();
       }
     }
 
@@ -717,6 +773,7 @@ export class CallSession {
     this.#grant = undefined;
     this.listenOnly = false;
     this.#session = undefined;
+    this.#screenSharing = false;
     this.#buffer = [];
     this.#pendingKeys = [];
     this.#ownKeyPending = false;

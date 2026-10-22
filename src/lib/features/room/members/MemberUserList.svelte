@@ -8,6 +8,7 @@
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
 
   import MemberIdentityRow from './MemberIdentityRow.svelte';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
 
   interface Props {
     title: string;
@@ -26,8 +27,8 @@
     userIds,
     members,
     onMemberProfile,
-    emptyTitle = $i18n.t('timeline.noReceipts'),
-    closeLabel = $i18n.t('timeline.closeMembers'),
+    emptyTitle = i18n.t('timeline.noReceipts'),
+    closeLabel = i18n.t('timeline.closeMembers'),
     onClose,
     showHeader = true,
     secondary: secondaryContent,
@@ -48,7 +49,7 @@
   {#if userIds.length === 0}
     <EmptyState title={emptyTitle} />
   {:else}
-    <ul class:flush={!showHeader}>
+    <ul class={{ flush: !showHeader }} {@attach scrollHint}>
       {#each userIds as userId (userId)}
         <li>
           <MemberIdentityRow class="member" {userId} {members} onProfile={onMemberProfile}>

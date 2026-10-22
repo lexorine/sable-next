@@ -26,6 +26,9 @@
   import type { Component } from 'svelte';
 
   import { i18n } from '#lib/i18n.js';
+  import { formatBinding } from '#lib/ui/shortcuts/binding.js';
+  import { bindingFor } from '#lib/ui/shortcuts/bindings.svelte.js';
+  import { isMacPlatform } from '#lib/ui/shortcuts/global-shortcuts.js';
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
   import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
 
@@ -67,20 +70,25 @@
     { action: 'details', label: 'composer.details', icon: CaretCircleDownIcon },
   ];
 
-  const primaryActions: FormatAction[] = [
+  const primaryActions: ReadonlySet<FormatAction> = new Set([
     'strong',
     'em',
     'link',
     'bullet_list',
     'ordered_list',
     'blockquote',
-  ];
+  ]);
   let available = $derived(
     markdown ? buttons.filter((button) => MARKDOWN_FORMATS.includes(button.action)) : buttons
   );
-  let primary = $derived(available.filter((button) => primaryActions.includes(button.action)));
-  let secondary = $derived(available.filter((button) => !primaryActions.includes(button.action)));
+  let primary = $derived(available.filter((button) => primaryActions.has(button.action)));
+  let secondary = $derived(available.filter((button) => !primaryActions.has(button.action)));
   let visible = $derived([...primary, ...secondary]);
+
+  function withShortcut(label: string, id: string): string {
+    const binding = bindingFor(id);
+    return binding ? `${label} (${formatBinding(binding, isMacPlatform())})` : label;
+  }
 
   function scrollSideways(event: WheelEvent & { currentTarget: HTMLDivElement }): void {
     const bar = event.currentTarget;
@@ -94,11 +102,11 @@
 <div
   class="formatting"
   role="group"
-  aria-label={$i18n.t('composer.formatting')}
+  aria-label={i18n.t('composer.formatting')}
   onwheel={scrollSideways}
 >
   {#each visible as button (button.action)}
-    <Tooltip label={$i18n.t(button.label)}>
+    <Tooltip label={withShortcut(i18n.t(button.label), `composer.${button.action}`)}>
       {#snippet trigger({ props })}
         <IconButton
           {...mergeProps(props, {
@@ -109,7 +117,7 @@
           variant="ghost"
           size="small"
           class="format-button choice"
-          label={$i18n.t(button.label)}
+          label={i18n.t(button.label)}
           aria-pressed={active.includes(button.action)}
         >
           <button.icon />
@@ -118,28 +126,28 @@
     </Tooltip>
   {/each}
   <ComposerColorButton
-    label={$i18n.t('composer.textColor')}
+    label={i18n.t('composer.textColor')}
     icon={TextTIcon}
     value={colors.fg}
     removable={!markdown}
     onPick={(value) => onColor('fg', value)}
   />
   <ComposerColorButton
-    label={$i18n.t('composer.highlightColor')}
+    label={i18n.t('composer.highlightColor')}
     icon={HighlighterIcon}
     value={colors.bg}
     removable={!markdown}
     onPick={(value) => onColor('bg', value)}
   />
   {#if source || !markdown}
-    <Tooltip label={$i18n.t('composer.markdownSource')}>
+    <Tooltip label={withShortcut(i18n.t('composer.markdownSource'), 'composer.toggleSource')}>
       {#snippet trigger({ props })}
         <IconButton
           {...mergeProps(props, { onclick: onToggleSource })}
           variant="ghost"
           size="small"
           class="format-button choice"
-          label={$i18n.t('composer.markdownSource')}
+          label={i18n.t('composer.markdownSource')}
           aria-pressed={source}
         >
           {#if source}

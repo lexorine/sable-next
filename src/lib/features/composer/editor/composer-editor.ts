@@ -10,7 +10,7 @@ import { dropCursor } from 'prosemirror-dropcursor';
 import { gapCursor } from 'prosemirror-gapcursor';
 import { history, redo, undo } from 'prosemirror-history';
 import { inputRules, undoInputRule } from 'prosemirror-inputrules';
-import { keymap } from 'prosemirror-keymap';
+import { keydownHandler, keymap } from 'prosemirror-keymap';
 import { Slice, type Node as ProseMirrorNode, type ResolvedPos } from 'prosemirror-model';
 import {
   Plugin,
@@ -23,9 +23,7 @@ import {
 import { Decoration, DecorationSet, EditorView } from 'prosemirror-view';
 import { untrack } from 'svelte';
 
-/* ProseMirror's own stylesheet is load-bearing, not cosmetic: it hides the
-   native caret and selection while a node selection is up, and disables the
-   ligatures that would otherwise misplace the caret in Nunito. */
+/* Hides the native caret on a node selection and disables ligatures that misplace it in Nunito. */
 import 'prosemirror-view/style/prosemirror.css';
 import 'prosemirror-gapcursor/style/gapcursor.css';
 
@@ -33,17 +31,21 @@ import type { PackImageView } from '#src/generated/protocol';
 
 import { enterInsertsNewline } from '#lib/settings/enter-key.svelte.js';
 import { preferences } from '#lib/settings/preferences.svelte.js';
+import { toProseMirrorKey } from '#lib/ui/shortcuts/binding.js';
+import { bindingFor } from '#lib/ui/shortcuts/bindings.svelte.js';
+import type { ShortcutId } from '#lib/ui/shortcuts/shortcuts.js';
 import type { AutocompleteQuery } from '../autocomplete';
-import { filesFrom } from '../composer-files';
+import { filesFrom } from '#lib/composer/composer-files.js';
+import { autolinks } from './autolinks';
 import { compositionInputRules } from './composition-rules';
 import {
   activeColors,
   activeMarks,
-  autolinkAtCursor,
   colorCommand,
   formatCommands,
   formattingInputRules,
   formattingKeymap,
+  formattingShortcuts,
   insideListItem,
   joinListItemBackward,
   sinkListEntry,
@@ -53,17 +55,18 @@ import {
   type FormatAction,
 } from './formatting';
 import { markdownColorCommand, markdownFormatCommands, markdownLink } from './markdown-format';
-import { lineDivsAsBreaks } from './pasted-lines';
+import { lineDivsAsBreaks, openLoneParagraph } from './pasted-lines';
 import { withPastedMentions } from './pasted-mentions';
 import type { EmoteMedia } from './node-views';
 import { composerMarkViews, composerNodeViews } from './node-views';
 import { hasAndroidCompositionQuirk, hasIosKeyboardContextQuirk } from '#lib/platform/input.js';
 
 import { filesFromSources, pastedImageSources } from './pasted-images';
+import { mathInputRule } from './math';
 import { mfmTimeInputRule } from './mfm';
 import { traceComposerInput } from './input-trace';
 import { queryKey, queryPlugin } from './query-plugin';
-import { composerSchema, parseMatrixHtml } from './schema';
+import { codeLanguage, composerSchema, parseMatrixHtml } from './schema';
 import {
   composerMarkdown,
   markdownFromSlice,
@@ -74,6 +77,21 @@ import {
   textSlice,
 } from './serialize';
 import { shortcodeInputRule } from './shortcodes';
+
+function shortcutKeymap(commands: Partial<Record<ShortcutId, Command>>): Plugin {
+  return new Plugin({
+    props: {
+      handleKeyDown(view, event) {
+        const map: Record<string, Command> = {};
+        for (const [id, command] of Object.entries(commands)) {
+          const binding = bindingFor(id);
+          if (binding) map[toProseMirrorKey(binding)] = command;
+        }
+        return keydownHandler(map)(view, event);
+      },
+    },
+  });
+}
 
 const androidBackspaceKeyEvent = (): KeyboardEvent =>
   new KeyboardEvent('keydown', {
@@ -89,13 +107,13 @@ function handleAndroidDeleteBackward(view: EditorView): void {
   if (!cursor || cursor.pos <= 0) return;
 
   const position = cursor.pos;
-  const contentSize = view.state.doc.content.size;
+  const doc = view.state.doc;
   window.setTimeout(() => {
     // The IME already changed the DOM, so let ProseMirror's observer handle it.
     const cursorAfter =
       view.state.selection instanceof TextSelection ? view.state.selection.$cursor : null;
     if (!cursorAfter || cursorAfter.pos !== position) return;
-    if (view.state.doc.content.size !== contentSize) return;
+    if (!view.state.doc.eq(doc)) return;
     if (view.someProp('handleKeyDown', (handler) => handler(view, androidBackspaceKeyEvent())))
       return;
     view.dispatch(view.state.tr.delete(position - 1, position));
@@ -103,8 +121,9 @@ function handleAndroidDeleteBackward(view: EditorView): void {
 }
 
 const insertHardBreak: Command = (state, dispatch) => {
-  const tr = autolinkAtCursor(state) ?? state.tr;
-  dispatch?.(tr.replaceSelectionWith(composerSchema.nodes.hard_break.create()).scrollIntoView());
+  dispatch?.(
+    state.tr.replaceSelectionWith(composerSchema.nodes.hard_break.create()).scrollIntoView()
+  );
   return true;
 };
 
@@ -229,7 +248,9 @@ const openFence: Command = (state, dispatch) => {
       position = lineStart + 1;
     }
     dispatch(
-      tr.setBlockType(position, position, codeBlock, { language: match[1] }).scrollIntoView()
+      tr
+        .setBlockType(position, position, codeBlock, { language: codeLanguage(match[1]) })
+        .scrollIntoView()
     );
   }
   return true;
@@ -426,8 +447,20 @@ function trailingParagraph(): Plugin {
   return new Plugin({
     appendTransaction: (transactions, _old, state) => {
       if (!transactions.some((tr) => tr.docChanged)) return null;
-      const last = state.doc.lastChild;
-      if (!last || last.type === composerSchema.nodes.paragraph) return null;
+      const { doc } = state;
+      const last = doc.lastChild;
+      if (!last) return null;
+      if (last.type === composerSchema.nodes.paragraph) {
+        let from = doc.content.size;
+        for (let index = doc.childCount - 1; index > 0; index -= 1) {
+          const child = doc.child(index);
+          const before = doc.child(index - 1);
+          if (child.content.size > 0 || before.type !== child.type || before.content.size > 0)
+            break;
+          from -= child.nodeSize;
+        }
+        return from === doc.content.size ? null : state.tr.delete(from, doc.content.size);
+      }
       if (last.type === composerSchema.nodes.code_block) return null;
       const tr = state.tr.insert(state.doc.content.size, composerSchema.nodes.paragraph.create());
       for (const plugin of state.plugins) {
@@ -459,6 +492,12 @@ function documentEdgeGuard(): Plugin {
           event.preventDefault();
           if (!event.shiftKey && !selection.eq(edge)) {
             view.dispatch(view.state.tr.setSelection(edge));
+          } else if (
+            !left &&
+            selection.empty &&
+            (view.state.storedMarks ?? selection.$from.marks()).length > 0
+          ) {
+            view.dispatch(view.state.tr.setStoredMarks([]));
           }
           return true;
         },
@@ -534,6 +573,38 @@ const outdentCode: Command = (state, dispatch) => {
   }
   return true;
 };
+
+function stepIntoBlankLine(direction: -1 | 1): Command {
+  return (state, dispatch, view) => {
+    const { $from, empty } = state.selection;
+    const { hard_break: hardBreak } = composerSchema.nodes;
+    if (!empty || !view || $from.parent.type !== composerSchema.nodes.paragraph) return false;
+    const pos = $from.pos;
+    let target: number;
+    if (direction < 0) {
+      const start = softLineStart($from);
+      if (start === $from.start()) return false;
+      const breakAt = start - 1;
+      const above = state.doc.resolve(breakAt);
+      if (breakAt !== $from.start() && above.nodeBefore?.type !== hardBreak) return false;
+      if (pos !== start && view.coordsAtPos(pos).top !== view.coordsAtPos(start).top) return false;
+      target = breakAt;
+    } else {
+      let breakAt = -1;
+      $from.parent.forEach((child, offset) => {
+        const at = $from.start() + offset;
+        if (breakAt < 0 && at >= pos && child.type === hardBreak) breakAt = at;
+      });
+      if (breakAt < 0 || state.doc.nodeAt(breakAt + 1)?.type !== hardBreak) return false;
+      if (pos !== breakAt && view.coordsAtPos(pos).top !== view.coordsAtPos(breakAt, -1).top) {
+        return false;
+      }
+      target = breakAt + 1;
+    }
+    dispatch?.(state.tr.setSelection(TextSelection.create(state.doc, target)).scrollIntoView());
+    return true;
+  };
+}
 
 function leaveCodeBlock(direction: -1 | 1): Command {
   return (state, dispatch, view) => {
@@ -622,6 +693,7 @@ export class ComposerEditor {
   private pillSpace: number | null = null;
   private androidDelete: { pos: number; at: number } | null = null;
   private iosEnter: { shift: boolean; handled: boolean } | null = null;
+  private shiftHeld = false;
   private keyboardReset: HTMLTextAreaElement | undefined;
   private keyboardResetFrame: number | undefined;
 
@@ -680,8 +752,8 @@ export class ComposerEditor {
       'aria-expanded': activeOption === null ? 'false' : 'true',
       ...(activeOption === null ? {} : { 'aria-activedescendant': activeOption }),
       /* No `aria-multiline`: it is a textbox property, invalid on a combobox. */
-      spellcheck: 'true',
-      autocapitalize: 'sentences',
+      spellcheck: preferences.composerSpellcheck ? 'true' : 'false',
+      autocapitalize: preferences.composerAutocapitalize ? 'sentences' : 'off',
       enterkeyhint: !enterInsertsNewline() ? 'send' : 'enter',
       ...(this.options.describedBy ? { 'aria-describedby': this.options.describedBy } : {}),
     };
@@ -700,22 +772,31 @@ export class ComposerEditor {
         rules: [
           shortcodeInputRule(this.options.emotes),
           ...(rich
-            ? [mfmTimeInputRule(composerSchema.nodes.mfm_time), ...formattingInputRules]
+            ? [
+                mfmTimeInputRule(composerSchema.nodes.mfm_time),
+                mathInputRule(composerSchema.nodes.math_inline),
+                ...formattingInputRules,
+              ]
             : []),
         ],
       }),
       compositionInputRules(),
-      ...(rich
-        ? [
-            keymap(formattingKeymap),
-            keymap({
-              'Mod-Shift-k': () => {
+      ...(rich ? [autolinks(), keymap(formattingKeymap)] : []),
+      shortcutKeymap({
+        ...(rich
+          ? {
+              ...formattingShortcuts,
+              'composer.link': () => {
                 this.options.onLinkRequest();
                 return true;
               },
-            }),
-          ]
-        : []),
+            }
+          : {}),
+        'composer.toggleSource': () => {
+          this.options.onSourceToggle(this.toggleSource());
+          return true;
+        },
+      }),
       gapCursor(),
       dropCursor(),
       trailingParagraph(),
@@ -734,10 +815,12 @@ export class ComposerEditor {
         ArrowUp: (state, dispatch, view) =>
           this.options.onNavigate('ArrowUp') ||
           leaveCodeBlock(-1)(state, dispatch, view) ||
+          stepIntoBlankLine(-1)(state, dispatch, view) ||
           moveToDocumentEdge('up')(state, dispatch, view),
         ArrowDown: (state, dispatch, view) =>
           this.options.onNavigate('ArrowDown') ||
           leaveCodeBlock(1)(state, dispatch, view) ||
+          stepIntoBlankLine(1)(state, dispatch, view) ||
           moveToDocumentEdge('down')(state, dispatch, view),
         'Shift-ArrowUp': chainCommands(escapeCodeBlock(-1), enterCodeBlock(-1)),
         'Shift-ArrowDown': chainCommands(escapeCodeBlock(1), enterCodeBlock(1)),
@@ -746,14 +829,9 @@ export class ComposerEditor {
           indentCode(this.markdownMode())(state, dispatch, view) ||
           sinkListEntry(state, dispatch, view),
         'Shift-Tab': outdentCode,
-        Escape: () => this.options.onNavigate('Escape'),
         Enter: this.enter,
         'Shift-Enter': this.shiftEnter,
         'Mod-Enter': () => this.submit(),
-        'Mod-Shift-m': () => {
-          this.options.onSourceToggle(this.toggleSource());
-          return true;
-        },
       }),
       keymap(baseKeymap),
     ];
@@ -808,7 +886,8 @@ export class ComposerEditor {
             this.linkSelection(pasteView, slice) ||
             this.pasteAsText(pasteView, event),
           transformPastedHTML: lineDivsAsBreaks,
-          transformPasted: (slice, pasteView) => this.pastedMentions(pasteView.state, slice),
+          transformPasted: (slice, pasteView) =>
+            this.pastedMentions(pasteView.state, openLoneParagraph(slice)),
           clipboardTextParser: (text, _context, plain) => {
             return plain || this.source || !preferences.richTextComposer
               ? textSlice(text)
@@ -831,10 +910,28 @@ export class ComposerEditor {
           clipboardTextSerializer: (slice) => markdownFromSlice(slice),
           handleDrop: (_view, event) => this.handleFiles(filesFrom(event.dataTransfer)),
           handleDOMEvents: {
-            keydown: (_view, event) => {
-              if (event.key === 'Enter' && hasIosKeyboardContextQuirk()) {
-                this.iosEnter = { shift: event.shiftKey, handled: false };
+            blur: (blurView) => {
+              const selection = getSelection();
+              if (selection?.anchorNode && blurView.dom.contains(selection.anchorNode)) {
+                selection.removeAllRanges();
               }
+              return false;
+            },
+            keydown: (_view, event) => {
+              if (event.key === 'Escape' && !event.isComposing) {
+                if (this.options.onNavigate('Escape')) event.preventDefault();
+                return true;
+              }
+              /* iOS can drop the Shift keyup. */
+              if (event.key === 'Shift') this.shiftHeld = true;
+              else if (!event.shiftKey) this.shiftHeld = false;
+              if (event.key === 'Enter' && hasIosKeyboardContextQuirk()) {
+                this.iosEnter = { shift: event.shiftKey && this.shiftHeld, handled: false };
+              }
+              return false;
+            },
+            keyup: (_view, event) => {
+              if (event.key === 'Shift') this.shiftHeld = false;
               return false;
             },
             beforeinput: (view, event) => {
@@ -1118,6 +1215,10 @@ export class ComposerEditor {
     const text = slice.content.textBetween(0, slice.content.size).trim();
     if (!URL_ONLY.test(text) || view.state.selection.empty) return false;
 
+    if (this.markdownMode()) {
+      view.dispatch(view.state.tr.replaceSelectionWith(markdownLink(view.state, text), false));
+      return true;
+    }
     const { from, to } = view.state.selection;
     view.dispatch(
       view.state.tr.addMark(from, to, composerSchema.marks.link.create({ href: text }))
@@ -1133,6 +1234,10 @@ export class ComposerEditor {
       if (line !== '') content.push(composerSchema.text(line));
     }
     this.setDoc(composerSchema.node('doc', null, paragraph.create(null, content)));
+  }
+
+  setLines(text: string): void {
+    this.setSource(text.replaceAll(/\r\n?/g, '\n'));
   }
 
   setText(text: string): void {

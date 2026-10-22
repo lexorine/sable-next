@@ -10,44 +10,47 @@
   import '../styles.css';
   import { createCoreClient } from '#lib/core/client.svelte.js';
   import { provideCoreClient } from '#lib/core/context.js';
-  import BannerDock from '#lib/ui/BannerDock.svelte';
   import TooltipProvider from '#lib/ui/primitives/TooltipProvider.svelte';
   import TitleBar from '#lib/ui/TitleBar.svelte';
-  import CoreHealthBanner from '#lib/ui/CoreHealthBanner.svelte';
   import SessionRestoreError from '#lib/ui/SessionRestoreError.svelte';
-  import AccountLocked from '#lib/ui/AccountLocked.svelte';
-  import DesktopUpdateBanner from '#lib/ui/DesktopUpdateBanner.svelte';
-  import WebUpdateBanner from '#lib/ui/WebUpdateBanner.svelte';
-  import RecoveryIncompleteBanner from '#lib/ui/RecoveryIncompleteBanner.svelte';
-  import UnverifiedDeviceBanner from '#lib/ui/UnverifiedDeviceBanner.svelte';
+  import AccountLocked from '#lib/features/sidebar/AccountLocked.svelte';
   import favicon from '#lib/assets/favicon.png';
   import { trackKeyboardInset } from '#lib/platform/keyboard.js';
   import { trackInspectorShortcut } from '#lib/platform/devtools.js';
+  import { trackZoomShortcuts } from '#lib/platform/zoom-shortcuts.js';
   import { suppressNativeContextMenu } from '#lib/platform/context-menu.js';
   import { blockEdgeNavigation } from '#lib/platform/edge-navigation.js';
+  import { systemDark } from '#lib/platform/system-theme.js';
   import { hostsServiceWorker, registerServiceWorker } from '#lib/platform/service-worker.js';
   import { notificationPermalink } from '#lib/features/notifications/notification-link.js';
   import { guardTouchClicks } from '#lib/ui/trailing-click.js';
   import {
     applyDesktopWindowSettings,
+    setWindowFullscreen,
+    supportsDesktopWindow,
     titleBarKind,
-    type TitleBarKind,
   } from '#lib/platform/window-decorations.js';
+  import { electronBridge } from '#lib/platform/electron.js';
   import { runtimeConfig } from '#lib/config/runtime-config.js';
   import { applyDeploymentDefaults, preferences } from '#lib/settings/preferences.svelte.js';
   import {
     activeCustomThemeCss,
     activeTweakCss,
+    hydrateCatalogThemes,
+    updateCatalogThemes,
     themePreview,
   } from '#lib/settings/custom-themes.svelte.js';
   import {
     applyCustomTheme,
     applyCustomTweaks,
+    applyFontFamily,
+    applyFontFamilyMono,
     applyQuickCss,
     applyTheme,
     resolveTheme,
   } from '#lib/settings/theme.js';
   import { shouldReduceMotion } from '#lib/ui/motion.js';
+  import { ALERT_MODULES, provideAlertProviders } from '#lib/features/sidebar/alerts.js';
 
   interface Props {
     children: Snippet;
@@ -56,16 +59,12 @@
   let { children }: Props = $props();
   const core = createCoreClient();
   provideCoreClient(core);
-  let systemPrefersDark = $state(false);
-  let titlebar = $state<TitleBarKind | null>(null);
+  const alertProviders = ALERT_MODULES.map((component) => component.priorityProvider());
+  provideAlertProviders(alertProviders);
+  let titlebar = $derived(titleBarKind(preferences.useCustomTitleBar));
 
   onMount(() => {
-    const media = window.matchMedia('(prefers-color-scheme: dark)');
-    const updateSystemTheme = (): void => {
-      systemPrefersDark = media.matches;
-    };
-    updateSystemTheme();
-    const stopListening = on(media, 'change', updateSystemTheme);
+    void hydrateCatalogThemes().then(updateCatalogThemes);
 
     if (isTauri()) {
       document.documentElement.dataset.tauriOs = osType();
@@ -74,6 +73,7 @@
     const stopTrackingKeyboard = trackKeyboardInset();
     const stopGuardingClicks = guardTouchClicks();
     const stopInspectorShortcut = trackInspectorShortcut();
+    const stopZoomShortcuts = trackZoomShortcuts();
     const stopSuppressingContextMenu = suppressNativeContextMenu();
     const stopBlockingEdgeNavigation = blockEdgeNavigation();
     void registerServiceWorker();
@@ -82,10 +82,10 @@
     });
     void core.start();
     return () => {
-      stopListening();
       stopTrackingKeyboard();
       stopGuardingClicks();
       stopInspectorShortcut();
+      stopZoomShortcuts();
       stopSuppressingContextMenu();
       stopBlockingEdgeNavigation();
       core.stop();
@@ -101,21 +101,32 @@
         | { type?: string; roomId?: string; userId?: string; eventId?: string }
         | undefined;
       if (message?.type !== 'sable:open-room' || message.roomId === undefined) return;
+      // eslint-disable-next-line svelte/no-navigation-without-resolve -- notificationPermalink() resolves the route itself
       void goto(notificationPermalink(message.roomId, message.eventId, message.userId));
     });
   });
 
   $effect(() => {
-    const kind = titleBarKind(preferences.useCustomTitleBar);
-    titlebar = kind;
-    document.documentElement.dataset.clientDecorations = kind === null ? 'off' : kind;
+    document.documentElement.dataset.clientDecorations = titlebar ?? 'off';
 
     void applyDesktopWindowSettings({
       closeToTray: preferences.closeToTray,
+      minimizeToTray: preferences.minimizeToTray,
       showSystemTrayIcon: preferences.showSystemTrayIcon,
       useCustomTitleBar: preferences.useCustomTitleBar,
+      smoothScrolling: preferences.smoothScrolling,
     }).catch((error: unknown) => {
       console.debug('[sable window] the desktop window settings were not applied', error);
+    });
+  });
+
+  $effect(() => {
+    electronBridge()?.applySettings({
+      hardwareAcceleration: preferences.hardwareAcceleration,
+      hardwareVideoAcceleration: preferences.hardwareVideoAcceleration,
+      smoothScrolling: preferences.smoothScrolling,
+      webRtcIpPolicy: preferences.webRtcIpPolicy,
+      updateChannel: preferences.updateChannel,
     });
   });
 
@@ -125,6 +136,7 @@
     document.documentElement.dataset.highContrast = preferences.highContrast ? 'on' : 'off';
     document.documentElement.dataset.reducedMotion = shouldReduceMotion() ? 'on' : 'off';
     document.documentElement.dataset.twitterEmoji = preferences.twitterEmoji ? 'on' : 'off';
+    document.documentElement.dataset.codeLigatures = preferences.codeLigatures ? 'on' : 'off';
     document.documentElement.dataset.blurMedia = preferences.blurMedia ? 'on' : 'off';
     document.documentElement.dataset.blurAvatars = preferences.blurAvatars ? 'on' : 'off';
     document.documentElement.dataset.blurEmotes = preferences.blurEmotes ? 'on' : 'off';
@@ -133,12 +145,12 @@
   $effect(() => {
     const preview = themePreview.current;
     if (preview) {
-      applyTheme(preview.kind, systemPrefersDark);
+      applyTheme(preview.kind, systemDark.current);
       applyCustomTheme(preview.css);
       return;
     }
-    applyTheme(preferences.theme, systemPrefersDark);
-    applyCustomTheme(activeCustomThemeCss(resolveTheme(preferences.theme, systemPrefersDark)));
+    applyTheme(preferences.theme, systemDark.current);
+    applyCustomTheme(activeCustomThemeCss(resolveTheme(preferences.theme, systemDark.current)));
   });
 
   $effect(() => {
@@ -148,7 +160,25 @@
   $effect(() => {
     applyQuickCss(preferences.quickCss);
   });
+
+  $effect(() => {
+    applyFontFamily(preferences.fontFamily);
+    applyFontFamilyMono(preferences.fontFamilyMono);
+  });
 </script>
+
+<svelte:window ononline={() => void hydrateCatalogThemes()} />
+<svelte:document
+  onvisibilitychange={() => {
+    if (document.visibilityState === 'visible') void updateCatalogThemes();
+  }}
+  onfullscreenchange={() => {
+    if (!supportsDesktopWindow()) return;
+    setWindowFullscreen(document.fullscreenElement !== null).catch((error: unknown) => {
+      console.debug('[sable window] the window fullscreen state was not applied', error);
+    });
+  }}
+/>
 
 <svelte:head>
   <title>Sable</title>
@@ -160,15 +190,6 @@
 <IconContext values={{ 'aria-hidden': true }}>
   {#if titlebar}
     <TitleBar kind={titlebar} />
-  {/if}
-  <CoreHealthBanner />
-  {#if !core.accountLocked}
-    <BannerDock>
-      <UnverifiedDeviceBanner />
-      <RecoveryIncompleteBanner />
-      <DesktopUpdateBanner />
-      <WebUpdateBanner />
-    </BannerDock>
   {/if}
 
   <TooltipProvider>

@@ -14,8 +14,7 @@ vi.mock('#lib/i18n.js', () => import('#lib/test-support/i18n.js'));
 vi.mock('#lib/platform/system-bars.js', () => ({ setSystemBarsHidden: vi.fn() }));
 
 import MediaViewer from './MediaViewer.svelte';
-import { resetVideoStreaming } from '#lib/ui/video-stream.svelte.js';
-import { resetVideoSupport } from '#lib/ui/video-support.js';
+import { spoilerVisibility, spoilerVisibilityKey } from './spoiler-visibility.svelte.js';
 import { toasts } from '#lib/ui/toasts.svelte.js';
 import { setSystemBarsHidden } from '#lib/platform/system-bars.js';
 
@@ -49,6 +48,7 @@ const videoItem: MediaItem = {
   blurhash: null,
   thumbnail: null,
   spoiler: null,
+  playback: null,
   eventId: '$video',
   sender: 'Alice',
 };
@@ -83,6 +83,7 @@ function rect(width: number, height: number): DOMRect {
 }
 
 afterEach(() => {
+  spoilerVisibility.clear();
   core.fetchMedia.mockReset();
   vi.restoreAllMocks();
 });
@@ -153,6 +154,21 @@ test('a spoiler opened in the viewer loads blurred without exposing its caption'
   expect(document.querySelector('.stage img')).not.toHaveClass('spoilered');
 });
 
+test('a spoiler already revealed in the timeline opens unblurred', async () => {
+  core.fetchMedia.mockResolvedValue(new Uint8Array(new ArrayBuffer()));
+  spoilerVisibility.set(
+    spoilerVisibilityKey('$image', 'mxc://example.org/spoiler', 'Ending'),
+    false
+  );
+  render(MediaViewer, {
+    items: [{ ...imageItem, source: 'mxc://example.org/spoiler', spoiler: 'Ending' }],
+    selectedEventId: '$image',
+    onClose: () => {},
+  });
+  expect(await screen.findByRole('img')).not.toHaveClass('spoilered');
+  expect(document.querySelector('.stage .media-image-spoiler')).not.toBeInTheDocument();
+});
+
 test('an ordinary viewer image can be locally hidden and revealed without closing', async () => {
   core.fetchMedia.mockResolvedValue(new Uint8Array(new ArrayBuffer()));
   const onClose = vi.fn();
@@ -178,7 +194,9 @@ test('a hidden video still waits for reveal before fetching', async () => {
   await tick();
   expect(core.fetchMedia).not.toHaveBeenCalled();
   await user.click(screen.getByRole('button', { name: /Ending/ }));
-  await vi.waitFor(() => expect(document.querySelector('video')).toBeInTheDocument());
+  await vi.waitFor(() => {
+    expect(document.querySelector('video')).toBeInTheDocument();
+  });
 });
 
 test('renders an audio attachment with a player', async () => {
@@ -203,7 +221,7 @@ test('jumps to the selected message from More', async () => {
   });
 
   await user.click(screen.getByRole('button', { name: 'timeline.moreActions' }));
-  await user.click(await screen.findByRole('menuitem', { name: 'viewer.jumpToMessage' }));
+  await user.click(await screen.findByRole('menuitem', { name: 'common.jumpToMessage' }));
 
   expect(onJump).toHaveBeenCalledExactlyOnceWith('$image');
 });
@@ -336,6 +354,39 @@ test('holding the mouse on a fitted image shows a lens that the wheel zooms and 
 
   await user.pointer({ keys: '[/MouseLeft]', target: img });
   expect(lens()).toBeNull();
+});
+
+test('the lens keeps its size and zoom for the next image', async () => {
+  stubRects(rect(800, 600), rect(800, 600));
+  core.fetchMedia.mockResolvedValue(new Uint8Array(new ArrayBuffer()));
+  const lens = () => document.querySelector<HTMLElement>('.lens');
+  const lensImage = () => document.querySelector<HTMLElement>('.lens img');
+  const hold = async (img: HTMLElement) =>
+    user.pointer({ keys: '[MouseLeft>]', target: img, coords: { clientX: 200, clientY: 150 } });
+
+  const first = render(MediaViewer, {
+    items: [imageItem],
+    selectedEventId: '$image',
+    onClose: () => {},
+  });
+  await hold(await screen.findByRole('img'));
+  const size = lens()?.style.width;
+  const zoomed = lensImage()?.style.width;
+  await fireEvent.wheel(stage(), { deltaY: -100 });
+  const shiftWheel = new WheelEvent('wheel', { deltaY: -100, bubbles: true, cancelable: true });
+  Object.defineProperty(shiftWheel, 'shiftKey', { value: true });
+  await fireEvent(stage(), shiftWheel);
+  const tunedSize = lens()?.style.width;
+  const tunedZoom = lensImage()?.style.width;
+  expect(tunedSize).not.toBe(size);
+  expect(tunedZoom).not.toBe(zoomed);
+  first.unmount();
+
+  render(MediaViewer, { items: [imageItem], selectedEventId: '$image', onClose: () => {} });
+  await hold(await screen.findByRole('img'));
+
+  expect(lens()?.style.width).toBe(tunedSize);
+  expect(lensImage()?.style.width).toBe(tunedZoom);
 });
 
 test('a zoomed image pans under the mouse instead of showing the lens', async () => {
@@ -490,48 +541,4 @@ test('closes instead of throwing when the selected media is no longer in the tim
   expect(onClose).toHaveBeenCalled();
   expect(core.fetchMedia).not.toHaveBeenCalled();
   expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
-});
-
-test('revokes the re-encoded stream when the viewer closes', async () => {
-  resetVideoSupport();
-  resetVideoStreaming();
-  vi.spyOn(window.HTMLVideoElement.prototype, 'canPlayType').mockReturnValue('');
-  let next = 0;
-  const revoked: string[] = [];
-  vi.stubGlobal(
-    'URL',
-    Object.assign(globalThis.URL, {
-      createObjectURL: () => `blob:stream-${String(next++)}`,
-      revokeObjectURL: (url: string) => revoked.push(url),
-    })
-  );
-  Object.assign(core, {
-    streamVideo: vi.fn((_source: string, _id: number, onChunk: (chunk: Uint8Array) => void) => {
-      onChunk(new Uint8Array([1]));
-      return Promise.resolve();
-    }),
-    videoStreamMime: vi.fn(() => Promise.resolve('video/webm; codecs="vp9,opus"')),
-  });
-
-  try {
-    const { unmount } = render(MediaViewer, {
-      items: [videoItem],
-      selectedEventId: '$video',
-      onClose: () => {},
-    });
-    await vi.waitFor(() => {
-      expect(document.querySelector('video')?.getAttribute('src')).toBe('blob:stream-0');
-    });
-    expect(revoked).toEqual([]);
-
-    unmount();
-
-    expect(revoked).toEqual(['blob:stream-0']);
-  } finally {
-    vi.unstubAllGlobals();
-    delete (core as Record<string, unknown>).streamVideo;
-    delete (core as Record<string, unknown>).videoStreamMime;
-    resetVideoSupport();
-    resetVideoStreaming();
-  }
 });

@@ -3,11 +3,17 @@
   import PlusIcon from 'phosphor-svelte/lib/PlusIcon';
   import TrashIcon from 'phosphor-svelte/lib/TrashIcon';
 
-  import type { PersonaTriggerView, PersonaView } from '#src/generated/protocol';
+  import type {
+    PersonaTriggerView,
+    PersonaView,
+    PersonaAlternateAvatarView,
+  } from '#src/generated/protocol';
 
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
-  import { formatPronouns, parsePronouns } from '#lib/personas/pronouns.js';
+  import { nativeFilePicker } from '#lib/platform/native-file-picker.js';
+  import { parsePronouns } from '#lib/personas/pronouns.js';
+  import { MAX_PRONOUN_INPUT, pronounText } from '#lib/profile/pronouns.js';
   import Alert from '#lib/ui/primitives/Alert.svelte';
   import Avatar from '#lib/ui/primitives/Avatar.svelte';
   import Button from '#lib/ui/primitives/Button.svelte';
@@ -16,7 +22,8 @@
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
   import Switch from '#lib/ui/primitives/Switch.svelte';
   import TextInput from '#lib/ui/primitives/TextInput.svelte';
-  import ColorSetting from './ColorSetting.svelte';
+  import { hexColorOrEmpty } from '#lib/ui/hex-color.js';
+  import ColorSetting from '#lib/ui/ColorSetting.svelte';
   import { uprightJpeg } from '#lib/ui/upright-jpeg.js';
 
   interface Props {
@@ -34,7 +41,8 @@
   let pronouns = $state('');
   let colorLight = $state('');
   let colorDark = $state('');
-  let triggers = $state<PersonaTriggerView[]>([]);
+  let triggers = $state<(PersonaTriggerView & { id: string })[]>([]);
+  let alternateAvatars = $state<{ id: string; avatar_url: string | null }[]>([]);
   let saving = $state(false);
   let error = $state<string | null>(null);
 
@@ -43,10 +51,12 @@
     untrack(() => {
       name = persona?.display_name ?? '';
       avatarUrl = persona?.avatar_url ?? null;
-      pronouns = formatPronouns(persona?.pronouns ?? []);
+      pronouns = pronounText(persona?.pronouns ?? []);
       colorLight = persona?.color_on_light ?? '';
       colorDark = persona?.color_on_dark ?? '';
-      triggers = persona?.triggers.map((trigger) => ({ ...trigger })) ?? [];
+      triggers =
+        persona?.triggers.map((trigger) => ({ ...trigger, id: crypto.randomUUID() })) ?? [];
+      alternateAvatars = persona?.alternate_avatars ?? [];
       error = null;
     });
   });
@@ -60,31 +70,66 @@
     error = null;
     try {
       const upright = await uprightJpeg(file);
-      avatarUrl = await core.commands.uploadMedia(
+      avatarUrl = await core.media.uploadMedia(
         upright.type || 'image/*',
         new Uint8Array(await upright.arrayBuffer())
       );
     } catch (cause) {
       console.warn('[sable personas] uploading the picture failed', cause);
-      error = $i18n.t('personas.saveFailed');
+      error = i18n.t('personas.saveFailed');
     } finally {
       saving = false;
     }
   }
 
   function addTrigger(): void {
-    triggers = [...triggers, { prefix: '', suffix: null, keep_trigger: false }];
+    triggers = [
+      ...triggers,
+      { prefix: '', suffix: null, keep_trigger: false, id: crypto.randomUUID() },
+    ];
   }
 
   function removeTrigger(index: number): void {
     triggers = triggers.filter((_, position) => position !== index);
   }
 
+  function addAlternateAvatar(): void {
+    alternateAvatars = [...alternateAvatars, { avatar_url: null, id: crypto.randomUUID() }];
+  }
+
+  function removeAlternateAvatar(index: number): void {
+    alternateAvatars = alternateAvatars.filter((_, position) => position !== index);
+  }
+
+  async function pickAlternateAvatar(
+    index: number,
+    event: Event & { currentTarget: HTMLInputElement }
+  ): Promise<void> {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = '';
+    if (!file) return;
+
+    saving = true;
+    error = null;
+    try {
+      const upright = await uprightJpeg(file);
+      alternateAvatars[index].avatar_url = await core.media.uploadMedia(
+        upright.type || 'image/*',
+        new Uint8Array(await upright.arrayBuffer())
+      );
+    } catch (cause) {
+      console.warn('[sable personas] uploading the picture failed', cause);
+      error = i18n.t('personas.saveFailed');
+    } finally {
+      saving = false;
+    }
+  }
+
   async function submit(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     const displayName = name.trim();
     if (displayName === '') {
-      error = $i18n.t('personas.nameRequired');
+      error = i18n.t('personas.nameRequired');
       return;
     }
 
@@ -97,40 +142,49 @@
           display_name: displayName,
           avatar_url: avatarUrl,
           pronouns: parsePronouns(pronouns),
-          color_on_light: colorLight.trim() || null,
-          color_on_dark: colorDark.trim() || null,
+          color_on_light: hexColorOrEmpty(colorLight) || null,
+          color_on_dark: hexColorOrEmpty(colorDark) || null,
           triggers: triggers
             .map((trigger) => ({
-              prefix: trigger.prefix?.trim() || null,
-              suffix: trigger.suffix?.trim() || null,
+              prefix: trigger.prefix?.trimStart() || null,
+              suffix: trigger.suffix?.trimEnd() || null,
               keep_trigger: trigger.keep_trigger,
             }))
             .filter((trigger) => trigger.prefix !== null || trigger.suffix !== null),
+          alternate_avatars: alternateAvatars.filter(
+            (avatar): avatar is PersonaAlternateAvatarView => avatar.avatar_url !== null
+          ),
           pluralkit: persona?.pluralkit ?? null,
+          last_used: persona?.last_used ?? null,
         },
         persona?.id ?? null
       );
       onOpenChange(false);
     } catch (cause) {
       console.warn('[sable personas] saving failed', cause);
-      error = $i18n.t('personas.saveFailed');
+      error = i18n.t('personas.saveFailed');
     } finally {
       saving = false;
     }
   }
 </script>
 
-<DialogFrame bind:open variant="settings" label={$i18n.t('personas.editorTitle')} {onOpenChange}>
+<DialogFrame bind:open variant="settings" label={i18n.t('personas.editorTitle')} {onOpenChange}>
   <form class="persona-editor" onsubmit={(event) => void submit(event)}>
-    <h2>{$i18n.t('personas.editorTitle')}</h2>
+    <h2>{i18n.t('personas.editorTitle')}</h2>
     {#if error}<Alert variant="critical" aria-live="polite">{error}</Alert>{/if}
 
     <div class="identity">
       <Avatar src={avatarUrl} {name} size="large" />
       <div class="identity-actions">
         <label class="file-button btn btn-secondary btn-small">
-          <input type="file" accept="image/*" onchange={(event) => void pickAvatar(event)} />
-          {$i18n.t('personas.avatarChoose')}
+          <input
+            use:nativeFilePicker
+            type="file"
+            accept="image/*"
+            onchange={(event) => void pickAvatar(event)}
+          />
+          {i18n.t('common.chooseAPicture')}
         </label>
         {#if avatarUrl}
           <Button
@@ -140,14 +194,14 @@
               avatarUrl = null;
             }}
           >
-            {$i18n.t('personas.avatarRemove')}
+            {i18n.t('personas.avatarRemove')}
           </Button>
         {/if}
       </div>
     </div>
 
     <label class="field">
-      <span>{$i18n.t('personas.name')}</span>
+      <span>{i18n.t('personas.name')}</span>
       <TextInput
         name="persona-name"
         bind:value={name}
@@ -155,28 +209,29 @@
         required
         maxlength={128}
       />
-      <small>{$i18n.t('personas.nameHint')}</small>
+      <small>{i18n.t('personas.nameHint')}</small>
     </label>
 
     <label class="field">
-      <span>{$i18n.t('personas.pronouns')}</span>
+      <span>{i18n.t('personas.pronouns')}</span>
       <TextInput
         name="persona-pronouns"
         bind:value={pronouns}
         autocomplete="off"
-        placeholder={$i18n.t('personas.pronounsPlaceholder')}
+        placeholder={i18n.t('common.pronounsPlaceholder')}
+        maxlength={MAX_PRONOUN_INPUT}
       />
     </label>
 
     <div class="colors">
       <ColorSetting
-        label={$i18n.t('personas.colorLight')}
+        label={i18n.t('personas.colorLight')}
         bind:value={colorLight}
         onCommit={() => {}}
         onReset={() => (colorLight = '')}
       />
       <ColorSetting
-        label={$i18n.t('personas.colorDark')}
+        label={i18n.t('personas.colorDark')}
         bind:value={colorDark}
         onCommit={() => {}}
         onReset={() => (colorDark = '')}
@@ -184,12 +239,12 @@
     </div>
 
     <fieldset class="triggers">
-      <legend>{$i18n.t('personas.triggers')}</legend>
-      <p>{$i18n.t('personas.triggersHint')}</p>
-      {#each triggers as trigger, index (index)}
+      <legend>{i18n.t('personas.triggers')}</legend>
+      <p>{i18n.t('personas.triggersHint')}</p>
+      {#each triggers as trigger, index (trigger.id)}
         <div class="trigger-row">
           <label class="field">
-            <span>{$i18n.t('personas.triggerPrefix')}</span>
+            <span>{i18n.t('personas.triggerPrefix')}</span>
             <TextInput
               name={`persona-trigger-prefix-${String(index)}`}
               value={trigger.prefix ?? ''}
@@ -203,7 +258,7 @@
             />
           </label>
           <label class="field">
-            <span>{$i18n.t('personas.triggerSuffix')}</span>
+            <span>{i18n.t('personas.triggerSuffix')}</span>
             <TextInput
               name={`persona-trigger-suffix-${String(index)}`}
               value={trigger.suffix ?? ''}
@@ -217,7 +272,7 @@
             />
           </label>
           <label class="field wrap">
-            <span>{$i18n.t('personas.triggerKeep')}</span>
+            <span>{i18n.t('personas.triggerKeep')}</span>
             <Switch
               label=""
               checked={trigger.keep_trigger}
@@ -230,7 +285,7 @@
             <IconButton
               variant="subtle"
               size="small"
-              label={$i18n.t('personas.triggerRemove')}
+              label={i18n.t('personas.triggerRemove')}
               onclick={() => {
                 removeTrigger(index);
               }}
@@ -242,7 +297,41 @@
       {/each}
       <Button variant="secondary" size="small" onclick={addTrigger}>
         <PlusIcon />
-        {$i18n.t('personas.triggerAdd')}
+        {i18n.t('personas.triggerAdd')}
+      </Button>
+    </fieldset>
+
+    <fieldset class="alternateAvatars">
+      <legend>{i18n.t('personas.alternateAvatars')}</legend>
+      <p>{i18n.t('personas.alternateAvatarsHint')}</p>
+      {#each alternateAvatars as avatar, index (avatar.id)}
+        <div class="avatar-row">
+          <Avatar src={avatar.avatar_url} {name} size="large" />
+          <label class="file-button btn btn-secondary btn-small">
+            <input
+              use:nativeFilePicker
+              type="file"
+              accept="image/*"
+              onchange={(event) => void pickAlternateAvatar(index, event)}
+            />
+            {i18n.t('common.chooseAPicture')}
+          </label>
+          {#if avatarUrl}
+            <Button
+              variant="danger"
+              size="small"
+              onclick={() => {
+                removeAlternateAvatar(index);
+              }}
+            >
+              {i18n.t('personas.avatarRemove')}
+            </Button>
+          {/if}
+        </div>
+      {/each}
+      <Button variant="secondary" size="small" onclick={addAlternateAvatar}>
+        <PlusIcon />
+        {i18n.t('personas.alternateAvatarAdd')}
       </Button>
     </fieldset>
 
@@ -253,9 +342,9 @@
           onOpenChange(false);
         }}
       >
-        {$i18n.t('personas.cancel')}
+        {i18n.t('common.cancel')}
       </Button>
-      <Button type="submit" loading={saving}>{$i18n.t('personas.save')}</Button>
+      <Button type="submit" loading={saving}>{i18n.t('common.save')}</Button>
     </DialogActions>
   </form>
 </DialogFrame>
@@ -320,7 +409,7 @@
     gap: var(--space-300);
   }
 
-  .triggers {
+  fieldset {
     border: var(--border-width) solid var(--bg-container-line);
     border-radius: var(--radius);
     display: grid;
@@ -329,12 +418,12 @@
     padding: var(--space-300) var(--space-400) var(--space-400);
   }
 
-  .triggers legend {
+  fieldset legend {
     font-weight: var(--font-weight-medium);
     padding: 0 var(--space-200);
   }
 
-  .triggers p {
+  fieldset p {
     color: var(--surface-var-on-container);
     font-size: var(--font-size-small);
     margin: 0;
@@ -369,8 +458,15 @@
       grid-template-columns: 1fr auto;
     }
 
-    .triggers {
+    fieldset {
       gap: var(--space-600);
     }
+  }
+
+  .avatar-row {
+    align-items: center;
+    column-gap: var(--space-300);
+    display: grid;
+    grid-template-columns: 1fr auto auto;
   }
 </style>

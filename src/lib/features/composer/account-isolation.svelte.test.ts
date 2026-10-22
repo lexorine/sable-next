@@ -5,8 +5,8 @@ import {
   writeDraft,
   draftDocuments,
   adoptDraftDocuments,
-} from './composer-drafts.svelte';
-import { adoptQueue, scheduledQueue, dueMessages } from './scheduled-queue.svelte';
+} from '#lib/composer/composer-drafts.svelte.js';
+import { adoptQueue, scheduledQueue, dueMessages } from '#lib/composer/scheduled-queue.svelte.js';
 
 const room = '!shared:test';
 const draft = { doc: { text: 'private' }, staged: [], nextStagedId: 0 };
@@ -46,12 +46,14 @@ test('a pending draft upload is not reused for the next account', async () => {
   const { draftsDocumentFor } = await import('#lib/settings/sync-documents.js');
   vi.useFakeTimers();
   const session = { account_id: 'a' };
-  const setSealedAccountData = vi.fn(() => Promise.resolve());
+  const setSealedAccountData = vi.fn(() => Promise.resolve(null));
   const core = {
     session,
-    commands: {
-      sealedAccountData: () => Promise.resolve({ content: null, state: 'plain', can_seal: true }),
-      setSealedAccountData,
+    rpc: {
+      account: {
+        sealedData: () => Promise.resolve({ content: null, state: 'plain', can_seal: true }),
+        setSealedData: setSealedAccountData,
+      },
     },
     subscribeEvents: () => () => {},
   } as unknown as import('#lib/core/client.svelte.js').CoreClient;
@@ -65,9 +67,9 @@ test('a pending draft upload is not reused for the next account', async () => {
   const stopB = sync.start(core, [draftsDocumentFor('b')]);
   await vi.advanceTimersByTimeAsync(10_000);
   expect(setSealedAccountData).toHaveBeenCalledTimes(1);
-  expect(setSealedAccountData).toHaveBeenCalledWith('moe.sable.next.drafts', {
-    v: 1,
-    drafts: { [room]: { text: 'B only' } },
+  expect(setSealedAccountData).toHaveBeenCalledWith({
+    event_type: 'moe.sable.next.drafts',
+    content: { v: 1, drafts: { [room]: { text: 'B only' } } },
   });
   stopB();
   vi.useRealTimers();

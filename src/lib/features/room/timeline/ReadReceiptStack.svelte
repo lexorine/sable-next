@@ -1,17 +1,18 @@
 <script lang="ts">
+  import { MediaQuery } from 'svelte/reactivity';
   import { cubicOut } from 'svelte/easing';
   import { scale } from 'svelte/transition';
   import type { MemberView } from '#src/generated/protocol';
 
   import { i18n } from '#lib/i18n.js';
-  import { createMediaQuery } from '#lib/ui/media-query.svelte.js';
   import { MOTION_MS, motionMs, shouldReduceMotion } from '#lib/ui/motion.js';
   import Avatar from '#lib/ui/primitives/Avatar.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
 
   import { memberAvatar, memberName } from '../members/members.js';
   import ReadReceiptFace from './ReadReceiptFace.svelte';
 
-  const MAX_FACES = 3;
+  const MAX_FACES = 2;
   const HOVER_FALLOFF = 0.45;
   const HOVER_SCALE = 1.05;
 
@@ -26,7 +27,7 @@
 
   let { readers, timestamps = {}, members, expanded = false, onOpen, onProfile }: Props = $props();
 
-  const coarse = createMediaQuery('(pointer: coarse)');
+  const coarse = new MediaQuery('(pointer: coarse)');
   let root = $state<HTMLElement | null>(null);
   let seen = $derived(
     readers.map((userId) => ({
@@ -90,14 +91,14 @@
 {/snippet}
 
 {#if readers.length > 0}
-  {#if coarse.matches}
+  {#if coarse.current}
     <button
       class="read-receipt-stack chip selection-open"
+      style:--stack-slots={MAX_FACES + 1}
       type="button"
-      aria-label={$i18n.t('timeline.seenByNames', { names })}
+      aria-label={i18n.t('timeline.seenByNames', { names })}
       aria-haspopup="dialog"
       aria-expanded={expanded}
-      title={names}
       onclick={(event) => onOpen(event.currentTarget)}
     >
       <span class="faces">
@@ -110,25 +111,30 @@
   {:else}
     <div
       class="read-receipt-stack faces"
+      style:--stack-slots={MAX_FACES + 1}
       role="group"
-      aria-label={$i18n.t('timeline.seenBy')}
+      aria-label={i18n.t('timeline.seenBy')}
       bind:this={root}
       onmouseleave={() => setShifts(null)}
     >
       {@render faceRow(true)}
       {#if overflow > 0}
-        <button
-          class={['t-avatar', 'overflow', 'selection-open']}
-          type="button"
-          aria-label={$i18n.t('timeline.seenByNames', { names: overflowNames })}
-          aria-haspopup="dialog"
-          aria-expanded={expanded}
-          title={overflowNames}
-          onmouseenter={() => setShifts(faces.length)}
-          onclick={(event) => onOpen(event.currentTarget)}
-        >
-          +{overflow}
-        </button>
+        <Tooltip label={overflowNames} multiline>
+          {#snippet trigger({ props })}
+            <button
+              {...props}
+              class={['t-avatar', 'overflow', 'selection-open']}
+              type="button"
+              aria-label={i18n.t('timeline.seenByNames', { names: overflowNames })}
+              aria-haspopup="dialog"
+              aria-expanded={expanded}
+              onmouseenter={() => setShifts(faces.length)}
+              onclick={(event) => onOpen(event.currentTarget)}
+            >
+              +{overflow}
+            </button>
+          {/snippet}
+        </Tooltip>
       {/if}
     </div>
   {/if}
@@ -137,9 +143,16 @@
 <style>
   .read-receipt-stack {
     --stack-ring: var(--bg-container);
+    --face-size: 1.125rem;
+    --stack-min: calc(
+      var(--space-050) + var(--stack-slots) * var(--face-size) - (var(--stack-slots) - 1) *
+        var(--space-150)
+    );
 
     align-items: center;
     display: inline-flex;
+    justify-content: flex-end;
+    min-inline-size: var(--stack-min);
   }
 
   .chip {
@@ -151,6 +164,7 @@
     font: inherit;
     height: var(--size-x300);
     max-width: 100%;
+    min-inline-size: calc(var(--stack-min) + 2 * var(--space-150) + 2 * var(--border-width));
     padding: 0 var(--space-150);
     position: relative;
     white-space: nowrap;
@@ -191,27 +205,32 @@
   }
 
   :global(.read-receipt-stack .t-avatar) {
-    transform: translateY(var(--shift, 0)) scale(var(--scale-active, 1));
-    transform-origin: center;
-    transition: transform var(--duration-medium) var(--ease-smooth-out);
-    will-change: transform;
     z-index: var(--z, 0);
   }
 
+  :global(.read-receipt-stack .t-avatar.overflow),
+  :global(.read-receipt-stack .t-avatar > .receipt-face) {
+    transform: translateY(var(--shift, 0)) scale(var(--scale-active, 1));
+    transform-origin: center;
+    transition: transform var(--duration-medium) var(--ease-smooth-out);
+  }
+
   @media (prefers-reduced-motion: reduce) {
-    :global(.read-receipt-stack .t-avatar) {
+    :global(.read-receipt-stack .t-avatar.overflow),
+    :global(.read-receipt-stack .t-avatar > .receipt-face) {
       transform: none;
       transition: none;
     }
   }
 
-  :global(html[data-reduced-motion='on'] .read-receipt-stack .t-avatar) {
+  :global(html[data-reduced-motion='on'] .read-receipt-stack .t-avatar.overflow),
+  :global(html[data-reduced-motion='on'] .read-receipt-stack .t-avatar > .receipt-face) {
     transform: none;
     transition: none;
   }
 
   :global(.avatar-root.receipt-face) {
-    --avatar-size: 1.125rem;
+    --avatar-size: var(--face-size);
 
     background: var(--stack-ring);
     box-shadow: 0 0 0 0.125rem var(--stack-ring);
@@ -230,10 +249,10 @@
     font: inherit;
     font-size: var(--font-size-small);
     font-variant-numeric: tabular-nums;
-    height: 1.125rem;
+    height: var(--face-size);
     justify-content: center;
     line-height: 1;
-    min-width: 1.125rem;
+    min-width: var(--face-size);
     padding: 0 var(--space-050);
     position: relative;
   }

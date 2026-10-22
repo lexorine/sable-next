@@ -1,4 +1,5 @@
 import { expect, type Locator, type Page } from '@playwright/test';
+import { nextFrames } from '../fixtures/settle';
 
 export class RoomTimeline {
   readonly container: Locator;
@@ -197,9 +198,7 @@ export class RoomTimeline {
   }
 
   /**
-   * Samples the anchor every frame while `action` runs. A settled-state check
-   * cannot see a jump that happens between two frames, and the failures worth
-   * catching here happen mid-flight.
+   * Samples the anchor every frame while `action` runs, to catch jumps between frames.
    */
   async sampleAnchorWhile(
     itemId: string,
@@ -283,7 +282,7 @@ export class RoomTimeline {
           `timeline rendered no fully visible anchor with stable bounds (skip ${String(skip)})`
         );
       }
-      await this.page.waitForTimeout(50);
+      await nextFrames(this.page, 3);
     }
   }
 

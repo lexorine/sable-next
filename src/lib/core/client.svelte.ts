@@ -1,22 +1,24 @@
-import type {
-  CoreEvent,
-  DeviceView,
-  EncryptionStatusView,
-  SearchCoverageView,
-  AuthIntent,
-  LoginFlowsView,
-  LoginIdentifier,
-  RegistrationFlowsView,
-  SessionInfo,
-  SyncStatus,
-  MutualRoomView,
-  ProfilePropagationView,
-  ProfileView,
-  RegistrationResultView,
-  VerificationView,
+import {
+  type CoreEvent,
+  type DeviceView,
+  type EncryptionStatusView,
+  type SearchCoverageView,
+  type AuthIntent,
+  type LoginFlowsView,
+  type LoginIdentifier,
+  type RegistrationFlowsView,
+  type SessionInfo,
+  type SyncStatus,
+  type MutualRoomView,
+  type ProfilePropagationView,
+  type ProfileView,
+  type RegistrationResultView,
+  type VerificationView,
+  type Rpc,
+  createRpc,
 } from '#src/generated/protocol';
 
-import { createCommands } from './commands.svelte.js';
+import { createMedia } from './media.svelte.js';
 import { invalidatePacks, isPackAccountDataEvent } from '#lib/emoji/load-packs.js';
 import { createTransport } from '../../transport/create';
 import type { Transport } from '../../transport';
@@ -26,7 +28,7 @@ import QuickLRU from 'quick-lru';
 import { on } from 'svelte/events';
 import { onDebugLogCapture, recordDebugLog } from '#lib/observability/debug-log.svelte.js';
 import { clearRoomListSnapshot } from '#lib/rooms/room-list-snapshot.js';
-import { clearRecentSearches } from '#lib/features/search/recent-searches.svelte.js';
+import { clearRecentSearches } from '#lib/search/recent-searches.svelte.js';
 import { reportSessionFailure } from '#lib/observability/session-telemetry.js';
 import {
   browserGatesCoreNetwork,
@@ -35,11 +37,13 @@ import {
 } from '#lib/platform/local-network.js';
 
 type WellKnownResponse = { 'm.homeserver'?: { base_url?: unknown } };
-export type { CallGrant, CreateRoomOptions, OutgoingMentions } from './commands.svelte.js';
+export type { OutgoingMentions } from './api/messages.svelte.js';
+export type { CreateRoomOptions } from './api/rooms.js';
 
 const profileCacheFreshMs = 2 * 60 * 1000;
 const profileFailureRetryMs = 60 * 1000;
 const relationsCacheFreshMs = 60 * 1000;
+const SLOW_START_MS = 15_000;
 const MAX_PROFILE_CACHE_ENTRIES = 256;
 const MAX_RELATIONS_CACHE_ENTRIES = 128;
 const MAX_PROFILE_LOOKUPS = 24;
@@ -138,7 +142,9 @@ export class CoreClient {
   verification = $state<ActiveVerification | null>(null);
   crashed = $state<string | null>(null);
   storageInterrupted = $state(false);
+  superseded = $state(false);
   restoreFailed = $state(false);
+  slowStart = $state(false);
   migrationFailed = $state(false);
   migrationError = $state<string | null>(null);
   sync = $state<SyncStatus | null>(null);
@@ -146,7 +152,7 @@ export class CoreClient {
   encryption = $state<EncryptionStatusView | null>(null);
   searchCoverage = $state<SearchCoverageView | null>(null);
   searchCoverageUnavailable = $state(false);
-  /** Every device on this account, pushed on change. Absolute, not a diff. */
+  /** Every device on this account, replaced whole on change. */
   deviceList = $state.raw<DeviceView[]>([]);
   unresponsive = $state(false);
   localNetworkBlocked = $state<string | null>(null);
@@ -164,8 +170,8 @@ export class CoreClient {
   /* eslint-disable svelte/prefer-svelte-reactivity */
   private readonly profileCache = new QuickLRU<
     string,
-    { accountId: string | null; profile: ProfileView }
-  >({ maxSize: MAX_PROFILE_CACHE_ENTRIES, maxAge: profileCacheFreshMs });
+    { accountId: string | null; profile: ProfileView; freshUntil: number }
+  >({ maxSize: MAX_PROFILE_CACHE_ENTRIES });
   private readonly profileRequests = new Map<
     string,
     {
@@ -197,7 +203,21 @@ export class CoreClient {
 
   private stopAccountChannel: (() => void) | null = null;
 
-  readonly commands = createCommands(() => this.ensureTransport());
+  readonly media = createMedia(() => this.ensureTransport());
+
+  readonly rpc = createRpc((method, params) => this.ensureTransport().call(method, params));
+
+  /** One client per transport, for flows that must finish on the transport they started on. */
+  readonly #pinned = new WeakMap<Transport, Rpc>();
+
+  #rpcOn(transport: Transport): Rpc {
+    let rpc = this.#pinned.get(transport);
+    if (!rpc) {
+      rpc = createRpc((method, params) => transport.call(method, params));
+      this.#pinned.set(transport, rpc);
+    }
+    return rpc;
+  }
 
   constructor(private readonly openTransport: () => Transport = createTransport) {
     if (this.accountChannel) {
@@ -218,6 +238,12 @@ export class CoreClient {
     } finally {
       if (this.startPromise === promise) this.startPromise = null;
     }
+  }
+
+  /** `start()` would otherwise join the stuck attempt. */
+  retryStart(): Promise<void> {
+    this.startPromise = null;
+    return this.start();
   }
 
   async login(
@@ -243,9 +269,8 @@ export class CoreClient {
         homeserver,
         this.resolvedHomeservers
       );
-      const response = await transport
-        .send({
-          type: 'login',
+      const userId = await this.#rpcOn(transport)
+        .auth.login({
           reauth_account_id: reauthAccountId ?? null,
           homeserver: resolvedHomeserver,
           identifier,
@@ -255,7 +280,7 @@ export class CoreClient {
 
       if (generation !== this.generation || transport !== this.transport) return;
 
-      await this.finishAuthentication(response.user_id, generation);
+      await this.finishAuthentication(userId, generation);
     } catch (error) {
       if (generation === this.generation && transport === this.transport) {
         this.replaceSession(previousSession);
@@ -268,19 +293,14 @@ export class CoreClient {
   async loginFlows(homeserver: string): Promise<LoginFlowsView> {
     const transport = this.ensureTransport();
     const resolvedHomeserver = await resolveHomeserverInPage(homeserver, this.resolvedHomeservers);
-    const response = await transport
-      .send({ type: 'login_flows', homeserver: resolvedHomeserver })
+    return this.#rpcOn(transport)
+      .auth.loginFlows({ homeserver: resolvedHomeserver })
       .catch((error: unknown) => blameLocalNetwork(error, resolvedHomeserver));
-    return response.flows;
   }
 
   async registrationFlows(homeserver: string): Promise<RegistrationFlowsView> {
     const resolvedHomeserver = await resolveHomeserverInPage(homeserver, this.resolvedHomeservers);
-    const response = await this.ensureTransport().send({
-      type: 'registration_flows',
-      homeserver: resolvedHomeserver,
-    });
-    return response.flows;
+    return this.rpc.auth.registrationFlows({ homeserver: resolvedHomeserver });
   }
 
   async requestPasswordResetEmail(
@@ -290,8 +310,7 @@ export class CoreClient {
     sendAttempt: number
   ): Promise<{ clientSecret: string; sid: string }> {
     const resolvedHomeserver = await resolveHomeserverInPage(homeserver, this.resolvedHomeservers);
-    const response = await this.ensureTransport().send({
-      type: 'request_password_reset_email',
+    const response = await this.rpc.auth.requestPasswordResetEmail({
       homeserver: resolvedHomeserver,
       email,
       client_secret: clientSecret,
@@ -308,8 +327,7 @@ export class CoreClient {
     logoutDevices: boolean
   ): Promise<void> {
     const resolvedHomeserver = await resolveHomeserverInPage(homeserver, this.resolvedHomeservers);
-    await this.ensureTransport().send({
-      type: 'reset_password',
+    await this.rpc.auth.resetPassword({
       homeserver: resolvedHomeserver,
       client_secret: clientSecret,
       sid,
@@ -340,15 +358,13 @@ export class CoreClient {
         homeserver,
         this.resolvedHomeservers
       );
-      const response = await transport.send({
-        type: 'register',
+      const result = await this.#rpcOn(transport).auth.register({
         homeserver: resolvedHomeserver,
         username,
         password,
         registration_email: registrationEmail,
         registration_token: registrationToken,
       });
-      const result = response.result;
       if (result.state === 'complete') {
         await this.finishAuthentication(result.user_id);
       } else {
@@ -364,10 +380,7 @@ export class CoreClient {
   }
 
   async continueRegistration(): Promise<RegistrationResultView> {
-    const response = await this.ensureTransport().send({
-      type: 'continue_registration',
-    });
-    const result = response.result;
+    const result = await this.rpc.auth.continueRegistration();
     if (result.state === 'complete') {
       await this.finishAuthentication(result.user_id);
     }
@@ -382,14 +395,12 @@ export class CoreClient {
   ): Promise<string> {
     const transport = this.ensureTransport();
     const resolvedHomeserver = await resolveHomeserverInPage(homeserver, this.resolvedHomeservers);
-    const response = await transport.send({
-      type: 'start_oidc_login',
+    return this.#rpcOn(transport).auth.startOidcLogin({
       reauth_account_id: reauthAccountId ?? null,
       homeserver: resolvedHomeserver,
       redirect_uri: redirectUri,
       intent,
     });
-    return response.authorization_url;
   }
 
   async completeOidcLogin(callbackUrl: string): Promise<void> {
@@ -406,14 +417,13 @@ export class CoreClient {
     this.status = 'authenticating';
 
     try {
-      const response = await transport.send({
-        type: 'complete_oidc_login',
+      const userId = await this.#rpcOn(transport).auth.completeOidcLogin({
         callback_url: callbackUrl,
       });
 
       if (generation !== this.generation || transport !== this.transport) return;
 
-      await this.finishAuthentication(response.user_id, generation);
+      await this.finishAuthentication(userId, generation);
     } catch (error) {
       if (generation === this.generation && transport === this.transport) {
         this.replaceSession(previousSession);
@@ -433,8 +443,7 @@ export class CoreClient {
       homeserver === null
         ? null
         : await resolveHomeserverInPage(homeserver, this.resolvedHomeservers);
-    await transport.send({
-      type: 'start_qr_login',
+    await this.#rpcOn(transport).auth.startQrLogin({
       homeserver: resolved,
       redirect_uri: redirectUri,
       scanned,
@@ -446,19 +455,19 @@ export class CoreClient {
   }
 
   async startQrGrant(scanned: string | null): Promise<void> {
-    await this.ensureTransport().send({ type: 'start_qr_grant', scanned });
+    await this.rpc.auth.startQrGrant({ scanned });
   }
 
   async qrCheckCode(code: number): Promise<void> {
-    await this.ensureTransport().send({ type: 'qr_check_code', code });
+    await this.rpc.auth.qrCheckCode({ code });
   }
 
   async qrGrantContinue(confirm: boolean): Promise<void> {
-    await this.ensureTransport().send({ type: 'qr_grant_continue', confirm });
+    await this.rpc.auth.qrGrantContinue({ confirm });
   }
 
   async cancelQr(): Promise<void> {
-    await this.ensureTransport().send({ type: 'cancel_qr' });
+    await this.rpc.auth.cancelQr();
   }
 
   async startSsoLogin(
@@ -470,15 +479,13 @@ export class CoreClient {
   ): Promise<string> {
     const transport = this.ensureTransport();
     const resolvedHomeserver = await resolveHomeserverInPage(homeserver, this.resolvedHomeservers);
-    const response = await transport.send({
-      type: 'start_sso_login',
+    return this.#rpcOn(transport).auth.startSsoLogin({
       reauth_account_id: reauthAccountId ?? null,
       homeserver: resolvedHomeserver,
       redirect_uri: redirectUri,
       idp_id: idpId ?? null,
       intent,
     });
-    return response.authorization_url;
   }
 
   async completeSsoLogin(callbackUrl: string): Promise<void> {
@@ -495,14 +502,13 @@ export class CoreClient {
     this.status = 'authenticating';
 
     try {
-      const response = await transport.send({
-        type: 'complete_sso_login',
+      const userId = await this.#rpcOn(transport).auth.completeSsoLogin({
         callback_url: callbackUrl,
       });
 
       if (generation !== this.generation || transport !== this.transport) return;
 
-      await this.finishAuthentication(response.user_id, generation);
+      await this.finishAuthentication(userId, generation);
     } catch (error) {
       if (generation === this.generation && transport === this.transport) {
         this.replaceSession(previousSession);
@@ -512,10 +518,18 @@ export class CoreClient {
     }
   }
 
+  cachedUserProfile(userId: string, allowStale = false): ProfileView | null {
+    const cached = this.profileCache.get(userId);
+    return cached?.accountId === (this.session?.account_id ?? null) &&
+      (allowStale || cached.freshUntil > Date.now())
+      ? cached.profile
+      : null;
+  }
+
   async userProfile(userId: string, urgent = false, signal?: AbortSignal): Promise<ProfileView> {
     const accountId = this.session?.account_id ?? null;
     const cached = this.profileCache.get(userId);
-    if (cached?.accountId === accountId) {
+    if (cached?.accountId === accountId && cached.freshUntil > Date.now()) {
       return cached.profile;
     }
 
@@ -534,7 +548,11 @@ export class CoreClient {
       .then((profile) => {
         if (this.profileRequests.get(userId)?.request === request) {
           this.profileFailures.delete(userId);
-          this.profileCache.set(userId, { accountId, profile });
+          this.profileCache.set(userId, {
+            accountId,
+            profile,
+            freshUntil: Date.now() + profileCacheFreshMs,
+          });
         }
         return profile;
       })
@@ -594,10 +612,12 @@ export class CoreClient {
   }
 
   refreshUserProfile(userId: string): Promise<ProfileView> {
-    this.profileCache.delete(userId);
-    this.profileFailures.delete(userId);
-    this.profileRequests.delete(userId);
+    this.invalidateProfile(userId);
     return this.userProfile(userId, true);
+  }
+
+  forgetProfileFailure(userId: string): void {
+    this.profileFailures.delete(userId);
   }
 
   private invalidateProfile(userId: string): void {
@@ -655,8 +675,7 @@ export class CoreClient {
         }
       }
       try {
-        return (await this.ensureTransport().send({ type: 'user_profile', user_id: userId }))
-          .profile;
+        return await this.rpc.account.userProfile({ user_id: userId });
       } catch (error) {
         if (!(error instanceof CoreError) || error.detail.code !== 'rate_limited') throw error;
         this.profileResumeAt = Math.max(
@@ -673,8 +692,7 @@ export class CoreClient {
   }
 
   /**
-   * Rooms shared with this user, plus whether the account ignores them. Cached
-   * because the core reads membership once per joined room to answer it.
+   * Rooms shared with this user and whether the account ignores them; cached because the core reads membership per room.
    */
   async userRelations(userId: string): Promise<UserRelations> {
     const accountId = this.session?.account_id ?? null;
@@ -683,10 +701,7 @@ export class CoreClient {
       return cached.relations;
     }
 
-    const response = await this.ensureTransport().send({
-      type: 'user_relations',
-      user_id: userId,
-    });
+    const response = await this.rpc.account.userRelations({ user_id: userId });
     const relations = {
       mutualRooms: response.mutual_rooms,
       ignored: response.ignored,
@@ -696,11 +711,9 @@ export class CoreClient {
   }
 
   async setUserIgnored(userId: string, ignored: boolean): Promise<void> {
-    await this.ensureTransport().send(
-      ignored
-        ? { type: 'ignore_user', user_id: userId }
-        : { type: 'unignore_user', user_id: userId }
-    );
+    await (ignored ? this.rpc.account.ignoreUser : this.rpc.account.unignoreUser)({
+      user_id: userId,
+    });
     this.relationsCache.delete(userId);
   }
 
@@ -709,11 +722,9 @@ export class CoreClient {
 
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       try {
-        const response = await this.ensureTransport().send({
-          type: 'search_coverage',
-        });
+        const coverage = await this.rpc.search.coverage();
         if (generation !== this.generation) return;
-        this.searchCoverage = response.coverage;
+        this.searchCoverage = coverage;
         this.searchCoverageUnavailable = false;
         return;
       } catch (error) {
@@ -729,14 +740,13 @@ export class CoreClient {
   async switchAccount(accountId: string): Promise<void> {
     const generation = this.generation;
     const transport = this.ensureTransport();
-    const response = await transport.send({
-      type: 'switch_account',
+    const session = await this.#rpcOn(transport).session.switchAccount({
       account_id: accountId,
     });
     if (generation !== this.generation || transport !== this.transport) return;
     await this.refreshAccounts();
     if (generation !== this.generation || transport !== this.transport) return;
-    this.replaceSession(response.session);
+    this.replaceSession(session);
     this.restoreFailed = false;
     this.crashed = null;
     this.storageInterrupted = false;
@@ -756,10 +766,7 @@ export class CoreClient {
   async removeAccount(accountId: string): Promise<void> {
     const transport = this.ensureTransport();
     const userId = this.accounts.find((account) => account.account_id === accountId)?.user_id;
-    await transport.send({
-      type: 'remove_account',
-      account_id: accountId,
-    });
+    await this.#rpcOn(transport).session.removeAccount({ account_id: accountId });
     await this.refreshAccounts();
     discardAccountStore(transport, accountId);
     clearRoomListSnapshot(accountId);
@@ -770,7 +777,7 @@ export class CoreClient {
     const transport = this.ensureTransport();
     const accountId = this.session?.account_id ?? null;
     const userId = this.session?.user_id ?? null;
-    await transport.send({ type: 'logout' });
+    await this.#rpcOn(transport).session.logout();
     this.generation += 1;
     this.replaceSession(null);
     this.verification = null;
@@ -808,32 +815,27 @@ export class CoreClient {
       pending.state.phase === 'requested' &&
       !pending.state.initiated_by_us
     ) {
-      await this.commands.acceptVerification(userId, pending.flowId);
+      await this.rpc.encryption.acceptVerification({ user_id: userId, flow_id: pending.flowId });
       return pending.flowId;
     }
-    const response = await this.ensureTransport().send({
-      type: 'request_verification',
+    const flowId = await this.rpc.encryption.requestVerification({
       user_id: userId,
       device_id: deviceId,
     });
     this.verification = {
       userId,
-      flowId: response.flow_id,
+      flowId,
       state: {
         phase: 'requested',
         is_self: userId === this.session?.user_id,
         initiated_by_us: true,
       },
     };
-    return response.flow_id;
+    return flowId;
   }
 
   async setProfileField(field: string, value: unknown): Promise<void> {
-    await this.ensureTransport().send({
-      type: 'set_profile_field',
-      field,
-      value,
-    });
+    await this.rpc.account.setProfileField({ field, value });
     const userId = this.session?.user_id;
     if (userId) this.invalidateProfile(userId);
   }
@@ -844,7 +846,7 @@ export class CoreClient {
     bytes: Uint8Array<ArrayBuffer>
   ): Promise<string> {
     const uri = await this.ensureTransport().uploadMedia(mime, bytes);
-    await this.commands.setRoomAvatar(roomId, uri);
+    await this.rpc.room_state.setAvatar({ room_id: roomId, url: uri });
     return uri;
   }
 
@@ -854,7 +856,7 @@ export class CoreClient {
     propagateTo: ProfilePropagationView
   ): Promise<string> {
     const uri = await this.ensureTransport().uploadMedia(mime, bytes);
-    await this.commands.setAvatarUrl(uri, propagateTo);
+    await this.rpc.account.setAvatarUrl({ url: uri, propagate_to: propagateTo });
     return uri;
   }
 
@@ -913,8 +915,8 @@ export class CoreClient {
     const reported = this.encryptionEvents;
     try {
       const [status, devices] = await Promise.all([
-        this.commands.encryptionStatus(),
-        this.commands.devices(),
+        this.rpc.encryption.status(),
+        this.rpc.encryption.devices(),
       ]);
       if (revision !== this.accountRevision) return;
       if (reported === this.encryptionEvents) this.encryption = status;
@@ -935,6 +937,7 @@ export class CoreClient {
     if (changed && session) {
       void this.primeEncryptionStatus();
       void this.primeSyncStatus();
+      void this.primeOwnProfile(session.user_id);
       if (browserGatesCoreNetwork()) void grantLocalNetworkAccess(session.homeserver);
     }
     if (changed && broadcast) this.accountChannel?.postMessage(null);
@@ -942,9 +945,9 @@ export class CoreClient {
 
   private async syncAccountFromWorker(): Promise<void> {
     try {
-      const response = await this.ensureTransport().send({ type: 'restore' });
-      if (response.session) {
-        this.replaceSession(response.session);
+      const session = await this.rpc.session.restore();
+      if (session) {
+        this.replaceSession(session);
         await this.refreshAccounts();
         this.status = 'ready';
       } else {
@@ -952,24 +955,31 @@ export class CoreClient {
         this.accounts = [];
         this.status = 'signed-out';
       }
-    } catch {
+    } catch (error) {
       // The worker may have closed before this tab receives the broadcast.
+      console.debug('[sable core] session not followed after broadcast', error);
     }
   }
 
   private async startTransport(): Promise<void> {
     const generation = ++this.generation;
     this.status = 'starting';
+    this.slowStart = false;
     this.migrationFailed = false;
     this.migrationError = null;
+    const slow = setTimeout(() => {
+      if (generation !== this.generation || this.status !== 'starting') return;
+      this.slowStart = true;
+      reportSessionFailure('restore_slow');
+    }, SLOW_START_MS);
 
     try {
       const transport = this.ensureTransport();
-      const response = await transport.send({ type: 'restore' });
+      const session = await this.#rpcOn(transport).session.restore();
       if (generation !== this.generation) return;
 
-      if (response.session) {
-        this.replaceSession(response.session);
+      if (session) {
+        this.replaceSession(session);
         await this.refreshAccounts();
         if (generation !== this.generation) return;
         this.restoreFailed = false;
@@ -993,13 +1003,18 @@ export class CoreClient {
     } catch (error) {
       if (generation !== this.generation) return;
 
-      console.error('[sable core] restore failed', error);
-      reportSessionFailure('restore', error);
+      if (error instanceof V1MigrationError) {
+        console.warn('[sable core] restore failed', error);
+      } else {
+        console.error('[sable core] restore failed', error);
+        reportSessionFailure('restore', error);
+      }
       if (error instanceof CoreError) {
         try {
           await this.refreshAccounts();
-        } catch {
+        } catch (refreshError) {
           // Keep the last known accounts if storage is unavailable.
+          console.debug('[sable core] accounts not refreshed after restore failure', refreshError);
         }
         if (generation !== this.generation) return;
       }
@@ -1008,6 +1023,9 @@ export class CoreClient {
       this.migrationError = error instanceof V1MigrationError ? error.message : null;
       this.status = 'error';
       this.cleanupTransport();
+    } finally {
+      clearTimeout(slow);
+      if (generation === this.generation) this.slowStart = false;
     }
   }
 
@@ -1026,6 +1044,10 @@ export class CoreClient {
     const unsubscribeStorageFailure = transport.subscribeStorageFailure?.(() => {
       this.storageInterrupted = true;
     });
+    // The closed transport stays in place so nothing reopens a worker here.
+    const unsubscribeSuperseded = transport.subscribeSuperseded?.(() => {
+      this.superseded = true;
+    });
     const unsubscribeStall = transport.subscribeStall((stalled) => {
       this.unresponsive = stalled;
     });
@@ -1036,6 +1058,7 @@ export class CoreClient {
       unsubscribeEvents();
       unsubscribeCrash();
       unsubscribeStorageFailure?.();
+      unsubscribeSuperseded?.();
       unsubscribeStall();
       stopLogCapture();
     };
@@ -1062,10 +1085,19 @@ export class CoreClient {
     return 'error';
   }
 
+  private async primeOwnProfile(userId: string): Promise<void> {
+    try {
+      await this.userProfile(userId);
+    } catch (error) {
+      this.forgetProfileFailure(userId);
+      console.debug('[sable core] own profile unavailable', error);
+    }
+  }
+
   private async primeSyncStatus(): Promise<void> {
     const revision = this.accountRevision;
     try {
-      const status = await this.commands.syncStatus();
+      const status = await this.rpc.session.syncStatus();
       if (revision !== this.accountRevision || this.sync !== null) return;
       this.applySyncStatus(status);
     } catch (error) {
@@ -1118,10 +1150,10 @@ export class CoreClient {
         this.searchCoverageUnavailable = false;
         return;
       case 'account_data_changed':
-        if (isPackAccountDataEvent(event.event_type)) invalidatePacks(this.commands);
+        if (isPackAccountDataEvent(event.event_type)) invalidatePacks(this.rpc);
         return;
       case 'image_packs_changed':
-        invalidatePacks(this.commands);
+        invalidatePacks(this.rpc);
         return;
       case 'session_ended':
         reportSessionFailure('session_ended', undefined, event.reason);
@@ -1136,22 +1168,19 @@ export class CoreClient {
   };
 
   private async refreshAccounts(): Promise<void> {
-    const response = await this.ensureTransport().send({
-      type: 'list_accounts',
-    });
-    this.accounts = response.accounts;
+    this.accounts = await this.rpc.session.listAccounts();
   }
 
   private async finishAuthentication(userId: string, generation = this.generation): Promise<void> {
     const transport = this.ensureTransport();
-    const response = await transport.send({ type: 'restore' });
+    const session = await this.#rpcOn(transport).session.restore();
     if (generation !== this.generation || transport !== this.transport) return;
-    if (!response.session || response.session.user_id !== userId) {
+    if (!session || session.user_id !== userId) {
       throw new CoreError({ code: 'not_logged_in' });
     }
     await this.refreshAccounts();
     if (generation !== this.generation || transport !== this.transport) return;
-    this.replaceSession(response.session);
+    this.replaceSession(session);
     this.status = 'ready';
   }
 
@@ -1183,14 +1212,16 @@ export class CoreClient {
 
     try {
       unsubscribe?.();
-    } catch {
+    } catch (error) {
       // Cleanup should continue even if a transport subscription fails.
+      console.debug('[sable core] transport subscription not released', error);
     }
 
     try {
       transport?.close();
-    } catch {
+    } catch (error) {
       // Closing an already-closed transport is safe to ignore.
+      console.debug('[sable core] transport not closed', error);
     }
   }
 }

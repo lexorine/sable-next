@@ -1,6 +1,6 @@
 import { expect, test, vi } from 'vitest';
 
-import type { RoomSummary } from '#src/generated/protocol';
+import type { RoomListItemView, RpcParams, Rpc } from '#src/generated/protocol';
 
 import {
   claimedRoomIds,
@@ -10,10 +10,9 @@ import {
   spacesDescendantRooms,
 } from './nav-rooms.js';
 
-function room(overrides: Partial<RoomSummary>): RoomSummary {
+function room(overrides: Partial<RoomListItemView>): RoomListItemView {
   return {
     room_id: '!r',
-    is_space: false,
     is_direct: false,
     direct_targets: [],
     state: 'joined',
@@ -23,27 +22,27 @@ function room(overrides: Partial<RoomSummary>): RoomSummary {
     highlight: 0,
     latest_event: null,
     ...overrides,
-  } as unknown as RoomSummary;
+  } as unknown as RoomListItemView;
 }
 
 test('only joined spaces claim their children', () => {
   const claimed = claimedRoomIds([
     room({
       room_id: '!joined',
-      is_space: true,
-      space_children: [{ room_id: '!child' }] as RoomSummary['space_children'],
+      room_kind: 'space',
+      space_children: [{ room_id: '!child' }] as RoomListItemView['space_children'],
     }),
     room({
       room_id: '!invited',
-      is_space: true,
+      room_kind: 'space',
       state: 'invited',
-      space_children: [{ room_id: '!other' }] as RoomSummary['space_children'],
+      space_children: [{ room_id: '!other' }] as RoomListItemView['space_children'],
     }),
     room({
       room_id: '!tombstoned',
-      is_space: true,
+      room_kind: 'space',
       is_tombstoned: true,
-      space_children: [{ room_id: '!replaced' }] as RoomSummary['space_children'],
+      space_children: [{ room_id: '!replaced' }] as RoomListItemView['space_children'],
     }),
     room({ room_id: '!plain' }),
   ]);
@@ -52,12 +51,16 @@ test('only joined spaces claim their children', () => {
 });
 
 test('tombstoned spaces are not active sidebar spaces', () => {
-  expect(isActiveSpace(room({ is_space: true, state: 'joined', is_tombstoned: true }))).toBe(false);
-  expect(isActiveSpace(room({ is_space: true, state: 'joined', is_tombstoned: false }))).toBe(true);
+  expect(isActiveSpace(room({ room_kind: 'space', state: 'joined', is_tombstoned: true }))).toBe(
+    false
+  );
+  expect(isActiveSpace(room({ room_kind: 'space', state: 'joined', is_tombstoned: false }))).toBe(
+    true
+  );
 });
 
 test('marks only rooms that are actually unread', () => {
-  const markRead = vi.fn(() => Promise.resolve());
+  const markRead = vi.fn(() => Promise.resolve(null));
 
   markRoomsRead(
     [
@@ -71,13 +74,31 @@ test('marks only rooms that are actually unread', () => {
   );
 
   expect(markRead.mock.calls).toEqual([
-    ['!unread', null, false],
-    ['!highlighted', null, false],
+    [
+      {
+        room_id: '!unread',
+        event_id: null,
+        private_receipt: false,
+        thread_root: null,
+        subscription: null,
+        fully_read: false,
+      },
+    ],
+    [
+      {
+        room_id: '!highlighted',
+        event_id: null,
+        private_receipt: false,
+        thread_root: null,
+        subscription: null,
+        fully_read: false,
+      },
+    ],
   ]);
 });
 
 test('a private reader still marks rooms read, just without telling them', () => {
-  const markRead = vi.fn(() => Promise.resolve());
+  const markRead = vi.fn(() => Promise.resolve(null));
 
   markRoomsRead(
     [room({ room_id: '!unread', unread: 1, latest_event: { event_id: '$a' } as never })],
@@ -85,22 +106,33 @@ test('a private reader still marks rooms read, just without telling them', () =>
     true
   );
 
-  expect(markRead.mock.calls).toEqual([['!unread', null, true]]);
+  expect(markRead.mock.calls).toEqual([
+    [
+      {
+        room_id: '!unread',
+        event_id: null,
+        private_receipt: true,
+        thread_root: null,
+        subscription: null,
+        fully_read: false,
+      },
+    ],
+  ]);
 });
 
 test('marks a room unread without moving its read marker', () => {
-  const markUnread = vi.fn(() => Promise.resolve());
+  const markUnread = vi.fn(() => Promise.resolve(null));
 
   markRoomUnread('!room:example.org', { markUnread });
 
-  expect(markUnread).toHaveBeenCalledWith('!room:example.org', null);
+  expect(markUnread).toHaveBeenCalledWith({ room_id: '!room:example.org', read_marker: null });
 });
 
 test('a failed mark does not stop the rest', () => {
   const markRead = vi
-    .fn<(roomId: string, eventId: string) => Promise<void>>()
+    .fn<(params: RpcParams<Rpc['timeline']['markRead']>) => Promise<null>>()
     .mockRejectedValueOnce(new Error('offline'))
-    .mockResolvedValueOnce();
+    .mockResolvedValueOnce(null);
 
   markRoomsRead(
     [
@@ -118,21 +150,21 @@ test('collects unique descendant rooms from several spaces', () => {
   const nestedRoom = room({ room_id: '!nested-room' });
   const nested = room({
     room_id: '!nested',
-    is_space: true,
-    space_children: [{ room_id: nestedRoom.room_id }] as RoomSummary['space_children'],
+    room_kind: 'space',
+    space_children: [{ room_id: nestedRoom.room_id }] as RoomListItemView['space_children'],
   });
   const alpha = room({
     room_id: '!alpha',
-    is_space: true,
+    room_kind: 'space',
     space_children: [
       { room_id: shared.room_id },
       { room_id: nested.room_id },
-    ] as RoomSummary['space_children'],
+    ] as RoomListItemView['space_children'],
   });
   const beta = room({
     room_id: '!beta',
-    is_space: true,
-    space_children: [{ room_id: shared.room_id }] as RoomSummary['space_children'],
+    room_kind: 'space',
+    space_children: [{ room_id: shared.room_id }] as RoomListItemView['space_children'],
   });
 
   expect(

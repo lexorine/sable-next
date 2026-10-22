@@ -3,12 +3,14 @@
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
   import { page } from '$app/state';
-  import type { ProfileView, SessionInfo } from '#src/generated/protocol';
+  import type { SessionInfo } from '#src/generated/protocol';
   import { runtimeConfig } from '#lib/config/runtime-config.js';
   import { useCoreClient } from '#lib/core/context.js';
-  import { pushOverride } from '#lib/features/notifications/push-config.js';
+  import { defaultSettingsSection } from '#lib/features/settings/settings-navigation.js';
+  import { pushOverride } from '#lib/notifications/push-config.js';
   import { logoutWithPush } from '#lib/features/notifications/web-push.js';
   import { i18n } from '#lib/i18n.js';
+  import { UserProfile } from '#lib/profile/user-profile.svelte.js';
   import ActionMenu from '#lib/ui/primitives/ActionMenu.svelte';
   import Avatar from '#lib/ui/primitives/Avatar.svelte';
   import Button from '#lib/ui/primitives/Button.svelte';
@@ -44,8 +46,8 @@
   let accountToLogout = $derived(
     core.accounts.find((account) => account.account_id === logoutAccountId) ?? null
   );
-  let profile = $state<ProfileView | null>(null);
-  let activeProfile = $derived(profile?.user_id === core.session?.user_id ? profile : null);
+  const ownProfile = new UserProfile(core, () => core.session?.user_id);
+  let activeProfile = $derived(ownProfile.current);
   let displayName = $derived(activeProfile?.display_name ?? core.session?.user_id ?? '?');
   let userStatus = $derived(
     resolveUserStatus(activeProfile, presenceStore.get(core.session?.user_id ?? ''))
@@ -57,21 +59,6 @@
     void runtimeConfig().then((config) => {
       accountSwitching = !config.disableAccountSwitcher;
     });
-  });
-
-  $effect(() => {
-    const userId = core.session?.user_id;
-    if (!userId) return;
-    let cancelled = false;
-    void core.userProfile(userId).then(
-      (nextProfile) => {
-        if (!cancelled) profile = nextProfile;
-      },
-      () => {}
-    );
-    return () => {
-      cancelled = true;
-    };
   });
 
   async function switchAccount(accountId: string): Promise<void> {
@@ -98,7 +85,13 @@
   }
 
   function openProfile(): void {
-    void goto(resolve('settings/account'));
+    const section = defaultSettingsSection();
+    if (mode === 'mobile') {
+      void goto(resolve(`settings/${section}`));
+      return;
+    }
+
+    void goto(resolve(`settings/${section}`), { shallow: true, state: { settings: { section } } });
   }
 
   async function logoutAccount(accountId: string): Promise<void> {
@@ -130,6 +123,13 @@
   function logout(): void {
     void signOut.request(() => logoutWithPush(core, pushOverride()));
   }
+
+  function openStatusEdit(): void {
+    void goto(resolve('settings/account?editStatus'), {
+      shallow: true,
+      state: { settings: { section: 'account' } },
+    });
+  }
 </script>
 
 {#snippet ownAvatar()}
@@ -137,7 +137,7 @@
   {#if ownPresence}
     <PresenceDot
       presence={ownPresence}
-      label={$i18n.t(`presence.${ownPresence}`)}
+      label={i18n.t(`presence.${ownPresence}`)}
       class="account-presence"
       size="medium"
     />
@@ -148,7 +148,7 @@
   <a
     class="quick-tool mobile-tool account-tool selection-layer"
     href={resolve('/(app)/profile')}
-    aria-label={$i18n.t('nav.manageAccounts')}
+    aria-label={i18n.t('nav.manageAccounts')}
     aria-current={page.url.pathname === '/profile' ? 'page' : undefined}
     draggable="false"
   >
@@ -157,11 +157,11 @@
 {:else}
   {#snippet profileTrigger({ props: tooltipProps }: { props: Record<string, unknown> })}
     <ActionMenu
-      label={$i18n.t('nav.switchAccount')}
-      class="account-popover"
+      label={i18n.t('nav.switchAccount')}
+      class="sidebar-popover"
       side={mode === 'compact' ? 'right' : 'top'}
       align={mode === 'compact' ? 'center' : 'start'}
-      sideOffset={8}
+      sideOffset={mode === 'compact' ? 20 : 24}
     >
       {#snippet trigger({ props })}
         <button
@@ -172,7 +172,7 @@
           'compact'
             ? 'compact-tool nav-tab-side'
             : 'desktop-tool nav-tab-bottom'}"
-          aria-label={$i18n.t('nav.switchAccount')}
+          aria-label={i18n.t('nav.switchAccount')}
         >
           {@render ownAvatar()}
         </button>
@@ -190,7 +190,26 @@
         statusEmoji={userStatus?.emoji}
         nameColorLight={activeProfile?.name_color_light}
         nameColorDark={activeProfile?.name_color_dark}
-      />
+      >
+        {#snippet statusField()}
+          <button
+            type="button"
+            class="account-profile-status-button"
+            onclick={openStatusEdit}
+            aria-label={i18n.t('nav.editStatus')}
+          >
+            <p class="account-profile-status-text explicit-scrollbar" role="region">
+              {#if userStatus?.emoji}<span class="account-profile-status-emoji"
+                  >{userStatus?.emoji}</span
+                >{/if}
+              {#if userStatus?.text}{userStatus?.text}{:else}<span
+                  class="account-profile-status-placeholder"
+                  >{i18n.t('common.statusPlaceholder')}</span
+                >{/if}
+            </p>
+          </button>
+        {/snippet}
+      </ProfileCard>
       <AccountMenuItems
         accounts={core.accounts}
         profiles={accountProfiles}
@@ -207,7 +226,7 @@
     </ActionMenu>
   {/snippet}
   <Tooltip
-    label={$i18n.t('nav.switchAccount')}
+    label={i18n.t('nav.switchAccount')}
     side={mode === 'compact' ? 'right' : 'top'}
     align={mode === 'compact' ? 'center' : 'start'}
     trigger={profileTrigger}
@@ -217,18 +236,18 @@
 <DialogFrame
   open={accountToLogout !== null}
   variant="verification"
-  label={$i18n.t('settings.logout')}
+  label={i18n.t('settings.logout')}
   onOpenChange={(open) => {
     if (!open && !switching) logoutAccountId = null;
   }}
 >
   {#if accountToLogout}
     <div class="logout-dialog">
-      <h2>{$i18n.t('settings.logout')}</h2>
+      <h2>{i18n.t('settings.logout')}</h2>
       <p>{accountToLogout.user_id}</p>
       <DialogActions>
         <Button variant="ghost" disabled={switching} onclick={() => (logoutAccountId = null)}
-          >{$i18n.t('settings.cancel')}</Button
+          >{i18n.t('common.cancel')}</Button
         >
         <Button
           variant="danger"
@@ -236,7 +255,7 @@
           onclick={() => {
             const accountId = accountToLogout?.account_id;
             if (accountId) void logoutAccount(accountId).then(() => (logoutAccountId = null));
-          }}>{$i18n.t('settings.logout')}</Button
+          }}>{i18n.t('settings.logout')}</Button
         >
       </DialogActions>
     </div>
@@ -250,7 +269,7 @@
     position: relative;
   }
 
-  :global(.account-popover .profile-card:not([style*='--profile-hero']) .profile-card-identity) {
+  :global(.sidebar-popover .profile-card:not([style*='--profile-hero']) .profile-card-identity) {
     padding-bottom: var(--space-150);
   }
 
@@ -268,5 +287,65 @@
   .logout-dialog h2,
   .logout-dialog p {
     margin: 0;
+  }
+
+  .account-profile-status-text {
+    -webkit-box-orient: vertical;
+    box-orient: vertical;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    margin: 0;
+    max-height: var(--space-1000);
+    overflow: hidden;
+    overflow-wrap: anywhere;
+    overscroll-behavior: contain;
+    padding: 0;
+  }
+
+  :global(.account-profile-header .profile-card-status) {
+    padding: 0;
+  }
+
+  :global(.account-profile-header .profile-card-status):has(.account-profile-status-button:hover) {
+    filter: brightness(1.1);
+    translate: 0 -1px;
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    :global(html:not([data-reduced-motion='on']) .account-profile-header .profile-card-status) {
+      transition:
+        filter var(--motion-normal) var(--motion-easing-standard),
+        translate var(--motion-fast) var(--ease-smooth-out);
+    }
+  }
+
+  .account-profile-status-button {
+    background: none;
+    border: 1px transparent solid;
+    border-radius: var(--radius);
+    color: inherit;
+    cursor: pointer;
+    display: inline-block;
+    min-width: var(--space-700);
+    padding: var(--space-200);
+    text-align: start;
+  }
+
+  .account-profile-status-text:focus-visible {
+    outline: var(--focus-ring-width) solid var(--focus-ring);
+    outline-offset: calc(-1 * var(--focus-ring-width));
+  }
+
+  .account-profile-status-placeholder {
+    opacity: 0.5;
+  }
+
+  :global(.account-profile-header .profile-card-status:hover .account-profile-status-text),
+  :global(.account-profile-header .profile-card-status:focus-within .account-profile-status-text) {
+    display: block;
+    -webkit-line-clamp: unset;
+    line-clamp: unset;
+    overflow-y: auto;
   }
 </style>

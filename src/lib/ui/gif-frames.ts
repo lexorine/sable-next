@@ -1,8 +1,6 @@
 /**
- * Frame-stepped GIF playback. An `<img>` cannot be paused, and `drawImage` on an
- * animated image copies its first frame rather than the one on screen, so
- * holding the frame a reader stopped on means stepping the frames ourselves.
- * WebKit has no `ImageDecoder`: callers fall back to letting the `<img>` animate.
+ * Frame-stepped GIF playback: an `<img>` cannot pause and `drawImage` copies frame 0.
+ * Without `ImageDecoder` (WebKit) callers let the `<img>` animate.
  */
 
 /** A frame asking for no delay wants "as fast as possible", which renderers floor. */
@@ -35,10 +33,7 @@ async function ownsFrames(decoder: ImageDecoder): Promise<boolean> {
 }
 
 /**
- * Opens `url` for frame-by-frame playback, or resolves to `null` when the
- * platform cannot decode frames or the image is not an animation worth
- * stepping. Frames are decoded on demand, so a long GIF costs one frame of
- * memory rather than all of them.
+ * Opens `url` for frame stepping, or `null` when frames cannot be decoded or it is not an animation. Frames decode on demand.
  */
 export async function openGifPlayback(url: string): Promise<GifPlayback | null> {
   if (typeof ImageDecoder !== 'function') return null;
@@ -49,7 +44,8 @@ export async function openGifPlayback(url: string): Promise<GifPlayback | null> 
     decoder = new ImageDecoder({ data: await response.arrayBuffer(), type: 'image/gif' });
     await decoder.tracks.ready;
     await decoder.completed;
-  } catch {
+  } catch (error) {
+    console.debug('[sable media] the gif could not be decoded', error);
     return null;
   }
 
@@ -78,7 +74,8 @@ export async function openGifPlayback(url: string): Promise<GifPlayback | null> 
             if (owned) image.close();
           },
         };
-      } catch {
+      } catch (error) {
+        console.debug('[sable media] a gif frame could not be decoded', error);
         return null;
       }
     },

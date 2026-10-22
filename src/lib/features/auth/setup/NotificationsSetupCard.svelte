@@ -6,9 +6,11 @@
   import { useCoreClient } from '#lib/core/context.js';
   import { grantPermission, permissionState } from '#lib/features/notifications/present.js';
   import { i18n, t } from '#lib/i18n.js';
-  import { setPreference } from '#lib/settings/preferences.svelte.js';
+  import { preferences, setPreference } from '#lib/settings/preferences.svelte.js';
   import Button from '#lib/ui/primitives/Button.svelte';
   import OptionCards from '#lib/ui/primitives/OptionCards.svelte';
+  import SettingsRow from '#lib/ui/primitives/SettingsRow.svelte';
+  import Switch from '#lib/ui/primitives/Switch.svelte';
   import AuthField from '../shared/AuthField.svelte';
   import AuthInfoBox from '../shared/AuthInfoBox.svelte';
   import AuthSecondaryAction from '../shared/AuthSecondaryAction.svelte';
@@ -29,6 +31,7 @@
   let groupModeChanged = false;
   let saving = $state(false);
   let error = $state<string | null>(null);
+  const contentId = $props.id();
 
   $effect(() => {
     let alive = true;
@@ -43,11 +46,13 @@
   $effect(() => {
     if (!askDefault) return;
     let alive = true;
-    void core.commands.defaultNotificationModes().then(
+    void core.rpc.notifications.defaultModes().then(
       ({ group }) => {
         if (alive && !groupModeChanged) groupMode = group === 'all' ? 'all' : 'mentions';
       },
-      () => undefined
+      (error: unknown) => {
+        console.debug('[sable setup] default notification modes unavailable', error);
+      }
     );
     return () => {
       alive = false;
@@ -70,7 +75,7 @@
     saving = true;
     error = null;
     try {
-      await core.commands.setDefaultNotificationMode(false, groupMode);
+      await core.rpc.notifications.setDefaultMode({ direct: false, mode: groupMode });
       onComplete();
     } catch {
       error = t('setup.notificationsSaveFailed');
@@ -88,16 +93,16 @@
     void finish();
   }}
 >
-  <AuthField labelId="notifications-setup-title" label={$i18n.t('setup.notificationsTitle')}>
+  <AuthField labelId="notifications-setup-title" label={i18n.t('setup.notificationsTitle')}>
     <AuthInfoBox>
       {#if permission === 'granted'}
-        {$i18n.t('setup.notificationsAllowed')}
+        {i18n.t('setup.notificationsAllowed')}
       {:else if permission === 'denied'}
-        {$i18n.t('setup.notificationsBlocked')}
+        {i18n.t('setup.notificationsBlocked')}
       {:else if permission === 'unsupported'}
-        {$i18n.t('setup.notificationsUnsupported')}
+        {i18n.t('setup.notificationsUnsupported')}
       {:else}
-        {$i18n.t('setup.notificationsDescription')}
+        {i18n.t('setup.notificationsDescription')}
       {/if}
     </AuthInfoBox>
   </AuthField>
@@ -105,27 +110,48 @@
   {#if permission === 'prompt'}
     <Button onclick={allow}>
       <BellRingingIcon aria-hidden="true" />
-      {$i18n.t('setup.notificationsAllow')}
+      {i18n.t('common.allowNotifications')}
     </Button>
   {/if}
 
+  {#if permission === 'granted'}
+    <ul class="settings-rows">
+      <SettingsRow
+        id="notification-content"
+        key="notificationContent"
+        title={i18n.t('settings.notificationContent')}
+        description={i18n.t('settings.notificationContentHint')}
+        control={contentId}
+      >
+        <Switch
+          id={contentId}
+          checked={preferences.notificationContent}
+          label={i18n.t('settings.notificationContent')}
+          onCheckedChange={(checked) => {
+            setPreference('notificationContent', checked);
+          }}
+        />
+      </SettingsRow>
+    </ul>
+  {/if}
+
   {#if askDefault}
-    <AuthField labelId="notifications-group-title" label={$i18n.t('setup.notificationsGroupLabel')}>
+    <AuthField labelId="notifications-group-title" label={i18n.t('setup.notificationsGroupLabel')}>
       <OptionCards
-        label={$i18n.t('setup.notificationsGroupLabel')}
+        label={i18n.t('setup.notificationsGroupLabel')}
         value={groupMode}
         disabled={saving}
         options={[
           {
             value: 'all',
-            label: $i18n.t('room.notifyAll'),
-            hint: $i18n.t('setup.notificationsAllHint'),
+            label: i18n.t('room.notifyAll'),
+            hint: i18n.t('setup.notificationsAllHint'),
             icon: BellRingingIcon,
           },
           {
             value: 'mentions',
-            label: $i18n.t('room.notifyMentions'),
-            hint: $i18n.t('setup.notificationsMentionsHint'),
+            label: i18n.t('room.notifyMentions'),
+            hint: i18n.t('setup.notificationsMentionsHint'),
             icon: BellSimpleIcon,
           },
         ]}
@@ -140,11 +166,11 @@
   <AuthStatusSlot message={error} />
 
   <Button type="submit" variant="primary" block loading={saving}>
-    {$i18n.t('auth.continue')}
+    {i18n.t('auth.continue')}
   </Button>
 </form>
 
-<AuthSecondaryAction label={$i18n.t('auth.skipForNow')} onclick={onSkip} disabled={saving} />
+<AuthSecondaryAction label={i18n.t('auth.skipForNow')} onclick={onSkip} disabled={saving} />
 
 <style>
   .notifications-setup-card {

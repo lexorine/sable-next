@@ -1,15 +1,22 @@
 <script lang="ts">
+  import { copyText } from '#lib/platform/clipboard.js';
   import * as Sentry from '@sentry/sveltekit';
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
   import { page } from '$app/state';
-  import { forgeIssueUrl, openForgeIssueUrl } from '#lib/features/bug-report/forge.js';
+  import {
+    forgeIssueUrl,
+    issueEnvironment,
+    openForgeIssueUrl,
+  } from '#lib/features/bug-report/forge.js';
   import { i18n } from '#lib/i18n.js';
+  import { describePlatform, issuePlatform } from '#lib/platform/diagnostics.js';
   import Button from '#lib/ui/primitives/Button.svelte';
   import TextArea from '#lib/ui/primitives/TextArea.svelte';
 
   let details = $state('');
   let detailsSent = $state(false);
+  let copied = $state(false);
 
   let crash = $derived(page.error?.stack !== undefined || page.error?.eventId !== undefined);
   let eventId = $derived(page.error?.eventId);
@@ -18,13 +25,30 @@
     void goto(resolve('/(app)/rooms'));
   }
 
-  function reportOnForge(): void {
+  async function copyError(): Promise<void> {
     const error = page.error;
     if (!error) return;
+    const stack = error.stack ?? '';
+    const text = stack.includes(error.message) ? stack : [error.message, stack].join('\n\n');
+    try {
+      await copyText(text.trim());
+      copied = true;
+    } catch (failure) {
+      console.debug('[sable] clipboard unavailable', failure);
+    }
+  }
+
+  async function reportOnForge(): Promise<void> {
+    const error = page.error;
+    if (!error) return;
+    const [platforms, os] = await Promise.all([issuePlatform(), describePlatform()]);
     const url = forgeIssueUrl('bug', `Crash: ${error.message}`, {
       description: error.message,
-      context: details.trim(),
-      info: ['```', error.stack ?? error.message, '```'].join('\n'),
+      platforms,
+      info: issueEnvironment(os),
+      context: [details.trim(), '```', error.stack ?? error.message, '```']
+        .filter(Boolean)
+        .join('\n'),
     });
     void openForgeIssueUrl(url);
   }
@@ -47,43 +71,43 @@
 <main class="error-page" aria-labelledby="error-title">
   <div class="error-content">
     <p class="error-code" aria-hidden="true">{page.status}</p>
-    <h1 id="error-title">{page.error?.message ?? $i18n.t('errors.pageTitle')}</h1>
+    <h1 id="error-title">{page.error?.message ?? i18n.t('errors.pageTitle')}</h1>
 
     {#if crash}
       <p class="crash-note">
-        {eventId === undefined
-          ? $i18n.t('errors.crashUnreported')
-          : $i18n.t('errors.crashReported')}
+        {eventId === undefined ? i18n.t('errors.crashUnreported') : i18n.t('errors.crashReported')}
       </p>
 
       {#if detailsSent}
-        <p class="crash-note">{$i18n.t('errors.detailsThanks')}</p>
+        <p class="crash-note">{i18n.t('errors.detailsThanks')}</p>
       {:else}
         <TextArea
           bind:value={details}
           rows={3}
-          aria-label={$i18n.t('errors.detailsLabel')}
-          placeholder={$i18n.t('errors.detailsPlaceholder')}
+          aria-label={i18n.t('errors.detailsLabel')}
+          placeholder={i18n.t('errors.detailsPlaceholder')}
         />
         {#if eventId !== undefined}
           <Button size="medium" disabled={details.trim() === ''} onclick={sendDetails}>
-            {$i18n.t('errors.sendDetails')}
+            {i18n.t('errors.sendDetails')}
           </Button>
         {/if}
       {/if}
 
-      <Button size="medium" onclick={reportOnForge}>{$i18n.t('errors.reportIssue')}</Button>
+      <Button size="medium" onclick={reportOnForge}>{i18n.t('errors.reportIssue')}</Button>
+      <Button size="medium" onclick={copyError}>
+        {copied ? i18n.t('common.copied') : i18n.t('common.copy')}
+      </Button>
 
       {#if page.error?.stack}
         <details class="stack">
-          <summary>{$i18n.t('errors.showStack')}</summary>
+          <summary>{i18n.t('errors.showStack')}</summary>
           <pre>{page.error.stack}</pre>
         </details>
       {/if}
     {/if}
 
-    <Button class="error-reload" size="medium" onclick={reloadApp}
-      >{$i18n.t('errors.reload')}</Button
+    <Button class="error-reload" size="medium" onclick={reloadApp}>{i18n.t('common.reload')}</Button
     >
   </div>
 </main>

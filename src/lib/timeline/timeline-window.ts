@@ -7,11 +7,13 @@ export interface TimelineRow<T> extends TimelineEntry<T> {
   index: number;
 }
 
-export interface TimelineWindowState {
+export interface TimelineWindowState<T = unknown> {
   start: number;
   end: number;
   firstVisible: number | null;
   lastVisible: number | null;
+  lastFullyVisible: number | null;
+  rows: readonly TimelineRow<T>[];
   pinned: boolean;
   scrolling: boolean;
 }
@@ -21,7 +23,7 @@ interface Options<T> {
   canvas: HTMLElement;
   content: HTMLElement;
   render: (rows: readonly TimelineRow<T>[]) => Promise<void>;
-  onChange: (state: TimelineWindowState) => void;
+  onChange: (state: TimelineWindowState<T>) => void;
   onScroll: (delta: number) => void;
   canFollowLatest?: () => boolean;
   onInteraction?: () => void;
@@ -100,6 +102,7 @@ export class TimelineWindow<T> {
   private renderTask: Promise<void> | null = null;
   private jumpVersion = 0;
   private missedDelta = 0;
+  private lastFullyVisible: number | null = null;
   private readonly observer: ResizeObserver;
   private readonly listeners = new AbortController();
 
@@ -179,16 +182,18 @@ export class TimelineWindow<T> {
     );
   }
 
-  get state(): TimelineWindowState {
+  get state(): TimelineWindowState<T> {
     return this.stateFor(this.visibleRows());
   }
 
-  private stateFor(visible: readonly TimelineRow<T>[]): TimelineWindowState {
+  private stateFor(visible: readonly TimelineRow<T>[]): TimelineWindowState<T> {
     return {
       start: this.start,
       end: this.end,
       firstVisible: visible[0]?.index ?? null,
       lastVisible: visible.at(-1)?.index ?? null,
+      lastFullyVisible: this.lastFullyVisible,
+      rows: this.rows,
       pinned: this.pinned,
       scrolling: this.active,
     };
@@ -214,19 +219,6 @@ export class TimelineWindow<T> {
     this.pending = items;
     if (this.active) return this.task;
     return this.drain();
-  }
-
-  holdAnchor(): void {
-    this.pinned = false;
-    this.publish(this.capture());
-  }
-
-  anchorKey(accept: (value: T) => boolean = () => true): string | null {
-    const anchor = this.anchors.find(({ key }) => {
-      const row = this.rows.find((candidate) => candidate.key === key);
-      return row !== undefined && accept(row.value);
-    });
-    return anchor?.key ?? null;
   }
 
   async jumpTo(
@@ -361,7 +353,9 @@ export class TimelineWindow<T> {
         this.countBucket(size.bucket, -size.height);
       }
       if (this.pinned || !this.ready || (first < 0 && anchorIndex === undefined)) {
-        this.start = Math.max(0, next.length - PAGE * 2);
+        const latest = Math.max(0, next.length - PAGE * 2);
+        this.start =
+          this.pinned && this.ready && first === this.start ? Math.max(latest, first) : latest;
         this.end = next.length;
       } else {
         this.start = Math.max(0, anchorIndex !== undefined ? anchorIndex - PAGE : first);
@@ -415,28 +409,38 @@ export class TimelineWindow<T> {
     );
   }
 
-  private visibleRows(): TimelineRow<T>[] {
+  private visibleRows(
+    onVisible?: (
+      row: TimelineRow<T>,
+      element: HTMLElement,
+      rect: DOMRect,
+      viewportTop: number
+    ) => void
+  ): TimelineRow<T>[] {
     const bounds = this.options.viewport.getBoundingClientRect();
     const elements = this.elements();
-    return this.rows.filter((_row, index) => {
-      const rect = elements.at(index)?.getBoundingClientRect();
-      return rect && rect.bottom > bounds.top && rect.top < bounds.bottom;
+    let lastFullyVisible: number | null = null;
+    const visible = this.rows.filter((row, index) => {
+      const element = elements.at(index);
+      if (!element) return false;
+      const rect = element.getBoundingClientRect();
+      if (rect.bottom <= bounds.bottom + EPSILON) {
+        lastFullyVisible = row.index;
+      }
+      if (rect.bottom <= bounds.top || rect.top >= bounds.bottom) return false;
+      onVisible?.(row, element, rect, bounds.top);
+      return true;
     });
+    this.lastFullyVisible = lastFullyVisible;
+    return visible;
   }
 
   private capture(): TimelineRow<T>[] {
-    const viewport = this.options.viewport;
-    const bounds = viewport.getBoundingClientRect();
-    const visible: TimelineRow<T>[] = [];
-    const entries = this.elements().flatMap((element, index) => {
-      const row = this.rows.at(index);
-      if (!row) return [];
-      const rect = element.getBoundingClientRect();
-      if (rect.bottom <= bounds.top || rect.top >= bounds.bottom) return [];
-      visible.push(row);
-      if (this.options.isAnchor && !this.options.isAnchor(row.value)) return [];
+    const entries: (Anchor & { full: boolean })[] = [];
+    const visible = this.visibleRows((row, element, rect, viewportTop) => {
+      if (this.options.isAnchor && !this.options.isAnchor(row.value)) return;
       const top = element.firstElementChild?.getBoundingClientRect().top ?? rect.top;
-      return [{ key: row.key, top: top - bounds.top, full: rect.top >= bounds.top }];
+      entries.push({ key: row.key, top: top - viewportTop, full: rect.top >= viewportTop });
     });
     this.anchors = entries
       .filter((entry) => entry.full)

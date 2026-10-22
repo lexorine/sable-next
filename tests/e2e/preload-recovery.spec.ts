@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { nextFrames } from './fixtures/settle';
 
 test('does not preload a route on hover, but still handles its error when clicked', async ({
   page,
@@ -14,7 +15,7 @@ test('does not preload a route on hover, but still handles its error when clicke
     const link = document.createElement('a');
     link.href = '/register';
     link.textContent = 'Preload target';
-    document.querySelector('body > div')?.append(link);
+    document.body.append(link);
   });
   const target = page.getByRole('link', { name: 'Preload target' });
   await page.route('**/_app/immutable/nodes/**', (route) => {
@@ -23,7 +24,7 @@ test('does not preload a route on hover, but still handles its error when clicke
   });
 
   await target.hover();
-  await page.waitForTimeout(250);
+  await nextFrames(page, 15);
 
   expect(lazyRouteRequests).toBe(0);
   expect(errors).toEqual([]);

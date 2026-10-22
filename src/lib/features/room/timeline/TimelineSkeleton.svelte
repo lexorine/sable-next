@@ -1,11 +1,11 @@
 <script lang="ts">
-  import type { TimelineItemView } from '#src/generated/protocol';
   import { i18n } from '#lib/i18n.js';
   import type { TimelineLayout } from '#lib/settings/preferences.svelte.js';
   import { onMount } from 'svelte';
   import { innerHeight } from 'svelte/reactivity/window';
 
   import TimelineItem from './TimelineItem.svelte';
+  import { previewMessage } from './preview-message';
 
   interface Props {
     layout?: TimelineLayout;
@@ -61,45 +61,11 @@
       });
     })()
   );
-
-  function placeholderItem(id: number): TimelineItemView {
-    return {
-      id: `placeholder-${String(id)}`,
-      event_id: null,
-      transaction_id: null,
-      send_state: null,
-      sender: null,
-      sender_name: null,
-      sender_avatar: null,
-      timestamp: 0,
-      content: {
-        kind: 'message',
-        body: '',
-        html: '',
-        emote: false,
-        notice: false,
-        edited: false,
-      },
-      in_reply_to: null,
-      thread_root: null,
-      thread_summary: null,
-      reactions: [],
-      is_own: false,
-      read_by: [],
-      read_timestamps: {},
-      per_message_profile: null,
-      bundled_link_previews: [],
-      link_previews_removed: null,
-      mention: 'none',
-      forwarded: null,
-      forum_title: null,
-    };
-  }
 </script>
 
 <div
   class={['timeline-placeholder', 'initial', 'items', `layout-${layout}`]}
-  aria-label={$i18n.t('timeline.loading')}
+  aria-label={i18n.t('timeline.loading')}
   role="status"
 >
   {#each rows as row (row.id)}
@@ -111,7 +77,7 @@
       ]}
     >
       <TimelineItem
-        item={placeholderItem(row.id)}
+        item={previewMessage(`placeholder-${String(row.id)}`, '')}
         collapsed={row.collapsed}
         {layout}
         placeholder

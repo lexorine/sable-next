@@ -1,15 +1,18 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
-import { type as osType } from '@tauri-apps/plugin-os';
+import { type as osType, version as osVersion } from '@tauri-apps/plugin-os';
 
+import { electronBridge } from './electron';
+import type { ScreenAudioListing } from './screen-audio-types';
 import { readJson, writeJson } from './local-json';
+import {
+  type ScreenAudioChoice,
+  startScreenAudioStream,
+  stopScreenAudioStream,
+} from './screen-audio-stream';
 
-export type ScreenAudioChoice =
-  | { kind: 'none' }
-  | { kind: 'system'; exclude: string[] }
-  | { kind: 'apps'; include: string[] };
+export const SCREEN_AUDIO_LABELS = ['Sable screen audio', 'vencord-screen-share'];
 
-export const SCREEN_AUDIO_LABEL = 'Sable screen audio';
-
+const WINDOWS_LOOPBACK_BUILD = 20348;
 const CHOICE_KEY = 'sable-screen-audio-choice';
 const DEVICE_ATTEMPTS = 20;
 const DEVICE_POLL_MS = 100;
@@ -20,8 +23,11 @@ const names = (value: unknown): string[] =>
 function parseChoice(value: unknown): ScreenAudioChoice {
   if (typeof value !== 'object' || value === null) return { kind: 'none' };
   const choice = value as Record<string, unknown>;
-  if (choice.kind === 'system') return { kind: 'system', exclude: names(choice.exclude) };
-  if (choice.kind === 'apps') return { kind: 'apps', include: names(choice.include) };
+  const workaround = choice.workaround === true ? { workaround: true } : {};
+  if (choice.kind === 'system')
+    return { kind: 'system', exclude: names(choice.exclude), ...workaround };
+  if (choice.kind === 'apps')
+    return { kind: 'apps', include: names(choice.include), ...workaround };
   return { kind: 'none' };
 }
 
@@ -33,12 +39,43 @@ export function rememberScreenAudioChoice(choice: ScreenAudioChoice): void {
   writeJson(CHOICE_KEY, choice, '[sable call] screen audio choice not persisted');
 }
 
-export function listScreenAudioApps(): Promise<string[]> {
-  return invoke<string[]>('screen_audio_apps');
+export async function listScreenAudioApps(): Promise<ScreenAudioListing> {
+  const electron = electronBridge();
+  if (electron) return electron.screenAudioApps();
+  const apps = await invoke<string[]>('screen_audio_apps');
+  return { status: 'available', apps: apps.map((name) => ({ id: name, label: name })) };
+}
+
+export function screenAudioAppLabel(id: string): string {
+  if (!id.startsWith('pipewire:')) return id;
+  try {
+    const props = JSON.parse(id.slice('pipewire:'.length)) as Partial<Record<string, string>>;
+    const name = props['application.name'] ?? props['node.name'] ?? id;
+    const details = [props['media.name'], props['application.process.id']].filter(Boolean);
+    return details.length ? `${name} (${details.join(' · ')})` : name;
+  } catch {
+    return id;
+  }
+}
+
+export async function unmuteScreenAudio(): Promise<void> {
+  await electronBridge()?.unmuteScreenAudio();
+}
+
+function windowsBuild(): number {
+  return Number(osVersion().split('.').at(2));
 }
 
 export function screenAudioSupported(): boolean {
-  return isTauri() && osType() === 'linux';
+  const electron = electronBridge();
+  if (electron) return electron.platform === 'linux';
+  if (!isTauri()) return false;
+  const os = osType();
+  return os === 'linux' || (os === 'windows' && windowsBuild() >= WINDOWS_LOOPBACK_BUILD);
+}
+
+export function screenAudioPicksMany(): boolean {
+  return electronBridge() !== undefined || osType() === 'linux';
 }
 
 async function findInput(label: string): Promise<MediaDeviceInfo | null> {
@@ -56,8 +93,12 @@ async function findInput(label: string): Promise<MediaDeviceInfo | null> {
 export async function captureScreenAudio(
   selection: Exclude<ScreenAudioChoice, { kind: 'none' }>
 ): Promise<MediaStreamTrack> {
-  const label = await invoke<string>('start_screen_audio', { selection });
+  const electron = electronBridge();
+  if (!electron && osType() === 'windows') return startScreenAudioStream(selection);
   try {
+    const label = electron
+      ? await electron.startScreenAudio(selection)
+      : await invoke<string>('start_screen_audio', { selection });
     const device = await findInput(label);
     if (!device) throw new Error('screen audio source did not appear');
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -73,11 +114,15 @@ export async function captureScreenAudio(
     if (!track) throw new Error('screen audio source gave no track');
     return track;
   } catch (error) {
-    await stopScreenAudio();
+    await stopScreenAudio().catch((cleanupError: unknown) => {
+      console.warn('[sable screen audio] cleanup failed', cleanupError);
+    });
     throw error;
   }
 }
 
 export function stopScreenAudio(): Promise<void> {
-  return invoke('stop_screen_audio');
+  const electron = electronBridge();
+  if (electron) return electron.stopScreenAudio();
+  return osType() === 'windows' ? stopScreenAudioStream() : invoke('stop_screen_audio');
 }

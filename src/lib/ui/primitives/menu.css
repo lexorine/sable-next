@@ -3,6 +3,7 @@
   --menu-max-height: 20rem;
   --radius-outer: var(--radii-400);
   --radius-padding: var(--space-100);
+  --menu-padding: var(--radius-padding);
   --radius-inner: max(0px, calc(var(--radius-outer) - var(--radius-padding)));
   --menu-item-hover: var(--surface-container-hover);
   --menu-item-active: var(--surface-container-active);
@@ -16,8 +17,36 @@
   max-height: var(--menu-max-height);
   min-width: var(--menu-min-width);
   overflow: auto;
-  padding: var(--radius-padding);
+  padding: var(--menu-padding);
   transform-origin: var(--bits-floating-transform-origin, top);
+}
+
+.menu-surface:has(> .menu-scroll-content) {
+  grid-template-rows: minmax(0, 1fr);
+  overflow: hidden;
+  padding: 0;
+}
+
+.menu-scroll-content {
+  display: grid;
+  gap: inherit;
+  grid-auto-rows: max-content;
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  padding: var(--menu-padding);
+}
+
+.menu-surface.message-menu {
+  --menu-max-height: var(--bits-floating-available-height, 100dvh);
+
+  max-width: 16rem;
+}
+
+.menu-surface.message-menu .menu-item > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 @keyframes menu-in {
@@ -40,7 +69,7 @@
   }
 
   html:not([data-reduced-motion='on']) .menu-surface[data-state='closed'] {
-    animation: menu-out var(--motion-normal) var(--ease-smooth-out);
+    animation: menu-out var(--motion-normal) var(--ease-smooth-out) forwards;
   }
 }
 

@@ -1,8 +1,10 @@
 #![recursion_limit = "512"]
 
 mod account_data;
+mod account_documents;
 mod account_lock;
 mod accounts;
+pub mod api;
 mod attachments;
 mod auth;
 mod bookmarks;
@@ -10,36 +12,49 @@ mod bot_commands;
 mod calendar;
 mod calls;
 mod cosmetics;
-mod dispatch;
+#[cfg(not(target_family = "wasm"))]
+mod credentials;
+mod delayed_events;
 mod errors;
+mod gestures;
 pub use errors::CoreError;
 pub(crate) use errors::ResultExt;
 pub mod image_packs;
 mod inbox;
 mod invites;
+mod link_previews;
 pub mod matrix_html;
 mod media;
 mod media_health;
+mod member_look;
 pub use media::GalleryAttachment;
 mod key_backup;
 mod messages;
 pub mod notifications;
 mod outgoing;
+mod pack_edits;
 mod password_reset;
 mod personas;
+mod pin_marker;
 pub mod polls;
+mod power_levels;
 mod presence;
 mod preview;
+mod probed_state;
+mod profile_overrides;
 pub mod profiles;
 pub mod protocol;
 pub mod push_check;
 pub mod push_rules;
 mod qr_login;
 mod reactions;
-/// MSC2815: reading the original content of a redacted event.
-pub mod redacted;
+mod redacted;
 mod registration;
 mod room_keys;
+mod room_list_batch;
+mod room_list_rows;
+mod room_settings;
+mod room_widgets;
 mod rooms;
 mod scheduled;
 mod sealed_account_data;
@@ -51,8 +66,11 @@ pub mod store;
 mod store_disposal;
 mod subscriptions;
 mod sync_support;
+mod thread_receipts;
+mod timeline_overlay;
 mod timelines;
 pub mod tls;
+mod utd;
 #[cfg(not(target_family = "wasm"))]
 pub mod v1_migration;
 mod verification;
@@ -81,11 +99,15 @@ use matrix_sdk_ui::timeline::Timeline;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use url::Url;
 
-use protocol::{CommandErr, CoreEvent, SubscriptionId};
+use protocol::{CoreEvent, RpcError, SubscriptionId};
 use session::{AccountRegistry, Session};
 use store::SessionStore;
 
 pub(crate) type Task = AbortOnDrop<()>;
+
+/// Lets pushes and pusher upkeep use the clients of the core that owns their store.
+#[cfg(not(target_family = "wasm"))]
+static CORES: std::sync::Mutex<Vec<std::sync::Weak<Core>>> = std::sync::Mutex::new(Vec::new());
 
 /// Owns every piece of Matrix state. A carrier only moves `Command`s in and
 /// `CoreEvent`s out.
@@ -106,13 +128,25 @@ pub struct Core {
     #[cfg(not(target_family = "wasm"))]
     v1_migration: Mutex<Option<v1_migration::Import>>,
     credential_writers: Mutex<HashMap<String, u64>>,
+    next_credential_writer: AtomicU64,
     account_clients: Mutex<HashMap<String, matrix_sdk::Client>>,
     session_handlers: std::sync::Mutex<Vec<matrix_sdk::event_handler::EventHandlerDropGuard>>,
     probed_pinned_rooms: std::sync::Mutex<
         HashMap<matrix_sdk::ruma::OwnedRoomId, Vec<matrix_sdk::ruma::OwnedEventId>>,
     >,
+    pinned_caches: std::sync::Mutex<
+        HashMap<
+            matrix_sdk::ruma::OwnedRoomId,
+            (
+                matrix_sdk::event_cache::PinnedEventsCache,
+                Arc<matrix_sdk::event_cache::EventCacheDropHandles>,
+            ),
+        >,
+    >,
     cosmetics: std::sync::Mutex<cosmetics::CosmeticsCache>,
     cosmetics_fetches: std::sync::Mutex<HashMap<matrix_sdk::ruma::OwnedRoomId, Arc<Mutex<()>>>>,
+    probed_state: std::sync::Mutex<probed_state::ProbedState>,
+    recent_state: std::sync::Mutex<probed_state::RecentState>,
     media_health: std::sync::Mutex<media_health::MediaHealth>,
     media_downloads: tokio::sync::Semaphore,
     key_backup_downloads: tokio::sync::Semaphore,
@@ -130,6 +164,7 @@ pub struct Core {
     session_tasks: std::sync::Mutex<Vec<Task>>,
     subscriptions: Mutex<HashMap<SubscriptionId, Subscription>>,
     room_subscriptions: Mutex<std::collections::BTreeSet<OwnedRoomId>>,
+    warm_rooms: std::sync::Mutex<std::collections::VecDeque<OwnedRoomId>>,
     account_data_lock: Mutex<()>,
     inbox_lock: Mutex<()>,
     account_data_types: Mutex<std::collections::BTreeSet<String>>,
@@ -148,6 +183,10 @@ pub struct Core {
     search_network: search::CrawlNetwork,
     search_foreground: AtomicBool,
     app_active: AtomicBool,
+    app_wake: tokio::sync::Notify,
+    sync_suspended: AtomicBool,
+    shut_down: AtomicBool,
+    activity_lock: Mutex<()>,
     server_search_enabled: AtomicBool,
     read_room: std::sync::Mutex<Option<OwnedRoomId>>,
     search_index: Mutex<search::MessageIndex>,
@@ -164,6 +203,7 @@ struct CallSession {
     delay_id: Option<String>,
     postpone: Option<Task>,
     updates: Option<Task>,
+    state: Arc<tokio::sync::Mutex<calls::CallRuntimeState>>,
     sticky_member: Option<String>,
     _handlers: Vec<matrix_sdk::event_handler::EventHandlerDropGuard>,
 }
@@ -210,6 +250,7 @@ enum PendingLogin {
 struct Subscription {
     tasks: Vec<Task>,
     timeline: Option<Arc<Timeline>>,
+    overlay: Option<Arc<std::sync::Mutex<timeline_overlay::TimelineOverlay>>>,
     thread_root: Option<OwnedEventId>,
     kind: SubscriptionKind,
 }
@@ -257,6 +298,10 @@ impl Core {
             search_network: search::CrawlNetwork::default(),
             search_foreground: AtomicBool::new(true),
             app_active: AtomicBool::new(true),
+            app_wake: tokio::sync::Notify::new(),
+            sync_suspended: AtomicBool::new(false),
+            shut_down: AtomicBool::new(false),
+            activity_lock: Mutex::new(()),
             server_search_enabled: AtomicBool::new(true),
             read_room: std::sync::Mutex::new(None),
             next_subscription: AtomicU32::new(1),
@@ -273,11 +318,15 @@ impl Core {
             #[cfg(not(target_family = "wasm"))]
             v1_migration: Mutex::new(None),
             credential_writers: Mutex::new(HashMap::new()),
+            next_credential_writer: AtomicU64::new(1),
             account_clients: Mutex::new(HashMap::new()),
             session_handlers: std::sync::Mutex::new(Vec::new()),
             probed_pinned_rooms: std::sync::Mutex::new(HashMap::new()),
+            pinned_caches: std::sync::Mutex::new(HashMap::new()),
             cosmetics: std::sync::Mutex::new(cosmetics::CosmeticsCache::default()),
             cosmetics_fetches: std::sync::Mutex::new(HashMap::new()),
+            probed_state: std::sync::Mutex::new(probed_state::ProbedState::default()),
+            recent_state: std::sync::Mutex::new(probed_state::RecentState::default()),
             media_health: std::sync::Mutex::new(media_health::MediaHealth::default()),
             media_downloads: tokio::sync::Semaphore::new(media::MAX_MEDIA_DOWNLOADS),
             notification_routes: Mutex::new(HashMap::new()),
@@ -293,6 +342,7 @@ impl Core {
             session_tasks: std::sync::Mutex::new(Vec::new()),
             subscriptions: Mutex::new(HashMap::new()),
             room_subscriptions: Mutex::new(std::collections::BTreeSet::new()),
+            warm_rooms: std::sync::Mutex::new(std::collections::VecDeque::new()),
             account_data_lock: Mutex::new(()),
             inbox_lock: Mutex::new(()),
             account_data_types: Mutex::new(std::collections::BTreeSet::new()),
@@ -307,7 +357,31 @@ impl Core {
             call_sessions: Mutex::new(HashMap::new()),
             desired_presence: std::sync::Mutex::new(protocol::PresenceView::Online),
         });
+        #[cfg(not(target_family = "wasm"))]
+        CORES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Arc::downgrade(&core));
+        #[cfg(not(target_family = "wasm"))]
+        notifications::evict_push_cache(std::path::Path::new(&core.store_id));
         (core, rx)
+    }
+
+    /// The core of this process that owns the stores under `base_store`.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn owning(base_store: &std::path::Path) -> Option<Arc<Self>> {
+        let wanted = std::fs::canonicalize(base_store).unwrap_or_else(|_| base_store.into());
+        let mut cores = CORES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cores.retain(|core| core.strong_count() > 0);
+        cores
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .find(|core| {
+                let base = std::path::Path::new(&core.store_id);
+                std::fs::canonicalize(base).unwrap_or_else(|_| base.into()) == wanted
+            })
     }
 
     #[must_use]
@@ -387,6 +461,88 @@ impl Core {
 
     pub fn set_app_active(&self, active: bool) {
         self.app_active.store(active, Ordering::Relaxed);
+        if active {
+            self.app_wake.notify_waiters();
+        }
+    }
+
+    pub async fn apply_app_activity(self: &Arc<Self>, active: bool) {
+        let _serial = self.activity_lock.lock().await;
+        if self.app_active.load(Ordering::Relaxed) != active {
+            return;
+        }
+        let Ok(sync_service) = self.sync_service().await else {
+            return;
+        };
+        if active {
+            #[cfg(target_os = "ios")]
+            if self.sync_suspended.load(Ordering::SeqCst) {
+                self.reopen_stores().await;
+            }
+            // Starting a running service is a no-op, but from `Offline` it retries at once.
+            self.sync_suspended.store(false, Ordering::SeqCst);
+            if !self.account_locked.load(Ordering::SeqCst) {
+                sync_service.start().await;
+            }
+        } else if self.call_sessions.lock().await.is_empty() {
+            self.sync_suspended.store(true, Ordering::SeqCst);
+            sync_service.stop().await;
+            #[cfg(target_os = "ios")]
+            self.close_stores().await;
+        }
+    }
+
+    #[cfg(target_os = "ios")]
+    async fn store_clients(&self) -> Vec<matrix_sdk::Client> {
+        let mut clients: Vec<_> = self
+            .account_clients
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect();
+        clients.extend(self.client().await.ok());
+        if let Some(PendingLogin::Oidc(.., client, _) | PendingLogin::Sso(.., client, _)) =
+            self.pending_login.lock().await.as_ref()
+        {
+            clients.push(client.clone());
+        }
+        clients.extend(
+            self.pending_registration
+                .lock()
+                .await
+                .as_ref()
+                .map(registration::PendingRegistration::client),
+        );
+        clients
+    }
+
+    #[cfg(target_os = "ios")]
+    async fn close_stores(&self) {
+        for client in self.store_clients().await {
+            if let Err(error) = client.pause().await {
+                tracing::warn!("closing the stores before suspension failed: {error}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "ios")]
+    async fn reopen_stores(&self) {
+        for client in self.store_clients().await {
+            if let Err(error) = client.resume().await {
+                tracing::warn!("reopening the stores after suspension failed: {error}");
+            }
+        }
+    }
+
+    pub(crate) async fn wait_until_active(&self) {
+        loop {
+            let woken = self.app_wake.notified();
+            if self.app_active.load(Ordering::Relaxed) {
+                return;
+            }
+            woken.await;
+        }
     }
 
     pub fn set_search_network_unmetered(&self, unmetered: bool) {
@@ -412,7 +568,7 @@ impl Core {
         self.next_timeline_access.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub(crate) async fn accounts(&self) -> Result<AccountRegistry, CommandErr> {
+    pub(crate) async fn accounts(&self) -> Result<AccountRegistry, RpcError> {
         let mut accounts = self.accounts.lock().await;
         if let Some(accounts) = accounts.as_ref() {
             return Ok(accounts.clone());
@@ -438,17 +594,22 @@ impl Core {
         {
             account.session.credentials.discard_tokens();
         }
+        #[cfg(not(target_family = "wasm"))]
+        let embedded_tokens = self
+            .load_login_tokens(&mut registry)
+            .await
+            .or_failed(self, "restore_login_tokens")?;
+        #[cfg(target_family = "wasm")]
+        let embedded_tokens = false;
         if migrated
             || reanchored
+            || embedded_tokens
             || registry
                 .accounts
                 .iter()
                 .any(|account| account.device_invalidated)
         {
-            let bytes =
-                serde_json::to_vec(&registry).or_failed(self, "migrate_session_registry")?;
-            self.sessions
-                .save(bytes)
+            self.write_registry(&registry)
                 .await
                 .or_failed(self, "migrate_session_registry")?;
         }
@@ -483,7 +644,7 @@ impl Core {
         }
     }
 
-    pub(crate) async fn allocate_account(&self) -> Result<(String, String), CommandErr> {
+    pub(crate) async fn allocate_account(&self) -> Result<(String, String), RpcError> {
         let mut accounts = self.accounts.lock().await;
         if accounts.is_none() {
             drop(accounts);
@@ -496,16 +657,12 @@ impl Core {
         Ok(accounts.allocate_account(&self.store_id))
     }
 
-    pub(crate) async fn client(&self) -> Result<matrix_sdk::Client, CommandErr> {
+    pub(crate) async fn client(&self) -> Result<matrix_sdk::Client, RpcError> {
         let guard = self.session.read().await;
-        Ok(guard
-            .as_ref()
-            .ok_or(CommandErr::NotLoggedIn)?
-            .client
-            .clone())
+        Ok(guard.as_ref().ok_or(RpcError::NotLoggedIn)?.client.clone())
     }
 
-    pub(crate) async fn account_data_types(&self) -> Result<Vec<String>, CommandErr> {
+    pub(crate) async fn account_data_types(&self) -> Result<Vec<String>, RpcError> {
         let client = self.client().await?;
         let store = client.state_store();
         let mut types = self.account_data_types.lock().await.clone();
@@ -565,7 +722,7 @@ impl Core {
         &self,
         event_type: GlobalAccountDataEventType,
         label: &str,
-    ) -> Result<Option<Raw<AnyGlobalAccountDataEventContent>>, CommandErr> {
+    ) -> Result<Option<Raw<AnyGlobalAccountDataEventContent>>, RpcError> {
         self.client()
             .await?
             .account()
@@ -577,10 +734,11 @@ impl Core {
     pub(crate) async fn put_global_account_data(
         &self,
         event_type: GlobalAccountDataEventType,
-        content: &serde_json::Value,
+        content: &impl serde::Serialize,
         label: &str,
-    ) -> Result<(), CommandErr> {
-        let raw = Raw::<AnyGlobalAccountDataEventContent>::from_json_string(content.to_string())
+    ) -> Result<(), RpcError> {
+        let raw = serde_json::value::to_raw_value(content)
+            .map(Raw::<AnyGlobalAccountDataEventContent>::from_json)
             .or_failed(self, label)?;
 
         self.client()
@@ -593,7 +751,7 @@ impl Core {
         Ok(())
     }
 
-    pub(crate) async fn push_rules(&self) -> Result<Arc<push_rules::PushRules>, CommandErr> {
+    pub(crate) async fn push_rules(&self) -> Result<Arc<push_rules::PushRules>, RpcError> {
         let client = self.client().await?;
         let mut cached = self.push_rules.lock().await;
         if let Some(rules) = cached.as_ref() {
@@ -604,33 +762,36 @@ impl Core {
         Ok(rules)
     }
 
+    pub(crate) async fn every_encrypted_event_pushed(&self) -> bool {
+        match self.push_rules().await {
+            Ok(rules) => rules.pushes_every_encrypted_event().await,
+            Err(_) => false,
+        }
+    }
+
     pub(crate) async fn sync_service(
         &self,
-    ) -> Result<Arc<matrix_sdk_ui::sync_service::SyncService>, CommandErr> {
+    ) -> Result<Arc<matrix_sdk_ui::sync_service::SyncService>, RpcError> {
         let guard = self.session.read().await;
         Ok(guard
             .as_ref()
-            .ok_or(CommandErr::NotLoggedIn)?
+            .ok_or(RpcError::NotLoggedIn)?
             .sync_service
             .clone())
     }
 
-    pub(crate) async fn room(&self, room_id: &OwnedRoomId) -> Result<matrix_sdk::Room, CommandErr> {
+    pub(crate) async fn room(&self, room_id: &OwnedRoomId) -> Result<matrix_sdk::Room, RpcError> {
         self.client()
             .await?
             .get_room(room_id)
-            .ok_or(CommandErr::UnknownRoom)
+            .ok_or(RpcError::UnknownRoom)
     }
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::large_futures,
-    reason = "the dispatch future is large and cannot be boxed"
-)]
 mod tests {
     use super::*;
-    use crate::protocol::{Command, CommandErr, CommandOk};
+    use crate::protocol::RpcError;
 
     struct FailingClearSessionStore;
 
@@ -691,8 +852,9 @@ mod tests {
     async fn commands_before_login_are_rejected() {
         let (core, _rx) = Core::new("test", Box::new(store::MemorySessionStore::default()));
         assert!(matches!(
-            core.dispatch(Command::SubscribeRoomList).await,
-            Err(CommandErr::NotLoggedIn)
+            core.run(crate::api::timeline::SubscribeRoomListParams {})
+                .await,
+            Err(RpcError::NotLoggedIn)
         ));
     }
 
@@ -701,7 +863,7 @@ mod tests {
         let (core, _rx) = Core::new("test", Box::new(FailingClearSessionStore));
         assert!(matches!(
             core.clear_persisted_session().await,
-            Err(CommandErr::Failed { .. })
+            Err(RpcError::Failed { .. })
         ));
     }
 
@@ -830,8 +992,9 @@ mod tests {
             }))
             .unwrap(),
         )));
+        let base = tempfile::tempdir().unwrap();
         let (core, _events) = Core::new(
-            "test",
+            base.path().to_str().unwrap(),
             Box::new(TestSessionStore {
                 bytes: bytes.clone(),
             }),
@@ -846,7 +1009,10 @@ mod tests {
             serde_json::from_slice(bytes.lock().await.as_deref().unwrap()).unwrap();
         assert_eq!(stored["accounts"].as_array().unwrap().len(), 1);
         assert_eq!(stored["accounts"][0]["needs_reauth"], true);
-        assert_eq!(stored["accounts"][0]["store_id"], "test-account-a1");
+        assert_eq!(
+            stored["accounts"][0]["store_id"],
+            session::account_store_id(base.path().to_str().unwrap(), "a1")
+        );
         assert!(stored["active_account_id"].is_null());
     }
 
@@ -876,13 +1042,13 @@ mod tests {
         )));
         let (core, _events) = Core::new("test", Box::new(TestSessionStore { bytes }));
 
+        assert!(matches!(core.restore().await, Ok(None)));
         assert!(matches!(
-            core.restore().await,
-            Ok(CommandOk::Restore { session: None })
-        ));
-        assert!(matches!(
-            core.switch_account("a1".to_owned()).await,
-            Err(CommandErr::NotLoggedIn)
+            core.switch_account(crate::api::session::SwitchAccountParams {
+                account_id: "a1".to_owned()
+            })
+            .await,
+            Err(RpcError::NotLoggedIn)
         ));
     }
 
@@ -926,44 +1092,105 @@ mod tests {
         assert!(text.contains("/new/container/moe.sable.next-account-a1"));
         assert!(!text.contains("/old/container"));
     }
+
+    fn registry_with_tokens(access_token: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "active_account_id": "a1",
+            "next_account_id": 2,
+            "accounts": [{
+                "account_id": "a1",
+                "store_id": "unused",
+                "session": {
+                    "homeserver": "https://example.org",
+                    "credentials": {
+                        "kind": "password",
+                        "user_id": "@alice:example.org",
+                        "device_id": "DEVICEID",
+                        "access_token": access_token,
+                        "refresh_token": format!("{access_token}-refresh")
+                    }
+                }
+            }]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn tokens_a_registry_still_holds_move_into_their_login_file() {
+        let base = tempfile::tempdir().unwrap();
+        let saved = Arc::new(Mutex::new(Some(registry_with_tokens("embedded"))));
+        let (core, _rx) = Core::new(
+            base.path().to_str().unwrap(),
+            Box::new(TestSessionStore {
+                bytes: saved.clone(),
+            }),
+        );
+
+        let accounts = core.accounts().await.unwrap();
+        let tokens = accounts.accounts[0].session.credentials.tokens();
+        assert_eq!(tokens.access_token, "embedded");
+
+        let logins = crate::credentials::LoginTokens::new(base.path());
+        assert_eq!(
+            logins.load("a1", "DEVICEID").unwrap().access_token,
+            "embedded"
+        );
+        let rewritten = saved.lock().await.clone().unwrap();
+        assert!(!String::from_utf8_lossy(&rewritten).contains("embedded"));
+    }
+
+    #[tokio::test]
+    async fn a_login_file_wins_over_tokens_a_registry_still_holds() {
+        let base = tempfile::tempdir().unwrap();
+        crate::credentials::LoginTokens::new(base.path())
+            .save(
+                "a1",
+                "DEVICEID",
+                &matrix_sdk::SessionTokens {
+                    access_token: "rotated".to_owned(),
+                    refresh_token: Some("rotated-refresh".to_owned()),
+                },
+            )
+            .unwrap();
+        let (core, _rx) = Core::new(
+            base.path().to_str().unwrap(),
+            Box::new(TestSessionStore {
+                bytes: Arc::new(Mutex::new(Some(registry_with_tokens("spent")))),
+            }),
+        );
+
+        let accounts = core.accounts().await.unwrap();
+        assert_eq!(
+            accounts.accounts[0]
+                .session
+                .credentials
+                .tokens()
+                .access_token,
+            "rotated"
+        );
+    }
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
-#[expect(
-    clippy::large_futures,
-    reason = "the dispatch future is large and cannot be boxed"
-)]
 mod sdk_timeline_tests;
 
 #[cfg(all(test, not(target_family = "wasm")))]
-#[expect(
-    clippy::large_futures,
-    reason = "the dispatch future is large and cannot be boxed"
-)]
 mod sdk_notification_tests;
 
 #[cfg(all(test, not(target_family = "wasm")))]
-#[expect(
-    clippy::large_futures,
-    reason = "the dispatch future is large and cannot be boxed"
-)]
 mod sdk_helpers_tests;
 
 #[cfg(all(test, not(target_family = "wasm")))]
-#[expect(
-    clippy::large_futures,
-    reason = "the dispatch future is large and cannot be boxed"
-)]
+mod live_member_tests;
+
+#[cfg(all(test, not(target_family = "wasm")))]
 mod sdk_verification_tests;
 
 #[cfg(test)]
-#[expect(
-    clippy::large_futures,
-    reason = "the dispatch future is large and cannot be boxed"
-)]
 mod live_tests {
     use super::*;
-    use crate::protocol::{Command, CommandErr, CommandOk};
+    use crate::protocol::RpcError;
 
     #[tokio::test]
     #[ignore = "hits matrix.org"]
@@ -972,16 +1199,13 @@ mod live_tests {
             "sable-next-discover",
             Box::new(store::MemorySessionStore::default()),
         );
-        let result = core
-            .dispatch(Command::DiscoverHomeserver {
+        let homeserver = core
+            .run(api::auth::DiscoverHomeserverParams {
                 server_name: "matrix.org".into(),
             })
             .await
             .expect("discovery should succeed");
 
-        let CommandOk::DiscoverHomeserver { homeserver } = result else {
-            panic!("wrong response variant");
-        };
         assert!(homeserver.contains("matrix.org"), "got {homeserver}");
     }
 
@@ -994,9 +1218,9 @@ mod live_tests {
             Box::new(store::MemorySessionStore::default()),
         );
         let error = core
-            .dispatch(Command::Login {
+            .run(api::auth::LoginParams {
                 homeserver: "https://matrix.org".into(),
-                identifier: crate::protocol::LoginIdentifier::User {
+                identifier: crate::api::auth::LoginIdentifier::User {
                     user: "sable-next-does-not-exist".into(),
                 },
                 password: "definitely-wrong".into(),
@@ -1005,6 +1229,6 @@ mod live_tests {
             .await
             .expect_err("login should fail");
 
-        assert!(matches!(error, CommandErr::Denied), "got {error:?}");
+        assert!(matches!(error, RpcError::Denied), "got {error:?}");
     }
 }

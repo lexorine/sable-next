@@ -2,6 +2,7 @@ import { isTauri } from '@tauri-apps/api/core';
 import { type as osType } from '@tauri-apps/plugin-os';
 
 import { isNativeMobile } from './os';
+import { electronBridge, isElectron } from './electron';
 
 export type WindowEdge =
   | 'North'
@@ -17,8 +18,10 @@ export type TitleBarKind = 'desktop' | 'mac';
 
 export interface DesktopWindowSettings {
   closeToTray: boolean;
+  minimizeToTray: boolean;
   showSystemTrayIcon: boolean;
   useCustomTitleBar: boolean;
+  smoothScrolling: boolean;
 }
 
 export interface DesktopWindowState {
@@ -29,23 +32,44 @@ export function supportsDesktopWindow(): boolean {
   return isTauri() && !isNativeMobile();
 }
 
+export function supportsCustomTitleBar(): boolean {
+  return supportsDesktopWindow() || isElectron();
+}
+
+function desktopOs(): 'macos' | 'windows' | 'linux' | null {
+  if (isElectron()) {
+    const platform = electronBridge()?.platform;
+    return platform === 'darwin' ? 'macos' : platform === 'win32' ? 'windows' : 'linux';
+  }
+  return supportsDesktopWindow() ? (osType() as 'macos' | 'windows' | 'linux') : null;
+}
+
 export function supportsTray(): boolean {
+  if (isElectron()) {
+    const platform = electronBridge()?.platform;
+    return platform === 'linux' || platform === 'win32';
+  }
   return supportsDesktopWindow() && osType() !== 'macos';
 }
 
+export function supportsSmoothScrollingToggle(): boolean {
+  return isElectron() || (supportsDesktopWindow() && osType() === 'linux');
+}
+
 export function customTitleBarDefault(): boolean {
-  return supportsDesktopWindow() && osType() === 'windows';
+  return desktopOs() === 'windows';
 }
 
 export function titleBarKind(useCustomTitleBar: boolean): TitleBarKind | null {
-  if (!useCustomTitleBar || !supportsDesktopWindow()) return null;
+  if (!useCustomTitleBar || !supportsCustomTitleBar()) return null;
 
-  return osType() === 'macos' ? 'mac' : 'desktop';
+  return desktopOs() === 'macos' ? 'mac' : 'desktop';
 }
 
 export async function applyDesktopWindowSettings(
   settings: DesktopWindowSettings
 ): Promise<DesktopWindowState | null> {
+  if (isElectron()) return electronBridge()?.applyWindowSettings(settings) ?? null;
   if (!supportsDesktopWindow()) return null;
 
   const { invoke } = await import('@tauri-apps/api/core');
@@ -58,19 +82,35 @@ async function currentWindow() {
 }
 
 export async function minimizeWindow(): Promise<void> {
+  if (isElectron()) return electronBridge()?.minimizeWindow();
   await (await currentWindow()).minimize();
 }
 
 export async function toggleMaximizeWindow(): Promise<void> {
+  if (isElectron()) return electronBridge()?.toggleMaximizeWindow();
   await (await currentWindow()).toggleMaximize();
 }
 
+export async function setWindowFullscreen(fullscreen: boolean): Promise<void> {
+  await (await currentWindow()).setFullscreen(fullscreen);
+}
+
 export async function closeWindow(): Promise<void> {
+  if (isElectron()) return electronBridge()?.closeWindow();
   await (await currentWindow()).close();
+}
+
+export async function quitApp(): Promise<void> {
+  const { exit } = await import('@tauri-apps/plugin-process');
+  await exit(0);
 }
 
 export async function startWindowResize(edge: WindowEdge): Promise<void> {
   await (await currentWindow()).startResizeDragging(edge);
+}
+
+export function supportsWindowResizeHandles(): boolean {
+  return supportsDesktopWindow();
 }
 
 export function supportsSnapLayouts(): boolean {
@@ -89,6 +129,13 @@ export const dismissSnapLayouts = (): Promise<void> => snapLayouts('dismiss_snap
 const MAXIMIZE_SETTLE_MS = 150;
 
 export async function watchMaximized(onChange: (maximized: boolean) => void): Promise<() => void> {
+  const electron = electronBridge();
+  if (electron) {
+    const stop = electron.onWindowMaximized(onChange);
+    onChange(await electron.isWindowMaximized());
+    return stop;
+  }
+
   const window = await currentWindow();
   onChange(await window.isMaximized());
 
@@ -129,6 +176,8 @@ export async function watchWindowFocus(onChange: (focused: boolean) => void): Pr
 }
 
 export async function watchHiddenToTray(onHidden: () => void): Promise<() => void> {
+  const electron = electronBridge();
+  if (electron) return electron.onWindowHiddenToTray(onHidden);
   if (!supportsDesktopWindow()) return () => {};
 
   const { listen } = await import('@tauri-apps/api/event');

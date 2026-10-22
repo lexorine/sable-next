@@ -27,9 +27,10 @@ vi.mock('#lib/rooms/presence.svelte.js', async () => {
 });
 
 import { setPreference } from '#lib/settings/preferences.svelte.js';
+import { nameColorOnDark, nameColorOnLight } from '#lib/ui/primitives/readable-color.js';
 
 import MembersDrawer from './MembersDrawer.svelte';
-import { FOUNDER_POWER_LEVEL, parsePowerLevelTags } from '../settings/power-level-tags';
+import { FOUNDER_POWER_LEVEL } from '../settings/power-level-tags';
 
 const observerBackup = globalThis.IntersectionObserver;
 
@@ -44,7 +45,7 @@ afterEach(() => {
 const user = userEvent.setup();
 const memberNames = () =>
   screen
-    .queryAllByRole('button', { name: /^Open .*'s profile$/ })
+    .queryAllByRole('button', { name: /^Open .*’s profile$/ })
     .map((member) => member.querySelector('.member-name')?.textContent);
 const groups = () =>
   screen.queryAllByRole('heading', { level: 3 }).map((heading) => heading.textContent);
@@ -94,7 +95,7 @@ test('sorts members by power then name and opens their profile', async () => {
   await tick();
 
   expect(memberNames()).toEqual(['Amy', 'Bob', 'Zoe']);
-  const amy = screen.getByRole('button', { name: "Open Amy's profile" });
+  const amy = screen.getByRole('button', { name: 'Open Amy’s profile' });
   await user.click(amy);
   expect(onMemberProfile).toHaveBeenCalledWith('@amy:example.org', amy);
 });
@@ -118,9 +119,7 @@ test.each([
           service: false,
         },
       ],
-      powerTags: parsePowerLevelTags({
-        [level]: { name, color: '#ff0000', icon: { key: icon } },
-      }),
+      powerTags: { [level]: { name, color: '#ff0000', icon } },
       onClose: vi.fn(),
       onMemberProfile: vi.fn(),
     },
@@ -130,6 +129,35 @@ test.each([
   expect(groups()).toEqual([`${icon}${name}`]);
   expect(document.querySelector('.member-identity-row .role-tag-icon')).not.toBeInTheDocument();
   expect(screen.getByText('Amy')).toHaveAttribute('style', expect.stringContaining('#cf0000'));
+});
+
+test('tints a role heading with its colour corrected for each theme', async () => {
+  renderWithTooltips(MembersDrawer, {
+    props: {
+      loading: false,
+      members: [
+        {
+          user_id: '@amy:example.org',
+          display_name: 'Amy',
+          avatar_url: null,
+          power_level: FOUNDER_POWER_LEVEL,
+          membership: 'join' as const,
+          member_ts: null,
+          kicked: false,
+          service: false,
+        },
+      ],
+      powerTags: {},
+      onClose: vi.fn(),
+      onMemberProfile: vi.fn(),
+    },
+  });
+  await tick();
+
+  const heading = screen.getByRole('heading', { level: 3 });
+  expect(heading).toHaveClass('tinted');
+  expect(heading.style.getPropertyValue('--name-color-on-light')).toBe(nameColorOnLight('#0000ff'));
+  expect(heading.style.getPropertyValue('--name-color-on-dark')).toBe(nameColorOnDark('#0000ff'));
 });
 
 test('waits for room role tags instead of briefly rendering default labels', async () => {
@@ -222,6 +250,24 @@ test('honours the sort preference and fetches the membership a filter names', as
 
   expect(memberNames()).toEqual(['Zoe', 'Amy']);
   expect(loadMembership).not.toHaveBeenCalled();
+});
+
+test('a membership tab loads again when the room members change', async () => {
+  const user = userEvent.setup();
+  const loadMembership = vi.fn(() => Promise.resolve([]));
+  const props = (members: never[]) => ({
+    component: MembersDrawer,
+    props: { loading: false, members, loadMembership, onClose: vi.fn(), onMemberProfile: vi.fn() },
+  });
+  const { rerender } = renderWithTooltips(MembersDrawer, props([]).props);
+  await user.click(screen.getByRole('button', { name: 'Filter members' }));
+  await user.click(screen.getByRole('menuitem', { name: /Left/ }));
+  await tick();
+  expect(loadMembership).toHaveBeenCalledTimes(1);
+
+  await rerender(props([]));
+  await tick();
+  expect(loadMembership).toHaveBeenCalledTimes(2);
 });
 
 test('renders a first page of members and grows when the sentinel shows', async () => {

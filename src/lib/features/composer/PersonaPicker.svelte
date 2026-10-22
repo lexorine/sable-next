@@ -1,8 +1,13 @@
 <script lang="ts">
+  import { MediaQuery } from 'svelte/reactivity';
   import { Popover } from 'bits-ui';
   import UserSwitchIcon from 'phosphor-svelte/lib/UserSwitchIcon';
 
-  import type { PerMessageProfileView, PersonaView } from '#src/generated/protocol';
+  import type {
+    PerMessageProfileView,
+    PersonaView,
+    PersonaAlternateAvatarView,
+  } from '#src/generated/protocol';
 
   import { page } from '$app/state';
   import MessageReproxyDialog from '#lib/features/room/messages/MessageReproxyDialog.svelte';
@@ -11,7 +16,6 @@
   import { usePersonaStore } from '#lib/personas/personas.svelte.js';
   import { useRoomList } from '#lib/rooms/room-list.svelte.js';
   import { BREAKPOINTS } from '#lib/ui/breakpoints.js';
-  import { createMediaQuery } from '#lib/ui/media-query.svelte.js';
   import Avatar from '#lib/ui/primitives/Avatar.svelte';
   import BottomSheet from '#lib/ui/primitives/BottomSheet.svelte';
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
@@ -21,6 +25,7 @@
 
   import PersonaMenu, { type PersonaScope } from './PersonaMenu.svelte';
   import { personaSpaces } from './persona-spaces.js';
+  import { preferences } from '#lib/settings/preferences.svelte.js';
 
   interface Props {
     roomId: string;
@@ -34,13 +39,24 @@
   let { roomId, onBeforeOpen, edit }: Props = $props();
   const personas = usePersonaStore();
   const roomList = useRoomList();
-  const appLayout = createMediaQuery(BREAKPOINTS.appLayout);
+  const appLayout = new MediaQuery(BREAKPOINTS.appLayout);
 
-  let desktop = $derived(appLayout.matches);
+  let desktop = $derived(appLayout.current);
   let open = $state(false);
-  let scope = $state<PersonaScope>('account');
-
   let spaces = $derived(personaSpaces(roomList.rooms, roomId, page.params.spaceId));
+  let hasSpace = $derived(spaces.target !== null);
+
+  function getScopeToOpen() {
+    if (personas.associationFor(roomId) !== undefined) {
+      return 'room';
+    } else if (hasSpace && spaces?.target && personas.associationFor(spaces.target) !== undefined) {
+      return 'space';
+    } else {
+      return 'account';
+    }
+  }
+
+  let scope = $state<PersonaScope>(getScopeToOpen());
   let scopeTarget = $derived(scope === 'room' ? roomId : scope === 'space' ? spaces.target : null);
   let selected = $derived(personas.selectionFor(scopeTarget));
   let disabled = $derived(scopeTarget !== null && personas.disabledIn(scopeTarget));
@@ -53,18 +69,33 @@
       now: Date.now(),
     }) ?? null
   );
+  let sortedPersonas = $derived(
+    preferences.personaPickerSortOrder === 'recent'
+      ? personas.personas.slice().sort((a, b) => (b.last_used ?? 0) - (a.last_used ?? 0))
+      : preferences.personaPickerSortOrder === 'alphabetical-asc'
+        ? personas.personas.slice().sort((a, b) => a.display_name.localeCompare(b.display_name))
+        : preferences.personaPickerSortOrder === 'alphabetical-desc'
+          ? personas.personas.slice().sort((a, b) => b.display_name.localeCompare(a.display_name))
+          : personas.personas
+  );
   let shown = $derived(edit ? edit.current : active);
   let label = $derived(
     shown
-      ? $i18n.t('personas.sendingAs', { name: shown.display_name })
-      : $i18n.t('personas.pickerLabel')
+      ? i18n.t('personas.sendingAs', { name: shown.display_name })
+      : i18n.t('personas.pickerLabel')
   );
   let editOpen = $state(false);
+  let activeAvatarUrl = $derived(
+    !!selected && !!active && selected.alternate_avatar_id
+      ? active.alternate_avatars?.find((avatar) => avatar.id === selected.alternate_avatar_id)
+          ?.avatar_url
+      : active?.avatar_url
+  );
 
   function handleOpenChange(next: boolean): void {
     open = next;
     if (next) {
-      scope = 'account';
+      scope = getScopeToOpen();
       void personas.load();
     }
   }
@@ -82,7 +113,18 @@
     open = false;
     personas.select(scopeTarget, persona?.id ?? null).catch((cause: unknown) => {
       console.warn('[sable personas] the selection could not be saved', cause);
-      toasts.error($i18n.t('errors.actionFailed'));
+      toasts.error(i18n.t('errors.actionFailed'));
+    });
+  }
+
+  function alternateAvatarChoose(
+    avatar: PersonaAlternateAvatarView | null,
+    persona: PersonaView
+  ): void {
+    open = false;
+    personas.select(scopeTarget, persona.id, null, avatar?.id).catch((cause: unknown) => {
+      console.warn('[sable personas] the selection could not be saved', cause);
+      toasts.error(i18n.t('errors.actionFailed'));
     });
   }
 
@@ -91,7 +133,7 @@
     if (scopeTarget === null) return;
     personas.disable(scopeTarget).catch((cause: unknown) => {
       console.warn('[sable personas] the selection could not be saved', cause);
-      toasts.error($i18n.t('errors.actionFailed'));
+      toasts.error(i18n.t('errors.actionFailed'));
     });
   }
 </script>
@@ -138,7 +180,7 @@
               {#if active}
                 <Avatar
                   id={active?.id ?? null}
-                  src={active?.avatar_url ?? null}
+                  src={activeAvatarUrl}
                   name={active?.display_name ?? null}
                   size="small"
                 />
@@ -156,16 +198,26 @@
         {...overlayLayer()}
         side="top"
         align="start"
+        sideOffset={10}
         collisionPadding={12}
+        onOpenAutoFocus={(e) => {
+          e.preventDefault();
+          const searchInput = document.getElementById('persona-search');
+          if (searchInput instanceof HTMLInputElement) {
+            searchInput.focus();
+            searchInput.select();
+          }
+        }}
       >
         <PersonaMenu
-          personas={personas.personas}
+          personas={sortedPersonas}
           {selected}
           {disabled}
           {scope}
-          hasSpace={spaces.target !== null}
+          {hasSpace}
           onScope={setScope}
           onChoose={choose}
+          onAlternateAvatarChoose={alternateAvatarChoose}
           onDisable={disable}
         />
       </Popover.Content>
@@ -185,7 +237,7 @@
     {#if active}
       <Avatar
         id={active?.id ?? null}
-        src={active?.avatar_url ?? null}
+        src={activeAvatarUrl}
         name={active?.display_name ?? null}
         size="small"
       />
@@ -195,18 +247,19 @@
   </IconButton>
   <BottomSheet
     bind:open
-    label={$i18n.t('personas.pickerHeading')}
-    closeLabel={$i18n.t('personas.cancel')}
+    label={i18n.t('personas.pickerLabel')}
+    closeLabel={i18n.t('common.cancel')}
     onOpenChange={handleOpenChange}
   >
     <PersonaMenu
-      personas={personas.personas}
+      personas={sortedPersonas}
       {selected}
       {disabled}
       {scope}
-      hasSpace={spaces.target !== null}
+      {hasSpace}
       onScope={setScope}
       onChoose={choose}
+      onAlternateAvatarChoose={alternateAvatarChoose}
       onDisable={disable}
     />
   </BottomSheet>

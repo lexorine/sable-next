@@ -1,5 +1,6 @@
 <script lang="ts">
   import { untrack } from 'svelte';
+  import { on } from 'svelte/events';
   import { RoomEvent, Track, type Participant, type RemoteTrack } from 'livekit-client';
   import type { Room as LivekitRoom } from 'livekit-client';
   import { preferences } from '#lib/settings/preferences.svelte.js';
@@ -19,18 +20,35 @@
   let node = $state<HTMLDivElement>();
   let audioElements = $state.raw<HTMLMediaElement[]>([]);
 
-  type Filtered = { source: AudioNode; gain: GainNode; filter?: AudioWorkletNode };
+  type Filtered = {
+    source: AudioNode;
+    gain: GainNode;
+    filter?: AudioWorkletNode;
+    live: boolean;
+  };
+  type Output = AudioContext & { setSinkId?: (deviceId: string) => Promise<void> };
 
   // eslint-disable-next-line svelte/prefer-svelte-reactivity -- audio graph bookkeeping, never rendered from
   const filtered = new Map<HTMLMediaElement, Filtered>();
+  let amplifier: Output | undefined;
+  let amplify: ((element: HTMLMediaElement) => void) | undefined;
 
   const levelOf = (element: HTMLMediaElement, muted: boolean, volume: number): void => {
+    if (volume > 1 && !filtered.has(element)) amplify?.(element);
     const graph = filtered.get(element);
-    if (graph) graph.gain.gain.value = muted ? 0 : volume;
+    if (graph?.live) graph.gain.gain.value = muted ? 0 : volume;
     else {
       element.muted = muted;
-      element.volume = volume;
+      element.volume = Math.min(volume, 1);
     }
+  };
+
+  const refresh = (element: HTMLMediaElement): void => {
+    levelOf(
+      element,
+      deafened,
+      volumeOf(element.dataset.identity ?? '', element.dataset.screen === 'true')
+    );
   };
 
   $effect(() => {
@@ -43,27 +61,51 @@
       preferences.incomingVoiceIsolation && supportsVoiceFilter()
         ? createVoiceFilterBank()
         : undefined;
-    const output = bank?.context as
-      | (AudioContext & { setSinkId?: (deviceId: string) => Promise<void> })
-      | undefined;
-    const outputDevice = bank ? preferences.audioOutputDevice : '';
-    if (output?.setSinkId && outputDevice) {
-      output.setSinkId(outputDevice).catch((error: unknown) => {
-        currentTelemetry?.failure('call.audio.filter_output', error);
+    const routeToDevice = (context: Output, device: string, failure: string): void => {
+      if (!context.setSinkId || !device) return;
+      context.setSinkId(device).catch((error: unknown) => {
+        if (error instanceof DOMException && error.name === 'NotFoundError') {
+          context.setSinkId?.('').catch(ignoreError);
+          return;
+        }
+        currentTelemetry?.failure(failure, error);
       });
+    };
+    if (bank) {
+      routeToDevice(
+        bank.context as Output,
+        preferences.audioOutputDevice,
+        'call.audio.filter_output'
+      );
     }
 
     // eslint-disable-next-line svelte/prefer-svelte-reactivity -- element bookkeeping, never rendered from
     const attached = new Map<string, { track: RemoteTrack; element: HTMLMediaElement }>();
 
-    const route = (currentBank: VoiceFilterBank, track: RemoteTrack, element: HTMLMediaElement) => {
-      const { context } = currentBank;
+    const route = (
+      context: AudioContext,
+      track: RemoteTrack,
+      element: HTMLMediaElement,
+      currentBank?: VoiceFilterBank
+    ) => {
       const source = context.createMediaStreamSource(new MediaStream([track.mediaStreamTrack]));
       const gain = context.createGain();
-      const graph: Filtered = { source, gain };
+      const graph: Filtered = { source, gain, live: false };
       source.connect(gain).connect(context.destination);
       filtered.set(element, graph);
-      void context.resume().catch(ignoreError);
+      on(element, 'volumechange', () => {
+        if (filtered.get(element) === graph && graph.live && !element.muted) element.muted = true;
+      });
+      void context
+        .resume()
+        .then(() => {
+          if (filtered.get(element) !== graph) return;
+          graph.live = true;
+          element.muted = true;
+          refresh(element);
+        })
+        .catch(ignoreError);
+      if (!currentBank) return;
       currentBank
         .create()
         .then((filter) => {
@@ -101,17 +143,17 @@
         element.dataset.identity = identity;
         const screen = track.source === Track.Source.ScreenShareAudio;
         if (screen) element.dataset.screen = 'true';
-        if (bank && !screen) {
-          element.muted = true;
-          route(bank, track, element);
-        }
+        attached.set(track.sid, { track, element });
+        if (bank && !screen) route(bank.context, track, element, bank);
         levelOf(
           element,
           untrack(() => deafened),
           untrack(() => volumeOf(identity, screen))
         );
+        on(element, 'volumechange', () => {
+          if (!filtered.get(element)?.live) untrack(() => refresh(element));
+        });
         currentNode.append(element);
-        attached.set(track.sid, { track, element });
         audioElements = [...untrack(() => audioElements), element];
         currentTelemetry?.event('call.audio.track_attached', {
           'audio.attached_count': attached.size,
@@ -144,6 +186,21 @@
       }
     };
 
+    const openAmplifier = (): Output => {
+      const context: Output = new AudioContext();
+      routeToDevice(
+        context,
+        untrack(() => preferences.audioOutputDevice),
+        'call.audio.amplifier_output'
+      );
+      return context;
+    };
+
+    amplify = (element) => {
+      const entry = [...attached.values()].find((candidate) => candidate.element === element);
+      if (entry) route(bank?.context ?? (amplifier ??= openAmplifier()), entry.track, element);
+    };
+
     const onSubscribed = (track: RemoteTrack, _publication: unknown, participant: Participant) =>
       attach(track, participant.identity);
 
@@ -165,19 +222,19 @@
         .off(RoomEvent.AudioPlaybackStatusChanged, recordPlaybackStatus);
       for (const sid of [...attached.keys()]) release(sid);
       bank?.close();
+      void amplifier?.close().catch(ignoreError);
+      amplifier = undefined;
+      amplify = undefined;
     };
   });
 
   $effect(() => {
-    const muted = deafened;
-    const volume = volumeOf;
-    for (const element of audioElements) {
-      levelOf(
-        element,
-        muted,
-        volume(element.dataset.identity ?? '', element.dataset.screen === 'true')
-      );
-    }
+    const device = preferences.audioOutputDevice;
+    amplifier?.setSinkId?.(device).catch(ignoreError);
+  });
+
+  $effect(() => {
+    for (const element of audioElements) refresh(element);
   });
 </script>
 

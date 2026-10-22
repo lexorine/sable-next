@@ -34,17 +34,17 @@
   side="right"
   align="center"
   class="call-volume-popover"
-  label={$i18n.t('call.participantVolume', { name })}
-  closeLabel={$i18n.t('call.dismiss')}
+  label={i18n.t('call.participantVolume', { name })}
+  closeLabel={i18n.t('common.dismiss')}
 >
   <div class="volume">
-    <p>{$i18n.t('call.participantVolume', { name })}</p>
+    <p>{i18n.t('call.participantVolume', { name })}</p>
     <div class="row">
       <Slider
         min={0}
         max={MAX_PARTICIPANT_VOLUME}
         step={0.05}
-        label={$i18n.t('call.participantVolume', { name })}
+        label={i18n.t('call.participantVolume', { name })}
         value={volume}
         oninput={apply}
       />
@@ -54,6 +54,14 @@
 </ResponsivePopover>
 
 <style>
+  :global(.responsive-popover.call-volume-popover) {
+    background: var(--surface-container);
+    border: var(--border-width) solid var(--surface-container-line);
+    border-radius: var(--radius);
+    color: var(--surface-on-container);
+    width: auto;
+  }
+
   .volume {
     display: grid;
     gap: var(--space-150);

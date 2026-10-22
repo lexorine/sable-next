@@ -7,6 +7,7 @@
   import { readReceiptEventId } from './timeline-format';
 
   const COALESCE_MS = 500;
+  const RETRY_MS = [1_000, 5_000, 30_000];
 
   interface Props {
     timeline: RoomTimeline;
@@ -24,18 +25,23 @@
   let readingEventId: string | null = null;
   let pendingEventId: string | null = null;
   let coalesceTimer: ReturnType<typeof setTimeout> | undefined;
+  let failures = 0;
 
-  function send(eventId: string): void {
+  async function send(eventId: string): Promise<void> {
     readingEventId = eventId;
-    void onRead(eventId)
-      .then(() => {
-        lastReadEventId = eventId;
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (readingEventId === eventId) readingEventId = null;
-        flush();
-      });
+    try {
+      await onRead(eventId);
+      lastReadEventId = eventId;
+      failures = 0;
+    } catch (error) {
+      console.debug('[sable timeline] read receipt failed, retrying', error);
+      failures += 1;
+      pendingEventId ??= eventId;
+    } finally {
+      if (readingEventId === eventId) readingEventId = null;
+      if (failures === 0) flush();
+      else coalesceTimer ??= setTimeout(flush, RETRY_MS[Math.min(failures, RETRY_MS.length) - 1]);
+    }
   }
 
   function flush(): void {
@@ -46,8 +52,7 @@
       return;
     }
     const eventId = pendingEventId;
-    if (!eventId || readingEventId !== null) return;
-    // Queued receipts were already visible, even if the tab is now hidden.
+    if (!active || !eventId || readingEventId !== null) return;
     if (
       readReceiptEventId(timeline.items, {
         visibleEventId: eventId,
@@ -59,11 +64,10 @@
       return;
     }
     pendingEventId = null;
-    send(eventId);
+    void send(eventId);
   }
 
   $effect(() => {
-    if (!active) flush();
     if (historical || !enabled) {
       pendingEventId = null;
       clearTimeout(coalesceTimer);
@@ -75,9 +79,10 @@
       documentVisible: active,
       lastReadEventId: pendingEventId ?? readingEventId ?? lastReadEventId,
     });
-    if (!eventId || eventId === readingEventId) return;
-    pendingEventId = eventId;
-    if (coalesceTimer === undefined) coalesceTimer = setTimeout(flush, COALESCE_MS);
+    if (eventId && eventId !== readingEventId) pendingEventId = eventId;
+    if (active && pendingEventId && coalesceTimer === undefined) {
+      coalesceTimer = setTimeout(flush, COALESCE_MS);
+    }
   });
 
   onDestroy(() => {

@@ -14,20 +14,29 @@
   const isComposer = $derived(category.id === 'composer');
   const isTimeline = $derived(category.id === 'timeline');
   const docked = $derived(isComposer || isTimeline);
+  let draftTextScale = $state<number | null>(null);
 </script>
 
 <AppPageShell
-  title={$i18n.t(category.name)}
-  description={category.description ? $i18n.t(category.description) : undefined}
+  title={i18n.t(category.name)}
+  description={category.description ? i18n.t(category.description) : undefined}
   density="compact"
   class={['settings-category', isComposer && 'settings-category-dock']}
 >
   {#if docked}
     <div class="settings-with-preview">
       <div class="settings-with-preview-scroll">
-        <SettingsCategorySections {category} />
+        <SettingsCategorySections
+          {category}
+          onRangeDraft={(key, value) => {
+            if (key === 'textScale') draftTextScale = value;
+          }}
+        />
       </div>
-      <div class="settings-preview-dock">
+      <div
+        class={['settings-preview-dock', draftTextScale !== null && 'text-scale-scope']}
+        style:--text-scale={draftTextScale}
+      >
         {#if isComposer}
           <ComposerSettingsPreview />
         {:else}

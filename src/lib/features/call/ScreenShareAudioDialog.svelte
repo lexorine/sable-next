@@ -9,8 +9,12 @@
   import {
     lastScreenAudioChoice,
     listScreenAudioApps,
-    type ScreenAudioChoice,
+    screenAudioPicksMany,
+    screenAudioAppLabel,
   } from '#lib/platform/screen-audio.js';
+  import { electronBridge } from '#lib/platform/electron.js';
+  import type { ScreenAudioListing } from '#lib/platform/screen-audio-types.js';
+  import type { ScreenAudioChoice } from '#lib/platform/screen-audio-stream.js';
   import Alert from '#lib/ui/primitives/Alert.svelte';
   import Button from '#lib/ui/primitives/Button.svelte';
   import DialogActions from '#lib/ui/primitives/DialogActions.svelte';
@@ -18,6 +22,7 @@
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
   import OptionCards from '#lib/ui/primitives/OptionCards.svelte';
   import Spinner from '#lib/ui/primitives/Spinner.svelte';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
 
   type Kind = ScreenAudioChoice['kind'];
 
@@ -28,6 +33,8 @@
 
   let { onShare, onCancel }: Props = $props();
 
+  const many = screenAudioPicksMany();
+  const linuxElectron = electronBridge()?.platform === 'linux';
   const last = lastScreenAudioChoice();
   let kind = $state<Kind>(last.kind);
   let excluded = $state<string[]>(last.kind === 'system' ? last.exclude : []);
@@ -35,28 +42,36 @@
   let playing = $state.raw<string[]>([]);
   let loading = $state(false);
   let failed = $state(false);
+  let backend = $state<ScreenAudioListing['status']>('available');
+  let labels = $state.raw<Record<string, string>>({});
+  let workaround = $state(last.kind !== 'none' && last.workaround === true);
 
   let picked = $derived(kind === 'system' ? excluded : included);
   let apps = $derived([...new Set([...playing, ...picked])].sort((a, b) => a.localeCompare(b)));
-  let ready = $derived(kind !== 'apps' || included.length > 0);
+  let available = $derived(backend === 'available' || backend === 'pipewire-pulse-missing');
+  let ready = $derived(
+    kind === 'none' ||
+      (!loading && !failed && available && (kind !== 'apps' || included.length > 0))
+  );
+  let listed = $derived(kind === 'apps' || (kind === 'system' && many));
 
   let options = $derived([
     {
       value: 'none' as const,
-      label: $i18n.t('call.screenAudioNone'),
-      hint: $i18n.t('call.screenAudioNoneHint'),
+      label: i18n.t('call.screenAudioNone'),
+      hint: i18n.t('call.screenAudioNoneHint'),
       icon: SpeakerSlashIcon,
     },
     {
       value: 'system' as const,
-      label: $i18n.t('call.screenAudioSystem'),
-      hint: $i18n.t('call.screenAudioSystemHint'),
+      label: i18n.t('call.screenAudioSystem'),
+      hint: i18n.t('call.screenAudioSystemHint'),
       icon: SpeakerHighIcon,
     },
     {
       value: 'apps' as const,
-      label: $i18n.t('call.screenAudioApps'),
-      hint: $i18n.t('call.screenAudioAppsHint'),
+      label: i18n.t(many ? 'call.screenAudioApps' : 'call.screenAudioAppsOne'),
+      hint: i18n.t(many ? 'call.screenAudioAppsHint' : 'call.screenAudioAppsOneHint'),
       icon: AppWindowIcon,
     },
   ]);
@@ -65,7 +80,10 @@
     loading = true;
     failed = false;
     try {
-      playing = await listScreenAudioApps();
+      const result = await listScreenAudioApps();
+      backend = result.status;
+      playing = result.apps.map((app) => app.id);
+      labels = Object.fromEntries(result.apps.map((app) => [app.id, app.label]));
     } catch (error) {
       console.warn('[sable call] could not list apps playing audio', error);
       failed = true;
@@ -76,21 +94,26 @@
 
   let requested = false;
   $effect(() => {
-    if (kind === 'none' || requested) return;
+    if (!listed || requested) return;
     requested = true;
     void refresh();
   });
 
   function toggle(app: string): void {
-    const next = picked.includes(app) ? picked.filter((name) => name !== app) : [...picked, app];
+    const next = !many
+      ? [app]
+      : picked.includes(app)
+        ? picked.filter((name) => name !== app)
+        : [...picked, app];
     if (kind === 'system') excluded = next;
     else included = next;
   }
 
   function share(): void {
     if (!ready) return;
-    if (kind === 'system') onShare({ kind, exclude: excluded });
-    else if (kind === 'apps') onShare({ kind, include: included });
+    const extra = linuxElectron && workaround ? { workaround: true } : {};
+    if (kind === 'system') onShare({ kind, exclude: $state.snapshot(excluded), ...extra });
+    else if (kind === 'apps') onShare({ kind, include: $state.snapshot(included), ...extra });
     else onShare({ kind: 'none' });
   }
 </script>
@@ -101,19 +124,19 @@
     if (!next) onCancel();
   }}
   variant="verification"
-  label={$i18n.t('call.screenAudioTitle')}
+  label={i18n.t('call.screenAudioTitle')}
   onConfirm={share}
 >
   <div class="screen-audio">
-    <h2>{$i18n.t('call.screenAudioTitle')}</h2>
+    <h2>{i18n.t('call.screenAudioTitle')}</h2>
     <Dialog.Description>
       {#snippet child({ props })}
-        <p {...props} class="explain">{$i18n.t('call.screenAudioExplain')}</p>
+        <p {...props} class="explain">{i18n.t('call.screenAudioExplain')}</p>
       {/snippet}
     </Dialog.Description>
 
     <OptionCards
-      label={$i18n.t('call.screenAudioChoice')}
+      label={i18n.t('call.screenAudioChoice')}
       {options}
       value={kind}
       onSelect={(next) => {
@@ -121,16 +144,22 @@
       }}
     />
 
-    {#if kind !== 'none'}
+    {#if listed}
       <section class="apps" aria-labelledby="screen-audio-apps">
         <header>
           <h3 id="screen-audio-apps">
-            {$i18n.t(kind === 'system' ? 'call.screenAudioExclude' : 'call.screenAudioInclude')}
+            {i18n.t(
+              kind === 'system'
+                ? 'call.screenAudioExclude'
+                : many
+                  ? 'call.screenAudioInclude'
+                  : 'call.screenAudioIncludeOne'
+            )}
           </h3>
           <IconButton
             variant="subtle"
             size="small"
-            label={$i18n.t('call.screenAudioRefresh')}
+            label={i18n.t('call.screenAudioRefresh')}
             {loading}
             onclick={() => void refresh()}
           >
@@ -139,27 +168,36 @@
         </header>
 
         {#if failed}
-          <Alert variant="critical" role="alert">{$i18n.t('call.screenAudioFailed')}</Alert>
+          <Alert variant="critical" role="alert">{i18n.t('call.screenAudioFailed')}</Alert>
+        {:else if backend === 'incompatible'}
+          <Alert variant="critical" role="alert">{i18n.t('call.screenAudioIncompatible')}</Alert>
+        {:else if backend === 'unavailable'}
+          <Alert variant="critical" role="alert">{i18n.t('call.screenAudioUnavailable')}</Alert>
+        {:else if backend === 'pipewire-pulse-missing'}
+          <Alert variant="warning" role="status"
+            >{i18n.t('call.screenAudioPipeWirePulseMissing')}</Alert
+          >
         {/if}
         {#if loading && apps.length === 0}
-          <div class="state"><Spinner small label={$i18n.t('call.screenAudioLoading')} /></div>
+          <div class="state"><Spinner small label={i18n.t('call.screenAudioLoading')} /></div>
         {:else if apps.length === 0}
-          {#if !failed}<p class="state">{$i18n.t('call.screenAudioEmpty')}</p>{/if}
+          {#if !failed && available}<p class="state">{i18n.t('call.screenAudioEmpty')}</p>{/if}
         {:else}
-          <ul>
+          <ul {@attach scrollHint}>
             {#each apps as app (app)}
               <li>
                 <label>
                   <input
-                    type="checkbox"
+                    type={many ? 'checkbox' : 'radio'}
+                    name="screen-audio-app"
                     checked={picked.includes(app)}
                     onchange={() => {
                       toggle(app);
                     }}
                   />
-                  <span class="app-name">{app}</span>
+                  <span class="app-name">{labels[app] ?? screenAudioAppLabel(app)}</span>
                   {#if !playing.includes(app)}
-                    <span class="quiet">{$i18n.t('call.screenAudioSilent')}</span>
+                    <span class="quiet">{i18n.t('call.screenAudioSilent')}</span>
                   {/if}
                 </label>
               </li>
@@ -169,12 +207,20 @@
       </section>
     {/if}
 
+    {#if linuxElectron && kind !== 'none'}
+      <label>
+        <input type="checkbox" bind:checked={workaround} />
+        {i18n.t('call.screenAudioWorkaround')}
+      </label>
+      <p class="explain">{i18n.t('call.screenAudioWorkaroundHint')}</p>
+    {/if}
+
     <DialogActions>
       <Button type="button" variant="ghost" onclick={onCancel}>
-        {$i18n.t('settings.cancel')}
+        {i18n.t('common.cancel')}
       </Button>
       <Button type="submit" disabled={!ready}>
-        {$i18n.t('call.screenAudioShare')}
+        {i18n.t('common.share')}
       </Button>
     </DialogActions>
   </div>

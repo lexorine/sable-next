@@ -3,6 +3,7 @@
 
   import { useCoreClient } from '#lib/core/context.js';
   import { scheduleInputs } from '#lib/features/composer/schedule-time.js';
+  import { notifiedRelation } from '#lib/features/room/messages/notified-relation.js';
   import { i18n } from '#lib/i18n.js';
   import Alert from '#lib/ui/primitives/Alert.svelte';
   import Button from '#lib/ui/primitives/Button.svelte';
@@ -48,6 +49,21 @@
     outcome = null;
   }
 
+  async function mainTimelineTarget(eventId: string): Promise<string> {
+    try {
+      const { source } = await core.rpc.timeline.eventSource({
+        room_id: roomId,
+        event_id: eventId,
+        include_original: false,
+      });
+      const relation = notifiedRelation(source);
+      return relation?.thread ? relation.eventId : eventId;
+    } catch (error) {
+      console.debug('[sable room] jumped-to event source unavailable', error);
+      return eventId;
+    }
+  }
+
   async function jump(): Promise<void> {
     const at = value === '' ? Number.NaN : new Date(value).getTime();
     if (Number.isNaN(at) || searching) return;
@@ -55,13 +71,18 @@
     searching = true;
     outcome = null;
     try {
-      const eventId = await core.commands.timestampToEvent(roomId, at, 'forward');
+      const eventId = await core.rpc.timeline.timestampToEvent({
+        room_id: roomId,
+        ts: at,
+        direction: 'forward',
+      });
       if (eventId === null) {
         outcome = 'missing';
         return;
       }
+      const target = await mainTimelineTarget(eventId);
       onOpenChange(false);
-      onJump(eventId);
+      onJump(target);
     } catch (error) {
       console.warn('[sable room] jump to time failed', error);
       outcome = 'failed';
@@ -75,14 +96,14 @@
   {open}
   {onOpenChange}
   variant="verification"
-  label={$i18n.t('room.jumpTitle')}
+  label={i18n.t('room.menuJumpToTime')}
   onConfirm={() => void jump()}
 >
   <div class="jump">
-    <h2>{$i18n.t('room.jumpTitle')}</h2>
-    <p class="explain">{$i18n.t('room.jumpBody')}</p>
+    <h2>{i18n.t('room.menuJumpToTime')}</h2>
+    <p class="explain">{i18n.t('room.jumpBody')}</p>
 
-    <DateTimeField label={$i18n.t('room.jumpMoment')} bind:value />
+    <DateTimeField label={i18n.t('common.dateAndTime')} bind:value />
 
     <div class="shortcuts">
       <Button
@@ -90,28 +111,28 @@
         variant="secondary"
         onclick={() => {
           setDay(0);
-        }}>{$i18n.t('room.jumpToday')}</Button
+        }}>{i18n.t('common.today')}</Button
       >
       <Button
         size="small"
         variant="secondary"
         onclick={() => {
           setDay(1);
-        }}>{$i18n.t('room.jumpYesterday')}</Button
+        }}>{i18n.t('common.yesterday')}</Button
       >
       <Button
         size="small"
         variant="secondary"
         onclick={() => {
           setDay(7);
-        }}>{$i18n.t('room.jumpLastWeek')}</Button
+        }}>{i18n.t('room.jumpLastWeek')}</Button
       >
     </div>
 
     {#if outcome === 'missing'}
-      <Alert variant="info" role="status">{$i18n.t('room.jumpMissing')}</Alert>
+      <Alert variant="info" role="status">{i18n.t('room.jumpMissing')}</Alert>
     {:else if outcome === 'failed'}
-      <Alert variant="critical" role="alert">{$i18n.t('room.jumpFailed')}</Alert>
+      <Alert variant="critical" role="alert">{i18n.t('room.jumpFailed')}</Alert>
     {/if}
 
     <DialogActions>
@@ -119,9 +140,9 @@
         variant="ghost"
         onclick={() => {
           onOpenChange(false);
-        }}>{$i18n.t('room.jumpCancel')}</Button
+        }}>{i18n.t('common.cancel')}</Button
       >
-      <Button type="submit" loading={searching}>{$i18n.t('room.jumpSubmit')}</Button>
+      <Button type="submit" loading={searching}>{i18n.t('room.jumpSubmit')}</Button>
     </DialogActions>
   </div>
 </DialogFrame>

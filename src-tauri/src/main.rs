@@ -146,6 +146,9 @@ fn cef_command_line_args(proxy: Option<&str>) -> Vec<(String, Option<String>)> {
         ),
     ];
 
+    if !app_lib::smooth_scrolling::enabled() {
+        args.push(("--disable-smooth-scrolling".into(), None));
+    }
     if let Ok(port) = std::env::var("SABLE_DEVTOOLS") {
         args.push(("--remote-debugging-port".into(), Some(port)));
     }
@@ -178,7 +181,7 @@ fn is_cef_subprocess() -> bool {
 
 #[cfg(all(feature = "cef", target_os = "linux"))]
 fn is_crash_reporter() -> bool {
-    std::env::var_os("_CRASH_REPORTER_SERVER").is_some()
+    sentry::integrations::minidump::MinidumpIntegration::new().is_crash_reporter_process()
 }
 
 #[cfg(all(feature = "cef", target_os = "linux"))]
@@ -202,16 +205,21 @@ fn apply_env_defaults(defaults: &[(&str, std::ffi::OsString)]) {
 
 #[cfg(target_os = "linux")]
 fn mark_own_audio() {
-    let marker = app_lib::screen_audio::SELF_MARKER;
-    let value = match std::env::var("PULSE_PROP") {
-        Ok(existing) if existing.contains(marker) => return,
-        Ok(existing) if !existing.trim().is_empty() => format!("{existing} {marker}"),
-        _ => marker.to_owned(),
+    append_pulse_prop("PULSE_PROP", app_lib::screen_audio::SELF_MARKER);
+    append_pulse_prop("PULSE_PROP_OVERRIDE", "application.name=Sable");
+}
+
+#[cfg(target_os = "linux")]
+fn append_pulse_prop(key: &str, prop: &str) {
+    let value = match std::env::var(key) {
+        Ok(existing) if existing.contains(prop) => return,
+        Ok(existing) if !existing.trim().is_empty() => format!("{existing} {prop}"),
+        _ => prop.to_owned(),
     };
     // SAFETY: single-threaded, before anything Tauri or CEF spawns a thread.
     #[expect(unsafe_code, reason = "FFI call")]
     unsafe {
-        std::env::set_var("PULSE_PROP", value);
+        std::env::set_var(key, value);
     }
 }
 
@@ -307,11 +315,10 @@ fn main() {
                 "asset".into(),
                 app_lib::TILE_URI_SCHEME.into(),
             ],
-            deep_link_schemes: vec![
-                "moe.sable.app".into(),
-                "moe.sable.next".into(),
-                "sable".into(),
-            ],
+            deep_link_schemes: app_lib::deep_link_ipc::schemes()
+                .iter()
+                .map(|scheme| (*scheme).into())
+                .collect(),
             command_line_args: cef_command_line_args(proxy.as_deref()),
             linux_windowing: if is_cef_views() {
                 tauri_runtime_cef::LinuxWindowing::Wayland

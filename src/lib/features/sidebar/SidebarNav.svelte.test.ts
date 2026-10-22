@@ -1,15 +1,17 @@
+import type { RoomPermissionsView } from '#src/generated/protocol';
 // @vitest-environment happy-dom
 
 import { render, screen, within } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import { afterEach, beforeEach, expect, onTestFinished, test, vi } from 'vitest';
 
-import type { CoreEvent, RoomSummary } from '#src/generated/protocol';
+import type { CoreEvent, RoomListItemView } from '#src/generated/protocol';
 
 vi.mock('$app/state', () => import('#lib/test-support/app-state.js'));
 vi.mock('$app/navigation', () => import('#lib/test-support/app-navigation.js'));
 
 import { visit } from '#lib/test-support/app-state.js';
+import { navigated } from '#lib/test-support/app-navigation.js';
 vi.mock('#lib/i18n.js', () => import('#lib/test-support/i18n.js'));
 const fixture = vi.hoisted(() => ({ roomList: null as RoomList | null }));
 vi.mock('#lib/rooms/room-list.svelte.js', async (importOriginal) => ({
@@ -34,11 +36,14 @@ vi.mock('#lib/rooms/presence.svelte.js', async (importOriginal) => ({
 import { core } from '#lib/core/__mocks__/context.js';
 import { setPreference } from '#lib/settings/preferences.svelte.js';
 
-core.roomPermissions.mockResolvedValue({ can_manage_children: false });
+core.rpc.members.permissions.mockResolvedValue({
+  can_manage_children: false,
+} as RoomPermissionsView);
 
 import SidebarNav from './SidebarNavHarness.test.svelte';
 import { RoomList } from '#lib/rooms/room-list.svelte.js';
 import type { CoreClient } from '#lib/core/client.svelte.js';
+import { withCounts } from '#lib/rooms/summary-fixtures.js';
 
 beforeEach(() => {
   visit('/rooms');
@@ -49,8 +54,8 @@ afterEach(() => {
   sidebarFixture.items = [];
 });
 
-function space(roomId = '!space:example.org', name = 'Space'): RoomSummary {
-  return {
+function space(roomId = '!space:example.org', name = 'Space'): RoomListItemView {
+  return withCounts({
     room_id: roomId,
     canonical_alias: null,
     name,
@@ -62,11 +67,10 @@ function space(roomId = '!space:example.org', name = 'Space'): RoomSummary {
     tags: [],
     state: 'joined',
     encrypted: null,
-    is_space: true,
+    room_kind: 'space',
     is_tombstoned: false,
-    is_voice: false,
     call_participants: [],
-    room_type: null,
+    screen_sharers: [],
     supports_knock: true,
     supports_restricted: true,
     supports_knock_restricted: true,
@@ -76,7 +80,7 @@ function space(roomId = '!space:example.org', name = 'Space'): RoomSummary {
     highlight: 0,
     marked_unread: false,
     latest_event: null,
-  };
+  });
 }
 
 async function startRoomList(core: CoreClient): Promise<RoomList> {
@@ -97,10 +101,75 @@ function railOrder(names: readonly string[]): (string | null)[] {
     .filter((name) => name !== null && names.includes(name));
 }
 
+test.each([
+  ['/rooms', {}, '/create-room', ['Unspaced']],
+  ['/direct', {}, '/create-room', ['Alice']],
+  ['/create-room', {}, '/create-room', ['Unspaced']],
+  ['/home', {}, '/create-room', ['Child', 'Unspaced', 'Alice']],
+  [
+    '/space/!space%3Aexample.org/lobby',
+    { spaceId: '!space:example.org' },
+    '/create-room',
+    ['Child'],
+  ],
+  [
+    '/space/!space%3Aexample.org/lobby',
+    { spaceId: '!space:example.org' },
+    '/space/!space%3Aexample.org/create-room',
+    ['Child'],
+  ],
+])(
+  'keeps the room list from %s while creating a room (%#)',
+  async (path, params, target, names) => {
+    const child = { ...space('!child:example.org', 'Child'), room_kind: 'text' };
+    const parent = {
+      ...space(),
+      space_children: [
+        { room_id: child.room_id, via: [], order: null, origin_server_ts: 1, suggested: false },
+      ],
+    };
+    const rooms = [
+      parent,
+      child,
+      { ...space('!unspaced:example.org', 'Unspaced'), room_kind: 'text' },
+      { ...space('!dm:example.org', 'Alice'), room_kind: 'text', is_direct: true },
+    ];
+    const client = {
+      subscribeEvents: () => () => {},
+      rpc: {
+        timeline: {
+          subscribeRoomList: () => Promise.resolve({ subscription: 1, rooms }),
+          unsubscribe: () => Promise.resolve(),
+        },
+      },
+    } as unknown as CoreClient;
+    await startRoomList(client);
+    visit(path, params);
+    render(SidebarNav);
+    await tick();
+
+    const roomNames = () =>
+      Array.from(document.querySelectorAll('.room-row .room-name'), (node) => node.textContent);
+    expect(roomNames()).toEqual(names);
+
+    visit(target, target.startsWith('/space/') ? params : {});
+    navigated();
+    await tick();
+
+    expect(roomNames()).toEqual(names);
+
+    visit('/rooms');
+    navigated();
+    await tick();
+
+    expect(roomNames()).toEqual(['Unspaced']);
+  }
+);
+
 test('adds an incoming unread DM to the navbar and removes it when read', async () => {
-  const room: RoomSummary = {
+  const room: RoomListItemView = {
     ...space('!dm:example.org', 'Alice'),
-    is_space: false,
+    room_kind: 'text',
     is_direct: true,
     direct_targets: ['@alice:example.org'],
   };
@@ -112,10 +181,14 @@ test('adds an incoming unread DM to the navbar and removes it when read', async 
         listeners.delete(listener);
       };
     },
-    commands: {
-      subscribeRoomList: () => Promise.resolve({ subscription: 1, rooms: [room] }),
-      notificationSettings: () => Promise.resolve({ room: null, default: 'all' }),
-      unsubscribe: () => Promise.resolve(),
+    rpc: {
+      timeline: {
+        subscribeRoomList: () => Promise.resolve({ subscription: 1, rooms: [room] }),
+        unsubscribe: () => Promise.resolve(),
+      },
+      notifications: {
+        settings: () => Promise.resolve({ room: null, default: 'all' }),
+      },
     },
   } as unknown as CoreClient;
   await startRoomList(core);
@@ -124,7 +197,7 @@ test('adds an incoming unread DM to the navbar and removes it when read', async 
 
   expect(screen.queryByRole('link', { name: 'Alice' })).not.toBeInTheDocument();
 
-  const incoming = {
+  const incoming = withCounts({
     ...room,
     unread: 1,
     notifying: 1,
@@ -135,7 +208,7 @@ test('adds an incoming unread DM to the navbar and removes it when read', async 
       sending: false,
       event_id: '$message',
     },
-  };
+  });
   for (const listener of listeners)
     listener({
       type: 'room_list_diff',
@@ -149,11 +222,24 @@ test('adds an incoming unread DM to the navbar and removes it when read', async 
   expect(within(dm).getByText('1').closest('.unread-badge')).toBeInTheDocument();
   expect(dm).toHaveAccessibleDescription('nav.unreadMessages:1');
 
+  visit('/direct/!dm%3Aexample.org', { roomId: room.room_id });
+  navigated();
+  await tick();
+  expect(screen.queryByRole('link', { name: 'Alice' })).not.toBeInTheDocument();
+  expect(
+    screen.getByRole('link', { name: 'common.directMessages' }).querySelector('.unread-badge')
+  ).toBeNull();
+
+  visit('/rooms');
+  navigated();
+  await tick();
+  expect(screen.getByRole('link', { name: 'Alice' })).toBeInTheDocument();
+
   for (const listener of listeners)
     listener({
       type: 'room_list_diff',
       subscription: 1,
-      diffs: [{ op: 'set', index: 0, value: { ...incoming, unread: 0 } }],
+      diffs: [{ op: 'set', index: 0, value: withCounts({ ...incoming, unread: 0 }) }],
     });
   await tick();
 
@@ -171,10 +257,11 @@ test('keeps the rail order when a room-list reset reorders spaces', async () => 
         listeners.delete(listener);
       };
     },
-    commands: {
-      subscribeRoomList: () => Promise.resolve({ subscription: 1, rooms: [alpha, beta] }),
-      roomNotificationModes: () => Promise.resolve([]),
-      unsubscribe: () => Promise.resolve(),
+    rpc: {
+      timeline: {
+        subscribeRoomList: () => Promise.resolve({ subscription: 1, rooms: [alpha, beta] }),
+        unsubscribe: () => Promise.resolve(),
+      },
     },
   } as unknown as CoreClient;
   await startRoomList(core);
@@ -205,10 +292,11 @@ test('a subspace pinned in the stored layout joins the rail beside its parent', 
   };
   const core = {
     subscribeEvents: () => () => {},
-    commands: {
-      subscribeRoomList: () => Promise.resolve({ subscription: 1, rooms: [parent, child] }),
-      roomNotificationModes: () => Promise.resolve([]),
-      unsubscribe: () => Promise.resolve(),
+    rpc: {
+      timeline: {
+        subscribeRoomList: () => Promise.resolve({ subscription: 1, rooms: [parent, child] }),
+        unsubscribe: () => Promise.resolve(),
+      },
     },
   } as unknown as CoreClient;
   await startRoomList(core);
@@ -225,28 +313,24 @@ test('a subspace pinned in the stored layout joins the rail beside its parent', 
 });
 
 test('a muted direct chat marked unread by hand still reaches the navbar', async () => {
-  const room: RoomSummary = {
+  const room: RoomListItemView = withCounts({
     ...space('!muted:example.org', 'Bo'),
-    is_space: false,
+    room_kind: 'text',
     is_direct: true,
     direct_targets: ['@bo:example.org'],
     marked_unread: true,
-  };
+    notification: { room: 'mute', default: 'all' },
+  });
   const core = {
     subscribeEvents: () => () => {},
-    commands: {
-      subscribeRoomList: () => Promise.resolve({ subscription: 1, rooms: [room] }),
-      roomNotificationModes: (roomIds: readonly string[]) =>
-        Promise.resolve(
-          roomIds.map((room_id) => ({ room_id, room: 'mute' as const, default: 'all' as const }))
-        ),
-      unsubscribe: () => Promise.resolve(),
+    rpc: {
+      timeline: {
+        subscribeRoomList: () => Promise.resolve({ subscription: 1, rooms: [room] }),
+        unsubscribe: () => Promise.resolve(),
+      },
     },
   } as unknown as CoreClient;
-  const roomList = await startRoomList(core);
-  await vi.waitFor(() => {
-    expect(roomList.notificationMode(room.room_id)).toBe('mute');
-  });
+  await startRoomList(core);
 
   render(SidebarNav, { mobile: true });
   await tick();
@@ -258,26 +342,22 @@ test('a muted direct chat marked unread by hand still reaches the navbar', async
 });
 
 test('a muted room marked unread by hand still marks its section as unread', async () => {
-  const room: RoomSummary = {
+  const room: RoomListItemView = withCounts({
     ...space('!muted-room:example.org', 'Ops'),
-    is_space: false,
+    room_kind: 'text',
     marked_unread: true,
-  };
+    notification: { room: 'mute', default: 'all' },
+  });
   const core = {
     subscribeEvents: () => () => {},
-    commands: {
-      subscribeRoomList: () => Promise.resolve({ subscription: 1, rooms: [room] }),
-      roomNotificationModes: (roomIds: readonly string[]) =>
-        Promise.resolve(
-          roomIds.map((room_id) => ({ room_id, room: 'mute' as const, default: 'all' as const }))
-        ),
-      unsubscribe: () => Promise.resolve(),
+    rpc: {
+      timeline: {
+        subscribeRoomList: () => Promise.resolve({ subscription: 1, rooms: [room] }),
+        unsubscribe: () => Promise.resolve(),
+      },
     },
   } as unknown as CoreClient;
-  const roomList = await startRoomList(core);
-  await vi.waitFor(() => {
-    expect(roomList.notificationMode(room.room_id)).toBe('mute');
-  });
+  await startRoomList(core);
 
   render(SidebarNav, { mobile: true });
   await tick();
@@ -291,27 +371,23 @@ test('a section totals its notifying rooms in green', async () => {
   onTestFinished(() => {
     setPreference('showUnreadCounts', false);
   });
-  const room: RoomSummary = {
+  const room: RoomListItemView = withCounts({
     ...space('!loud:example.org', 'Loud'),
-    is_space: false,
+    room_kind: 'text',
     unread: 4,
     notifying: 4,
-  };
+    notification: { room: 'all', default: 'all' },
+  });
   const core = {
     subscribeEvents: () => () => {},
-    commands: {
-      subscribeRoomList: () => Promise.resolve({ subscription: 1, rooms: [room] }),
-      roomNotificationModes: (roomIds: readonly string[]) =>
-        Promise.resolve(
-          roomIds.map((room_id) => ({ room_id, room: 'all' as const, default: 'all' as const }))
-        ),
-      unsubscribe: () => Promise.resolve(),
+    rpc: {
+      timeline: {
+        subscribeRoomList: () => Promise.resolve({ subscription: 1, rooms: [room] }),
+        unsubscribe: () => Promise.resolve(),
+      },
     },
   } as unknown as CoreClient;
-  const roomList = await startRoomList(core);
-  await vi.waitFor(() => {
-    expect(roomList.notificationMode(room.room_id)).toBe('all');
-  });
+  await startRoomList(core);
 
   render(SidebarNav, { mobile: true });
   await tick();

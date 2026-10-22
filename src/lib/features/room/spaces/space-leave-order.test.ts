@@ -1,15 +1,16 @@
 import { expect, test } from 'vitest';
 
-import type { RoomSummary, SpaceChildEdge } from '#src/generated/protocol';
+import type { RoomListItemView, SpaceChildEdge } from '#src/generated/protocol';
 
 import { joinedSpaceChildrenLeaveOrder, recursiveSpaceLeaveOrder } from './space-leave-order';
+import { withCounts } from '#lib/rooms/summary-fixtures.js';
 
 function edge(roomId: string): SpaceChildEdge {
   return { room_id: roomId, via: [], order: null, origin_server_ts: 0, suggested: false };
 }
 
-function room(roomId: string, overrides: Partial<RoomSummary> = {}): RoomSummary {
-  return {
+function room(roomId: string, overrides: Partial<RoomListItemView> = {}): RoomListItemView {
+  return withCounts({
     room_id: roomId,
     canonical_alias: null,
     name: roomId,
@@ -21,11 +22,10 @@ function room(roomId: string, overrides: Partial<RoomSummary> = {}): RoomSummary
     tags: [],
     state: 'joined',
     encrypted: null,
-    is_space: false,
     is_tombstoned: false,
-    is_voice: false,
     call_participants: [],
-    room_type: null,
+    screen_sharers: [],
+    room_kind: 'text',
     supports_knock: false,
     supports_restricted: false,
     supports_knock_restricted: false,
@@ -36,14 +36,14 @@ function room(roomId: string, overrides: Partial<RoomSummary> = {}): RoomSummary
     marked_unread: false,
     latest_event: null,
     ...overrides,
-  };
+  });
 }
 
 test('leaves rooms before their space, deepest first', () => {
   const rooms = [
-    room('!root', { is_space: true, space_children: [edge('!a'), edge('!sub')] }),
+    room('!root', { room_kind: 'space', space_children: [edge('!a'), edge('!sub')] }),
     room('!a'),
-    room('!sub', { is_space: true, space_children: [edge('!b')] }),
+    room('!sub', { room_kind: 'space', space_children: [edge('!b')] }),
     room('!b'),
   ];
 
@@ -55,14 +55,14 @@ test('leaves rooms before their space, deepest first', () => {
 });
 
 test('recursive order leaves the root space last', () => {
-  const rooms = [room('!root', { is_space: true, space_children: [edge('!a')] }), room('!a')];
+  const rooms = [room('!root', { room_kind: 'space', space_children: [edge('!a')] }), room('!a')];
 
   expect(recursiveSpaceLeaveOrder(rooms, '!root')).toEqual(['!a', '!root']);
 });
 
 test('skips rooms that are not joined', () => {
   const rooms = [
-    room('!root', { is_space: true, space_children: [edge('!a'), edge('!left')] }),
+    room('!root', { room_kind: 'space', space_children: [edge('!a'), edge('!left')] }),
     room('!a'),
     room('!left', { state: 'invited' }),
   ];
@@ -75,7 +75,7 @@ test('skips rooms that are not joined', () => {
 
 test('skips a tombstoned child', () => {
   const rooms = [
-    room('!root', { is_space: true, space_children: [edge('!old')] }),
+    room('!root', { room_kind: 'space', space_children: [edge('!old')] }),
     room('!old', { is_tombstoned: true }),
   ];
 
@@ -84,15 +84,15 @@ test('skips a tombstoned child', () => {
 
 test('does not loop on a cyclical space graph', () => {
   const rooms = [
-    room('!root', { is_space: true, space_children: [edge('!sub')] }),
-    room('!sub', { is_space: true, space_children: [edge('!root')] }),
+    room('!root', { room_kind: 'space', space_children: [edge('!sub')] }),
+    room('!sub', { room_kind: 'space', space_children: [edge('!root')] }),
   ];
 
   expect(joinedSpaceChildrenLeaveOrder(rooms, '!root').order).toEqual(['!sub']);
 });
 
 test('an unjoined root leaves nothing', () => {
-  const rooms = [room('!root', { is_space: true, state: 'invited' })];
+  const rooms = [room('!root', { room_kind: 'space', state: 'invited' })];
 
   expect(joinedSpaceChildrenLeaveOrder(rooms, '!root').order).toEqual([]);
 });

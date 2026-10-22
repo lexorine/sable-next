@@ -1,24 +1,12 @@
 // Catches the class of defect no linter sees: duplicated landmarks, controls
 // with no accessible name, ARIA roles missing the contract they promise.
 
-import AxeBuilder from '@axe-core/playwright';
-import type { Page } from '@playwright/test';
-
 import en from '../../src/locales/en.json' with { type: 'json' };
+import { violations } from './fixtures/a11y';
 import { expect, test, SIGNED_OUT } from './fixtures/test';
 import { TIMELINE_ROOM_NAME } from './fixtures/continuwuity';
 
 test.use({ storageState: SIGNED_OUT });
-
-const TAGS = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'];
-
-async function violations(page: Page) {
-  const result = await new AxeBuilder({ page }).withTags(TAGS).analyze();
-  return result.violations.map((violation) => ({
-    id: violation.id,
-    nodes: violation.nodes.map((node) => node.target.join(' ')),
-  }));
-}
 
 test('the sign-in page has no accessibility violations', async ({ auth, homeserver, page }) => {
   await auth.open(homeserver.baseUrl);
@@ -66,7 +54,7 @@ test('the signed-in surfaces have no accessibility violations', async ({
 
   await page.setViewportSize({ width: 1280, height: 800 });
   await page.goto('/search');
-  const field = page.getByRole('combobox', { name: en.search.title });
+  const field = page.getByRole('combobox', { name: en.common.searchMessages });
   await field.fill('in:Timeline from:e2e ');
   await expect(
     page.getByRole('list', { name: en.search.activeFilters }).getByRole('listitem')

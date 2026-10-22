@@ -1,22 +1,26 @@
-import type { CoreCommands } from '#lib/core/commands.svelte.js';
+import type { CoreClient } from '#lib/core/client.svelte.js';
 import { isRecord } from '#lib/guards.js';
 
-export async function redactReaction(
-  commands: Pick<CoreCommands, 'roomEventRelations' | 'sendRedaction'>,
+export async function fetchReaction(
+  core: Pick<CoreClient, 'rpc'>,
   roomId: string,
   eventId: string,
   key: string,
   sender: string
-): Promise<void> {
+): Promise<Set<string>> {
   const eventIds = new Set<string>();
   const seenPages = new Set<string>();
   let from: string | undefined;
   do {
-    const page = await commands.roomEventRelations(roomId, eventId, {
-      relType: 'm.annotation',
-      eventType: 'm.reaction',
-      from,
+    const page = await core.rpc.timeline.roomEventRelations({
+      room_id: roomId,
+      event_id: eventId,
+      rel_type: 'm.annotation',
+      event_type: 'm.reaction',
+      from: from ?? null,
+      to: null,
       limit: 100,
+      direction: null,
     });
     for (const event of page.chunk) {
       if (
@@ -43,7 +47,18 @@ export async function redactReaction(
     }
   } while (from !== undefined);
 
+  return eventIds;
+}
+
+export async function redactReaction(
+  core: Pick<CoreClient, 'rpc'>,
+  roomId: string,
+  eventId: string,
+  key: string,
+  sender: string
+): Promise<void> {
+  const eventIds = await fetchReaction(core, roomId, eventId, key, sender);
   for (const reactionId of eventIds) {
-    await commands.sendRedaction(roomId, reactionId, null);
+    await core.rpc.messages.sendRedaction({ room_id: roomId, event_id: reactionId, reason: null });
   }
 }

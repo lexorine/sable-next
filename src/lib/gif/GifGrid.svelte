@@ -1,0 +1,227 @@
+<script lang="ts">
+  import HeartIcon from 'phosphor-svelte/lib/HeartIcon';
+  import HeartStraightIcon from 'phosphor-svelte/lib/HeartStraightIcon';
+
+  import { i18n } from '#lib/i18n.js';
+  import Spinner from '#lib/ui/primitives/Spinner.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
+
+  import { favoriteGifs, isFavorite, recentGifs, toggleFavorite } from './favorites.svelte';
+  import { GifSearch } from './gif-search.svelte';
+  import {
+    gifProvider,
+    type GifProviderSetting,
+    type GifResult,
+    type GifsConfig,
+  } from './providers';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
+
+  interface Props {
+    config: GifsConfig;
+    providerSetting: GifProviderSetting;
+    query: string;
+    onPick: (gif: GifResult) => void;
+  }
+
+  let { config, providerSetting, query, onPick }: Props = $props();
+
+  const search = new GifSearch();
+
+  let favorites = $derived(favoriteGifs());
+  let provider = $derived(gifProvider(config, providerSetting));
+
+  $effect(() => {
+    const apiKey = provider.apiKey(config);
+    if (apiKey === null) return;
+    search.search(provider, apiKey, query);
+    return () => {
+      search.cancel();
+    };
+  });
+
+  let searching = $derived(query.trim() !== '');
+  let recent = $derived(recentGifs());
+  let empty = $derived(
+    searching ? search.results.length === 0 : recent.length + favorites.length === 0
+  );
+
+  function star(event: MouseEvent, gif: GifResult): void {
+    event.stopPropagation();
+    toggleFavorite(gif);
+  }
+</script>
+
+{#snippet tiles(gifs: readonly GifResult[])}
+  <ul>
+    {#each gifs as gif (gif.mediaUrl)}
+      {@const kept = isFavorite(favorites, gif)}
+      <li>
+        <Tooltip label={gif.title} disabled={!gif.title}>
+          {#snippet trigger({ props })}
+            <button
+              {...props}
+              type="button"
+              class="gif-cell"
+              aria-label={gif.title}
+              onclick={() => {
+                onPick(gif);
+              }}
+            >
+              <img
+                src={gif.previewUrl}
+                alt=""
+                width={gif.width || 4}
+                height={gif.height || 3}
+                loading="lazy"
+                decoding="async"
+                referrerpolicy="no-referrer"
+              />
+            </button>
+          {/snippet}
+        </Tooltip>
+        <button
+          type="button"
+          class="gif-star choice"
+          aria-pressed={kept}
+          aria-label={kept ? i18n.t('composer.gifUnfavorite') : i18n.t('composer.gifFavorite')}
+          onclick={(event) => {
+            star(event, gif);
+          }}
+        >
+          {#if kept}
+            <HeartIcon weight="fill" />
+          {:else}
+            <HeartStraightIcon />
+          {/if}
+        </button>
+      </li>
+    {/each}
+  </ul>
+{/snippet}
+
+<div class="gif-grid" {@attach scrollHint}>
+  {#if search.loading}
+    <div class="gif-note"><Spinner label={i18n.t('a11y.loading')} /></div>
+  {:else if search.failed}
+    <div class="gif-note">{i18n.t('composer.gifSearchFailed')}</div>
+  {:else if empty}
+    <div class="gif-note">
+      {searching ? i18n.t('composer.gifNoMatches') : i18n.t('composer.gifEmptyFavorites')}
+    </div>
+  {:else}
+    {#if searching}
+      {@render tiles(search.results)}
+    {:else}
+      {#if favorites.length > 0}
+        <h3>{i18n.t('composer.gifFavorites')}</h3>
+        {@render tiles(favorites)}
+      {/if}
+      {#if recent.length > 0}
+        <h3>{i18n.t('composer.gifRecent')}</h3>
+        {@render tiles(recent)}
+      {/if}
+    {/if}
+    <p class="gif-attribution">
+      {i18n.t('composer.gifAttribution', { provider: provider.label })}
+    </p>
+  {/if}
+</div>
+
+<style>
+  .gif-grid {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    min-width: 0;
+    overflow-y: auto;
+    padding: var(--space-200);
+  }
+
+  .gif-grid h3 {
+    font-size: var(--font-size-small);
+    margin: var(--space-100) 0;
+  }
+
+  .gif-grid ul {
+    column-gap: var(--space-100);
+    columns: 2;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  .gif-grid li {
+    break-inside: avoid;
+    margin-bottom: var(--space-100);
+    position: relative;
+  }
+
+  .gif-cell {
+    background: var(--surface-var-container);
+    border: 0;
+    border-radius: var(--radius);
+    cursor: pointer;
+    display: block;
+    overflow: hidden;
+    padding: 0;
+    width: 100%;
+  }
+
+  .gif-cell img {
+    display: block;
+    height: auto;
+    width: 100%;
+  }
+
+  .gif-cell:hover,
+  .gif-cell:focus-visible {
+    outline: var(--border-width) solid var(--primary-main);
+  }
+
+  .gif-star {
+    --star-size: calc(var(--icon-size-small) + var(--space-100) * 2);
+
+    align-items: center;
+    background: var(--surface-container);
+    border: 0;
+    border-radius: var(--radius);
+    color: var(--surface-on-container);
+    cursor: pointer;
+    display: flex;
+    height: var(--star-size);
+    justify-content: center;
+    position: absolute;
+    right: 0.25rem;
+    top: 0.25rem;
+    width: var(--star-size);
+  }
+
+  .gif-star::after {
+    border-radius: inherit;
+    content: '';
+    inset: calc((var(--star-size) - var(--target-hit)) / 2);
+    position: absolute;
+  }
+
+  .gif-star :global(svg) {
+    height: var(--icon-size-small);
+    width: var(--icon-size-small);
+  }
+
+  .gif-attribution {
+    color: var(--surface-var-on-container);
+    font-size: var(--font-size-small);
+    margin: var(--space-300) 0 0;
+  }
+
+  .gif-note {
+    align-items: center;
+    color: var(--surface-var-on-container);
+    display: flex;
+    flex: 1;
+    font-size: var(--font-size-small);
+    justify-content: center;
+    padding: var(--space-400);
+    text-align: center;
+  }
+</style>

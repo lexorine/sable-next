@@ -9,9 +9,9 @@
   import DialogFrame from '#lib/ui/primitives/DialogFrame.svelte';
   import TextInput from '#lib/ui/primitives/TextInput.svelte';
 
-  import { USER_EMOTES_EVENT_TYPE } from './pack-address.js';
   import { normalizeShortcode } from './pack-content.js';
-  import { mergedPackContent, uploadCandidates, type EmoteCandidate } from './steal-emotes.js';
+  import { uploadCandidates, type EmoteCandidate } from './steal-emotes.js';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
 
   interface Props {
     open?: boolean;
@@ -39,10 +39,10 @@
     busy = true;
     failed = false;
     try {
-      const added = await uploadCandidates(core, $state.snapshot(picks));
-      const current = await core.commands.accountData(USER_EMOTES_EVENT_TYPE);
-      await core.commands.setAccountData(USER_EMOTES_EVENT_TYPE, mergedPackContent(current, added));
-      invalidatePacks(core.commands);
+      await core.rpc.packs.addAccountImages({
+        images: await uploadCandidates(core, $state.snapshot(picks)),
+      });
+      invalidatePacks(core.rpc);
       names = {};
       open = false;
     } catch (error) {
@@ -57,25 +57,25 @@
 <DialogFrame
   bind:open
   variant="verification"
-  label={$i18n.t('emotes.stealTitle')}
+  label={i18n.t('emotes.stealTitle')}
   onConfirm={() => {
     void add();
   }}
 >
   <div class="steal">
-    <h2>{$i18n.t('emotes.stealTitle')}</h2>
-    <p class="explain">{$i18n.t('emotes.stealExplain')}</p>
+    <h2>{i18n.t('emotes.stealTitle')}</h2>
+    <p class="explain">{i18n.t('emotes.stealExplain')}</p>
     {#if failed}
-      <Alert variant="critical" role="alert">{$i18n.t('emotes.stealFailed')}</Alert>
+      <Alert variant="critical" role="alert">{i18n.t('emotes.stealFailed')}</Alert>
     {/if}
 
-    <ul class="candidates">
+    <ul class="candidates" {@attach scrollHint}>
       {#each candidates as candidate (candidate.source)}
         <li>
           <MediaImage source={candidate.source} alt="" width={32} height={32} original />
           <TextInput
             value={names[candidate.source] ?? candidate.shortcode}
-            aria-label={$i18n.t('emotes.shortcode')}
+            aria-label={i18n.t('emotes.shortcode')}
             disabled={busy}
             oninput={(event: Event & { currentTarget: HTMLInputElement }) => {
               names = { ...names, [candidate.source]: event.currentTarget.value };
@@ -94,10 +94,10 @@
           open = false;
         }}
       >
-        {$i18n.t('timeline.cancel')}
+        {i18n.t('common.cancel')}
       </Button>
       <Button type="submit" variant="primary" disabled={busy || !ready} loading={busy}>
-        {$i18n.t('emotes.stealConfirm')}
+        {i18n.t('common.add')}
       </Button>
     </DialogActions>
   </div>

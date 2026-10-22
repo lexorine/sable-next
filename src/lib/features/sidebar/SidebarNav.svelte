@@ -1,6 +1,6 @@
 <script lang="ts">
   import { i18n } from '#lib/i18n.js';
-  import type { RoomSummary } from '#src/generated/protocol';
+  import type { RoomListItemView } from '#src/generated/protocol';
   import { onMount } from 'svelte';
   import { afterNavigate, goto } from '$app/navigation';
   import { page } from '$app/state';
@@ -8,13 +8,9 @@
   import ActiveCallBar from '#lib/features/call/ActiveCallBar.svelte';
   import { useCallSession } from '#lib/features/call/call-session.svelte.js';
   import { roomSectionPath } from '#lib/rooms/permalink.js';
-  import { useRoomList } from '#lib/rooms/room-list.svelte.js';
-  import {
-    addUnread,
-    spacesContainingRoom,
-    spaceUnreadTotals,
-    type UnreadCount,
-  } from '#lib/rooms/spaces.js';
+  import { findRoomByPathId, useRoomList } from '#lib/rooms/room-list.svelte.js';
+  import { addUnread, spacesContainingRoom, spaceUnreadTotals } from '#lib/rooms/spaces.js';
+  import type { UnreadCount } from '#lib/rooms/unread.js';
   import { hasUnread } from '#lib/rooms/unread.js';
   import {
     applyDrop,
@@ -44,6 +40,7 @@
     markRoomsRead,
     spacesDescendantRooms,
   } from './nav-rooms.js';
+  import CoreHealthBanner from '#lib/ui/CoreHealthBanner.svelte';
 
   interface Props {
     mobile?: boolean;
@@ -52,7 +49,7 @@
   }
 
   const MIN_ROOM_NAV_WIDTH = 50;
-  const COLLAPSED_ROOM_NAV_WIDTH = 190;
+  const COLLAPSED_ROOM_NAV_WIDTH = 230;
   const MAX_ROOM_NAV_WIDTH = 500;
   const ROOM_NAV_WIDTH_STEP = 80;
   const ROOM_NAV_STORAGE_KEY = 'sable-room-navigation-width';
@@ -61,11 +58,18 @@
   const core = useCoreClient();
   const roomList = useRoomList();
   const call = useCallSession();
-  let pathname = $state(page.url.pathname);
+  let pathname = $state(page.url.pathname === '/create-room' ? '/rooms' : page.url.pathname);
   let spaceId = $state(page.params.spaceId);
+  let roomId = $state(page.params.roomId);
 
   afterNavigate(() => {
-    if (page.url.pathname === '/inbox' || page.url.pathname === '/search') return;
+    roomId = page.params.roomId;
+    if (
+      page.url.pathname === '/inbox' ||
+      page.url.pathname === '/search' ||
+      page.url.pathname === '/create-room'
+    )
+      return;
     pathname = page.url.pathname;
     spaceId = page.params.spaceId;
   });
@@ -115,7 +119,7 @@
   );
   let entries = $derived(mergeSpaces(spaceSidebar.items, orderedSpaceIds));
   let homeRooms = $derived(
-    roomList.rooms.filter((room) => room.state === 'joined' && !room.is_space)
+    roomList.rooms.filter((room) => room.state === 'joined' && room.room_kind !== 'space')
   );
   let homeUnread = $derived(unreadCounts(homeRooms));
   let unspacedRooms = $derived(
@@ -125,8 +129,10 @@
   let allDirectRooms = $derived(
     roomList.rooms.filter((room) => room.state === 'joined' && room.is_direct)
   );
+  let openRoomId = $derived(findRoomByPathId(roomList.rooms, roomId)?.room_id);
+  let otherDirectRooms = $derived(allDirectRooms.filter((room) => room.room_id !== openRoomId));
   let directRooms = $derived(
-    allDirectRooms
+    otherDirectRooms
       .filter((room) => hasUnread(roomList.badgeUnreadFor(room)))
       .sort(
         (left, right) => (right.latest_event?.timestamp ?? 0) - (left.latest_event?.timestamp ?? 0)
@@ -135,13 +141,13 @@
   );
   let directUnread = $derived(
     unreadCounts(
-      allDirectRooms.filter(
+      otherDirectRooms.filter(
         (room) => !directRooms.some((directRoom) => directRoom.room_id === room.room_id)
       )
     )
   );
 
-  function unreadCounts(rooms: readonly RoomSummary[]): UnreadCount {
+  function unreadCounts(rooms: readonly RoomListItemView[]): UnreadCount {
     return rooms.reduce((total, room) => addUnread(total, roomList.badgeUnreadFor(room)), {
       unread: 0,
       highlight: 0,
@@ -150,13 +156,13 @@
 
   function markSectionRead(section: 'home' | 'unspaced' | 'direct'): void {
     const rooms = { home: homeRooms, unspaced: unspacedRooms, direct: allDirectRooms }[section];
-    markRoomsRead(rooms, core.commands, readReceiptIsPrivate());
+    markRoomsRead(rooms, core.rpc.timeline, readReceiptIsPrivate());
   }
 
   function markFolderRead(folder: SidebarFolder): void {
     markRoomsRead(
       spacesDescendantRooms(roomList.rooms, folder.content),
-      core.commands,
+      core.rpc.timeline,
       readReceiptIsPrivate()
     );
   }
@@ -231,10 +237,11 @@
   {#if call.active}
     <ActiveCallBar
       session={call}
-      roomName={callRoom?.name ?? $i18n.t('call.title')}
+      roomName={callRoom?.name ?? i18n.t('call.title')}
       collapsed={!mobile && collapsed}
       onReturn={() => {
         if (call.roomId === null) return;
+        // eslint-disable-next-line svelte/no-navigation-without-resolve -- roomSectionPath() resolves the route itself
         void goto(roomSectionPath(roomList.rooms, call.roomId));
       }}
     />
@@ -243,7 +250,8 @@
 
 <aside class="sidebar">
   {#if mobile}
-    <nav class="mobile-navigation" aria-label={$i18n.t('nav.primary')}>
+    <nav class="mobile-navigation" aria-label={i18n.t('nav.primary')}>
+      <CoreHealthBanner />
       <div class="navigation-main">
         <NavigationRail
           {pathname}
@@ -272,7 +280,7 @@
       <UserQuickTools mobile {onNavigate} />
     </nav>
   {:else}
-    <nav class="desktop-navigation" aria-label={$i18n.t('nav.primary')}>
+    <nav class="desktop-navigation" aria-label={i18n.t('nav.primary')}>
       <div class="desktop-navigation-main">
         <NavigationRail
           {pathname}
@@ -300,7 +308,7 @@
           value={roomNavWidth}
           min={MIN_ROOM_NAV_WIDTH}
           max={MAX_ROOM_NAV_WIDTH}
-          label={$i18n.t('nav.resizeRooms')}
+          label={i18n.t('nav.resizeRooms')}
           grow="right"
           step={ROOM_NAV_WIDTH_STEP}
           onResize={(next) => (roomNavWidth = clampRoomNavWidth(next))}
@@ -364,10 +372,11 @@
     .sidebar {
       height: 100dvh;
       left: 0;
-      padding-top: var(--titlebar-height);
+      padding-left: var(--safe-left);
+      padding-top: var(--safe-top);
       position: fixed;
       top: 0;
-      width: calc(var(--navigation-rail-width) + var(--room-nav-width));
+      width: calc(var(--navigation-rail-width) + var(--room-nav-width) + var(--safe-left));
       z-index: 2;
     }
 

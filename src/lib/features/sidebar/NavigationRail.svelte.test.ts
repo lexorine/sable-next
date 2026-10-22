@@ -1,3 +1,4 @@
+import type { RoomPermissionsView } from '#src/generated/protocol';
 // @vitest-environment happy-dom
 
 import { render, screen, within } from '@testing-library/svelte';
@@ -5,8 +6,9 @@ import { userEvent } from '@testing-library/user-event';
 import { tick, type ComponentProps } from 'svelte';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 
-import type { RoomSummary } from '#src/generated/protocol';
+import type { RoomListItemView } from '#src/generated/protocol';
 
+const listed = vi.hoisted((): RoomListItemView[] => []);
 vi.mock('$app/state', () => import('#lib/test-support/app-state.js'));
 vi.mock('$app/navigation', () => import('#lib/test-support/app-navigation.js'));
 
@@ -23,21 +25,26 @@ vi.mock('$app/paths', () => ({
 }));
 vi.mock('#lib/i18n.js', () => import('#lib/test-support/i18n.js'));
 vi.mock('#lib/rooms/room-list.svelte.js', () => ({
-  roomPathParam: (room: RoomSummary) => encodeURIComponent(room.room_id),
-  useRoomList: () => ({ rooms: [], quietRoomIds: new Set() }),
+  roomPathParam: (room: RoomListItemView) => encodeURIComponent(room.room_id),
+  findRoomByPathId: (rooms: RoomListItemView[], pathId: string) =>
+    rooms.find((room) => room.room_id === pathId || room.canonical_alias === pathId),
+  useRoomList: () => ({ rooms: listed, quietRoomIds: new Set() }),
 }));
 vi.mock('#lib/core/context.js');
 
 import { core } from '#lib/core/__mocks__/context.js';
 import type { SidebarFolder } from '#lib/spaces/sidebar-layout.js';
 
-core.roomPermissions.mockResolvedValue({ can_manage_children: false });
+core.rpc.members.permissions.mockResolvedValue({
+  can_manage_children: false,
+} as RoomPermissionsView);
 
 import TooltipProvider from '#lib/ui/primitives/TooltipProvider.svelte';
 
 import NavigationRail from './NavigationRail.svelte';
 import { LONG_PRESS_MS } from '#lib/ui/long-press.svelte.js';
 import { setPreference } from '#lib/settings/preferences.svelte.js';
+import { withCounts } from '#lib/rooms/summary-fixtures.js';
 import { savedSpacePaths, spaceNavigationHref } from './space-paths.js';
 
 beforeEach(() => {
@@ -72,8 +79,8 @@ async function openMenu(target: Element): Promise<HTMLElement[]> {
 
 const labels = (items: HTMLElement[]) => items.map((item) => item.textContent.trim());
 
-function space(roomId = '!space:example.org', name = 'Space'): RoomSummary {
-  return {
+function space(roomId = '!space:example.org', name = 'Space'): RoomListItemView {
+  return withCounts({
     room_id: roomId,
     canonical_alias: null,
     name,
@@ -85,11 +92,10 @@ function space(roomId = '!space:example.org', name = 'Space'): RoomSummary {
     tags: [],
     state: 'joined',
     encrypted: null,
-    is_space: true,
+    room_kind: 'space',
     is_tombstoned: false,
-    is_voice: false,
     call_participants: [],
-    room_type: null,
+    screen_sharers: [],
     supports_knock: true,
     supports_restricted: true,
     supports_knock_restricted: true,
@@ -99,7 +105,7 @@ function space(roomId = '!space:example.org', name = 'Space'): RoomSummary {
     highlight: 0,
     marked_unread: false,
     latest_event: null,
-  };
+  });
 }
 
 test('badges unread direct chats', async () => {
@@ -112,10 +118,10 @@ test('badges unread direct chats', async () => {
   });
   await tick();
 
-  expect(within(tab('nav.direct')).getByText('3').closest('.unread-badge')).toHaveClass(
+  expect(within(tab('common.directMessages')).getByText('3').closest('.unread-badge')).toHaveClass(
     'unread-badge-count'
   );
-  expect(tab('nav.direct')).toHaveAccessibleDescription('nav.unreadMentions:3');
+  expect(tab('common.directMessages')).toHaveAccessibleDescription('nav.unreadMentions:3');
 });
 
 test('badges the unspaced section', async () => {
@@ -166,12 +172,12 @@ test('search leaves the rail when the preference is off', async () => {
   renderRail({ spaces: [], mobile: true });
   await tick();
 
-  expect(tab('search.title')).toHaveAttribute('href', '/search');
+  expect(tab('common.searchMessages')).toHaveAttribute('href', '/search');
 
   setPreference('showSearch', false);
   await tick();
 
-  expect(screen.queryByRole('link', { name: 'search.title' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('link', { name: 'common.searchMessages' })).not.toBeInTheDocument();
 });
 
 test('uses a dot for ordinary unread messages outside spaces', async () => {
@@ -184,7 +190,7 @@ test('uses a dot for ordinary unread messages outside spaces', async () => {
 });
 
 test('shows unread direct rooms as individual avatars', async () => {
-  const directRoom = {
+  const directRoom = withCounts({
     room_id: '!dm:example.org',
     canonical_alias: null,
     name: 'Alice',
@@ -196,11 +202,10 @@ test('shows unread direct rooms as individual avatars', async () => {
     tags: [],
     state: 'joined' as const,
     encrypted: null,
-    is_space: false,
     is_tombstoned: false,
-    is_voice: false,
     call_participants: [],
-    room_type: null,
+    screen_sharers: [],
+    room_kind: 'text',
     supports_knock: true,
     supports_restricted: true,
     supports_knock_restricted: true,
@@ -210,7 +215,7 @@ test('shows unread direct rooms as individual avatars', async () => {
     highlight: 0,
     marked_unread: false,
     latest_event: null,
-  } satisfies RoomSummary;
+  });
   renderRail({ spaces: [], directRooms: [directRoom], mobile: true });
   await tick();
 
@@ -295,8 +300,8 @@ test('marks a whole section read from the tab that badges it', async () => {
   });
   await tick();
 
-  await openMenu(tab('nav.direct'));
-  await user.click(screen.getByRole('menuitem', { name: 'nav.markSectionRead' }));
+  await openMenu(tab('common.directMessages'));
+  await user.click(screen.getByRole('menuitem', { name: 'common.markAsRead' }));
 
   expect(marked).toEqual(['direct']);
 });
@@ -314,7 +319,7 @@ test('marks the rooms outside spaces read from their tab', async () => {
   await tick();
 
   await openMenu(tab('nav.unspaced'));
-  await user.click(screen.getByRole('menuitem', { name: 'nav.markSectionRead' }));
+  await user.click(screen.getByRole('menuitem', { name: 'common.markAsRead' }));
 
   expect(marked).toEqual(['unspaced']);
 });
@@ -479,7 +484,7 @@ test('marks every space in a folder as read even when no badge is shown', async 
   await tick();
 
   await openMenu(screen.getByRole('button', { name: 'nav.folderExpand:Alpha, Beta' }));
-  await user.click(screen.getByRole('menuitem', { name: 'nav.markSectionRead' }));
+  await user.click(screen.getByRole('menuitem', { name: 'common.markAsRead' }));
 
   expect(marked).toEqual(['!a:example.org', '!b:example.org']);
 });
@@ -548,7 +553,7 @@ test('right-clicking a top-level space opens its options menu', async () => {
   await tick();
 
   const items = labels(await openMenu(tab('Alpha')));
-  expect(items).toContain('room.menuMarkRead');
+  expect(items).toContain('common.markAsRead');
   expect(items).not.toContain('settings.showUnreadCounts');
 });
 
@@ -589,7 +594,7 @@ test('long-pressing a top-level space opens its options menu', async () => {
   vi.useRealTimers();
 
   await vi.waitFor(() => {
-    expect(labels(screen.getAllByRole('menuitem'))).toContain('room.menuMarkRead');
+    expect(labels(screen.getAllByRole('menuitem'))).toContain('common.markAsRead');
   });
 });
 
@@ -610,7 +615,7 @@ test('opens the direct root on mobile even when it has a saved chat', async () =
   renderRail({ spaces: [], mobile: true });
   await tick();
 
-  expect(tab('nav.direct')).toHaveAttribute('href', '/direct');
+  expect(tab('common.directMessages')).toHaveAttribute('href', '/direct');
   expect(linkTo('/direct/!dm%3Aexample.org')).not.toBeInTheDocument();
 });
 
@@ -667,6 +672,22 @@ test('a space opened through the rooms tab does not become the rooms tab target'
   expect(savedSpacePaths().rooms).toBe('/rooms');
 });
 
+test('a space joined by address does not become the rooms tab target', async () => {
+  listed.push({ ...space('!space:example.org'), canonical_alias: '#space:example.org' });
+  renderRail({ spaces: [] });
+  await tick();
+
+  visit('/rooms/!space%3Aexample.org');
+  navigated();
+  visit('/space/%23space%3Aexample.org/lobby', { spaceId: '#space:example.org' });
+  navigated();
+  listed.length = 0;
+  await tick();
+
+  expect(tab('nav.unspaced')).toHaveAttribute('href', '/rooms');
+  expect(savedSpacePaths().rooms).toBe('/rooms');
+});
+
 test('offers join by address from the add button', async () => {
   const visited: string[] = [];
   renderRail({
@@ -680,8 +701,8 @@ test('offers join by address from the add button', async () => {
 
   await vi.waitFor(() => {
     expect(labels(screen.getAllByRole('menuitem'))).toEqual([
-      'nav.createRoom',
-      'nav.createSpace',
+      'common.createRoom',
+      'common.createSpace',
       'nav.joinWithAddress',
       'nav.explore',
     ]);

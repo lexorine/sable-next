@@ -1,6 +1,6 @@
 # v1 to v2 migration
 
-Migration runs before account restoration on web and Tauri. It preserves user
+Migration runs before account restoration on web and Tauri. The Electron desktop app does not run it. It preserves user
 and device IDs, tokens, OAuth client registration, encryption keys and supported
 settings. Existing v2 accounts and settings take precedence.
 
@@ -40,7 +40,7 @@ Migrated accounts use normal v2 stores. To remove the importer afterward:
    Remove their module declarations, the Core field/initializer, four Tauri
    command registrations, and sable-core's direct `rusqlite` dependency.
    Regenerate the lockfile. The SDK still needs SQLite.
-4. Delete `playwright.migration.config.ts`, `tests/e2e/v1-migration.spec.ts` and
+4. Delete `tests/e2e/playwright.migration.config.ts`, `tests/e2e/v1-migration.spec.ts` and
    the migration fixtures. Remove `AccountSync.legacy` and its test if it has
    no remaining callers.
 
@@ -64,8 +64,8 @@ store. Browser emulation does not test native app upgrades.
 
 ```sh
 pnpm test src/lib/migrations/v1
-pnpm exec playwright test -c playwright.migration.config.ts
-cargo test --locked -p sable-core v1_migration
+pnpm exec playwright test -c tests/e2e/playwright.migration.config.ts
+cargo nextest run --locked -p sable-core v1_migration
 pnpm check
 cargo check --locked -p app --lib
 cargo check --locked -p sable-wasm --target wasm32-unknown-unknown

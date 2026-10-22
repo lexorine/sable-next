@@ -1,37 +1,62 @@
 <script lang="ts">
   import ceoArt from './ceo.png';
-  import { APP_ICON_STOPS, GHOST_SABLE_PATH, SABLE_EYE_PATH, SABLE_PATHS } from './icon-art.js';
   import {
+    APP_ICON_STOPS,
+    CRISP_PRIDE_STOPS,
+    GHOST_SABLE_PATH,
+    SABLE_EYE_PATH,
+    SABLE_PATHS,
+    PAW_PATH,
+  } from './icon-art.js';
+  import {
+    isSupporterColors,
     supporterButtonText,
     supporterColor,
+    supporterGradientAngle,
     supporterVariant,
+    supportsSupporterColors,
     DEFAULT_SUPPORTER_BACKGROUND_COLOR,
     type SupporterAppearance,
   } from './variants.js';
+
   let {
     variant = 'gold',
     shape = 'circle',
     customBackground = false,
     backgroundColor = DEFAULT_SUPPORTER_BACKGROUND_COLOR,
     color,
+    colors,
+    gradientAngle,
   }: Partial<SupporterAppearance> = $props();
   const id = $props.id();
   let chosen = $derived(supporterVariant(variant));
-  const transStops = [
-    'var(--supporter-blue)',
-    'var(--supporter-pink)',
-    'var(--supporter-white)',
-    'var(--supporter-pink)',
-    'var(--supporter-blue)',
-  ].flatMap((color, index) => [
-    { color, offset: String(index / 5) },
-    { color, offset: String((index + 1) / 5) },
-  ]);
-  let stops = $derived(chosen === 'trans' ? transStops : APP_ICON_STOPS[chosen]);
+  let customizable = $derived(supportsSupporterColors(chosen));
+  let customStops = $derived.by(() => {
+    if (!customizable || !isSupporterColors(colors)) return null;
+    const count = colors.length;
+    return colors.map((col, index) => ({
+      color: supporterColor(col),
+      offset: String(index / (count - 1)),
+    }));
+  });
+  let customCoords = $derived.by(() => {
+    const angle = supporterGradientAngle(gradientAngle);
+    const rad = ((angle - 90) * Math.PI) / 180;
+    const dx = Math.cos(rad);
+    const dy = Math.sin(rad);
+    const x1 = Math.round((0.5 - 0.5 * dx) * 1000) / 10;
+    const y1 = Math.round((0.5 - 0.5 * dy) * 1000) / 10;
+    const x2 = Math.round((0.5 + 0.5 * dx) * 1000) / 10;
+    const y2 = Math.round((0.5 + 0.5 * dy) * 1000) / 10;
+    return { x1: `${x1}%`, y1: `${y1}%`, x2: `${x2}%`, y2: `${y2}%` };
+  });
+  let stops = $derived(customStops ?? CRISP_PRIDE_STOPS[chosen] ?? APP_ICON_STOPS[chosen]);
+  let isVertical = $derived(chosen in CRISP_PRIDE_STOPS && chosen !== 'intersex');
   let backing = $derived(
     customBackground
       ? supporterColor(backgroundColor, DEFAULT_SUPPORTER_BACKGROUND_COLOR)
-      : chosen === 'custom' && supporterButtonText(color) === 'var(--supporter-white)'
+      : customizable &&
+          supporterButtonText(customStops ? colors?.[0] : color) === 'var(--supporter-white)'
         ? 'var(--supporter-white)'
         : 'var(--supporter-card-bg)'
   );
@@ -40,25 +65,34 @@
 <svg
   class="supporter-mark"
   data-variant={chosen}
-  style:color={chosen === 'custom' ? supporterColor(color) : undefined}
+  style:color={customizable && !customStops ? supporterColor(color) : undefined}
   viewBox="0 0 512 512"
   fill="none"
   aria-hidden="true"
   xmlns="http://www.w3.org/2000/svg"
 >
   <defs>
-    <linearGradient
-      {id}
-      x1="0"
-      y1="0"
-      x2={chosen === 'trans' ? '0' : '1'}
-      y2={chosen === 'trans' ? '1' : '0'}
-    >
-      {#each stops ?? [] as stop, index (index)}<stop
-          offset={stop.offset}
-          stop-color={stop.color}
-        />{/each}
-    </linearGradient>
+    {#if chosen === 'intersex'}
+      <radialGradient {id} cx="50%" cy="54%" r="38%">
+        {#each stops ?? [] as stop, index (index)}<stop
+            offset={stop.offset}
+            stop-color={stop.color}
+          />{/each}
+      </radialGradient>
+    {:else}
+      <linearGradient
+        {id}
+        x1={customStops ? customCoords.x1 : '0'}
+        y1={customStops ? customCoords.y1 : '0'}
+        x2={customStops ? customCoords.x2 : isVertical ? '0' : '1'}
+        y2={customStops ? customCoords.y2 : isVertical ? '1' : '0'}
+      >
+        {#each stops ?? [] as stop, index (index)}<stop
+            offset={stop.offset}
+            stop-color={stop.color}
+          />{/each}
+      </linearGradient>
+    {/if}
   </defs>
   {#if chosen === 'ceo'}
     <image href={ceoArt} width="512" height="512" />
@@ -80,11 +114,15 @@
           ? 'translate(26 26) scale(.9)'
           : undefined}
     >
-      <path
-        fill={stops ? 'url(#' + id + ')' : 'currentColor'}
-        d={chosen === 'ghost' ? GHOST_SABLE_PATH : SABLE_PATHS[0]}
-      />
-      <path fill={backing} opacity="0.45" d={SABLE_PATHS[1]} />
+      {#if chosen === 'paw'}
+        <path fill={stops ? 'url(#' + id + ')' : 'currentColor'} d={PAW_PATH} />
+      {:else}
+        <path
+          fill={stops ? 'url(#' + id + ')' : 'currentColor'}
+          d={chosen === 'ghost' ? GHOST_SABLE_PATH : SABLE_PATHS[0]}
+        />
+        <path fill={backing} opacity="0.45" d={SABLE_PATHS[1]} />
+      {/if}
       {#if chosen === 'propeller'}
         <path fill="var(--supporter-red)" d="M125 174C146 81 277 69 324 150L225 174Z" />
         <path fill="var(--supporter-yellow)" d="M125 174C138 107 175 87 222 96L237 171Z" />

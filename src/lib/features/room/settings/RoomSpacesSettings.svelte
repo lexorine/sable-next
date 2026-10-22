@@ -4,9 +4,10 @@
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
 
-  import type { RoomSummary } from '#src/generated/protocol';
+  import type { RoomListItemView, RoomPowerLevelsView } from '#src/generated/protocol';
 
   import { useCoreClient } from '#lib/core/context.js';
+  import { joinRoom } from '#lib/core/api/rooms.js';
   import { i18n } from '#lib/i18n.js';
   import { roomPathParamFromId, useRoomList } from '#lib/rooms/room-list.svelte.js';
   import Button from '#lib/ui/primitives/Button.svelte';
@@ -14,8 +15,12 @@
   import SettingsRow from '#lib/ui/primitives/SettingsRow.svelte';
   import { toasts } from '#lib/ui/toasts.svelte.js';
 
+  import { canSendState } from './permission-groups';
+
   interface Props {
-    room: RoomSummary | null;
+    room: RoomListItemView | null;
+    levels: RoomPowerLevelsView | null;
+    ownPowerLevel: number;
   }
 
   interface ParentEvent {
@@ -23,7 +28,7 @@
     content?: { canonical?: unknown; via?: unknown };
   }
 
-  let { room }: Props = $props();
+  let { room, levels, ownPowerLevel }: Props = $props();
   const core = useCoreClient();
   const roomList = useRoomList();
 
@@ -33,18 +38,21 @@
     via: string[];
   }
 
-  let parents = $state<Entry[]>([]);
+  let parents = $state.raw<Entry[]>([]);
   let joining = $state<string | null>(null);
+  let promoting = $state<string | null>(null);
   let run = 0;
 
   let roomId = $derived(room?.room_id ?? null);
+  let canEdit = $derived(canSendState(levels, ownPowerLevel, 'm.space.parent'));
   let listing = $derived(
     roomId === null
       ? []
       : roomList.rooms
           .filter(
             (space) =>
-              space.is_space && space.space_children.some((child) => child.room_id === roomId)
+              space.room_kind === 'space' &&
+              space.space_children.some((child) => child.room_id === roomId)
           )
           .map((space) => space.room_id)
   );
@@ -67,8 +75,8 @@
     if (!target) return;
 
     const current = ++run;
-    void core.commands
-      .roomStateEventsRaw(target, 'm.space.parent', null)
+    void core.rpc.room_state
+      .eventsRaw({ room_id: target, event_type: 'm.space.parent', state_key: null })
       .then((events) => {
         if (current !== run) return;
         parents = (events as ParentEvent[]).flatMap((event) =>
@@ -95,14 +103,44 @@
     void goto(resolve('/(app)/space/[spaceId]', { spaceId: roomPathParamFromId(spaceId) }));
   }
 
+  async function makeCanonical(entry: Entry): Promise<void> {
+    const target = roomId;
+    if (!target) return;
+
+    const send = (parent: Entry, canonical: boolean) =>
+      core.rpc.room_state.sendEvent({
+        room_id: target,
+        event_type: 'm.space.parent',
+        state_key: parent.spaceId,
+        content: canonical ? { via: parent.via, canonical } : { via: parent.via },
+      });
+
+    promoting = entry.spaceId;
+    try {
+      await send(entry, true);
+      for (const other of parents.filter((p) => p.canonical && p.spaceId !== entry.spaceId)) {
+        await send(other, false);
+      }
+      parents = parents.map((parent) => ({
+        ...parent,
+        canonical: parent.spaceId === entry.spaceId,
+      }));
+    } catch (error) {
+      console.warn('[sable room] changing the canonical space failed', error);
+      toasts.error(i18n.t('errors.actionFailed'));
+    } finally {
+      promoting = null;
+    }
+  }
+
   async function join(entry: Entry): Promise<void> {
     joining = entry.spaceId;
     try {
-      await core.commands.joinRoom(entry.spaceId, entry.via);
+      await joinRoom(core.rpc, entry.spaceId, entry.via);
       open(entry.spaceId);
     } catch (error) {
       console.warn('[sable room] joining a parent space failed', error);
-      toasts.error($i18n.t('errors.actionFailed'));
+      toasts.error(i18n.t('errors.actionFailed'));
     } finally {
       joining = null;
     }
@@ -110,17 +148,28 @@
 </script>
 
 {#if entries.length > 0}
-  <SettingsRow title={$i18n.t('room.spacesTitle')} description={$i18n.t('room.spacesHint')}>
+  <SettingsRow title={i18n.t('room.spacesTitle')} description={i18n.t('room.spacesHint')}>
     <ul class="spaces">
       {#each entries as entry (entry.spaceId)}
         <li>
           <span class="name">{roomList.labelFor(entry.spaceId)}</span>
           <span class="kind">
-            {entry.canonical ? $i18n.t('room.spaceCanonical') : $i18n.t('room.spaceOther')}
+            {entry.canonical ? i18n.t('room.spaceCanonical') : i18n.t('room.spaceOther')}
           </span>
+          {#if canEdit && !entry.canonical && entry.via.length > 0}
+            <Button
+              size="small"
+              variant="secondary"
+              loading={promoting === entry.spaceId}
+              disabled={promoting !== null}
+              onclick={() => makeCanonical(entry)}
+            >
+              {i18n.t('room.spaceMakeCanonical')}
+            </Button>
+          {/if}
           {#if roomList.byId(entry.spaceId)}
             <IconButton
-              label={$i18n.t('room.spaceOpen')}
+              label={i18n.t('room.spaceOpen')}
               size="small"
               onclick={() => open(entry.spaceId)}
             >
@@ -133,7 +182,7 @@
               disabled={entry.via.length === 0}
               onclick={() => join(entry)}
             >
-              {$i18n.t('room.spaceJoin')}
+              {i18n.t('common.join')}
             </Button>
           {/if}
         </li>

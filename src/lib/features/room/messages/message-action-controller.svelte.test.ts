@@ -3,9 +3,10 @@ import { expect, test, vi } from 'vitest';
 import type { CoreClient } from '#lib/core/client.svelte.js';
 import type { TimelineItemView } from '#src/generated/protocol';
 import { MessageActionExecutor } from './message-action-controller.svelte.js';
+import { withRowFields } from '#lib/features/room/timeline/row-fixtures.js';
 
 function message(): TimelineItemView {
-  return {
+  return withRowFields({
     id: 'item',
     event_id: '$item',
     transaction_id: null,
@@ -21,6 +22,7 @@ function message(): TimelineItemView {
       emote: false,
       notice: false,
       edited: false,
+      jumbo: null,
     },
     in_reply_to: null,
     thread_root: null,
@@ -35,7 +37,7 @@ function message(): TimelineItemView {
     mention: 'none',
     forwarded: null,
     forum_title: null,
-  };
+  });
 }
 
 function fixture() {
@@ -53,14 +55,20 @@ function fixture() {
     onOpenThread: vi.fn(),
     onReply: vi.fn(),
   };
-  const source = Promise.withResolvers<string>();
+  const source = Promise.withResolvers<{
+    source: string;
+    encrypted: boolean;
+    original: string | null;
+  }>();
   const removeLinkPreviews = vi.fn(() => Promise.resolve());
   const deps = {
     core: {
       commands: {
         imagePacks: vi.fn(),
-        eventSource: vi.fn(() => source.promise),
-        removeLinkPreviews,
+      },
+      rpc: {
+        messages: { removeLinkPreviews },
+        timeline: { eventSource: vi.fn(() => source.promise) },
       },
     } as unknown as CoreClient,
     personaStore: { load: vi.fn(async () => {}) },
@@ -113,12 +121,18 @@ test('source lookup keeps the event selected when the action began', async () =>
   const selected = context.item;
   executor.actions.onViewSource?.();
   context.item = { ...message(), event_id: '$next', id: 'next' };
-  source.resolve('{"event_id":"$item"}');
+  source.resolve({
+    source: '{"event_id":"$item"}',
+    encrypted: true,
+    original: '{"type":"m.room.encrypted"}',
+  });
   await source.promise;
   await Promise.resolve();
   expect(deps.dialogs.open).toHaveBeenCalledWith(selected, {
     kind: 'source',
     source: '{"event_id":"$item"}',
+    encrypted: true,
+    original: '{"type":"m.room.encrypted"}',
   });
 });
 
@@ -129,5 +143,9 @@ test('removing embeds edits the message in its own thread', () => {
 
   executor.actions.onRemoveLinkPreviews?.();
 
-  expect(removeLinkPreviews).toHaveBeenCalledWith('!room', '$item', '$root');
+  expect(removeLinkPreviews).toHaveBeenCalledWith({
+    room_id: '!room',
+    event_id: '$item',
+    thread_root: '$root',
+  });
 });

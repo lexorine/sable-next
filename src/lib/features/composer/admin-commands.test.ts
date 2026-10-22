@@ -1,4 +1,4 @@
-import type { RoomSummary } from '#src/generated/protocol';
+import type { RoomListItemView } from '#src/generated/protocol';
 import { expect, test } from 'vitest';
 
 import catalog from './admin-commands.json';
@@ -42,8 +42,8 @@ const commands: AdminCommand[] = [
   },
 ];
 
-function room(room_id: string, canonical_alias: string | null): RoomSummary {
-  return { room_id, name: null, canonical_alias, avatar_url: null } as RoomSummary;
+function room(room_id: string, canonical_alias: string | null): RoomListItemView {
+  return { room_id, name: null, canonical_alias, avatar_url: null } as RoomListItemView;
 }
 
 function labels(command: string, scope: Parameters<typeof adminSuggestions>[1]): string[] {
@@ -112,7 +112,7 @@ test('a catalog command is written back as the text continuwuity parses', () => 
   if (!reset) throw new Error('users reset-password is missing from the catalog');
 
   const result = buildInvocation(reset, draftsFromText(reset, '--logout bob'), '!admin ');
-  expect(result.ok && result.body).toBe('!admin users reset-password --logout bob');
+  expect(result.kind === 'built' && result.body).toBe('!admin users reset-password --logout bob');
 });
 
 test('until the catalog loads only the prefix completes', async () => {

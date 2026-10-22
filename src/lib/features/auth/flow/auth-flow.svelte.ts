@@ -33,7 +33,7 @@ export class AuthFlowController {
   isEditingHomeserver = $state(false);
 
   private validationGeneration = 0;
-  private validatedHomeserver: string | null = null;
+  private validatedHomeserver = $state<string | null>(null);
   private validatedRegistrationHomeserver: string | null = null;
   private registrationValidationKey = '';
 
@@ -44,6 +44,19 @@ export class AuthFlowController {
   ) {
     this.homeserver = homeserver;
     this.registrationToken = registrationToken;
+  }
+
+  get loginProviderReady(): boolean {
+    return (
+      this.validatedHomeserver === this.homeserver.trim() &&
+      this.loginFlows !== null &&
+      !this.isCheckingHomeserver &&
+      this.error === null
+    );
+  }
+
+  validateInitialHomeserver(displayedStage = 0): Promise<LoginFlowsView | null> {
+    return this.homeserver.trim() ? this.validateHomeserver(displayedStage) : Promise.resolve(null);
   }
 
   async validateHomeserver(displayedStage = 0): Promise<LoginFlowsView | null> {

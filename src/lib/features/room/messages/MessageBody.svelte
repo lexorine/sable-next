@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { on } from 'svelte/events';
   import type { TimelineItemView, MemberView } from '#src/generated/protocol';
 
   import type { MatrixLink } from '#lib/rooms/matrix-link.js';
@@ -6,6 +7,7 @@
   import MediaContent from '#lib/ui/MediaContent.svelte';
   import MediaImage from '#lib/ui/MediaImage.svelte';
   import Button from '#lib/ui/primitives/Button.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
   import { i18n } from '#lib/i18n.js';
   import TrashIcon from 'phosphor-svelte/lib/TrashIcon';
 
@@ -13,11 +15,15 @@
 
   import { previewableLinks } from '../media/link-preview.js';
   import FormattedBody from './FormattedBody.svelte';
+  import EmoteCard from './EmoteCard.svelte';
   import LinkEmbed from '../media/embeds/LinkEmbed.svelte';
-  import RedactedContent from './RedactedContent.svelte';
   import TimelineGallery from '../timeline/TimelineGallery.svelte';
   import { galleryItemId } from '../media/media-items.js';
+  import { spoilerVisibility, spoilerVisibilityKey } from '../media/spoiler-visibility.svelte.js';
   import TimelineLocation from '../timeline/TimelineLocation.svelte';
+  import { memberName } from '../members/members.js';
+  import { redactedLabel } from './redacted-label';
+  import RedactedContent from './RedactedContent.svelte';
   import TimelineLiveLocation from '../timeline/TimelineLiveLocation.svelte';
   import TimelinePoll from '../timeline/TimelinePoll.svelte';
   import {
@@ -32,6 +38,8 @@
     item: TimelineItemView;
     canRedactOthers: boolean;
     roomId?: string;
+    redactionReason?: string | null;
+    redactedBy?: string | null;
     encrypted?: boolean | null;
     senderTimezone?: string | null;
     members?: readonly MemberView[];
@@ -46,6 +54,8 @@
     item,
     canRedactOthers,
     roomId = '',
+    redactionReason = null,
+    redactedBy = null,
     encrypted = null,
     senderTimezone = null,
     members = [],
@@ -57,7 +67,7 @@
   }: Props = $props();
   let previewLinks = $derived(
     item.content.kind === 'gallery' && item.link_previews_removed !== true
-      ? previewableLinks(item.content.html)
+      ? previewableLinks(item.content.html, item.content.body)
       : []
   );
   let spoiler = $derived(
@@ -67,14 +77,23 @@
     (roomMedia?.hidden ?? false) && HIDEABLE_MEDIA.includes(item.content.kind)
   );
   let spoilerKey = $derived(
-    JSON.stringify([item.id, 'source' in item.content ? item.content.source : null, spoiler])
+    spoilerVisibilityKey(
+      item.event_id ?? item.id,
+      'source' in item.content ? item.content.source : null,
+      spoiler
+    )
   );
   let revealedSpoiler = $state<string | null>(null);
-  let imageSpoilerHidden = $derived.by(() => {
-    void spoilerKey;
-    return spoiler !== null;
-  });
+  let imageSpoilerHidden = $derived(spoilerVisibility.get(spoilerKey) ?? spoiler !== null);
   let showCaption = $derived(preferences.captionPosition !== 'hidden');
+  let stickerAnchor = $state<HTMLElement | null>(null);
+  let stickerHovered = $state(false);
+
+  function dismissStickerTooltip(node: HTMLElement) {
+    return on(node, 'keydown', (event) => {
+      if (event.key === 'Escape') stickerHovered = false;
+    });
+  }
 </script>
 
 {#if ((item.content.kind !== 'image' && spoiler !== null) || hiddenByPolicy) && revealedSpoiler !== spoilerKey}
@@ -84,47 +103,71 @@
       revealedSpoiler = spoilerKey;
     }}
   >
-    {spoiler ? `${spoiler} — ` : ''}{$i18n.t(
+    {spoiler ? `${spoiler} — ` : ''}{i18n.t(
       spoiler === null ? 'timeline.hiddenMedia' : 'timeline.spoilerMedia'
     )}
   </Button>
+  {#if item.content.kind === 'video' && showCaption && item.content.html}
+    <FormattedBody html={item.content.html} {senderTimezone} {onMatrixLink} />
+  {:else if item.content.kind === 'video' && showCaption && item.content.caption}
+    <p class="body">{item.content.caption}</p>
+  {/if}
 {:else if item.content.kind === 'redacted'}
+  {@const reason = item.content.reason ?? redactionReason}
   <p class="redacted">
     <TrashIcon size={14} aria-hidden="true" />
-    {item.content.reason
-      ? $i18n.t('timeline.redactedWithReason', { reason: item.content.reason })
-      : $i18n.t('timeline.redacted')}
+    {redactedLabel(redactedBy ? memberName(members, redactedBy) : null, reason ?? null)}
   </p>
-  <!--
-    MSC2815. `canRedactOthers` is the room's `redact` level applied to someone
-    else's event, which is exactly the gate the server enforces for reading a
-    redacted event, so it doubles as the permission for this affordance.
-  -->
-  {#if canRedactOthers && item.event_id && roomId}
-    <RedactedContent {roomId} {item} {senderTimezone} {onMatrixLink} />
-  {/if}
-{:else if item.content.kind === 'message'}
-  {#if item.content.html}
-    <FormattedBody html={item.content.html} {senderTimezone} {onMatrixLink} />
-  {:else}
-    <p class="body">{item.content.body}</p>
+  {#if canRedactOthers && roomId && item.event_id}
+    <RedactedContent {roomId} eventId={item.event_id} {item} {senderTimezone} {onMatrixLink} />
   {/if}
 {:else if item.content.kind === 'sticker'}
-  <MediaImage
-    class="sticker privacy-media"
-    autoplay={preferences.autoplayStickers}
-    source={item.content.source}
-    alt={item.content.body}
-    title={item.content.body}
-    width={304}
-    height={304}
-    intrinsicWidth={item.content.width}
-    intrinsicHeight={item.content.height}
-    mime={item.content.mime}
-    bind:spoilerHidden={imageSpoilerHidden}
-    retryable
-    onclick={() => item.event_id && onOpenMedia?.(item.event_id)}
-  />
+  {@const sticker = item.content}
+  <div
+    class="sticker"
+    role="group"
+    aria-label={sticker.body}
+    bind:this={stickerAnchor}
+    onpointerenter={(event) => (stickerHovered = event.pointerType !== 'touch')}
+    onpointerleave={() => (stickerHovered = false)}
+    onfocusin={() => (stickerHovered = true)}
+    onfocusout={() => (stickerHovered = false)}
+    {@attach dismissStickerTooltip}
+  >
+    <MediaImage
+      class="privacy-media"
+      autoplay={preferences.autoplayStickers}
+      source={sticker.source}
+      alt={sticker.body}
+      width={304}
+      height={304}
+      intrinsicWidth={sticker.width}
+      intrinsicHeight={sticker.height}
+      mime={sticker.mime}
+      bind:spoilerHidden={
+        () => imageSpoilerHidden, (hidden) => spoilerVisibility.set(spoilerKey, hidden)
+      }
+      retryable
+      onclick={() => item.event_id && onOpenMedia?.(item.event_id)}
+    />
+  </div>
+  {#if stickerHovered && !imageSpoilerHidden}
+    <Tooltip label={sticker.body} open customAnchor={stickerAnchor} side="top">
+      {#snippet content()}
+        <EmoteCard label={sticker.body}>
+          <MediaImage
+            source={sticker.source}
+            alt=""
+            width={64}
+            height={64}
+            mime={sticker.mime}
+            original
+            autoplay={preferences.autoplayStickers}
+          />
+        </EmoteCard>
+      {/snippet}
+    </Tooltip>
+  {/if}
   {#if !imageSpoilerHidden && preferences.alwaysShowAltText}<p class="body">
       {item.content.body}
     </p>{/if}
@@ -145,14 +188,16 @@
       size={item.content.size}
       blurhash={item.content.blurhash}
       spoilerReason={item.content.spoiler}
-      bind:spoilerHidden={imageSpoilerHidden}
+      bind:spoilerHidden={
+        () => imageSpoilerHidden, (hidden) => spoilerVisibility.set(spoilerKey, hidden)
+      }
       spoilerName={item.content.filename}
       retryable
       onclick={() => item.event_id && onOpenMedia?.(item.event_id)}
     />
-    {#if !imageSpoilerHidden && showCaption && item.content.html}
+    {#if showCaption && item.content.html}
       <FormattedBody html={item.content.html} {senderTimezone} {onMatrixLink} />
-    {:else if !imageSpoilerHidden && showCaption && item.content.caption}
+    {:else if showCaption && item.content.caption}
       <p class="body">{item.content.caption}</p>
     {:else if !imageSpoilerHidden && !item.content.caption && preferences.alwaysShowAltText}
       <p class="body">{item.content.filename}</p>
@@ -161,6 +206,7 @@
 {:else if item.content.kind === 'gallery'}
   <TimelineGallery
     items={item.content.items}
+    eventId={item.event_id ?? undefined}
     body={item.content.body}
     html={item.content.html}
     {senderTimezone}
@@ -203,6 +249,7 @@
       durationMs={item.content.kind === 'audio' ? item.content.duration_ms : null}
       waveform={item.content.kind === 'audio' ? item.content.waveform : null}
       audioMetadata={item.content.kind === 'audio' ? item.content.metadata : null}
+      playback={item.content.kind === 'video' ? item.content.playback : null}
       onOpen={item.event_id ? () => onOpenMedia?.(item.event_id ?? '') : undefined}
     />
     {#if showCaption && item.content.html}
@@ -212,9 +259,15 @@
     {/if}
   </div>
 {/if}
-{#each previewLinks as url (url)}
-  <LinkEmbed {url} {encrypted} />
-{/each}
+{#if item.content.kind === 'gallery' && item.bundled_link_previews.length > 0}
+  {#each item.bundled_link_previews as preview (preview.url)}
+    <LinkEmbed url={preview.url} bundled={preview} {encrypted} />
+  {/each}
+{:else}
+  {#each previewLinks as url (url)}
+    <LinkEmbed {url} {encrypted} />
+  {/each}
+{/if}
 
 <style>
   .body {
@@ -262,27 +315,6 @@
     margin: 0;
   }
 
-  /* The recovered content sits under the tombstone, not in place of it. */
-  :global(.unredacted) {
-    border-inline-start: var(--border-width) solid var(--primary-main);
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-100);
-    margin-block-start: var(--space-100);
-    padding-inline-start: var(--space-200);
-  }
-
-  :global(.unredacted-label) {
-    color: var(--surface-var-on-container);
-    font-size: var(--font-size-small);
-  }
-
-  :global(.unredacted-failed) {
-    color: var(--surface-var-on-container);
-    display: block;
-    font-size: var(--font-size-small);
-  }
-
   :global(.image) {
     border-radius: var(--radius);
     display: block;
@@ -299,7 +331,7 @@
     );
   }
 
-  :global(.sticker) {
+  .sticker {
     border-radius: var(--radius);
     display: block;
     margin-top: var(--space-100);
@@ -307,7 +339,7 @@
     width: var(--timeline-sticker-width);
   }
 
-  :global(.sticker) + .body {
+  .sticker + .body {
     margin-top: var(--space-200);
   }
 
@@ -317,6 +349,8 @@
   }
 
   :global(.media.media-frame-video) {
+    contain: inline-size;
+    contain-intrinsic-inline-size: var(--timeline-media-max);
     max-height: var(--timeline-media-max);
     width: min(
       var(--timeline-media-fill),

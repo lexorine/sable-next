@@ -8,10 +8,12 @@ import {
   PRONOUNS_FIELD,
   STATUS_FIELD,
   legacyDeletes,
+  statusContent,
 } from '#lib/profile/fields.js';
 import { pronounSets, pronounText } from '#lib/profile/pronouns.js';
 import { t } from '#lib/i18n.js';
 import { preferences } from '#lib/settings/preferences.svelte.js';
+import { hexColorOrEmpty } from '#lib/ui/hex-color.js';
 import { uprightJpeg } from '#lib/ui/upright-jpeg.js';
 
 export function revokeAvatarPreview(preview: string | null): void {
@@ -39,6 +41,7 @@ interface LoadedProfile {
   pronouns: string;
   nameColor: string;
   status: string;
+  statusEmoji: string | null;
   legacyFields: string[];
 }
 
@@ -48,6 +51,7 @@ function loadedFields(profile: ProfileView): LoadedProfile {
     pronouns: pronounText(profile.pronouns),
     nameColor: profile.name_color_dark ?? profile.name_color_light ?? '',
     status: profile.status?.text ?? '',
+    statusEmoji: profile.status?.emoji ?? null,
     legacyFields: profile.legacy_fields,
   };
 }
@@ -78,6 +82,7 @@ export class ProfileController {
     pronouns: '',
     nameColor: '',
     status: '',
+    statusEmoji: null,
     legacyFields: [],
   };
 
@@ -150,13 +155,13 @@ export class ProfileController {
       const name = this.displayName.trim();
       const propagateTo = preferences.profileChangePropagation;
       if (name && name !== loaded.displayName) {
-        await this.options.core.commands.setDisplayName(name, propagateTo);
+        await this.options.core.rpc.account.setDisplayName({ name, propagate_to: propagateTo });
       }
       const core = this.options.core;
       if (this.pronouns.trim() !== loaded.pronouns) {
         await core.setProfileField(PRONOUNS_FIELD, pronounSets(this.pronouns));
       }
-      const color = this.nameColor.trim();
+      const color = hexColorOrEmpty(this.nameColor);
       if (color !== loaded.nameColor) {
         await core.setProfileField(
           NAME_COLOR_FIELD,
@@ -165,13 +170,13 @@ export class ProfileController {
       }
       const status = this.status.trim();
       if (status !== loaded.status) {
-        await core.setProfileField(STATUS_FIELD, status ? { text: status } : null);
+        await core.setProfileField(STATUS_FIELD, statusContent(status, loaded.statusEmoji));
         for (const [field] of legacyDeletes(loaded.legacyFields, LEGACY_STATUS_FIELDS)) {
           await core.setProfileField(field, null);
         }
       }
       if (this.bannerFile) {
-        const url = await core.commands.uploadMedia(
+        const url = await core.media.uploadMedia(
           this.bannerFile.type || 'image/*',
           new Uint8Array(await this.bannerFile.arrayBuffer())
         );
@@ -184,7 +189,7 @@ export class ProfileController {
         const bytes = new Uint8Array(await upright.arrayBuffer());
         await this.options.core.uploadAvatar(upright.type || 'image/*', bytes, propagateTo);
       } else if (this.avatarCleared) {
-        await this.options.core.commands.setAvatarUrl(null, propagateTo);
+        await this.options.core.rpc.account.setAvatarUrl({ url: null, propagate_to: propagateTo });
       }
       await this.finish();
     } catch {

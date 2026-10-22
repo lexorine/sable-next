@@ -2,7 +2,7 @@
   import { CoreError } from '#src/transport';
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n, t } from '#lib/i18n.js';
-  import { pickFiles, saveBytes } from '#lib/platform/files.js';
+  import { pickFiles } from '#lib/platform/files.js';
   import Alert from '#lib/ui/primitives/Alert.svelte';
   import Button from '#lib/ui/primitives/Button.svelte';
   import Label from '#lib/ui/primitives/Label.svelte';
@@ -11,7 +11,7 @@
   import TextInput from '#lib/ui/primitives/TextInput.svelte';
   import '#lib/ui/primitives/settings-row.css';
 
-  const EXPORT_NAME = 'sable-keys.txt';
+  import { ROOM_KEYS_EXPORT_NAME, saveRoomKeys } from './room-key-export';
 
   const core = useCoreClient();
 
@@ -56,12 +56,11 @@
     error = null;
     notice = null;
     try {
-      const armored = await core.commands.exportRoomKeys(exportPassphrase);
-      const outcome = await saveBytes(new TextEncoder().encode(armored), EXPORT_NAME, 'text/plain');
+      const outcome = await saveRoomKeys(core.rpc.encryption, exportPassphrase);
       if (outcome === 'failed') {
         error = t('settings.roomKeysExportFailed');
       } else if (outcome === 'saved') {
-        notice = t('settings.roomKeysExported', { name: EXPORT_NAME });
+        notice = t('settings.roomKeysExported', { name: ROOM_KEYS_EXPORT_NAME });
         closeExport();
       }
     } catch (cause) {
@@ -94,11 +93,11 @@
     error = null;
     notice = null;
     try {
-      const { imported, total } = await core.commands.importRoomKeys(
-        await file.text(),
-        importPassphrase
-      );
-      notice = t('settings.roomKeysImported', { imported, total });
+      const { imported, total } = await core.rpc.encryption.importRoomKeys({
+        export: await file.text(),
+        passphrase: importPassphrase,
+      });
+      notice = t('settings.roomKeysImported', { imported, count: total, total });
       closeImport();
     } catch (cause) {
       console.warn('[sable settings] room key import failed', cause);
@@ -109,16 +108,16 @@
   }
 </script>
 
-<SettingsSection headingId="room-keys-heading" title={$i18n.t('settings.roomKeys')}>
+<SettingsSection headingId="room-keys-heading" title={i18n.t('settings.roomKeys')}>
   <ul class="settings-rows">
     <SettingsRow
       id="room-keys-export"
-      title={$i18n.t('settings.roomKeysExport')}
-      description={$i18n.t('settings.roomKeysExportDescription')}
+      title={i18n.t('settings.roomKeysExport')}
+      description={i18n.t('settings.roomKeysExportDescription')}
     >
       {#if !exportOpen}
         <Button variant="secondary" size="small" onclick={() => (exportOpen = true)}>
-          {$i18n.t('settings.roomKeysExportAction')}
+          {i18n.t('settings.roomKeysExportAction')}
         </Button>
       {/if}
     </SettingsRow>
@@ -132,7 +131,7 @@
         void exportKeys();
       }}
     >
-      <Label for="room-keys-export-passphrase">{$i18n.t('settings.roomKeysPassphrase')}</Label>
+      <Label for="room-keys-export-passphrase">{i18n.t('settings.roomKeysPassphrase')}</Label>
       <TextInput
         id="room-keys-export-passphrase"
         type="password"
@@ -142,7 +141,7 @@
         required
         autofocus
       />
-      <Label for="room-keys-export-confirm">{$i18n.t('settings.roomKeysConfirmPassphrase')}</Label>
+      <Label for="room-keys-export-confirm">{i18n.t('settings.roomKeysConfirmPassphrase')}</Label>
       <TextInput
         id="room-keys-export-confirm"
         type="password"
@@ -153,7 +152,7 @@
         required
       />
       {#if mismatch}
-        <p class="settings-note" role="alert">{$i18n.t('settings.roomKeysPassphraseMismatch')}</p>
+        <p class="settings-note" role="alert">{i18n.t('settings.roomKeysPassphraseMismatch')}</p>
       {/if}
       <div class="form-actions">
         <Button
@@ -161,10 +160,10 @@
           loading={exporting}
           disabled={!exportPassphrase || exportPassphrase !== exportConfirm}
         >
-          {$i18n.t('settings.roomKeysExportAction')}
+          {i18n.t('settings.roomKeysExportAction')}
         </Button>
         <Button variant="ghost" disabled={exporting} onclick={closeExport}>
-          {$i18n.t('settings.cancel')}
+          {i18n.t('common.cancel')}
         </Button>
       </div>
     </form>
@@ -173,12 +172,12 @@
   <ul class="settings-rows">
     <SettingsRow
       id="room-keys-import"
-      title={$i18n.t('settings.roomKeysImport')}
-      description={$i18n.t('settings.roomKeysImportDescription')}
+      title={i18n.t('settings.roomKeysImport')}
+      description={i18n.t('settings.roomKeysImportDescription')}
     >
       {#if !importFile}
         <Button variant="secondary" size="small" onclick={() => void pickImport()}>
-          {$i18n.t('settings.roomKeysImportAction')}
+          {i18n.t('common.import')}
         </Button>
       {/if}
       <input
@@ -206,7 +205,7 @@
       }}
     >
       <p class="settings-note room-keys-file">{importFile.name}</p>
-      <Label for="room-keys-import-passphrase">{$i18n.t('settings.roomKeysPassphrase')}</Label>
+      <Label for="room-keys-import-passphrase">{i18n.t('settings.roomKeysPassphrase')}</Label>
       <TextInput
         id="room-keys-import-passphrase"
         type="password"
@@ -218,10 +217,10 @@
       />
       <div class="form-actions">
         <Button type="submit" loading={importing}>
-          {$i18n.t('settings.roomKeysImportAction')}
+          {i18n.t('common.import')}
         </Button>
         <Button variant="ghost" disabled={importing} onclick={closeImport}>
-          {$i18n.t('settings.cancel')}
+          {i18n.t('common.cancel')}
         </Button>
       </div>
     </form>

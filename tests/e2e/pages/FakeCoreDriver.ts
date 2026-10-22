@@ -12,20 +12,20 @@ export class FakeCoreDriver {
   timelineCommands(): Promise<string[]> {
     return this.page.evaluate(() =>
       window.__e2eCommands.filter(
-        (command) => command === 'subscribe_timeline' || command === 'paginate'
+        (command) => command === 'timeline.subscribe' || command === 'timeline.paginate'
       )
     );
   }
 
   subscribeCount(): Promise<number> {
     return this.page.evaluate(
-      () => window.__e2eCommands.filter((command) => command === 'subscribe_timeline').length
+      () => window.__e2eCommands.filter((command) => command === 'timeline.subscribe').length
     );
   }
 
   paginateCount(): Promise<number> {
     return this.page.evaluate(
-      () => window.__e2eCommands.filter((command) => command === 'paginate').length
+      () => window.__e2eCommands.filter((command) => command === 'timeline.paginate').length
     );
   }
 

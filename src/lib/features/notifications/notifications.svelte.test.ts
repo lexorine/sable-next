@@ -2,7 +2,7 @@
 
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 
-import type { NotificationView, RoomSummary } from '#src/generated/protocol';
+import type { NotificationView, RoomListItemView } from '#src/generated/protocol';
 
 const mocks = vi.hoisted(() => ({
   retire: vi.fn().mockResolvedValue(undefined),
@@ -27,6 +27,7 @@ import type { CoreClient } from '#lib/core/client.svelte.js';
 
 import { NotificationCenter } from './notifications.svelte';
 import { preferences } from '#lib/settings/preferences.svelte.js';
+import { withCounts } from '#lib/rooms/summary-fixtures.js';
 
 beforeEach(() => {
   mocks.retire.mockClear();
@@ -46,15 +47,15 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-function room(unread: number): RoomSummary {
-  return {
+function room(unread: number): RoomListItemView {
+  return withCounts({
     room_id: '!room:example.org',
     state: 'joined',
     unread,
     notifying: unread,
     highlight: 0,
     marked_unread: false,
-  } as RoomSummary;
+  } as RoomListItemView);
 }
 
 function center(): NotificationCenter {
@@ -62,7 +63,10 @@ function center(): NotificationCenter {
   notifications.start(
     {
       session: { account_id: 'a1', user_id: '@me:example.org' },
-      commands: { setReadRoom: mocks.setReadRoom, ackWebPusher: mocks.ackWebPusher },
+      rpc: {
+        push: { ackWebPusher: mocks.ackWebPusher },
+        session: { setReadRoom: mocks.setReadRoom },
+      },
       subscribeEvents: () => () => {},
     } as unknown as CoreClient,
     () => {}
@@ -77,7 +81,7 @@ test('a room read after it was unread retires its alerts', () => {
   expect(mocks.retire).not.toHaveBeenCalled();
 
   notifications.retireRead([room(0)]);
-  expect(mocks.retire).toHaveBeenCalledWith('@me:example.org', '!room:example.org');
+  expect(mocks.retire).toHaveBeenCalledWith('@me:example.org', ['!room:example.org']);
 });
 
 test('a room already read on another device retires a cold notification', () => {
@@ -86,7 +90,7 @@ test('a room already read on another device retires a cold notification', () => 
   notifications.retireRead([room(0)]);
   notifications.retireRead([room(0)]);
 
-  expect(mocks.retire).toHaveBeenCalledExactlyOnceWith('@me:example.org', '!room:example.org');
+  expect(mocks.retire).toHaveBeenCalledExactlyOnceWith('@me:example.org', ['!room:example.org']);
 });
 
 test('opening a room retires its alerts and tells the core to skip it', () => {
@@ -94,8 +98,8 @@ test('opening a room retires its alerts and tells the core to skip it', () => {
 
   notifications.readRoom('!room:example.org');
 
-  expect(mocks.setReadRoom).toHaveBeenCalledWith('!room:example.org');
-  expect(mocks.retire).toHaveBeenCalledWith('@me:example.org', '!room:example.org');
+  expect(mocks.setReadRoom).toHaveBeenCalledWith({ room_id: '!room:example.org' });
+  expect(mocks.retire).toHaveBeenCalledWith('@me:example.org', ['!room:example.org']);
 });
 
 test('leaving a room clears the core-side gate', () => {
@@ -104,7 +108,7 @@ test('leaving a room clears the core-side gate', () => {
   notifications.readRoom('!room:example.org');
   notifications.readRoom(null);
 
-  expect(mocks.setReadRoom).toHaveBeenLastCalledWith(null);
+  expect(mocks.setReadRoom).toHaveBeenLastCalledWith({ room_id: null });
 });
 
 test('an Android push for the room being read is immediately retired', () => {
@@ -117,7 +121,7 @@ test('an Android push for the room being read is immediately retired', () => {
     | undefined;
   handler?.({ message: JSON.stringify({ notification: { room_id: '!room:example.org' } }) });
 
-  expect(mocks.retire).toHaveBeenCalledExactlyOnceWith('@me:example.org', '!room:example.org');
+  expect(mocks.retire).toHaveBeenCalledExactlyOnceWith('@me:example.org', ['!room:example.org']);
 });
 
 test("a read push for another account retires that account's alert and not the reader's", () => {
@@ -138,11 +142,11 @@ test("a read push for another account retires that account's alert and not the r
     }),
   });
 
-  expect(mocks.retire).toHaveBeenCalledExactlyOnceWith('@other:example.org', '!room:example.org');
+  expect(mocks.retire).toHaveBeenCalledExactlyOnceWith('@other:example.org', ['!room:example.org']);
 });
 
-function readThrough(eventId: string): RoomSummary {
-  return { ...room(0), latest_event: { event_id: eventId } } as RoomSummary;
+function readThrough(eventId: string): RoomListItemView {
+  return { ...room(0), latest_event: { event_id: eventId } } as RoomListItemView;
 }
 
 function push(eventId: string): void {
@@ -163,7 +167,7 @@ test('an Android push for a message already read on another device is retired', 
 
   push('$new');
 
-  expect(mocks.retire).toHaveBeenCalledExactlyOnceWith('@me:example.org', '!room:example.org');
+  expect(mocks.retire).toHaveBeenCalledExactlyOnceWith('@me:example.org', ['!room:example.org']);
 });
 
 test('an Android push that outruns its read message is retired once the message syncs', () => {
@@ -176,7 +180,7 @@ test('an Android push that outruns its read message is retired once the message 
   expect(mocks.retire).not.toHaveBeenCalled();
 
   notifications.retireRead([readThrough('$new')]);
-  expect(mocks.retire).toHaveBeenCalledExactlyOnceWith('@me:example.org', '!room:example.org');
+  expect(mocks.retire).toHaveBeenCalledExactlyOnceWith('@me:example.org', ['!room:example.org']);
 });
 
 test('an Android push for an unread message stands until the room is read', () => {
@@ -185,11 +189,11 @@ test('an Android push for an unread message stands until the room is read', () =
   mocks.retire.mockClear();
 
   push('$new');
-  notifications.retireRead([{ ...readThrough('$new'), unread: 1, notifying: 1 }]);
+  notifications.retireRead([withCounts({ ...readThrough('$new'), unread: 1, notifying: 1 })]);
   expect(mocks.retire).not.toHaveBeenCalled();
 
   notifications.retireRead([readThrough('$new')]);
-  expect(mocks.retire).toHaveBeenCalledExactlyOnceWith('@me:example.org', '!room:example.org');
+  expect(mocks.retire).toHaveBeenCalledExactlyOnceWith('@me:example.org', ['!room:example.org']);
 });
 
 test('a native MSC4174 validation push without native handling is acknowledged without an alert', async () => {
@@ -201,7 +205,10 @@ test('a native MSC4174 validation push without native handling is acknowledged w
   handler?.({ message: JSON.stringify({ app_id: 'moe.sable.webpush', ack_token: 'token' }) });
 
   await vi.waitFor(() => {
-    expect(mocks.ackWebPusher).toHaveBeenCalledWith('moe.sable.webpush', 'token');
+    expect(mocks.ackWebPusher).toHaveBeenCalledWith({
+      app_id: 'moe.sable.webpush',
+      ack_token: 'token',
+    });
   });
   expect(mocks.retire).not.toHaveBeenCalled();
 });
@@ -314,7 +321,7 @@ test.each(['joined', 'left', 'banned'] as const)(
     expect(mocks.retire).not.toHaveBeenCalled();
 
     notifications.retireRead([{ ...room(0), state }]);
-    expect(mocks.retire).toHaveBeenCalledExactlyOnceWith('@me:example.org', '!room:example.org');
+    expect(mocks.retire).toHaveBeenCalledExactlyOnceWith('@me:example.org', ['!room:example.org']);
   }
 );
 
@@ -323,58 +330,19 @@ test('rejecting an invite removes its entry from the SDK non-left room list', ()
   notifications.present(invite());
   notifications.retireRead([{ ...room(0), state: 'invited' }]);
   notifications.retireRead([]);
-  expect(mocks.retire).toHaveBeenCalledExactlyOnceWith('@me:example.org', '!room:example.org');
+  expect(mocks.retire).toHaveBeenCalledExactlyOnceWith('@me:example.org', ['!room:example.org']);
 });
 
 function message(eventId: string): NotificationView {
   return { ...invite(), event_id: eventId, body: 'Hello', noisy: true };
 }
 
-test('a second message in a room with a standing alert does not sound again', () => {
-  const notifications = center();
-
-  notifications.present(message('$one'));
-  expect(mocks.sound).toHaveBeenCalledTimes(1);
-
-  notifications.present(message('$two'));
-  expect(mocks.sound).toHaveBeenCalledTimes(1);
-
-  notifications.retireRead([room(0)]);
-  notifications.present(message('$three'));
-  expect(mocks.sound).toHaveBeenCalledTimes(2);
-});
-
-test('reading a room re-arms its sound while read alerts are left standing', () => {
-  preferences.clearNotificationsOnRead = false;
-  const notifications = center();
-
-  notifications.present(message('$one'));
-  notifications.readRoom('!room:example.org');
-  notifications.readRoom(null);
-  notifications.present(message('$two'));
-  expect(mocks.sound).toHaveBeenCalledTimes(2);
-
-  notifications.retireRead([room(0)]);
-  notifications.present(message('$three'));
-  expect(mocks.sound).toHaveBeenCalledTimes(3);
-  expect(mocks.retire).not.toHaveBeenCalled();
-});
-
-test('a mention sounds even in a room with a standing alert', () => {
-  const notifications = center();
-
-  notifications.present(message('$one'));
-  notifications.present({ ...message('$two'), mention: true });
-
-  expect(mocks.sound).toHaveBeenCalledTimes(2);
-});
-
-test('every message sounds while only notifying once is off', () => {
-  preferences.notifyOnce = false;
+test('a message whose rule rings sounds every time, alert standing or not', () => {
   const notifications = center();
 
   notifications.present(message('$one'));
   notifications.present(message('$two'));
+  notifications.present({ ...message('$three'), noisy: false });
 
   expect(mocks.sound).toHaveBeenCalledTimes(2);
 });
@@ -402,4 +370,19 @@ test('posted alerts are left alone while read alerts stay standing', () => {
   vi.advanceTimersByTime(1000);
 
   expect(mocks.retireRead).not.toHaveBeenCalled();
+});
+
+test('a first sweep retires every read room in one call', () => {
+  const notifications = center();
+  const rooms = Array.from({ length: 500 }, (_unused, index) => ({
+    ...room(0),
+    room_id: `!read${index}:example.org`,
+  }));
+
+  notifications.retireRead(rooms);
+
+  expect(mocks.retire).toHaveBeenCalledExactlyOnceWith(
+    '@me:example.org',
+    rooms.map((read) => read.room_id)
+  );
 });

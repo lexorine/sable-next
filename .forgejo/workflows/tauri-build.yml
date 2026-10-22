@@ -1,7 +1,8 @@
 name: Build apps
 on:
+  schedule:
+    - cron: '0 0,12 * * *'
   push:
-    branches: [main]
     tags: ['v*']
   workflow_dispatch:
     inputs:
@@ -16,14 +17,14 @@ concurrency:
 env:
   MISE_GITHUB_TOKEN: ${{ secrets.MISE_GITHUB_TOKEN }}
   CARGO_INCREMENTAL: 0
-  CARGO_PROFILE_RELEASE_DEBUG: '1'
+  CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
   CARGO_PROFILE_RELEASE_STRIP: none
   CARGO_TERM_COLOR: always
   FORGEJO_URL: https://git.sable.moe
   FORGEJO_REPOSITORY: ${{ github.repository }}
   FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
   # Each nightly is ~1.5 GB of bundles on a node with ~100 GB of disk.
-  NIGHTLY_KEEP: 5
+  NIGHTLY_KEEP: 20
   SCCACHE_BUCKET: sccache
   SCCACHE_S3_KEY_PREFIX: sable-next
   SCCACHE_ENDPOINT: https://s3.erwanleboucher.dev
@@ -32,7 +33,7 @@ env:
 jobs:
   setup-release:
     name: Resolve release target
-    runs-on: light
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
@@ -41,6 +42,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       ref: ${{ steps.meta.outputs.ref }}
       nightly: ${{ steps.meta.outputs.nightly }}
+      skip: ${{ steps.gate.outputs.skip }}
     steps:
       - name: Check out repository
         uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -51,25 +53,55 @@ jobs:
         uses: ./.forgejo/actions/resolve-release-meta
         with:
           input-tag: ${{ inputs.tag }}
+      - name: Check out the release target
+        if: ${{ steps.meta.outputs.nightly != 'true' }}
+        uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.meta.outputs.ref }}
+          persist-credentials: false
+      - name: Verify the release preparation
+        if: ${{ steps.meta.outputs.nightly != 'true' }}
+        run: node scripts/release/release-prep.mjs "${{ steps.meta.outputs.version }}"
+      - name: Skip scheduled build without new commits
+        id: gate
+        if: ${{ github.event_name == 'schedule' }}
+        run: |
+          age=$(( $(date +%s) - $(git log -1 --format=%ct) ))
+          if [ "$age" -gt 43200 ]; then echo 'skip=true' >> "$GITHUB_OUTPUT"; fi
       - name: Wait for release to exist
         if: ${{ steps.meta.outputs.nightly != 'true' }}
         env:
           TAG: ${{ steps.meta.outputs.tag }}
         run: node scripts/ci/forgejo-release.mjs wait --attempts 12 --interval 15
-      - name: Create nightly prerelease
-        if: ${{ steps.meta.outputs.nightly == 'true' }}
+      - name: Dispatch the GitHub build for the tag
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         env:
+          GH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+          TAG: ${{ steps.meta.outputs.nightly != 'true' && steps.meta.outputs.tag || '' }}
+        run: |
+          [ -n "$GH_TOKEN" ] || { echo 'GH_DISPATCH_TOKEN is not set; dispatch the GitHub build for this tag by hand.' >&2; exit 1; }
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            https://api.github.com/repos/SableClient/sable-next/actions/workflows/tauri-build.yml/dispatches \
+            -d "{\"ref\":\"main\",\"inputs\":{\"tag\":\"$TAG\"}}"
+      - name: Create nightly prerelease
+        if: ${{ steps.meta.outputs.nightly == 'true' && steps.gate.outputs.skip != 'true' }}
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
           SHA: ${{ github.sha }}
         run: |
           node scripts/ci/forgejo-release.mjs ensure \
-            --tag "${{ steps.meta.outputs.tag }}" \
+            --tag "$TAG" \
             --sha "$SHA" \
             --prerelease true \
-            --title "Nightly build ${{ steps.meta.outputs.version }}" \
+            --title "Nightly build $VERSION" \
             --notes "Nightly build from main at $SHA"
   build-web:
     name: Build web assets
     needs: setup-release
+    if: ${{ needs.setup-release.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     # Cold, this compiles the workspace for wasm32 in release. Warm, the setup
     # action restores the bindings and only Vite runs.
@@ -105,8 +137,8 @@ jobs:
       # bundles in step with the desktop and mobile ones.
       - name: Attach web bundle to release
         run: |
-          tar --create --gzip --file "sable-next-${VERSION}-web.tar.gz" --directory dist .
-          node scripts/ci/forgejo-release.mjs upload "sable-next-${VERSION}-web.tar.gz"
+          tar --create --gzip --file "sable-${VERSION}-web.tar.gz" --directory dist .
+          node scripts/ci/forgejo-release.mjs upload "sable-${VERSION}-web.tar.gz"
       - name: Upload web assets
         uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
@@ -118,15 +150,22 @@ jobs:
           if-no-files-found: error
           retention-days: 7
   docker:
-    name: Build and push image
+    name: Build image (${{ matrix.arch }})
     needs: [setup-release, build-web]
-    runs-on: multiarch
+    runs-on: docker-arm64
     timeout-minutes: 60
+    strategy:
+      fail-fast: true
+      matrix:
+        arch: [amd64, arm64]
     permissions:
       contents: read
       packages: write
     env:
       REGISTRY: git.sable.moe
+      ARCH: ${{ matrix.arch }}
+      PACKAGES_USER: ${{ secrets.PACKAGES_USER }}
+      PACKAGES_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
     steps:
       - name: Check out repository
         uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -139,75 +178,112 @@ jobs:
         uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
         with:
           name: web-assets
-      # `github.repository` keeps the owner's capitals and an image reference
-      # cannot. metadata-action lowercases its own tags; the cache refs below
-      # are handed to buildx verbatim.
-      - name: Resolve the image name
-        id: image
-        run: echo "name=${GITHUB_REPOSITORY,,}" >>"$GITHUB_OUTPUT"
-      - name: Extract image metadata
-        id: meta
-        uses: https://github.com/docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        with:
-          images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
-          flavor: latest=false
-          tags: |
-            type=raw,value=dev,enable=${{ needs.setup-release.outputs.nightly == 'true' }}
-            type=sha,prefix=,format=short,enable=${{ needs.setup-release.outputs.nightly == 'true' }}
-            type=raw,value=latest,enable=${{ needs.setup-release.outputs.nightly == 'false' }}
-            type=semver,pattern={{version}},value=${{ needs.setup-release.outputs.version }},enable=${{ needs.setup-release.outputs.nightly == 'false' }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.setup-release.outputs.version }},enable=${{ needs.setup-release.outputs.nightly == 'false' }}
       - name: Log in to the container registry
-        uses: https://github.com/docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        run: echo "$PACKAGES_TOKEN" | docker login "$REGISTRY" --username "$PACKAGES_USER" --password-stdin
+      # Each job builds natively on a runner of its own architecture and pushes
+      # an untagged image by digest; `docker-manifest` joins them under the
+      # release tags. The docker-container driver is what registry cache needs.
+      - name: Build and push image by digest
+        env:
+          REVISION: ${{ github.sha }}
+          VERSION: ${{ needs.setup-release.outputs.version }}
+        run: |
+          # `github.repository` keeps the owner's capitals; an image reference cannot.
+          image="$REGISTRY/${GITHUB_REPOSITORY,,}"
+          docker buildx create --name "ci-$GITHUB_RUN_ID-$ARCH" --driver docker-container --use
+          # Forgejo fails the push when both arch jobs upload the same layer at once.
+          for attempt in 1 2 3; do
+            docker buildx build . \
+              --file packaging/docker/Dockerfile \
+              --platform "linux/$ARCH" \
+              --label "org.opencontainers.image.source=$FORGEJO_URL/$GITHUB_REPOSITORY" \
+              --label "org.opencontainers.image.revision=$REVISION" \
+              --label "org.opencontainers.image.version=$VERSION" \
+              --cache-from "type=registry,ref=$image:buildcache-$ARCH" \
+              --cache-to "type=registry,ref=$image:buildcache-$ARCH,mode=max,ignore-error=true" \
+              --output "type=image,name=$image,push-by-digest=true,name-canonical=true,push=true" \
+              --metadata-file "$RUNNER_TEMP/build-metadata.json" && break
+            [ "$attempt" -lt 3 ] || exit 1
+            sleep $((attempt * 10))
+          done
+          mkdir digests
+          node -p "require(process.env.RUNNER_TEMP + '/build-metadata.json')['containerimage.digest']" > "digests/$ARCH"
+      - name: Remove the builder
+        if: ${{ always() }}
+        run: docker buildx rm --force "ci-$GITHUB_RUN_ID-$ARCH" || true
+      - name: Upload digest
+        uses: https://code.forgejo.org/forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ secrets.PACKAGES_USER }}
-          password: ${{ secrets.PACKAGES_TOKEN }}
-      # The base image is multi-arch but `setcap` still runs under emulation.
-      - name: Set up QEMU
-        uses: https://github.com/docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
-      - name: Set up Docker Buildx
-        uses: https://github.com/docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - name: Build and push image
-        uses: https://github.com/docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache,mode=max
+          name: image-digest-${{ matrix.arch }}
+          path: digests/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
 
-  linux:
-    name: Linux x86_64 (CEF)
-    needs: [setup-release, build-web]
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
+  docker-manifest:
+    name: Publish image manifest
+    needs: [setup-release, docker]
+    runs-on: docker-arm64
+    timeout-minutes: 10
     permissions:
-      contents: write
+      contents: read
+      packages: write
+    env:
+      REGISTRY: git.sable.moe
+      PACKAGES_USER: ${{ secrets.PACKAGES_USER }}
+      PACKAGES_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+      NIGHTLY: ${{ needs.setup-release.outputs.nightly }}
+      VERSION: ${{ needs.setup-release.outputs.version }}
+      SHA: ${{ github.sha }}
+    steps:
+      - name: Download amd64 digest
+        uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
+        with:
+          name: image-digest-amd64
+          path: digests
+      - name: Download arm64 digest
+        uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
+        with:
+          name: image-digest-arm64
+          path: digests
+      - name: Log in to the container registry
+        run: echo "$PACKAGES_TOKEN" | docker login "$REGISTRY" --username "$PACKAGES_USER" --password-stdin
+      - name: Create and push the multi-arch manifest
+        run: |
+          image="$REGISTRY/${GITHUB_REPOSITORY,,}"
+          if [ "$NIGHTLY" = 'true' ]; then
+            tags=(dev "${SHA::7}")
+          else
+            tags=(latest "$VERSION" "${VERSION%.*}")
+          fi
+          tag_args=()
+          for tag in "${tags[@]}"; do tag_args+=(--tag "$image:$tag"); done
+          docker buildx imagetools create "${tag_args[@]}" \
+            "$image@$(cat digests/amd64)" \
+            "$image@$(cat digests/arm64)"
+          docker buildx imagetools inspect "$image:${tags[0]}"
+
+  android-warm:
+    name: Warm Android ${{ matrix.target }}
+    needs: [setup-release, build-web]
+    if: ${{ needs.setup-release.outputs.skip != 'true' && needs.setup-release.outputs.nightly != 'true' }}
+    runs-on: docker
+    timeout-minutes: 90
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64, armv7, i686, x86_64]
     env:
       RUSTC_WRAPPER: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID != '' && 'sccache' || '' }}
       AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
-      ARCH: x86_64
-      MISE_DISABLE_TOOLS: aqua:WebAssembly/binaryen,ubi:rustwasm/wasm-bindgen
-      # rustc peaks at several GB per crate while compiling the CEF runtime.
-      CARGO_BUILD_JOBS: '4'
-      TAG: ${{ needs.setup-release.outputs.tag }}
       VERSION: ${{ needs.setup-release.outputs.version }}
-      # Read by src-tauri/build.rs, which bakes them into the binary.
-      VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
-      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-      SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
-      SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
-      VITE_SENTRY_ENVIRONMENT: ${{ needs.setup-release.outputs.nightly == 'true' && 'preview' || 'production' }}
-      VITE_APP_VERSION: ${{ needs.setup-release.outputs.version }}
-      SABLE_BUILD_FLAVOR: ${{ needs.setup-release.outputs.nightly == 'true' && 'nightly' || 'stable' }}
-      IS_NIGHTLY: ${{ needs.setup-release.outputs.nightly }}
-      UPDATER_ENDPOINT: ${{ needs.setup-release.outputs.nightly == 'true' && 'https://git.sable.moe/SableClient/sable-next/releases/download/nightly/latest.json' || '' }}
-      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      MISE_ENV: tauri
+      CARGO_BUILD_JOBS: '2'
+      RUST_TARGETS: aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+      ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
     steps:
       - name: Check out repository
         uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -218,79 +294,50 @@ jobs:
         uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
         with:
           name: web-assets
-      # tauri-runtime depends on webkit2gtk on Linux whatever the runtime, so
-      # the headers stay even though nothing renders through it. --as-needed
-      # keeps it out of the binary, hence no runtime dep in nfpm.yaml.
-      - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y \
-            build-essential \
-            file \
-            libayatana-appindicator3-1 \
-            libclang-dev \
-            libgtk-3-dev \
-            libpipewire-0.3-dev \
-            libsoup-3.0-dev \
-            libwebkit2gtk-4.1-dev \
-            pkg-config
+      - name: Drop assets the native app never loads
+        run: rm -rf dist/deepfilternet3 dist/_app/immutable/workers
       - name: Set up app
         uses: ./.forgejo/actions/setup
         with:
           rust: 'true'
-          rust-cache-key: tauri-linux
+          rust-cache-key: tauri-android
           install-mise-tools: 'false'
-      - name: Prepare in-place v1 upgrade identity
-        if: ${{ needs.setup-release.outputs.nightly != 'true' }}
-        run: node scripts/ci/prepare-v1-release.mjs
+      - name: Set up Android SDK and NDK
+        run: mise run tauri:setup:android
+      - name: Add Rust targets
+        run: |
+          # shellcheck disable=SC2086 # RUST_TARGETS is a space-separated list.
+          rustup target add $RUST_TARGETS
+      - name: Set up Gradle cache
+        uses: https://github.com/gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+      - name: Limit Gradle memory
+        run: |
+          printf '\n%s\n' \
+            'org.gradle.workers.max=1' \
+            'org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8' \
+            'kotlin.daemon.jvmargs=-Xmx512m' \
+            >> src-tauri/gen/android/gradle.properties
       - name: Stamp release version into tauri.conf.json
+        run: node scripts/ci/set-tauri-version.mjs "$VERSION"
+      - name: Set up Android signing
+        if: ${{ env.ANDROID_KEY_BASE64 != '' }}
         run: |
-          args=''
-          [ -n "$UPDATER_ENDPOINT" ] && args="--updater-endpoint=$UPDATER_ENDPOINT"
-          node scripts/ci/set-tauri-version.mjs "$VERSION" $args
-      - name: Build Linux bundles
-        run: |
-          config_args=(--config src-tauri/tauri.ci.conf.json)
-          if [ "$IS_NIGHTLY" = 'true' ]; then
-            config_args+=(--config src-tauri/tauri.nightly.conf.json)
-            package_args=('Sable v2 Nightly' sable-next)
-          else
-            package_args=(Sable sable)
-          fi
-          pnpm tauri:cef build "${config_args[@]}"
-          mise run cef:package "$VERSION" "${package_args[@]}"
-          node scripts/ci/upload-sentry-symbols.mjs target/release
-      - name: Check the CEF packages carry what they should
-        run: |
-          deb="target/release/bundle/deb/sable-next-${VERSION}-linux-${ARCH}.deb"
-          contents=$(dpkg-deb --contents "$deb")
-          ctrl=$(dpkg-deb --ctrl-tarfile "$deb" | tar -t)
-          grep -q 'etc/apparmor.d/sable-next$' <<<"$contents"
-          grep -qx './postinst' <<<"$ctrl"
-          grep -qx './prerm' <<<"$ctrl"
-          grep -q 'opt/sable-next/CEF-LICENSE.txt$' <<<"$contents"
-      - name: Check stable packages replace v1
-        if: ${{ needs.setup-release.outputs.nightly != 'true' }}
-        run: test "$(dpkg-deb --field "target/release/bundle/deb/sable-next-${VERSION}-linux-${ARCH}.deb" Package)" = sable
-      - name: Sign the AppImage for the updater
-        if: ${{ env.TAURI_SIGNING_PRIVATE_KEY != '' }}
-        run: pnpm tauri signer sign "target/release/bundle/appimage/sable-next-${VERSION}-linux-${ARCH}.AppImage"
-      - name: Attach Linux bundles to release
-        run: |
-          bundles=()
-          for bundle in "target/release/bundle/deb/sable-next-${VERSION}-linux-${ARCH}.deb" \
-                        "target/release/bundle/rpm/sable-next-${VERSION}-linux-${ARCH}.rpm" \
-                        "target/release/bundle/sable-next-${VERSION}-linux-${ARCH}.tar.gz" \
-                        "target/release/bundle/appimage/sable-next-${VERSION}-linux-${ARCH}.AppImage" \
-                        "target/release/bundle/appimage/sable-next-${VERSION}-linux-${ARCH}.AppImage.sig"; do
-            [ -e "$bundle" ] && bundles+=("$bundle")
-          done
-          node scripts/ci/forgejo-release.mjs upload "${bundles[@]}"
+          cd src-tauri/gen/android
+          echo "keyAlias=$ANDROID_KEY_ALIAS" > keystore.properties
+          echo "password=$ANDROID_KEY_PASSWORD" >> keystore.properties
+          base64 -d <<< "$ANDROID_KEY_BASE64" > "$RUNNER_TEMP/keystore.jks"
+          echo "storeFile=$RUNNER_TEMP/keystore.jks" >> keystore.properties
+      - name: Build one ABI
+        run: pnpm tauri android build --config src-tauri/tauri.ci.conf.json --apk --target ${{ matrix.target }}
+      - name: Show sccache stats
+        if: ${{ always() && env.RUSTC_WRAPPER != '' }}
+        run: sccache --show-stats || true
   android:
     name: Build Android
-    needs: [setup-release, build-web]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    needs: [setup-release, build-web, android-warm]
+    if: ${{ !cancelled() && needs.setup-release.result == 'success' && needs.build-web.result == 'success' }}
+    runs-on: docker
+    timeout-minutes: 120
     permissions:
       contents: write
     env:
@@ -300,11 +347,10 @@ jobs:
       TAG: ${{ needs.setup-release.outputs.tag }}
       VERSION: ${{ needs.setup-release.outputs.version }}
       MISE_ENV: tauri
-      # Limit peak memory while compiling the SDK and linking the app on the Android runner.
-      CARGO_BUILD_JOBS: '1'
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '4'
-      # Matches the ABIs passed to `tauri android build` below.
-      RUST_TARGETS: aarch64-linux-android armv7-linux-androideabi
+      CARGO_BUILD_JOBS: '2'
+      RUST_TARGETS: ${{ needs.setup-release.outputs.nightly == 'true' && 'aarch64-linux-android' || 'aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android' }}
+      # The same ABIs under the names `tauri android build --target` takes.
+      ANDROID_TARGETS: ${{ needs.setup-release.outputs.nightly == 'true' && 'aarch64' || 'aarch64 armv7 i686 x86_64' }}
       # Read by src-tauri/build.rs, which bakes them into the binary.
       VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
       SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
@@ -343,12 +389,12 @@ jobs:
           # shellcheck disable=SC2086 # RUST_TARGETS is a space-separated list.
           rustup target add $RUST_TARGETS
       - name: Set up Gradle cache
-        uses: https://github.com/gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+        uses: https://github.com/gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
       - name: Limit Gradle memory
         run: |
           printf '\n%s\n' \
             'org.gradle.workers.max=1' \
-            'org.gradle.jvmargs=-Xmx1024m -Dfile.encoding=UTF-8' \
+            'org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8' \
             'kotlin.daemon.jvmargs=-Xmx512m' \
             >> src-tauri/gen/android/gradle.properties
       - name: Prepare in-place v1 upgrade identity
@@ -378,7 +424,8 @@ jobs:
           mv "$nightly_source_dir/app" "$app_dir/src/main/java/$nightly_package_dir"
           mv "$nightly_source_dir/buildSrc" "$build_src_dir/src/main/java/$nightly_package_dir"
           sed -i 's/moe\.sable\.next/moe.sable.next.nightly/g' \
-            "$app_dir/build.gradle.kts" "$app_dir/src/main/AndroidManifest.xml"
+            "$app_dir/build.gradle.kts" "$app_dir/src/main/AndroidManifest.xml" \
+            "$app_dir/src/main/res/xml/shortcuts.xml"
           sed -i \
             -e 's/Java_moe_sable_next_MainActivity/Java_moe_sable_next_nightly_MainActivity/g' \
             -e 's#moe/sable/next/MainActivity#moe/sable/next/nightly/MainActivity#g' \
@@ -396,7 +443,7 @@ jobs:
         env:
           SABLE_FOSS: '1'
         run: |
-          node scripts/fastlane-changelog.mjs "$VERSION" --check
+          node scripts/release/fastlane-changelog.mjs "$VERSION" --check
           unset VITE_SENTRY_DSN VITE_SENTRY_ENVIRONMENT SENTRY_AUTH_TOKEN SENTRY_ORG SENTRY_PROJECT
           mv src-tauri/capabilities/geolocation.json "$RUNNER_TEMP/geolocation.json"
           pnpm tauri android build --config src-tauri/tauri.ci.conf.json --apk --split-per-abi \
@@ -408,26 +455,28 @@ jobs:
             dir="src-tauri/gen/android/app/build/outputs/apk/$flavor/release"
             apk="$(find "$dir" -name '*.apk' -type f | head -n 1)"
             [ -n "$apk" ] || { echo "FOSS $abi APK not found" >&2; exit 1; }
-            mv "$apk" "$dir/sable-next-${VERSION}-android-${abi}-foss.apk"
+            mv "$apk" "$dir/sable-${VERSION}-android-${abi}-foss.apk"
           done
       - name: Build Android bundles
         run: |
           config_args=(--config src-tauri/tauri.ci.conf.json)
           [ "$IS_NIGHTLY" = 'true' ] && config_args+=(--config src-tauri/tauri.nightly.conf.json)
-          pnpm tauri android build "${config_args[@]}" --apk --aab --target aarch64 armv7
-          node scripts/ci/upload-sentry-symbols.mjs \
-            target/aarch64-linux-android/release target/armv7-linux-androideabi/release
+          # shellcheck disable=SC2086 # ANDROID_TARGETS is a space-separated list.
+          pnpm tauri android build "${config_args[@]}" --apk --aab --target $ANDROID_TARGETS
+          symbol_dirs=()
+          for target in $RUST_TARGETS; do symbol_dirs+=("target/$target/release"); done
+          node scripts/ci/upload-sentry-symbols.mjs "${symbol_dirs[@]}"
           out='src-tauri/gen/android/app/build/outputs'
           apk="$(find "$out/apk/universal/release" -name '*.apk' -type f | head -n 1)"
           aab="$(find "$out/bundle/universalRelease" -name '*.aab' -type f | head -n 1)"
           [ -n "$apk" ] || { echo 'APK not found' >&2; exit 1; }
           [ -n "$aab" ] || { echo 'AAB not found' >&2; exit 1; }
-          mv "$apk" "$(dirname "$apk")/sable-next-${VERSION}-android-universal.apk"
-          mv "$aab" "$(dirname "$aab")/sable-next-${VERSION}-android-universal.aab"
+          mv "$apk" "$(dirname "$apk")/sable-${VERSION}-android-universal.apk"
+          mv "$aab" "$(dirname "$aab")/sable-${VERSION}-android-universal.aab"
       - name: Verify the APK is signed
         if: ${{ env.ANDROID_KEY_BASE64 != '' }}
         run: |
-          apk="src-tauri/gen/android/app/build/outputs/apk/universal/release/sable-next-${VERSION}-android-universal.apk"
+          apk="src-tauri/gen/android/app/build/outputs/apk/universal/release/sable-${VERSION}-android-universal.apk"
           sdk="$(mise exec -- printenv ANDROID_HOME)"
           apksigner="$(find "$sdk/build-tools" -name apksigner -type f | sort | tail -n 1)"
           [ -n "$apksigner" ] || { echo 'apksigner not found' >&2; exit 1; }
@@ -435,15 +484,261 @@ jobs:
       - name: Attach Android bundles to release
         run: |
           mapfile -d '' bundles < <(find src-tauri/gen/android/app/build/outputs -type f \
-            -name 'sable-next-*' \( -name '*.apk' -o -name '*.aab' \) -print0)
+            -name 'sable-*' \( -name '*.apk' -o -name '*.aab' \) -print0)
           [ "${#bundles[@]}" -gt 0 ] || { echo 'No Android bundles found' >&2; exit 1; }
           node scripts/ci/forgejo-release.mjs upload "${bundles[@]}"
+      - name: Show sccache stats
+        if: ${{ always() && env.RUSTC_WRAPPER != '' }}
+        run: sccache --show-stats || true
+  electron-linux:
+    name: Linux x86_64 (Electron)
+    needs: [setup-release, build-web]
+    runs-on: docker
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      RUSTC_WRAPPER: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID != '' && 'sccache' || '' }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
+      MISE_DISABLE_TOOLS: github:WebAssembly/binaryen,ubi:rustwasm/wasm-bindgen
+      VERSION: ${{ needs.setup-release.outputs.version }}
+      TAG: ${{ needs.setup-release.outputs.tag }}
+      SHA: ${{ github.sha }}
+      # Baked into the main process by electron/build.mjs.
+      VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+      SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+      VITE_SENTRY_ENVIRONMENT: ${{ needs.setup-release.outputs.nightly == 'true' && 'preview' || 'production' }}
+      VITE_APP_VERSION: ${{ needs.setup-release.outputs.version }}
+      SABLE_BUILD_FLAVOR: ${{ needs.setup-release.outputs.nightly == 'true' && 'nightly' || 'stable' }}
+    steps:
+      - name: Check out repository
+        uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.setup-release.outputs.ref }}
+          persist-credentials: false
+      - name: Download web assets
+        uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
+        with:
+          name: web-assets
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential pkg-config rpm
+      - name: Set up app
+        uses: ./.forgejo/actions/setup
+        with:
+          rust: 'true'
+          rust-cache-key: electron-linux
+          install-mise-tools: 'false'
+      - name: Package
+        run: pnpm --dir electron package --linux
+      - name: Upload main process source maps
+        run: node scripts/ci/upload-sentry-sourcemaps.mjs electron/dist app:///dist
+      - name: Publish Electron bundles and update metadata
+        run: node electron/publish-updates.mjs
+      - name: Publish deb and rpm to the package registries
+        env:
+          PACKAGES_USER: ${{ secrets.PACKAGES_USER }}
+          PACKAGES_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+        run: |
+          channel=stable
+          case "$VERSION" in *-nightly.*) channel=nightly ;; esac
+          api="https://git.sable.moe/api/packages/${GITHUB_REPOSITORY_OWNER}"
+          upload() {
+            code=$(curl -sS -o /dev/null -w '%{http_code}' --user "$PACKAGES_USER:$PACKAGES_TOKEN" \
+              --upload-file "$1" "$2")
+            # 409 means this exact version is already published.
+            case "$code" in 201|409) ;; *) echo "Upload of $1 failed with HTTP $code" >&2; exit 1 ;; esac
+          }
+          for deb in electron/release/*.deb; do
+            upload "$deb" "$api/debian/pool/$channel/main/upload"
+          done
+          for rpm in electron/release/*.rpm; do
+            upload "$rpm" "$api/rpm/$channel/upload"
+          done
+
+  electron-macos:
+    name: macOS arm64 (Electron)
+    needs: [setup-release, build-web]
+    runs-on: macos-latest
+    defaults:
+      run:
+        shell: bash
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.setup-release.outputs.version }}
+      TAG: ${{ needs.setup-release.outputs.tag }}
+      SHA: ${{ github.sha }}
+      # Baked into the main process by electron/build.mjs.
+      VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+      SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+      VITE_SENTRY_ENVIRONMENT: ${{ needs.setup-release.outputs.nightly == 'true' && 'preview' || 'production' }}
+      VITE_APP_VERSION: ${{ needs.setup-release.outputs.version }}
+      SABLE_BUILD_FLAVOR: ${{ needs.setup-release.outputs.nightly == 'true' && 'nightly' || 'stable' }}
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_API_ISSUER: ${{ secrets.APP_STORE_API_ISSUER_ID }}
+      APPLE_API_KEY_ID: ${{ secrets.APP_STORE_API_KEY_ID }}
+    steps:
+      - name: Check out repository
+        uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.setup-release.outputs.ref }}
+          persist-credentials: false
+      - name: Download web assets
+        uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
+        with:
+          name: web-assets
+      - name: Set up app
+        uses: ./.forgejo/actions/setup
+        with:
+          rust: 'true'
+          rust-cache-key: electron-macos
+          install-mise-tools: 'false'
+      - name: Write the App Store Connect API key
+        uses: ./.forgejo/actions/app-store-connect-key
+        with:
+          key-id: ${{ secrets.APP_STORE_API_KEY_ID }}
+          key: ${{ secrets.APP_STORE_API_KEY_BASE64 }}
+      - name: Import the signing identity
+        if: ${{ env.APPLE_CERTIFICATE != '' }}
+        uses: ./.forgejo/actions/apple-signing-keychain
+        with:
+          certificate: ${{ secrets.APPLE_CERTIFICATE }}
+          password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      - name: Package
+        run: |
+          sign_args=()
+          if [ -n "${APPLE_CERTIFICATE:-}" ]; then
+            # electron-builder takes the key's path, not its ID, from APPLE_API_KEY.
+            export APPLE_API_KEY="$APPLE_API_KEY_PATH"
+            export CSC_KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+            sign_args=(-c.mac.identity=NXLJ6G3CP7 -c.mac.hardenedRuntime=true -c.forceCodeSigning=true)
+          else
+            case "$VERSION" in
+              *-nightly.*) unset APPLE_API_ISSUER APPLE_API_KEY_ID ;;
+              *) echo 'APPLE_CERTIFICATE is required to build a stable macOS release.' >&2; exit 1 ;;
+            esac
+          fi
+          pnpm --dir electron package --mac "${sign_args[@]}"
+      - name: Remove the signing keychain
+        if: ${{ always() && env.APPLE_CERTIFICATE != '' }}
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+      - name: Upload main process source maps
+        run: node scripts/ci/upload-sentry-sourcemaps.mjs electron/dist app:///dist
+      - name: Publish Electron bundles and update metadata
+        run: node electron/publish-updates.mjs
+
+  ios:
+    name: Build iOS
+    needs: [setup-release, build-web]
+    runs-on: macos-latest
+    defaults:
+      run:
+        shell: bash
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    outputs:
+      ipa_size: ${{ steps.ipa.outputs.size }}
+      ipa_version: ${{ steps.ipa.outputs.version }}
+      ipa_build: ${{ steps.ipa.outputs.build }}
+    env:
+      TAG: ${{ needs.setup-release.outputs.tag }}
+      VERSION: ${{ needs.setup-release.outputs.version }}
+      RUST_TARGETS: aarch64-apple-ios
+      # Read by src-tauri/build.rs, which bakes them into the binary.
+      VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+      SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+      VITE_SENTRY_ENVIRONMENT: ${{ needs.setup-release.outputs.nightly == 'true' && 'preview' || 'production' }}
+      VITE_APP_VERSION: ${{ needs.setup-release.outputs.version }}
+      SABLE_BUILD_FLAVOR: ${{ needs.setup-release.outputs.nightly == 'true' && 'nightly' || 'stable' }}
+      APPLE_API_ISSUER: ${{ secrets.APP_STORE_API_ISSUER_ID }}
+      APPLE_API_KEY: ${{ secrets.APP_STORE_API_KEY_ID }}
+    steps:
+      - name: Check out repository
+        uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.setup-release.outputs.ref }}
+          persist-credentials: false
+      - name: Download web assets
+        uses: https://code.forgejo.org/forgejo/download-artifact@769f970437aa3291b13f35dc23fc87967d7fb19f # v7
+        with:
+          name: web-assets
+      - name: Set up app
+        uses: ./.forgejo/actions/setup
+        with:
+          rust: 'true'
+          rust-cache-key: tauri-ios
+          install-mise-tools: 'false'
+      - name: Write the App Store Connect API key
+        uses: ./.forgejo/actions/app-store-connect-key
+        with:
+          key-id: ${{ secrets.APP_STORE_API_KEY_ID }}
+          key: ${{ secrets.APP_STORE_API_KEY_BASE64 }}
+      - name: Prepare in-place v1 upgrade identity
+        if: ${{ needs.setup-release.outputs.nightly != 'true' }}
+        run: node scripts/ci/prepare-v1-release.mjs
+      - name: Stamp release version into tauri.conf.json
+        run: node scripts/ci/set-tauri-version.mjs "${VERSION%%-*}"
+      - name: Set up iOS project
+        run: |
+          command -v pod >/dev/null || brew install cocoapods
+          pnpm tauri ios init --ci
+      - name: Download iOS frameworks
+        run: pnpm ios:frameworks
+      - name: Add Rust target
+        run: |
+          # shellcheck disable=SC2086 # RUST_TARGETS is a space-separated list.
+          rustup target add $RUST_TARGETS
+      - name: Build iOS bundle
+        id: ipa
+        run: |
+          pnpm tauri ios build --config src-tauri/tauri.ci.conf.json \
+            --export-method app-store-connect --build-number "$(date -u +%s)" --ci
+          node scripts/ci/upload-sentry-symbols.mjs --ios
+          ipa="$(find src-tauri/gen/apple/build -type f -name '*.ipa' | head -n 1)"
+          [ -n "$ipa" ] || { echo 'No iOS IPA found' >&2; exit 1; }
+          target="$(dirname "$ipa")/sable-${VERSION}-ios-arm64.ipa"
+          [ "$ipa" = "$target" ] || mv "$ipa" "$target"
+
+          unzip -p "$target" 'Payload/*.app/Info.plist' > Info.plist
+          short_version="$(plutil -extract CFBundleShortVersionString raw -o - Info.plist)"
+          bundle_version="$(plutil -extract CFBundleVersion raw -o - Info.plist)"
+
+          {
+            echo "path=$target"
+            echo "size=$(stat -f%z "$target")"
+            echo "version=$short_version"
+            echo "build=$bundle_version"
+          } >> "$GITHUB_OUTPUT"
+      - name: Attach iOS bundle to release
+        env:
+          IPA_PATH: ${{ steps.ipa.outputs.path }}
+        run: node scripts/ci/forgejo-release.mjs upload "$IPA_PATH"
+      - name: Upload to TestFlight
+        if: ${{ needs.setup-release.outputs.nightly == 'true' }}
+        env:
+          IPA_PATH: ${{ steps.ipa.outputs.path }}
+        run: |
+          command -v fastlane >/dev/null || brew install fastlane
+          fastlane ios testflight ipa:"$IPA_PATH" version:"$VERSION"
+
   github-bundles:
     name: Wait for GitHub bundles
     needs: setup-release
+    if: ${{ needs.setup-release.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     # github-bundles.json is published by the GitHub-side handoff job, which
-    # waits on the whole desktop/linux/ios matrix.
+    # waits on the Windows and Linux aarch64 builds.
     timeout-minutes: 120
     steps:
       - name: Check out repository
@@ -460,7 +755,7 @@ jobs:
   obtainium:
     name: Publish Obtainium config
     needs: [setup-release, android, github-bundles]
-    runs-on: light
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
@@ -479,8 +774,8 @@ jobs:
         run: node scripts/ci/forgejo-release.mjs upload obtainium.json
   altstore:
     name: Publish AltStore source
-    needs: [setup-release, github-bundles]
-    runs-on: light
+    needs: [setup-release, ios]
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
@@ -488,6 +783,9 @@ jobs:
       TAG: ${{ needs.setup-release.outputs.tag }}
       VERSION: ${{ needs.setup-release.outputs.version }}
       IS_NIGHTLY: ${{ needs.setup-release.outputs.nightly }}
+      IPA_SIZE: ${{ needs.ios.outputs.ipa_size }}
+      IPA_VERSION: ${{ needs.ios.outputs.ipa_version }}
+      IPA_BUILD: ${{ needs.ios.outputs.ipa_build }}
     steps:
       - name: Check out repository
         uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -497,11 +795,10 @@ jobs:
       # One asset name for both channels keeps the subscribed URL stable.
       - name: Build AltStore source
         run: |
-          node scripts/ci/forgejo-release.mjs download --pattern github-bundles.json --dir .
-          ipa_name="$(jq -r '.ipa.name' github-bundles.json)"
-          ipa_size="$(jq -r '.ipa.size' github-bundles.json)"
-          ipa_version="$(jq -r '.ipa.version' github-bundles.json)"
-          ipa_build="$(jq -r '.ipa.build' github-bundles.json)"
+          ipa_name="sable-${VERSION}-ios-arm64.ipa"
+          ipa_size="$IPA_SIZE"
+          ipa_version="$IPA_VERSION"
+          ipa_build="$IPA_BUILD"
 
           if [ "$IS_NIGHTLY" = 'true' ]; then
             # Older entries would 404 once their nightly release is pruned.
@@ -523,11 +820,7 @@ jobs:
             fi
           fi
 
-          if [ "$IS_NIGHTLY" = 'true' ]; then
-            export ALTSTORE_BUNDLE_IDENTIFIER=moe.sable.next.nightly
-          else
-            export ALTSTORE_BUNDLE_IDENTIFIER=moe.sable.client
-          fi
+          export ALTSTORE_BUNDLE_IDENTIFIER=moe.sable.app
           node scripts/ci/update-altstore-source.mjs \
             altstore-source.json \
             "$ipa_version" \
@@ -535,36 +828,14 @@ jobs:
             "$ipa_size" \
             "https://git.sable.moe/SableClient/sable-next/releases/download/${TAG}/${ipa_name}" \
             "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
-            "Sable v2 $VERSION"
+            "Sable $VERSION"
       - name: Attach AltStore source to release
         run: node scripts/ci/forgejo-release.mjs upload altstore-source.json
-  updater-manifest:
-    name: Publish updater manifest
-    needs: [setup-release, linux, github-bundles]
-    if: ${{ always() && needs.setup-release.result == 'success' && needs.linux.result == 'success' && needs.github-bundles.result == 'success' }}
-    runs-on: light
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    env:
-      TAG: ${{ needs.setup-release.outputs.tag }}
-      VERSION: ${{ needs.setup-release.outputs.version }}
-    steps:
-      - name: Check out repository
-        uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.setup-release.outputs.ref }}
-          persist-credentials: false
-      - name: Build updater manifest
-        run: node scripts/ci/build-updater-manifest.mjs
-      - name: Upload updater manifest
-        if: ${{ hashFiles('latest.json') != '' }}
-        run: node scripts/ci/forgejo-release.mjs upload latest.json
   publish-latest:
     name: Refresh latest tag
-    needs: [setup-release, updater-manifest, altstore]
+    needs: [setup-release, altstore, obtainium]
     if: ${{ needs.setup-release.outputs.nightly != 'true' }}
-    runs-on: light
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
@@ -580,10 +851,11 @@ jobs:
           persist-credentials: false
       - name: Upload manifests to latest
         run: |
-          node scripts/ci/forgejo-release.mjs download \
-            --tag "$TAG" --pattern 'latest.json' --dir .
+          shopt -s nullglob
           node scripts/ci/forgejo-release.mjs download \
             --tag "$TAG" --pattern 'altstore-source.json' --dir .
+          node scripts/ci/forgejo-release.mjs download \
+            --tag "$TAG" --pattern 'obtainium.json' --dir .
 
           git tag -f latest "$SHA"
           git push --force \
@@ -599,12 +871,12 @@ jobs:
             --tag latest \
             --title 'Latest stable' \
             --notes "Stable manifests for $VERSION. Bundles live on the $TAG release."
-          node scripts/ci/forgejo-release.mjs upload --tag latest latest.json altstore-source.json
+          node scripts/ci/forgejo-release.mjs upload --tag latest altstore-source.json obtainium.json
   publish-nightly-channel:
     name: Refresh nightly channel metadata
-    needs: [setup-release, updater-manifest, obtainium, altstore]
-    if: ${{ always() && needs.setup-release.outputs.nightly == 'true' }}
-    runs-on: light
+    needs: [setup-release, obtainium, altstore]
+    if: ${{ always() && needs.setup-release.outputs.nightly == 'true' && needs.setup-release.outputs.skip != 'true' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
@@ -632,7 +904,7 @@ jobs:
             --prerelease true \
             --title 'Nightly channel' \
             --notes "$notes"
-          for name in obtainium.json altstore-source.json latest.json; do
+          for name in obtainium.json altstore-source.json; do
             node scripts/ci/forgejo-release.mjs download \
               --tag "$TAG" --pattern "$name" --dir .
             [ ! -e "$name" ] || \
@@ -642,15 +914,20 @@ jobs:
         run: |
           repo=https://sableclient.github.io/sable-next/repo
           protect=""
-          for arch in x86_64 aarch64; do
-            commit="$(curl -fsS "$repo/refs/heads/app/moe.sable.next.Nightly/$arch/master")"
+          for arch in x86_64; do
+            commit="$(curl -fsS "$repo/refs/heads/app/moe.sable.next.electron.Nightly/$arch/master")"
             protect="$protect,$(curl -fsS "$repo/objects/${commit:0:2}/${commit:2}.commit" \
               | grep -aoE 'download/nightly-[^/]+' | cut -d/ -f2 | tr '\n' ',')"
           done
+          mkdir channel
+          node scripts/ci/forgejo-release.mjs download --tag nightly --pattern '*.json' --dir channel
+          node scripts/ci/forgejo-release.mjs download --tag nightly --pattern '*.yml' --dir channel
+          protect="$protect,$(cat channel/* | grep -oE 'download/nightly-[^/]+' \
+            | cut -d/ -f2 | sort -u | tr '\n' ',')"
           node scripts/ci/forgejo-release.mjs prune --keep "$NIGHTLY_KEEP" --protect "$protect"
   distribute-aur:
     name: Publish to the AUR
-    needs: [setup-release, linux]
+    needs: [setup-release, electron-linux]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -669,7 +946,7 @@ jobs:
         run: |
           mkdir debs
           node scripts/ci/forgejo-release.mjs download \
-            --pattern "sable-next-${VERSION}-linux-x86_64.deb" --dir debs
+            --pattern "sable-${VERSION}-amd64.deb" --dir debs
           ls debs | grep -q . || { echo 'The x86_64 deb is not on the release' >&2; exit 1; }
       - name: Push to the AUR
         env:
@@ -688,16 +965,26 @@ jobs:
             pkgver="$VERSION"
             relver=-
           fi
-          sha="$(sha256sum "debs/sable-next-${VERSION}-linux-x86_64.deb" | awk '{print $1}')"
+          sha="$(sha256sum "debs/sable-${VERSION}-amd64.deb" | awk '{print $1}')"
 
           mkdir -p ~/.ssh
           printf '%s\n' "$AUR_KEY" > ~/.ssh/aur_key
           chmod 600 ~/.ssh/aur_key
-          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
-          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur_key -o IdentitiesOnly=yes"
+          # Pinned from https://aur.archlinux.org (SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4).
+          echo 'aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN' \
+            >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur_key -o IdentitiesOnly=yes -o ConnectTimeout=30"
 
-          git clone "ssh://aur@aur.archlinux.org/${pkg}.git" aur-repo
-          bash scripts/ci/render-aur.sh "$pkg" "$pkgver" "$relver" "$sha" aur-render
+          retry() {
+            for attempt in 1 2 3 4; do
+              "$@" && return 0
+              [ "$attempt" -lt 4 ] && sleep $((attempt * 15))
+            done
+            return 1
+          }
+
+          retry git clone "ssh://aur@aur.archlinux.org/${pkg}.git" aur-repo
+          scripts/ci/render-aur.sh "$pkg" "$pkgver" "$relver" "$sha" aur-render
           cp aur-render/PKGBUILD aur-render/.SRCINFO "aur-render/${pkg}.install" aur-repo/
 
           cd aur-repo
@@ -709,10 +996,10 @@ jobs:
             exit 0
           fi
           git commit -m "${pkg} ${VERSION}"
-          git push
+          retry git push
   distribute-homebrew:
     name: Publish the Homebrew cask
-    needs: [setup-release, github-bundles]
+    needs: [setup-release, electron-macos]
     if: ${{ needs.setup-release.outputs.nightly != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -731,39 +1018,54 @@ jobs:
         run: |
           mkdir dmg
           node scripts/ci/forgejo-release.mjs download \
-            --pattern "sable-next-${VERSION}-macos-universal.dmg" --dir dmg
+            --pattern "sable-${VERSION}-arm64.dmg" --dir dmg
           ls dmg | grep -q . || { echo 'The DMG is not on the release' >&2; exit 1; }
-      - name: Push the cask to the tap
+      - name: Push the cask to the taps
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          HOMEBREW_GITHUB_TAP_TOKEN: ${{ secrets.HOMEBREW_GITHUB_TAP_TOKEN }}
         run: |
-          if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
-            echo '::notice::HOMEBREW_TAP_TOKEN is not set; skipping the Homebrew publish.'
-            exit 0
-          fi
-          sha="$(sha256sum "dmg/sable-next-${VERSION}-macos-universal.dmg" | awk '{print $1}')"
-          git clone --depth 1 \
-            "https://x-access-token:${HOMEBREW_TAP_TOKEN}@git.sable.moe/SableClient/homebrew-sable.git" tap
+          sha="$(sha256sum "dmg/sable-${VERSION}-arm64.dmg" | awk '{print $1}')"
 
-          mkdir -p tap/Casks
-          sed \
-            -e "s/^  version .*/  version '${VERSION}'/" \
-            -e "s/^  sha256 .*/  sha256 '${sha}'/" \
-            packaging/homebrew/sable.rb > tap/Casks/sable.rb
+          push_tap() (
+            local name="$1" token="$2" url="$3"
+            token="$(printf '%s' "$token" | tr -d '\r\n')"
+            if [ -z "$token" ]; then
+              echo "::notice::The ${name} tap token is not set; skipping that tap."
+              return 0
+            fi
+            local auth
+            auth="$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\r\n')"
+            echo "::add-mask::${auth}"
+            export GIT_CONFIG_COUNT=1
+            export GIT_CONFIG_KEY_0="http.https://${url%%/*}/.extraHeader"
+            export GIT_CONFIG_VALUE_0="Authorization: Basic ${auth}"
+            rm -rf tap
+            git clone --depth 1 "https://${url}" tap
+            mkdir -p tap/Casks
+            sed \
+              -e "s/^  version .*/  version '${VERSION}'/" \
+              -e "s/^  sha256 .*/  sha256 '${sha}'/" \
+              packaging/homebrew/sable.rb > tap/Casks/sable.rb
+            (
+              cd tap
+              git config user.name 'Sable release'
+              git config user.email 'release@sable.moe'
+              git add Casks/sable.rb
+              if git diff --cached --quiet; then
+                echo "Nothing changed on the ${name} tap; skipping the push."
+                exit 0
+              fi
+              git commit -m "sable ${VERSION}"
+              git push origin HEAD:refs/heads/main
+            )
+          )
 
-          cd tap
-          git config user.name 'Sable release'
-          git config user.email 'release@sable.moe'
-          git add Casks/sable.rb
-          if git diff --cached --quiet; then
-            echo 'Nothing changed; skipping the push.'
-            exit 0
-          fi
-          git commit -m "sable ${VERSION}"
-          git push origin HEAD:refs/heads/main
+          push_tap Forgejo "${HOMEBREW_TAP_TOKEN:-}" git.sable.moe/SableClient/homebrew-sable.git
+          push_tap GitHub "${HOMEBREW_GITHUB_TAP_TOKEN:-}" github.com/SableClient/homebrew-sable.git
   distribute-flathub:
     name: Open the Flathub update PR
-    needs: [setup-release, github-bundles]
+    needs: [setup-release, electron-linux, github-bundles]
     if: ${{ needs.setup-release.outputs.nightly != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -782,7 +1084,7 @@ jobs:
         run: |
           mkdir tarballs
           node scripts/ci/forgejo-release.mjs download \
-            --pattern "sable-next-${VERSION}-linux-*.tar.gz" --dir tarballs
+            --pattern "sable-${VERSION}-*.tar.gz" --dir tarballs
       - name: Open the Flathub PR
         env:
           FLATHUB_TOKEN: ${{ secrets.FLATHUB_TOKEN }}
@@ -798,18 +1100,19 @@ jobs:
           fi
 
           arch_args() {
-            local file="tarballs/sable-next-${VERSION}-linux-$1.tar.gz"
+            local file="tarballs/sable-${VERSION}-$1.tar.gz"
             if [ -e "$file" ]; then
-              echo "$(sha256sum "$file" | awk '{print $1}'):$(stat -c %s "$file")"
+              sha256sum "$file" | awk '{print $1}'
             else
               echo '-'
             fi
           }
-          node scripts/ci/render-flatpak-stable.mjs "$VERSION" "$(arch_args x86_64)" "$(arch_args aarch64)"
+          node scripts/release/flatpak-metainfo-release.mjs "$VERSION"
+          node scripts/ci/render-flatpak-stable.mjs "$VERSION" "$(arch_args x64)" "$(arch_args arm64)"
 
           src=packaging/flatpak
           sed 's#\.\./\.\./LICENSE#LICENSE#' "$src/moe.sable.client.yml" > flathub/moe.sable.client.yml
-          cp "$src/moe.sable.client.desktop" "$src/moe.sable.client.metainfo.xml" "$src/flathub.json" "$src/sable-next.sh" flathub/
+          cp "$src/moe.sable.client.desktop" "$src/moe.sable.client.metainfo.xml" "$src/flathub.json" "$src/sable.sh" flathub/
           cp LICENSE flathub/LICENSE
           rm -rf flathub/icons && cp -r "$src/icons" flathub/icons
 
@@ -823,7 +1126,14 @@ jobs:
           fi
           git checkout -b "update-${VERSION}"
           git commit -m "Update Sable to ${VERSION}"
-          git push origin "update-${VERSION}"
+          git push --force origin "update-${VERSION}"
+          open=$(curl -fsS -H "Authorization: Bearer ${FLATHUB_TOKEN}" -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/flathub/moe.sable.client/pulls?state=open&head=flathub:update-${VERSION}" \
+            | python3 -c 'import json, sys; print(len(json.load(sys.stdin)))')
+          if [ "$open" != 0 ]; then
+            echo "The Flathub PR for ${VERSION} is already open; its branch was updated."
+            exit 0
+          fi
           VERSION="$VERSION" python3 - <<'PY' | curl -fsS -X POST \
             -H "Authorization: Bearer ${FLATHUB_TOKEN}" -H 'Accept: application/vnd.github+json' \
             -d @- https://api.github.com/repos/flathub/moe.sable.client/pulls
@@ -836,3 +1146,57 @@ jobs:
               "body": f"Bumps the release tarballs to {version}.",
           }))
           PY
+  distribute-playstore:
+    name: Publish to Google Play
+    needs: [setup-release, android]
+    if: ${{ needs.setup-release.outputs.nightly != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.setup-release.outputs.tag }}
+      VERSION: ${{ needs.setup-release.outputs.version }}
+      PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+    steps:
+      - name: Check out repository
+        if: ${{ env.PLAY_SERVICE_ACCOUNT_JSON != '' }}
+        uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.setup-release.outputs.ref }}
+          persist-credentials: false
+      - name: Download the AAB
+        if: ${{ env.PLAY_SERVICE_ACCOUNT_JSON != '' }}
+        run: |
+          mkdir aab
+          node scripts/ci/forgejo-release.mjs download \
+            --pattern "sable-${VERSION}-android-universal.aab" --dir aab
+          ls aab | grep -q . || { echo 'The universal AAB is not on the release' >&2; exit 1; }
+      - name: Prepare the release notes
+        if: ${{ env.PLAY_SERVICE_ACCOUNT_JSON != '' }}
+        id: notes
+        run: |
+          IFS=. read -r major minor patch <<<"$VERSION"
+          code=$(( (major * 1000000 + minor * 1000 + patch) * 10 + 2 ))
+          changelog="fastlane/metadata/android/en-US/changelogs/${code}.txt"
+          if [ -f "$changelog" ]; then
+            mkdir whatsnew
+            cp "$changelog" whatsnew/whatsnew-en-US
+            echo 'dir=whatsnew' >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No changelog at ${changelog}; publishing without release notes."
+            echo 'dir=' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Upload to Google Play
+        if: ${{ env.PLAY_SERVICE_ACCOUNT_JSON != '' }}
+        uses: https://github.com/r0adkll/upload-google-play@e738b9dd8f2476ea806d921b64aacd24f34515a5 # v1.1.5
+        with:
+          serviceAccountJsonPlainText: ${{ env.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: moe.sable.client
+          releaseFiles: aab/sable-${{ needs.setup-release.outputs.version }}-android-universal.aab
+          tracks: production
+          status: completed
+          whatsNewDirectory: ${{ steps.notes.outputs.dir }}
+      - name: Report the skipped publish
+        if: ${{ env.PLAY_SERVICE_ACCOUNT_JSON == '' }}
+        run: echo '::notice::PLAY_SERVICE_ACCOUNT_JSON is not set; skipping the Google Play publish.'

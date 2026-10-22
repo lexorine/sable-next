@@ -1,9 +1,12 @@
+use crate::api::push::PusherView;
 use crate::errors::CoreError;
 use matrix_sdk::Client;
 #[cfg(not(target_family = "wasm"))]
 use matrix_sdk::ruma::OwnedEventId;
 use matrix_sdk::ruma::api::client::push::{PusherIds, PusherInit, PusherKind};
+use matrix_sdk::ruma::api::client::state::get_state_event_for_key;
 use matrix_sdk::ruma::events::AnySyncTimelineEvent;
+use matrix_sdk::ruma::events::StateEventType;
 use matrix_sdk::ruma::events::TimelineEventType;
 #[cfg(not(target_family = "wasm"))]
 use matrix_sdk::ruma::events::room::encrypted::OriginalSyncRoomEncryptedEvent;
@@ -18,11 +21,19 @@ use matrix_sdk_ui::notification_client::{
 use url::Url;
 
 use crate::preview;
-use crate::protocol::{NotificationView, PushEventView, PushFetchView, PusherView};
+use crate::protocol::{NotificationView, PushEventView, PushFetchView};
 #[cfg(not(target_family = "wasm"))]
 use crate::session::{AccountRegistry, PersistedAccount};
 #[cfg(not(target_family = "wasm"))]
 use crate::store::{FileSessionStore, SessionStore};
+#[cfg(not(target_family = "wasm"))]
+use matrix_sdk::store::RoomLoadSettings;
+
+#[cfg(not(target_family = "wasm"))]
+mod push_cache;
+
+#[cfg(not(target_family = "wasm"))]
+pub use push_cache::evict as evict_push_cache;
 
 pub(crate) const GATEWAY_PATH: &str = "/_matrix/push/v1/notify";
 
@@ -47,7 +58,7 @@ pub(crate) async fn pusher_display_name(client: &Client, fallback: String) -> St
 /// Resolve Android's app-data root to the session and SDK stores under `files`.
 #[cfg(not(target_family = "wasm"))]
 #[must_use]
-fn cold_push_store_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
+pub fn cold_push_store_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
     data_dir.join("files")
 }
 
@@ -69,6 +80,7 @@ fn push_account<'a>(
 pub enum ColdPush {
     Clear(String),
     Discard,
+    Unevaluated,
     NeedsKey { quietly: bool },
     Undecryptable,
 }
@@ -76,7 +88,6 @@ pub enum ColdPush {
 /// Decrypt an Android push.
 #[cfg(not(target_family = "wasm"))]
 pub async fn decrypt_cold_push(
-    core: Option<&crate::Core>,
     data_dir: &std::path::Path,
     user_id: &str,
     device_id: &str,
@@ -85,97 +96,31 @@ pub async fn decrypt_cold_push(
     fetch_keys: bool,
 ) -> ColdPush {
     let store_dir = cold_push_store_dir(data_dir);
-    if let Some(core) = core {
-        let live = core
-            .session
-            .read()
-            .await
-            .as_ref()
-            .filter(|session| {
-                session.client.user_id().is_some_and(|id| id == user_id)
-                    && session.client.device_id().is_some_and(|id| id == device_id)
-            })
-            .map(|session| (session.client.clone(), session.sync_service.clone()));
-        return match live {
-            Some((client, sync_service)) => {
-                let key_fetch = if fetch_keys {
-                    KeyFetch::Live(sync_service)
-                } else {
-                    KeyFetch::Never
-                };
-                decrypt_push_event(&client, key_fetch, room_id, event_json).await
-            }
-            None => {
-                match cold_push_from_store(&store_dir, user_id, device_id, room_id, event_json)
-                    .await
-                {
-                    ColdPush::NeedsKey { quietly: true } if fetch_keys => ColdPush::Discard,
-                    ColdPush::NeedsKey { .. } if fetch_keys => ColdPush::Undecryptable,
-                    result => result,
-                }
-            }
-        };
-    }
-    let Some(client) = restore_push_client(&store_dir, user_id, device_id).await else {
+    let Some(host) = push_cache::cold_host(&store_dir, user_id, device_id).await else {
         return ColdPush::Undecryptable;
     };
     let decrypt = || {
-        decrypt_push_event(
-            &client,
-            if fetch_keys {
-                KeyFetch::Cold
-            } else {
-                KeyFetch::Never
-            },
+        let key_fetch = if fetch_keys {
+            host.key_fetch()
+        } else {
+            KeyFetch::Never
+        };
+        Box::pin(decrypt_push_event(
+            host.client(),
+            key_fetch,
             room_id,
             event_json,
-        )
+        ))
     };
     let result = decrypt().await;
-    if fetch_keys
-        && matches!(result, ColdPush::Undecryptable | ColdPush::NeedsKey { .. })
-        && client.refresh().await
-    {
-        decrypt().await
-    } else {
-        result
+    match result {
+        ColdPush::Undecryptable | ColdPush::NeedsKey { .. }
+            if fetch_keys && host.refresh().await =>
+        {
+            decrypt().await
+        }
+        result => result,
     }
-}
-
-/// Decrypt using the same session and SDK stores as the application. Callers
-/// must bound the operation to the platform's notification processing budget.
-#[cfg(not(target_family = "wasm"))]
-pub async fn decrypt_push_from_store(
-    store_dir: &std::path::Path,
-    user_id: &str,
-    device_id: &str,
-    room_id: &str,
-    event_json: &str,
-) -> Option<String> {
-    match cold_push_from_store(store_dir, user_id, device_id, room_id, event_json).await {
-        ColdPush::Clear(clear) => Some(clear),
-        ColdPush::Discard | ColdPush::NeedsKey { .. } | ColdPush::Undecryptable => None,
-    }
-}
-
-#[cfg(not(target_family = "wasm"))]
-async fn cold_push_from_store(
-    store_dir: &std::path::Path,
-    user_id: &str,
-    device_id: &str,
-    room_id: &str,
-    event_json: &str,
-) -> ColdPush {
-    let Some(client) = restore_push_client(store_dir, user_id, device_id).await else {
-        return ColdPush::Undecryptable;
-    };
-    Box::pin(decrypt_push_event(
-        &client,
-        KeyFetch::Never,
-        room_id,
-        event_json,
-    ))
-    .await
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -207,9 +152,9 @@ pub async fn settle_refreshes<T>(operation: impl std::future::Future<Output = T>
 #[cfg(not(target_family = "wasm"))]
 pub struct PushClient {
     client: Client,
-    owner: Option<std::sync::Arc<FileSessionStore>>,
-    base_store: String,
-    account_id: String,
+    /// Only a client opened without a `Core` refreshes; the app's own clients refresh themselves.
+    refreshes: bool,
+    _lease: Option<crate::session::StoreLease>,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -223,25 +168,19 @@ impl std::ops::Deref for PushClient {
 
 #[cfg(not(target_family = "wasm"))]
 impl PushClient {
+    /// Only OAuth refreshes, under the SDK's cross-process lock; the saved tokens
+    /// are written by the session callbacks while that lock is held.
     async fn refresh(&self) -> bool {
-        let Some(store) = self.owner.clone() else {
-            return false;
-        };
-        if !self.token_rejected().await {
+        if !self.refreshes
+            || self.client.oauth().full_session().is_none()
+            || !self.token_rejected().await
+        {
             return false;
         }
         let client = self.client.clone();
-        let base_store = self.base_store.clone();
-        let account_id = self.account_id.clone();
         let (sent, refreshed) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            let refreshed = client.refresh_access_token().await.is_ok()
-                && persist_push_session(&store, &base_store, &account_id, &client)
-                    .await
-                    .inspect_err(|error| tracing::error!("could not persist push session: {error}"))
-                    .is_ok();
-            drop(store);
-            let _ = sent.send(refreshed);
+            let _ = sent.send(client.oauth().refresh_access_token().await.is_ok());
         });
         let _ = PENDING_REFRESHES.try_with(|pending| {
             pending
@@ -280,61 +219,204 @@ impl PushClient {
     }
 }
 
-/// Restore a notification login, rotating credentials only while holding ownership.
+/// Restore a notification login, rotating OAuth credentials under the SDK's cross-process lock.
 #[cfg(not(target_family = "wasm"))]
 pub async fn restore_push_client(
     store_dir: &std::path::Path,
     user_id: &str,
     device_id: &str,
 ) -> Option<PushClient> {
-    let directory = store_dir.to_owned();
-    let owner = tokio::task::spawn_blocking(move || FileSessionStore::try_exclusive(directory))
-        .await
-        .ok()?
-        .ok()?
-        .map(std::sync::Arc::new);
-    let stored = FileSessionStore::new(store_dir).load().await.ok()??;
-    let base_store = store_dir.to_str()?;
-    let (mut accounts, _) = AccountRegistry::from_bytes(&stored, base_store).ok()?;
-    accounts.reanchor_stores(base_store);
-    let account = push_account(&accounts, user_id, device_id)?;
-    let client = crate::session::restore_notification_client(&account.store_id, &account.session)
-        .await
-        .ok()?;
-    Some(PushClient {
-        client,
-        owner,
-        base_store: base_store.to_owned(),
-        account_id: account.account_id.clone(),
+    let host = push_host(store_dir, user_id, device_id, RoomLoadSettings::default()).await?;
+    Some(match host {
+        PushHost::Live { client, .. } => PushClient {
+            client,
+            refreshes: false,
+            _lease: None,
+        },
+        PushHost::Shared { client, lease } => PushClient {
+            client,
+            refreshes: false,
+            _lease: Some(lease),
+        },
+        PushHost::Own(client) => client,
     })
 }
 
 #[cfg(not(target_family = "wasm"))]
-async fn persist_push_session(
-    store: &FileSessionStore,
-    base_store: &str,
-    account_id: &str,
-    client: &Client,
-) -> Result<(), crate::store::StoreError> {
-    let stored = store
-        .load()
-        .await?
-        .ok_or(crate::store::StoreError::Invalid("push session is missing"))?;
-    let (mut accounts, _) = AccountRegistry::from_bytes(&stored, base_store)?;
-    let Some(account) = accounts
-        .accounts
-        .iter_mut()
-        .find(|account| account.account_id == account_id && !account.needs_reauth)
-    else {
-        return Ok(());
+async fn open_push_client(
+    store_dir: &std::path::Path,
+    user_id: &str,
+    device_id: &str,
+    room_load: RoomLoadSettings,
+) -> Option<PushClient> {
+    let account = saved_push_account(store_dir, user_id, device_id).await?;
+    let base_store = store_dir.to_str()?;
+    let client = crate::session::restore_notification_client(
+        &account.store_id,
+        &account.session,
+        room_load,
+        |client| install_push_session_callbacks(client, base_store, &account),
+    )
+    .await
+    .ok()?;
+    Some(PushClient {
+        client,
+        refreshes: true,
+        _lease: None,
+    })
+}
+
+#[cfg(not(target_family = "wasm"))]
+async fn saved_push_account(
+    store_dir: &std::path::Path,
+    user_id: &str,
+    device_id: &str,
+) -> Option<PersistedAccount> {
+    let stored = FileSessionStore::new(store_dir).load().await.ok()??;
+    let base_store = store_dir.to_str()?;
+    let (mut accounts, _) = AccountRegistry::from_bytes(&stored, base_store).ok()?;
+    accounts.reanchor_stores(base_store);
+    let mut account = push_account(&accounts, user_id, device_id).cloned()?;
+    let logins = crate::credentials::LoginTokens::new(store_dir);
+    let (account_id, device_id) = (account.account_id.clone(), device_id.to_owned());
+    // Until the app first moves them into a file, a registry still holds the tokens.
+    if let Some(tokens) = tokio::task::spawn_blocking(move || logins.load(&account_id, &device_id))
+        .await
+        .ok()?
+    {
+        account.session.credentials.set_tokens(tokens);
+    }
+    Some(account)
+}
+
+#[cfg(not(target_family = "wasm"))]
+enum PushHost {
+    Live {
+        client: Client,
+        sync_service: std::sync::Arc<matrix_sdk_ui::sync_service::SyncService>,
+    },
+    Shared {
+        client: Client,
+        lease: crate::session::StoreLease,
+    },
+    Own(PushClient),
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl PushHost {
+    fn client(&self) -> &Client {
+        match self {
+            Self::Live { client, .. } | Self::Shared { client, .. } => client,
+            Self::Own(push) => push,
+        }
+    }
+
+    fn key_fetch(&self) -> KeyFetch {
+        match self {
+            Self::Live { sync_service, .. } => KeyFetch::Live(sync_service.clone()),
+            _ => KeyFetch::Cold,
+        }
+    }
+
+    async fn refresh(&self) -> bool {
+        match self {
+            Self::Own(push) => push.refresh().await,
+            _ => false,
+        }
+    }
+
+    async fn retry<T, E, F: std::future::Future<Output = Result<T, E>>>(
+        &self,
+        request: impl Fn() -> F,
+    ) -> Result<T, E> {
+        match self {
+            Self::Own(push) => push.retry(request).await,
+            _ => request().await,
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+const RESTORE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A core in this process opens the client, so a store never has two there. Without one, the
+/// push opens its own and never waits for, or blocks, the app.
+#[cfg(not(target_family = "wasm"))]
+async fn push_host(
+    store_dir: &std::path::Path,
+    user_id: &str,
+    device_id: &str,
+    room_load: RoomLoadSettings,
+) -> Option<PushHost> {
+    let Some(core) = crate::Core::owning(store_dir) else {
+        return open_push_client(store_dir, user_id, device_id, room_load)
+            .await
+            .map(PushHost::Own);
     };
-    let Some(current) = crate::session::current_session(client, account.session.homeserver.clone())
-    else {
-        return Ok(());
+    let _ = tokio::time::timeout(RESTORE_WAIT, core.restore_lock.lock()).await;
+    if let Some(host) = live_push_host(&core, user_id, device_id).await {
+        return Some(host);
+    }
+    let accounts = core.accounts().await.ok()?;
+    let account = push_account(&accounts, user_id, device_id)?;
+    let lease = crate::session::store_lease(&account.store_id).await;
+    if let Some(host) = live_push_host(&core, user_id, device_id).await {
+        return Some(host);
+    }
+    let client = core.saved_account_client(account, &lease).await.ok()?;
+    Some(PushHost::Shared { client, lease })
+}
+
+#[cfg(not(target_family = "wasm"))]
+async fn live_push_host(core: &crate::Core, user_id: &str, device_id: &str) -> Option<PushHost> {
+    core.session
+        .read()
+        .await
+        .as_ref()
+        .filter(|session| is_login(&session.client, user_id, device_id))
+        .map(|session| PushHost::Live {
+            client: session.client.clone(),
+            sync_service: session.sync_service.clone(),
+        })
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn is_login(client: &Client, user_id: &str, device_id: &str) -> bool {
+    client.user_id().is_some_and(|id| id == user_id)
+        && client.device_id().is_some_and(|id| id == device_id)
+}
+
+/// Synchronous, as the SDK calls them inside a refresh, possibly on a single-threaded runtime.
+#[cfg(not(target_family = "wasm"))]
+fn install_push_session_callbacks(client: &Client, base_store: &str, account: &PersistedAccount) {
+    let base_store = std::path::Path::new(base_store);
+    let device_id = account.session.credentials.device_id();
+    let reload = {
+        let logins = crate::credentials::LoginTokens::new(base_store);
+        let (account_id, device_id) = (account.account_id.clone(), device_id.clone());
+        move |_: Client| {
+            logins
+                .load(&account_id, &device_id)
+                .ok_or_else(|| "this login has no saved tokens".into())
+        }
     };
-    account.session = current.keeping_endpoint_of(&account.session);
-    let bytes = serde_json::to_vec(&accounts)?;
-    store.save(bytes).await
+    let save = {
+        let logins = crate::credentials::LoginTokens::new(base_store);
+        let account_id = account.account_id.clone();
+        move |client: Client| {
+            let tokens = client
+                .session_tokens()
+                .ok_or(crate::store::StoreError::Invalid(
+                    "the refreshed client has no tokens",
+                ))?;
+            logins
+                .save(&account_id, &device_id, &tokens)
+                .map_err(Into::into)
+        }
+    };
+    if let Err(error) = client.set_session_callbacks(Box::new(reload), Box::new(save)) {
+        tracing::error!("could not install push session callbacks: {error}");
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -367,6 +449,7 @@ async fn decrypt_push_event(
     else {
         return ColdPush::Undecryptable;
     };
+    let _ = crate::rooms::fill_own_member(&room).await;
     let push_context = room.push_context().await.ok().flatten();
     let Ok(decrypted) = room.decrypt_event(&event, push_context.as_ref()).await else {
         return undecryptable;
@@ -374,13 +457,16 @@ async fn decrypt_push_event(
 
     match &decrypted.kind {
         matrix_sdk::deserialized_responses::TimelineEventKind::Decrypted(clear) => {
-            return if decrypted
-                .push_actions()
-                .is_some_and(|actions| !notifies(actions))
-            {
-                ColdPush::Discard
-            } else {
-                ColdPush::Clear(clear.event.json().get().to_owned())
+            let actions = decrypted.push_actions();
+            return match actions {
+                None => ColdPush::Unevaluated,
+                Some(actions) if notifies(actions) => {
+                    let noisy = actions
+                        .iter()
+                        .any(|action| action.sound().is_some() || action.is_highlight());
+                    ColdPush::Clear(marked_noisy(clear.event.json().get(), noisy))
+                }
+                Some(_) => ColdPush::Discard,
             };
         }
         matrix_sdk::deserialized_responses::TimelineEventKind::UnableToDecrypt {
@@ -412,12 +498,17 @@ async fn decrypt_push_event(
         return undecryptable;
     };
     match notifications.get_notification(&room_id, &event_id).await {
+        Ok(NotificationStatus::Event(item)) if item.actions.is_none() => ColdPush::Unevaluated,
+        Ok(NotificationStatus::Event(item)) if !item.actions.as_deref().is_some_and(notifies) => {
+            ColdPush::Discard
+        }
         Ok(NotificationStatus::Event(item)) => match item.raw_event {
             RawNotificationEvent::Timeline(clear)
                 if clear.get_field::<String>("type").ok().flatten().as_deref()
                     != Some("m.room.encrypted") =>
             {
-                ColdPush::Clear(clear.json().get().to_owned())
+                let noisy = item.is_noisy == Some(true) || item.has_mention == Some(true);
+                ColdPush::Clear(marked_noisy(clear.json().get(), noisy))
             }
             _ => undecryptable,
         },
@@ -429,51 +520,479 @@ async fn decrypt_push_event(
 }
 
 #[cfg(not(target_family = "wasm"))]
+fn marked_noisy(clear: &str, noisy: bool) -> String {
+    if !noisy {
+        return clear.to_owned();
+    }
+    let Ok(mut event) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(clear)
+    else {
+        return clear.to_owned();
+    };
+    event.insert(NOISY_KEY.to_owned(), true.into());
+    serde_json::to_string(&event).unwrap_or_else(|_| clear.to_owned())
+}
+
+#[cfg(not(target_family = "wasm"))]
 pub async fn fetch_cold_push_event(
-    core: Option<&crate::Core>,
     data_dir: &std::path::Path,
     user_id: &str,
     device_id: &str,
     room_id: &str,
     event_id: &str,
 ) -> PushFetchView {
-    let (Ok(room_id), Ok(event_id)) = (RoomId::parse(room_id), EventId::parse(event_id)) else {
-        return PushFetchView::Unavailable;
-    };
-    let live = match core {
-        Some(core) => core
-            .session
-            .read()
-            .await
-            .as_ref()
-            .filter(|session| {
-                session.client.user_id().is_some_and(|id| id == user_id)
-                    && session.client.device_id().is_some_and(|id| id == device_id)
-            })
-            .map(|session| (session.client.clone(), session.sync_service.clone())),
-        None => None,
-    };
-    if let Some((client, sync_service)) = live {
-        return Box::pin(fetch_push_event(&client, sync_service, &room_id, &event_id)).await;
+    match PushSession::cached(&cold_push_store_dir(data_dir), user_id, device_id, room_id).await {
+        Some(session) => session.fetch(event_id).await,
+        None => PushFetchView::Unavailable,
     }
-    let store_dir = cold_push_store_dir(data_dir);
-    let Some(client) = restore_push_client(&store_dir, user_id, device_id).await else {
-        return PushFetchView::Unavailable;
+}
+
+/// One restored login for every step of a push, which callers must bound to
+/// the platform's notification processing budget.
+#[cfg(not(target_family = "wasm"))]
+pub struct PushSession {
+    host: push_cache::ColdHost,
+    store_dir: std::path::PathBuf,
+    room_id: matrix_sdk::ruma::OwnedRoomId,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl PushSession {
+    pub async fn open(
+        store_dir: &std::path::Path,
+        user_id: &str,
+        device_id: &str,
+        room_id: &str,
+    ) -> Option<Self> {
+        let room_id = RoomId::parse(room_id).ok()?;
+        let host = push_host(
+            store_dir,
+            user_id,
+            device_id,
+            RoomLoadSettings::One(room_id.clone()),
+        )
+        .await?;
+        Some(Self {
+            host: push_cache::ColdHost::uncached(host),
+            store_dir: store_dir.to_owned(),
+            room_id,
+        })
+    }
+
+    /// Android's login, which stays restored for as long as no core takes the store.
+    async fn cached(
+        store_dir: &std::path::Path,
+        user_id: &str,
+        device_id: &str,
+        room_id: &str,
+    ) -> Option<Self> {
+        let room_id = RoomId::parse(room_id).ok()?;
+        Some(Self {
+            host: push_cache::cold_host(store_dir, user_id, device_id).await?,
+            store_dir: store_dir.to_owned(),
+            room_id,
+        })
+    }
+
+    /// Only with the keys already stored.
+    pub async fn decrypt(&self, event_json: &str) -> Option<String> {
+        match Box::pin(decrypt_push_event(
+            self.host.client(),
+            KeyFetch::Never,
+            self.room_id.as_str(),
+            event_json,
+        ))
+        .await
+        {
+            ColdPush::Clear(clear) => Some(clear),
+            ColdPush::Discard
+            | ColdPush::Unevaluated
+            | ColdPush::NeedsKey { .. }
+            | ColdPush::Undecryptable => None,
+        }
+    }
+
+    pub async fn fetch(&self, event_id: &str) -> PushFetchView {
+        let Ok(event_id) = EventId::parse(event_id) else {
+            return PushFetchView::Unavailable;
+        };
+        let setup = match &*self.host {
+            PushHost::Live { sync_service, .. } => NotificationProcessSetup::SingleProcess {
+                sync_service: sync_service.clone(),
+            },
+            // Without this client's own sync service, the SDK's store lock coordinates it with others.
+            _ => NotificationProcessSetup::MultipleProcesses,
+        };
+        let fetch = || {
+            Box::pin(fetch_push_event_with(
+                self.host.client(),
+                setup.clone(),
+                &self.room_id,
+                &event_id,
+            ))
+        };
+        let result = fetch().await;
+        if matches!(result, PushFetchView::Unavailable) && self.host.refresh().await {
+            fetch().await
+        } else {
+            result
+        }
+    }
+
+    #[must_use]
+    pub fn joined_members(&self) -> Option<u64> {
+        self.host
+            .client()
+            .get_room(&self.room_id)
+            .map(|room| room.joined_members_count())
+    }
+
+    /// `sender` asks for the avatars, `content` for the message's image; leave out
+    /// the content when the notification may not show the message.
+    pub async fn media(
+        &self,
+        sender: Option<&str>,
+        content: Option<&serde_json::Value>,
+    ) -> PushMedia {
+        let client = self.host.client();
+        let Some(room) = client.get_room(&self.room_id) else {
+            return PushMedia::default();
+        };
+        let sender_url =
+            match sender.and_then(|sender| matrix_sdk::ruma::UserId::parse(sender).ok()) {
+                Some(sender) => room
+                    .get_member_no_sync(&sender)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|member| member.avatar_url().map(ToOwned::to_owned)),
+                None => None,
+            };
+        let room_url = if sender.is_none() || room.is_direct().await.unwrap_or(false) {
+            None
+        } else {
+            room.avatar_url()
+        };
+        let own = match sender {
+            Some(_) => room
+                .get_member_no_sync(room.own_user_id())
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        };
+        let own_name = own
+            .as_ref()
+            .and_then(|member| member.display_name().map(ToOwned::to_owned));
+        let own_url = own.and_then(|member| member.avatar_url().map(ToOwned::to_owned));
+        let image = match content {
+            Some(content) if crate::account_documents::shows_media_previews(&room).await => {
+                message_image(content)
+            }
+            _ => None,
+        };
+        let directory = self.store_dir.join(PUSH_MEDIA_DIRECTORY);
+        prune_push_media(&directory).await;
+        let avatar = |url: Option<matrix_sdk::ruma::OwnedMxcUri>| {
+            let source = url.map(matrix_sdk::ruma::events::room::MediaSource::Plain);
+            cached_push_media(
+                client,
+                &directory,
+                source,
+                Some((PUSH_AVATAR_SIZE, PUSH_AVATAR_SIZE)),
+            )
+        };
+        let (sender, room, own_avatar, image) = futures_util::join!(
+            avatar(sender_url),
+            avatar(room_url),
+            avatar(own_url),
+            cached_push_media(
+                client,
+                &directory,
+                image,
+                Some((PUSH_IMAGE_WIDTH, PUSH_IMAGE_HEIGHT))
+            ),
+        );
+        PushMedia {
+            sender: sender.map(|(path, _)| path),
+            room: room.map(|(path, _)| path),
+            image: image.map(|(path, mimetype)| PushImage { path, mimetype }),
+            own_name,
+            own_avatar: own_avatar.map(|(path, _)| path),
+        }
+    }
+
+    /// Sends `text` to the room, then marks `event_id` read. Retrying with the same
+    /// `transaction_id` never sends it twice.
+    pub async fn reply(
+        &self,
+        text: &str,
+        transaction_id: &str,
+        event_id: &str,
+        private_receipt: bool,
+    ) -> bool {
+        let Some(room) = self.host.client().get_room(&self.room_id) else {
+            return false;
+        };
+        let content = crate::outgoing::message_content(
+            text.to_owned(),
+            None,
+            crate::protocol::MessageKind::Text,
+            Vec::new(),
+            false,
+        );
+        let transaction = matrix_sdk::ruma::OwnedTransactionId::from(transaction_id);
+        let sent = self
+            .host
+            .retry(|| {
+                room.send(content.clone())
+                    .with_transaction_id(transaction.clone())
+                    .into_future()
+            })
+            .await;
+        if let Err(error) = sent {
+            tracing::warn!("notification reply not sent: {error}");
+            return false;
+        }
+        self.mark_read(event_id, private_receipt).await;
+        true
+    }
+
+    /// In the event's thread, or the main timeline, as the app's timelines would.
+    pub async fn mark_read(&self, event_id: &str, private_receipt: bool) -> bool {
+        use matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType;
+        use matrix_sdk::ruma::events::receipt::ReceiptThread;
+
+        let (Some(room), Ok(event_id)) = (
+            self.host.client().get_room(&self.room_id),
+            EventId::parse(event_id),
+        ) else {
+            return false;
+        };
+        let thread = crate::timelines::receipt_thread_root(&room, &event_id, None)
+            .await
+            .map_or(ReceiptThread::Main, ReceiptThread::Thread);
+        let receipt = if private_receipt {
+            ReceiptType::ReadPrivate
+        } else {
+            ReceiptType::Read
+        };
+        let sent = self
+            .host
+            .retry(|| room.send_single_receipt(receipt.clone(), thread.clone(), event_id.clone()))
+            .await;
+        if let Err(error) = &sent {
+            tracing::warn!("notification receipt not sent: {error}");
+        }
+        sent.is_ok()
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub async fn cold_push_session(
+    data_dir: &std::path::Path,
+    user_id: &str,
+    device_id: &str,
+    room_id: &str,
+) -> Option<PushSession> {
+    PushSession::cached(&cold_push_store_dir(data_dir), user_id, device_id, room_id).await
+}
+
+#[cfg(not(target_family = "wasm"))]
+const PUSH_AVATAR_SIZE: u32 = 96;
+#[cfg(not(target_family = "wasm"))]
+const PUSH_IMAGE_WIDTH: u32 = 800;
+#[cfg(not(target_family = "wasm"))]
+const PUSH_IMAGE_HEIGHT: u32 = 600;
+/// Encrypted media is decrypted in memory, which a notification process can barely spare,
+/// and the sender's declared size is the only bound known before downloading it.
+#[cfg(not(target_family = "wasm"))]
+const PUSH_ENCRYPTED_IMAGE_MAX_BYTES: u64 = 1024 * 1024;
+#[cfg(not(target_family = "wasm"))]
+const PUSH_MEDIA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(not(target_family = "wasm"))]
+const PUSH_MEDIA_MAX_AGE: std::time::Duration = std::time::Duration::from_hours(7 * 24);
+
+#[cfg(not(target_family = "wasm"))]
+const PUSH_MEDIA_DIRECTORY: &str = "push-media";
+
+/// Decrypted previews must not outlive the accounts they were shown for.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) async fn clear_push_media(store_dir: &std::path::Path) {
+    match tokio::fs::remove_dir_all(store_dir.join(PUSH_MEDIA_DIRECTORY)).await {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            tracing::warn!("could not clear the push media cache: {error}");
+        }
+        _ => {}
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Debug, Default, serde::Serialize)]
+pub struct PushMedia {
+    pub sender: Option<String>,
+    pub room: Option<String>,
+    pub image: Option<PushImage>,
+    pub own_name: Option<String>,
+    pub own_avatar: Option<String>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Debug, serde::Serialize)]
+pub struct PushImage {
+    pub path: String,
+    pub mimetype: &'static str,
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub async fn cold_push_media(
+    data_dir: &std::path::Path,
+    user_id: &str,
+    device_id: &str,
+    room_id: &str,
+    sender: Option<&str>,
+    content: Option<&serde_json::Value>,
+) -> PushMedia {
+    match PushSession::cached(&cold_push_store_dir(data_dir), user_id, device_id, room_id).await {
+        Some(session) => session.media(sender, content).await,
+        None => PushMedia::default(),
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn message_image(
+    content: &serde_json::Value,
+) -> Option<matrix_sdk::ruma::events::room::MediaSource> {
+    use matrix_sdk::ruma::events::room::MediaSource;
+    use serde_json::Value;
+
+    let msgtype = content.get("msgtype")?.as_str()?;
+    if msgtype != "m.image" && msgtype != "m.video" {
+        return None;
+    }
+    let info = content.get("info");
+    let plain = |url: Option<&Value>| {
+        url.and_then(|url| serde_json::from_value(url.clone()).ok())
+            .map(MediaSource::Plain)
     };
-    let Ok(sync_service) = crate::session::build_sync(client.client.clone()).await else {
-        return PushFetchView::Unavailable;
+    let encrypted = |file: Option<&Value>, declared: Option<&Value>| {
+        let small = declared
+            .and_then(|declared| declared.get("size"))
+            .and_then(Value::as_u64)
+            .is_some_and(|size| size <= PUSH_ENCRYPTED_IMAGE_MAX_BYTES);
+        file.filter(|_| small)
+            .and_then(|file| serde_json::from_value(file.clone()).ok())
+            .map(MediaSource::Encrypted)
     };
-    let result = Box::pin(fetch_push_event(
-        &client,
-        sync_service.clone(),
-        &room_id,
-        &event_id,
-    ))
-    .await;
-    if matches!(result, PushFetchView::Unavailable) && client.refresh().await {
-        Box::pin(fetch_push_event(&client, sync_service, &room_id, &event_id)).await
-    } else {
-        result
+    let thumbnail = encrypted(
+        info.and_then(|info| info.get("thumbnail_file")),
+        info.and_then(|info| info.get("thumbnail_info")),
+    )
+    .or_else(|| plain(info.and_then(|info| info.get("thumbnail_url"))));
+    if thumbnail.is_some() || msgtype != "m.image" {
+        return thumbnail;
+    }
+    plain(content.get("url")).or_else(|| encrypted(content.get("file"), info))
+}
+
+#[cfg(not(target_family = "wasm"))]
+async fn cached_push_media(
+    client: &Client,
+    directory: &std::path::Path,
+    source: Option<matrix_sdk::ruma::events::room::MediaSource>,
+    bounds: Option<(u32, u32)>,
+) -> Option<(String, &'static str)> {
+    use base64::Engine as _;
+    use matrix_sdk::media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings};
+    use matrix_sdk::ruma::events::room::MediaSource;
+    use sha2::{Digest, Sha256};
+
+    let source = source?;
+    let format = match (&source, bounds) {
+        (MediaSource::Plain(_), Some((width, height))) => {
+            MediaFormat::Thumbnail(MediaThumbnailSettings::new(width.into(), height.into()))
+        }
+        _ => MediaFormat::File,
+    };
+    let url = match &source {
+        MediaSource::Plain(url) => url.as_str(),
+        MediaSource::Encrypted(file) => file.url.as_str(),
+    };
+    let key = match &format {
+        MediaFormat::Thumbnail(settings) => format!("{url}#{}x{}", settings.width, settings.height),
+        MediaFormat::File => url.to_owned(),
+    };
+    let path = directory.join(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(key.as_bytes())),
+    );
+    if let Ok(mut file) = tokio::fs::File::open(&path).await {
+        let mut head = [0; 12];
+        let read = tokio::io::AsyncReadExt::read(&mut file, &mut head)
+            .await
+            .ok()?;
+        return Some((
+            path.to_str()?.to_owned(),
+            image_mimetype(head.get(..read)?)?,
+        ));
+    }
+    let request = MediaRequestParameters { source, format };
+    let bytes = tokio::time::timeout(
+        PUSH_MEDIA_TIMEOUT,
+        client.media().get_media_content(&request, false),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let mimetype = image_mimetype(&bytes)?;
+    tokio::fs::create_dir_all(directory).await.ok()?;
+    // Another push may be reading the same file while this one writes it.
+    let partial = path.with_extension(format!("{}.partial", std::process::id()));
+    tokio::fs::write(&partial, bytes).await.ok()?;
+    tokio::fs::rename(&partial, &path).await.ok()?;
+    Some((path.to_str()?.to_owned(), mimetype))
+}
+
+/// Only formats both platforms decode in a notification.
+#[cfg(not(target_family = "wasm"))]
+const fn image_mimetype(bytes: &[u8]) -> Option<&'static str> {
+    match bytes {
+        [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
+        [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
+        [b'G', b'I', b'F', b'8', ..] => Some("image/gif"),
+        [
+            b'R',
+            b'I',
+            b'F',
+            b'F',
+            _,
+            _,
+            _,
+            _,
+            b'W',
+            b'E',
+            b'B',
+            b'P',
+            ..,
+        ] => Some("image/webp"),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+async fn prune_push_media(directory: &std::path::Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(directory).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let stale = entry
+            .metadata()
+            .await
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > PUSH_MEDIA_MAX_AGE);
+        if stale {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
     }
 }
 
@@ -484,19 +1003,60 @@ pub async fn fetch_push_event(
     event_id: &EventId,
 ) -> PushFetchView {
     let setup = NotificationProcessSetup::SingleProcess { sync_service };
+    fetch_push_event_with(client, setup, room_id, event_id).await
+}
+
+async fn fetch_push_event_with(
+    client: &Client,
+    setup: NotificationProcessSetup,
+    room_id: &RoomId,
+    event_id: &EventId,
+) -> PushFetchView {
     let Ok(notifications) = NotificationClient::new(client.clone(), setup).await else {
         return PushFetchView::Unavailable;
     };
     match notifications.get_notification(room_id, event_id).await {
-        Ok(NotificationStatus::Event(item)) => push_event_view(*item)
-            .map_or(PushFetchView::Unavailable, |event| PushFetchView::Event {
-                event,
-            }),
+        Ok(NotificationStatus::Event(item))
+            if item
+                .actions
+                .as_deref()
+                .is_some_and(|actions| !notifies(actions)) =>
+        {
+            PushFetchView::Discard
+        }
+        Ok(NotificationStatus::Event(item)) => {
+            let Some(mut event) = push_event_view(*item) else {
+                return PushFetchView::Unavailable;
+            };
+            if event.sender_display_name.is_none() {
+                event.sender_display_name = Some(sender_name(client, room_id, &event.sender).await);
+            }
+            PushFetchView::Event { event }
+        }
         Ok(NotificationStatus::EventFilteredOut | NotificationStatus::EventRedacted) => {
             PushFetchView::Discard
         }
         Ok(NotificationStatus::EventNotFound) | Err(_) => PushFetchView::Unavailable,
     }
+}
+
+async fn sender_name(client: &Client, room_id: &RoomId, sender: &str) -> String {
+    let request = get_state_event_for_key::v3::Request::new(
+        room_id.to_owned(),
+        StateEventType::RoomMember,
+        sender.to_owned(),
+    );
+    let fetched = client.send(request).await.ok().and_then(|response| {
+        serde_json::from_str::<serde_json::Value>(response.event_or_content.get()).ok()
+    });
+    fetched
+        .as_ref()
+        .map(|value| value.get("content").unwrap_or(value))
+        .and_then(|content| content.get("displayname")?.as_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(sender)
+        .to_owned()
 }
 
 fn push_event_view(item: NotificationItem) -> Option<PushEventView> {
@@ -505,6 +1065,7 @@ fn push_event_view(item: NotificationItem) -> Option<PushEventView> {
         RawNotificationEvent::Invite(raw) => raw.json().get(),
     };
     let mut event: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let noisy = item.is_noisy == Some(true) || item.has_mention == Some(true);
     Some(PushEventView {
         event_type: event.get("type")?.as_str()?.to_owned(),
         content: event
@@ -515,6 +1076,8 @@ fn push_event_view(item: NotificationItem) -> Option<PushEventView> {
         sender_display_name: item.sender_display_name,
         room_name: item.room_computed_display_name,
         room_avatar_url: item.room_avatar_url,
+        encrypted: item.is_room_encrypted == Some(true),
+        noisy,
     })
 }
 
@@ -522,7 +1085,7 @@ pub use crate::push_rules::notifies;
 
 #[must_use]
 pub fn uses_direct_push_rules(room: &matrix_sdk::Room) -> bool {
-    room.active_members_count() == 2
+    room.direct_targets_length() > 0
 }
 
 pub async fn every_encrypted_event_pushed(client: &Client) -> bool {
@@ -542,7 +1105,7 @@ pub async fn notification(
     let notifications = NotificationClient::new(client.clone(), setup).await.ok()?;
 
     match notifications.get_notification(room_id, event_id).await {
-        Ok(NotificationStatus::Event(item)) => {
+        Ok(NotificationStatus::Event(item)) if item.actions.as_deref().is_some_and(notifies) => {
             Some(view(client.user_id()?.to_owned(), room_id, event_id, *item))
         }
         _ => None,
@@ -628,6 +1191,41 @@ pub(crate) fn gateway(url: &str) -> Result<String, CoreError> {
     Ok(parsed.to_string())
 }
 
+#[derive(serde::Serialize)]
+struct ApsOut {
+    #[serde(rename = "mutable-content")]
+    mutable_content: u8,
+}
+
+#[derive(serde::Serialize)]
+struct DefaultPayloadOut {
+    user_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aps: Option<ApsOut>,
+}
+
+/// A gateway that builds the alert itself only starts the iOS notification extension when this asks for it.
+fn default_payload(user_id: String, mutable_content: bool) -> DefaultPayloadOut {
+    DefaultPayloadOut {
+        user_id,
+        aps: mutable_content.then_some(ApsOut { mutable_content: 1 }),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct PusherDataOut {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_payload: Option<DefaultPayloadOut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p256dh: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth: Option<String>,
+}
+
 /// A cold platform notification is built from this payload, and it derives its
 /// identity from `user_id`, so leaving it out stops a running app replacing it.
 /// # Errors
@@ -639,24 +1237,21 @@ pub async fn set_pusher(client: &Client, pusher: PusherView) -> Result<(), CoreE
     if pusher.event_id_only {
         pusher_data.format = Some(PushFormat::EventIdOnly);
     }
-    if let Some(user_id) = client.user_id() {
-        pusher_data
-            .data
-            .insert("user_id".to_owned(), user_id.as_str().into());
-        pusher_data.data.insert(
-            "default_payload".to_owned(),
-            serde_json::json!({ "user_id": user_id.as_str() }),
-        );
-    }
-    if let Some(keys) = pusher.web_push {
-        pusher_data
-            .data
-            .insert("endpoint".to_owned(), keys.endpoint.into());
-        pusher_data
-            .data
-            .insert("p256dh".to_owned(), keys.p256dh.into());
-        pusher_data.data.insert("auth".to_owned(), keys.auth.into());
-    }
+    let user_id = client.user_id().map(ToString::to_string);
+    let (endpoint, p256dh, auth) = pusher.web_push.map_or((None, None, None), |keys| {
+        (Some(keys.endpoint), Some(keys.p256dh), Some(keys.auth))
+    });
+    pusher_data.data = serde_json::to_value(PusherDataOut {
+        default_payload: user_id
+            .clone()
+            .map(|user_id| default_payload(user_id, cfg!(target_os = "ios"))),
+        user_id,
+        endpoint,
+        p256dh,
+        auth,
+    })
+    .and_then(serde_json::from_value)
+    .map_err(|error| error.to_string())?;
 
     client
         .pusher()
@@ -692,15 +1287,16 @@ pub async fn remove_pusher(
 }
 
 const BACKFILL_GRACE_MS: u64 = 60_000;
+pub const NOISY_KEY: &str = "moe.sable.noisy";
 
 #[must_use]
 pub fn is_backfill(
-    session_start: MilliSecondsSinceUnixEpoch,
+    now: MilliSecondsSinceUnixEpoch,
     origin_server_ts: MilliSecondsSinceUnixEpoch,
 ) -> bool {
-    let start: u64 = session_start.get().into();
+    let now: u64 = now.get().into();
     let sent: u64 = origin_server_ts.get().into();
-    sent < start.saturating_sub(BACKFILL_GRACE_MS)
+    sent < now.saturating_sub(BACKFILL_GRACE_MS)
 }
 
 pub async fn is_read(room: &matrix_sdk::Room, sent: MilliSecondsSinceUnixEpoch) -> bool {
@@ -740,10 +1336,14 @@ fn body(event: &NotificationEvent) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::api::push::{PusherView, WebPusherView};
     use matrix_sdk::ruma::events::AnySyncTimelineEvent;
     use matrix_sdk::ruma::push::{ConditionalPushRule, RuleKind, Ruleset};
     use matrix_sdk::ruma::serde::Raw;
-    use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, UInt, owned_device_id, room_id, user_id};
+    use matrix_sdk::ruma::{
+        EventId, MilliSecondsSinceUnixEpoch, UInt, event_id, mxc_uri, owned_device_id, room_id,
+        user_id,
+    };
     use matrix_sdk::test_utils::mocks::MatrixMockServer;
     use matrix_sdk_base::crypto::{
         olm::{Account, EncryptionSettings, InboundGroupSession, OutboundGroupSession, SenderData},
@@ -752,9 +1352,10 @@ mod tests {
     use matrix_sdk_test::JoinedRoomBuilder;
     use serde_json::json;
 
+    use super::push_cache::cold_host;
     use super::{
-        ColdPush, cold_push_store_dir, decrypt_cold_push, fetch_cold_push_event, gateway,
-        is_backfill, push_account, restore_push_client,
+        ColdPush, PushHost, cold_push_store_dir, decrypt_cold_push, fetch_cold_push_event, gateway,
+        is_backfill, push_account, push_host, restore_push_client,
     };
     use crate::preview::describe;
     use crate::protocol::PushFetchView;
@@ -765,9 +1366,57 @@ mod tests {
         MilliSecondsSinceUnixEpoch(UInt::from(millis))
     }
 
+    #[test]
+    fn an_ios_default_payload_asks_for_the_notification_extension() {
+        use super::default_payload;
+        assert_eq!(
+            serde_json::to_value(default_payload("@a:b".to_owned(), true)).unwrap(),
+            json!({ "user_id": "@a:b", "aps": { "mutable-content": 1 } })
+        );
+        assert_eq!(
+            serde_json::to_value(default_payload("@a:b".to_owned(), false)).unwrap(),
+            json!({ "user_id": "@a:b" })
+        );
+    }
+
+    #[test]
+    fn pusher_data_omits_what_is_absent_and_nests_the_default_payload() {
+        use super::{DefaultPayloadOut, PusherDataOut};
+        assert_eq!(
+            serde_json::to_value(PusherDataOut {
+                user_id: Some("@a:b".to_owned()),
+                default_payload: Some(DefaultPayloadOut {
+                    user_id: "@a:b".to_owned(),
+                    aps: None,
+                }),
+                endpoint: Some("https://push.example/sub".to_owned()),
+                p256dh: Some("key".to_owned()),
+                auth: Some("secret".to_owned()),
+            })
+            .unwrap(),
+            json!({
+                "user_id": "@a:b",
+                "default_payload": { "user_id": "@a:b" },
+                "endpoint": "https://push.example/sub",
+                "p256dh": "key",
+                "auth": "secret",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(PusherDataOut {
+                user_id: None,
+                default_payload: None,
+                endpoint: None,
+                p256dh: None,
+                auth: None,
+            })
+            .unwrap(),
+            json!({})
+        );
+    }
+
     #[tokio::test]
     async fn pushers_use_the_current_device_name() {
-        use crate::protocol::{PusherView, WebPusherView};
         use matrix_sdk::test_utils::client::MockClientBuilder;
         use wiremock::matchers::{body_partial_json, method, path};
         use wiremock::{Mock, ResponseTemplate};
@@ -948,37 +1597,7 @@ mod tests {
                     builder.add_joined_room(joined);
                 })
                 .await;
-            let room = room_id!("!cold:example.org");
-            let sender = Account::new(user_id!("@sender:example.org"));
-            let keys = sender.identity_keys();
-            let outbound = OutboundGroupSession::new(
-                owned_device_id!("SENDER"),
-                std::sync::Arc::new(keys),
-                room,
-                EncryptionSettings::default(),
-            )
-            .unwrap();
-            let inbound = InboundGroupSession::new(
-                outbound.sender_key(),
-                keys.ed25519,
-                room,
-                &outbound.session_key().await,
-                SenderData::unknown(),
-                None,
-                EventEncryptionAlgorithm::MegolmV1AesSha2,
-                None,
-                false,
-            )
-            .unwrap();
-            client
-                .olm_machine_for_testing()
-                .await
-                .as_ref()
-                .unwrap()
-                .store()
-                .import_room_keys(vec![inbound.export().await], None, |_, _| ())
-                .await
-                .unwrap();
+            let outbound = shared_room_key(&client).await;
             Self {
                 data_dir,
                 client: Some(client),
@@ -993,7 +1612,6 @@ mod tests {
 
         async fn decrypt(&self, device: &str, event: &str) -> ColdPush {
             decrypt_cold_push(
-                None,
                 &self.data_dir,
                 "@alice:example.org",
                 device,
@@ -1006,7 +1624,6 @@ mod tests {
 
         async fn decrypt_locally(&self, event: &str) -> ColdPush {
             decrypt_cold_push(
-                None,
                 &self.data_dir,
                 "@alice:example.org",
                 "A",
@@ -1020,12 +1637,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_cold_push_decrypts_from_androids_persisted_store() {
-        let mut fixture = ColdFixture::new(
-            "store",
-            JoinedRoomBuilder::new(room_id!("!cold:example.org")),
-            None,
-        )
-        .await;
+        let mut fixture = ColdFixture::new("store", cold_room_with_members(), None).await;
         let event = fixture
             .push(
                 "m.room.message",
@@ -1052,6 +1664,293 @@ mod tests {
         assert!(!fixture.data_dir.join("session.json").exists());
 
         tokio::fs::remove_dir_all(&fixture.data_dir).await.unwrap();
+    }
+
+    async fn shared_room_key(client: &matrix_sdk::Client) -> OutboundGroupSession {
+        let room = room_id!("!cold:example.org");
+        let sender = Account::new(user_id!("@sender:example.org"));
+        let keys = sender.identity_keys();
+        let outbound = OutboundGroupSession::new(
+            owned_device_id!("SENDER"),
+            std::sync::Arc::new(keys),
+            room,
+            EncryptionSettings::default(),
+        )
+        .unwrap();
+        let inbound = InboundGroupSession::new(
+            outbound.sender_key(),
+            keys.ed25519,
+            room,
+            &outbound.session_key().await,
+            SenderData::unknown(),
+            None,
+            EventEncryptionAlgorithm::MegolmV1AesSha2,
+            None,
+            false,
+        )
+        .unwrap();
+        client
+            .olm_machine_for_testing()
+            .await
+            .as_ref()
+            .unwrap()
+            .store()
+            .import_room_keys(vec![inbound.export().await], None, |_, _| ())
+            .await
+            .unwrap();
+        outbound
+    }
+
+    async fn saved_login(
+        server: &MatrixMockServer,
+        data_dir: &std::path::Path,
+    ) -> crate::session::PersistedAccount {
+        let session = serde_json::from_value(json!({
+            "homeserver": server.uri(), "resolved_homeserver": server.uri(),
+            "credentials": {"kind": "password", "user_id": "@alice:example.org",
+                "device_id": "A", "access_token": "test-token"}
+        }))
+        .unwrap();
+        saved_login_as(data_dir, session).await
+    }
+
+    async fn saved_login_as(
+        data_dir: &std::path::Path,
+        session: PersistedSession,
+    ) -> crate::session::PersistedAccount {
+        let base = cold_push_store_dir(data_dir);
+        let mut registry = crate::session::AccountRegistry::empty();
+        let (account_id, store_id) = registry.allocate_account(base.to_str().unwrap());
+        registry.upsert(crate::session::PersistedAccount {
+            account_id,
+            store_id,
+            session,
+            needs_reauth: false,
+            device_invalidated: false,
+        });
+        FileSessionStore::new(&base)
+            .save(serde_json::to_vec(&registry).unwrap())
+            .await
+            .unwrap();
+        let account = registry.accounts.remove(0);
+        let seeded = crate::session::restore_client(&account.store_id, &account.session, true)
+            .await
+            .unwrap();
+        crate::session::restore_credentials(&seeded, &account.session)
+            .await
+            .unwrap();
+        account
+    }
+
+    fn core_of(data_dir: &std::path::Path) -> std::sync::Arc<crate::Core> {
+        let base = cold_push_store_dir(data_dir);
+        crate::Core::new(
+            base.to_str().unwrap(),
+            Box::new(FileSessionStore::new(&base)),
+        )
+        .0
+    }
+
+    async fn waits_for(lease_holder: impl FnOnce(), store_id: &str) {
+        let opening = tokio::spawn({
+            let store_id = store_id.to_owned();
+            async move { drop(crate::session::store_lease(&store_id).await) }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!opening.is_finished());
+        lease_holder();
+        tokio::time::timeout(std::time::Duration::from_secs(5), opening)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_push_decrypts_on_the_client_the_core_opens_for_its_login() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let server = MatrixMockServer::new().await;
+        server.mock_versions().ok().mount().await;
+        let account = saved_login(&server, data_dir.path()).await;
+        let core = core_of(data_dir.path());
+        let lease = crate::session::store_lease(&account.store_id).await;
+        let client = core.saved_account_client(&account, &lease).await.unwrap();
+        drop(lease);
+        server
+            .mock_sync()
+            .ok_and_run(&client, |builder| {
+                builder.add_joined_room(cold_room_with_members());
+            })
+            .await;
+        let outbound = shared_room_key(&client).await;
+        let event = encrypted_push(
+            &outbound,
+            "m.room.message",
+            json!({"msgtype":"m.text", "body":"Shared preview"}),
+        )
+        .await;
+        let held = crate::session::base_client(&account.store_id).unwrap();
+
+        let decrypted = decrypt_cold_push(
+            data_dir.path(),
+            "@alice:example.org",
+            "A",
+            COLD_ROOM,
+            &event,
+            true,
+        )
+        .await;
+
+        assert!(matches!(decrypted, ColdPush::Clear(_)));
+        assert!(std::sync::Arc::ptr_eq(
+            &held,
+            &crate::session::base_client(&account.store_id)
+                .expect("the core's client still owns the store"),
+        ));
+    }
+
+    #[tokio::test]
+    async fn pusher_upkeep_uses_the_client_of_the_core_in_the_process() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let server = MatrixMockServer::new().await;
+        server.mock_versions().ok().mount().await;
+        let account = saved_login(&server, data_dir.path()).await;
+        let core = core_of(data_dir.path());
+
+        let upkeep = restore_push_client(
+            &cold_push_store_dir(data_dir.path()),
+            "@alice:example.org",
+            "A",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            core.account_clients
+                .lock()
+                .await
+                .contains_key(&account.account_id)
+        );
+        assert!(crate::session::base_client(&account.store_id).is_some());
+        drop(upkeep);
+    }
+
+    #[tokio::test]
+    async fn a_core_does_not_wait_for_a_push_that_opened_the_store_before_it() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let server = MatrixMockServer::new().await;
+        server.mock_versions().ok().mount().await;
+        let account = saved_login(&server, data_dir.path()).await;
+        let cold = restore_push_client(
+            &cold_push_store_dir(data_dir.path()),
+            "@alice:example.org",
+            "A",
+        )
+        .await
+        .unwrap();
+        let base = cold_push_store_dir(data_dir.path());
+        let (core, _) = crate::Core::new(
+            base.to_str().unwrap(),
+            Box::new(crate::store::ExclusiveFileSessionStore::new(&base)),
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let accounts = core.accounts().await.unwrap();
+            let lease = crate::session::store_lease(&account.store_id).await;
+            core.saved_account_client(&accounts.accounts[0], &lease)
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("the core opens beside a running push");
+        drop(cold);
+    }
+
+    #[tokio::test]
+    async fn the_core_cannot_activate_a_login_while_a_push_runs_on_its_client() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let server = MatrixMockServer::new().await;
+        server.mock_versions().ok().mount().await;
+        let account = saved_login(&server, data_dir.path()).await;
+        let _core = core_of(data_dir.path());
+        let host = push_host(
+            &cold_push_store_dir(data_dir.path()),
+            "@alice:example.org",
+            "A",
+            matrix_sdk::store::RoomLoadSettings::default(),
+        )
+        .await;
+        assert!(matches!(host, Some(PushHost::Shared { .. })));
+
+        waits_for(|| drop(host), &account.store_id).await;
+    }
+
+    #[tokio::test]
+    async fn pushes_reuse_one_restored_client() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let server = MatrixMockServer::new().await;
+        server.mock_versions().ok().mount().await;
+        saved_login(&server, data_dir.path()).await;
+        let store_dir = cold_push_store_dir(data_dir.path());
+
+        let first = cold_host(&store_dir, "@alice:example.org", "A").await;
+        assert!(matches!(first.as_deref(), Some(PushHost::Own(_))));
+        drop(first);
+        // A second restore could not find the login any more.
+        tokio::fs::remove_file(store_dir.join("session.json"))
+            .await
+            .unwrap();
+        assert!(
+            cold_host(&store_dir, "@alice:example.org", "A")
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cache_gives_way_to_a_starting_core() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let server = MatrixMockServer::new().await;
+        server.mock_versions().ok().mount().await;
+        saved_login(&server, data_dir.path()).await;
+        let store_dir = cold_push_store_dir(data_dir.path());
+        drop(cold_host(&store_dir, "@alice:example.org", "A").await);
+
+        let core = core_of(data_dir.path());
+        let host = cold_host(&store_dir, "@alice:example.org", "A").await;
+        assert!(matches!(host.as_deref(), Some(PushHost::Shared { .. })));
+        drop(host);
+        drop(core);
+
+        // Only the cached client could still serve the push once the login is gone.
+        tokio::fs::remove_file(store_dir.join("session.json"))
+            .await
+            .unwrap();
+        assert!(
+            cold_host(&store_dir, "@alice:example.org", "A")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_evicted_login_is_restored_from_what_is_saved() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let server = MatrixMockServer::new().await;
+        server.mock_versions().ok().mount().await;
+        saved_login(&server, data_dir.path()).await;
+        let store_dir = cold_push_store_dir(data_dir.path());
+        drop(cold_host(&store_dir, "@alice:example.org", "A").await);
+
+        super::evict_push_cache(&store_dir);
+
+        tokio::fs::remove_file(store_dir.join("session.json"))
+            .await
+            .unwrap();
+        assert!(
+            cold_host(&store_dir, "@alice:example.org", "A")
+                .await
+                .is_none()
+        );
     }
 
     async fn encrypted_push(
@@ -1123,6 +2022,81 @@ mod tests {
         tokio::fs::remove_dir_all(&fixture.data_dir).await.unwrap();
     }
 
+    fn cold_room_without_me() -> JoinedRoomBuilder {
+        let factory = matrix_sdk_test::event_factory::EventFactory::new()
+            .room(room_id!("!cold:example.org"))
+            .sender(user_id!("@sender:example.org"));
+        JoinedRoomBuilder::new(room_id!("!cold:example.org"))
+            .add_state_event(factory.member(user_id!("@sender:example.org")))
+            .add_state_event(factory.default_power_levels())
+    }
+
+    #[tokio::test]
+    async fn a_cold_push_without_our_membership_follows_the_push_rules() {
+        use matrix_sdk::ruma::push::{NewPushRule, NewSimplePushRule};
+
+        let mut rules = Ruleset::server_default(user_id!("@alice:example.org"));
+        rules
+            .insert(
+                NewPushRule::Room(NewSimplePushRule::new(
+                    room_id!("!cold:example.org").to_owned(),
+                    vec![],
+                )),
+                None,
+                None,
+            )
+            .unwrap();
+        let fixture = ColdFixture::new("no-member", cold_room_without_me(), Some(rules)).await;
+        let sticker = fixture
+            .push(
+                "m.sticker",
+                json!({"body": "wave", "url": "mxc://example.org/wave", "info": {}}),
+            )
+            .await;
+
+        assert_eq!(fixture.decrypt("A", &sticker).await, ColdPush::Unevaluated);
+        tokio::fs::remove_dir_all(&fixture.data_dir).await.unwrap();
+
+        let fixture = ColdFixture::new("fetched-member", cold_room_without_me(), None).await;
+        let factory =
+            matrix_sdk_test::event_factory::EventFactory::new().room(room_id!("!cold:example.org"));
+        fixture
+            .server
+            .mock_get_members()
+            .ok(vec![
+                factory.member(user_id!("@alice:example.org")).into_raw(),
+                factory.member(user_id!("@sender:example.org")).into_raw(),
+            ])
+            .mount()
+            .await;
+        let message = fixture
+            .push(
+                "m.room.message",
+                json!({"msgtype":"m.text", "body":"hello"}),
+            )
+            .await;
+
+        assert!(matches!(
+            fixture.decrypt("A", &message).await,
+            ColdPush::Clear(_)
+        ));
+        tokio::fs::remove_dir_all(&fixture.data_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cold_push_whose_rules_cannot_be_evaluated_is_not_a_plain_discard() {
+        let fixture = ColdFixture::new("unevaluated", cold_room_without_me(), None).await;
+        let message = fixture
+            .push(
+                "m.room.message",
+                json!({"msgtype":"m.text", "body":"hello"}),
+            )
+            .await;
+
+        assert_eq!(fixture.decrypt("A", &message).await, ColdPush::Unevaluated);
+        tokio::fs::remove_dir_all(&fixture.data_dir).await.unwrap();
+    }
+
     #[tokio::test]
     async fn a_cold_push_in_an_all_messages_room_is_shown_under_a_mentions_default() {
         use matrix_sdk::ruma::push::{NewPushRule, NewSimplePushRule, PredefinedUnderrideRuleId};
@@ -1156,10 +2130,41 @@ mod tests {
         let ColdPush::Clear(clear) = fixture.decrypt("A", &message).await else {
             panic!("an all-messages room must still notify");
         };
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&clear).unwrap()["content"]["body"],
-            "hello"
-        );
+        let clear = serde_json::from_str::<serde_json::Value>(&clear).unwrap();
+        assert_eq!(clear["content"]["body"], "hello");
+        assert_eq!(clear.get(super::NOISY_KEY), None);
+        tokio::fs::remove_dir_all(&fixture.data_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cold_push_whose_rule_rings_is_marked_noisy() {
+        use matrix_sdk::ruma::push::{Action, NewPushRule, NewSimplePushRule, Tweak};
+
+        let mut rules = Ruleset::server_default(user_id!("@alice:example.org"));
+        rules
+            .insert(
+                NewPushRule::Room(NewSimplePushRule::new(
+                    room_id!("!cold:example.org").to_owned(),
+                    vec![
+                        Action::Notify,
+                        Action::SetTweak(Tweak::Sound("default".into())),
+                    ],
+                )),
+                None,
+                None,
+            )
+            .unwrap();
+        let fixture = ColdFixture::new("noisy", cold_room_with_members(), Some(rules)).await;
+        let message = fixture
+            .push("m.room.message", json!({"msgtype":"m.text", "body":"ring"}))
+            .await;
+
+        let ColdPush::Clear(clear) = fixture.decrypt("A", &message).await else {
+            panic!("a ringing room must notify");
+        };
+        let clear = serde_json::from_str::<serde_json::Value>(&clear).unwrap();
+        assert_eq!(clear["content"]["body"], "ring");
+        assert_eq!(clear[super::NOISY_KEY], true);
         tokio::fs::remove_dir_all(&fixture.data_dir).await.unwrap();
     }
 
@@ -1208,28 +2213,8 @@ mod tests {
     }
 
     async fn fetch(fixture: &ColdFixture, device: &str, event: serde_json::Value) -> PushFetchView {
-        use matrix_sdk::ruma::api::client::sync::sync_events::v5;
-
-        let mut room = v5::response::Room::new();
-        room.initial = Some(true);
-        room.timeline = vec![Raw::from_json_string(event.to_string()).unwrap()];
-        let mut response = v5::Response::new("1".to_owned());
-        response.rooms =
-            std::collections::BTreeMap::from([(room_id!("!cold:example.org").to_owned(), room)]);
-        let _sync = fixture
-            .server
-            .mock_sliding_sync()
-            .ok(response)
-            .mount_as_scoped()
-            .await;
-        let _encryption = fixture
-            .server
-            .mock_room_state_encryption()
-            .plain()
-            .mount_as_scoped()
-            .await;
+        let _mocks = mount_fetch(fixture, &event).await;
         fetch_cold_push_event(
-            None,
             &fixture.data_dir,
             "@alice:example.org",
             device,
@@ -1237,6 +2222,93 @@ mod tests {
             event["event_id"].as_str().unwrap(),
         )
         .await
+    }
+
+    async fn mount_fetch(
+        fixture: &ColdFixture,
+        event: &serde_json::Value,
+    ) -> (wiremock::MockGuard, wiremock::MockGuard) {
+        mount_fetch_with(fixture, event, true).await
+    }
+
+    async fn mount_fetch_with(
+        fixture: &ColdFixture,
+        event: &serde_json::Value,
+        own_member: bool,
+    ) -> (wiremock::MockGuard, wiremock::MockGuard) {
+        use matrix_sdk::ruma::api::client::sync::sync_events::v5;
+
+        let mut room = v5::response::Room::new();
+        room.initial = Some(true);
+        room.timeline = vec![Raw::from_json_string(event.to_string()).unwrap()];
+        room.required_state = own_member
+            .then(|| {
+                matrix_sdk_test::event_factory::EventFactory::new()
+                    .room(room_id!("!cold:example.org"))
+                    .member(user_id!("@alice:example.org"))
+                    .into_raw()
+            })
+            .into_iter()
+            .collect();
+        let mut response = v5::Response::new("1".to_owned());
+        response.rooms =
+            std::collections::BTreeMap::from([(room_id!("!cold:example.org").to_owned(), room)]);
+        let sync = fixture
+            .server
+            .mock_sliding_sync()
+            .ok(response)
+            .mount_as_scoped()
+            .await;
+        let encryption = fixture
+            .server
+            .mock_room_state_encryption()
+            .plain()
+            .mount_as_scoped()
+            .await;
+        (sync, encryption)
+    }
+
+    #[tokio::test]
+    async fn a_pushed_event_whose_rules_cannot_be_evaluated_is_still_fetched() {
+        let fixture = ColdFixture::new("fetch-unevaluated", cold_room_without_me(), None).await;
+        let message = json!({"type": "m.room.message", "event_id": "$unevaluated",
+            "sender": "@sender:example.org", "origin_server_ts": 1,
+            "content": {"msgtype": "m.text", "body": "rules unknown"}});
+        let _mocks = mount_fetch_with(&fixture, &message, false).await;
+
+        let fetched = fetch_cold_push_event(
+            &fixture.data_dir,
+            "@alice:example.org",
+            "A",
+            COLD_ROOM,
+            "$unevaluated",
+        )
+        .await;
+
+        assert!(
+            matches!(fetched, PushFetchView::Event { .. }),
+            "{fetched:?}"
+        );
+        tokio::fs::remove_dir_all(&fixture.data_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_push_is_fetched_while_another_process_holds_the_store() {
+        let fixture = ColdFixture::new("held", cold_room_with_members(), None).await;
+        let app = FileSessionStore::try_exclusive(cold_push_store_dir(&fixture.data_dir))
+            .unwrap()
+            .unwrap();
+        let message = json!({"type": "m.room.message", "event_id": "$extension",
+            "sender": "@sender:example.org", "origin_server_ts": 1,
+            "content": {"msgtype": "m.text", "body": "while the app runs"}});
+
+        let PushFetchView::Event { event } = fetch(&fixture, "A", message).await else {
+            panic!("a push must be fetched beside the app's process");
+        };
+        assert_eq!(event.content["body"], "while the app runs");
+
+        drop(app);
+        tokio::fs::remove_dir_all(&fixture.data_dir).await.unwrap();
     }
 
     #[tokio::test]
@@ -1253,7 +2325,8 @@ mod tests {
         assert_eq!(payload["type"], "m.room.message");
         assert_eq!(payload["content"]["body"], "fetched by id");
         assert_eq!(payload["sender"], "@sender:example.org");
-        assert!(!event.room_name.is_empty());
+        assert_ne!(event.room_name, "");
+        assert!(!event.noisy);
 
         assert!(matches!(
             fetch(&fixture, "OTHER", message).await,
@@ -1264,110 +2337,368 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cold_push_saves_the_tokens_it_refreshes() {
-        use wiremock::{
-            Mock, ResponseTemplate,
-            matchers::{header, method, path},
+    async fn a_fetched_mention_is_noisy() {
+        let fixture = ColdFixture::new("fetch-mention", cold_room_with_members(), None).await;
+        let message = json!({"type": "m.room.message", "event_id": "$mention",
+            "sender": "@sender:example.org", "origin_server_ts": 1,
+            "content": {"msgtype": "m.text", "body": "alice?",
+                "m.mentions": {"user_ids": ["@alice:example.org"]}}});
+
+        let PushFetchView::Event { event } = fetch(&fixture, "A", message).await else {
+            panic!("a mention must notify");
+        };
+        assert!(event.noisy);
+
+        tokio::fs::remove_dir_all(&fixture.data_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn push_media_is_thumbnailed_once_and_reused() {
+        let fixture = ColdFixture::new("media", media_room(None), None).await;
+        let thumbnails = mount_thumbnails(&fixture, 1).await;
+        let image = json!({"msgtype": "m.image", "body": "cat.png",
+            "url": "mxc://example.org/cat"});
+
+        let first = media(&fixture, Some(&image)).await;
+        let read = |path: &str| std::fs::read(path).unwrap();
+        assert_eq!(read(first.sender.as_deref().unwrap()), thumbnails["face"]);
+        assert_eq!(read(first.room.as_deref().unwrap()), thumbnails["lounge"]);
+        assert_eq!(read(first.own_avatar.as_deref().unwrap()), thumbnails["me"]);
+        assert_eq!(first.own_name.as_deref(), Some("Alice"));
+        let image_file = first.image.as_ref().unwrap();
+        assert_eq!(read(&image_file.path), thumbnails["cat"]);
+        assert_eq!(image_file.mimetype, "image/png");
+        let again = media(&fixture, Some(&image)).await;
+        assert_eq!(again.sender, first.sender);
+        assert_eq!(again.image.unwrap().path, image_file.path);
+
+        tokio::fs::remove_dir_all(&fixture.data_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_room_with_media_previews_off_gets_no_push_image() {
+        let off = Raw::from_json_string(
+            json!({"type": "m.media_preview_config", "content": {"media_previews": "off"}})
+                .to_string(),
+        )
+        .unwrap();
+        let fixture = ColdFixture::new("media-off", media_room(Some(off)), None).await;
+        mount_thumbnails(&fixture, 0..=1).await;
+        let image = json!({"msgtype": "m.image", "body": "cat.png",
+            "url": "mxc://example.org/cat"});
+
+        let media = media(&fixture, Some(&image)).await;
+        assert!(media.image.is_none());
+        assert!(media.sender.is_some());
+
+        tokio::fs::remove_dir_all(&fixture.data_dir).await.unwrap();
+    }
+
+    #[test]
+    fn a_push_image_prefers_a_thumbnail_and_skips_large_encrypted_originals() {
+        use matrix_sdk::ruma::events::room::MediaSource;
+
+        let encrypted = |url: &str| {
+            json!({"url": url, "v": "v2", "iv": "AAAAAAAAAAAAAAAAAAAAAA",
+                "hashes": {"sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+                "key": {"kty": "oct", "alg": "A256CTR", "ext": true,
+                    "k": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "key_ops": ["encrypt", "decrypt"]}})
+        };
+        let source = |content: serde_json::Value| match super::message_image(&content) {
+            Some(MediaSource::Plain(url)) => Some(url.to_string()),
+            Some(MediaSource::Encrypted(file)) => Some(file.url.to_string()),
+            None => None,
         };
 
-        let data_dir =
-            std::env::temp_dir().join(format!("sable-cold-push-refresh-{}", std::process::id()));
-        let store_dir = cold_push_store_dir(&data_dir);
-        let server = MatrixMockServer::new().await;
-        server.mock_versions().ok().mount().await;
-        let persisted: PersistedSession = serde_json::from_value(json!({
-            "homeserver": server.uri(), "resolved_homeserver": server.uri(),
-            "credentials": {"kind": "password", "user_id": "@alice:example.org",
-                "device_id": "A", "access_token": "old-access", "refresh_token": "old-refresh"}
-        }))
+        assert_eq!(
+            source(
+                json!({"msgtype": "m.image", "url": "mxc://example.org/full",
+                "info": {"thumbnail_url": "mxc://example.org/small"}})
+            ),
+            Some("mxc://example.org/small".to_owned())
+        );
+        assert_eq!(
+            source(json!({"msgtype": "m.video", "url": "mxc://example.org/clip"})),
+            None
+        );
+        assert_eq!(
+            source(
+                json!({"msgtype": "m.image", "file": encrypted("mxc://example.org/small"),
+                "info": {"size": 1024}})
+            ),
+            Some("mxc://example.org/small".to_owned())
+        );
+        assert_eq!(
+            source(
+                json!({"msgtype": "m.image", "file": encrypted("mxc://example.org/huge"),
+                "info": {"size": 8 * 1024 * 1024}})
+            ),
+            None
+        );
+        assert_eq!(
+            source(
+                json!({"msgtype": "m.image", "url": "mxc://example.org/full",
+                "info": {"thumbnail_file": encrypted("mxc://example.org/unsized")}})
+            ),
+            Some("mxc://example.org/full".to_owned())
+        );
+        assert_eq!(
+            source(json!({"msgtype": "m.video",
+                "info": {"thumbnail_file": encrypted("mxc://example.org/thumb"),
+                    "thumbnail_info": {"size": 2048}}})),
+            Some("mxc://example.org/thumb".to_owned())
+        );
+        assert_eq!(
+            source(json!({"msgtype": "m.image", "file": encrypted("mxc://example.org/unsized")})),
+            None
+        );
+        assert_eq!(source(json!({"msgtype": "m.text", "body": "hi"})), None);
+    }
+
+    #[tokio::test]
+    async fn clearing_push_media_removes_the_cache_and_tolerates_its_absence() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let cache = store_dir.path().join("push-media");
+        tokio::fs::create_dir_all(&cache).await.unwrap();
+        tokio::fs::write(cache.join("preview"), b"decrypted")
+            .await
+            .unwrap();
+
+        super::clear_push_media(store_dir.path()).await;
+        assert!(!cache.exists());
+        super::clear_push_media(store_dir.path()).await;
+    }
+
+    fn media_room(
+        account_data: Option<Raw<matrix_sdk::ruma::events::AnyRoomAccountDataEvent>>,
+    ) -> JoinedRoomBuilder {
+        let factory = matrix_sdk_test::event_factory::EventFactory::new()
+            .room(room_id!("!cold:example.org"))
+            .sender(user_id!("@sender:example.org"));
+        let room = JoinedRoomBuilder::new(room_id!("!cold:example.org"))
+            .add_state_event(
+                factory
+                    .member(user_id!("@alice:example.org"))
+                    .display_name("Alice")
+                    .avatar_url(mxc_uri!("mxc://example.org/me")),
+            )
+            .add_state_event(
+                factory
+                    .member(user_id!("@sender:example.org"))
+                    .avatar_url(mxc_uri!("mxc://example.org/face")),
+            )
+            .add_state_event(
+                factory
+                    .room_avatar()
+                    .url(mxc_uri!("mxc://example.org/lounge")),
+            )
+            .add_state_event(factory.default_power_levels());
+        match account_data {
+            Some(event) => room.add_account_data(event),
+            None => room,
+        }
+    }
+
+    async fn mount_thumbnails(
+        fixture: &ColdFixture,
+        times: impl Into<wiremock::Times> + Clone,
+    ) -> std::collections::HashMap<&'static str, Vec<u8>> {
+        use wiremock::{
+            Mock, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let mut thumbnails = std::collections::HashMap::new();
+        for media in ["face", "lounge", "me", "cat"] {
+            let png = [b"\x89PNG\r\n\x1a\n".as_slice(), media.as_bytes()].concat();
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/_matrix/client/v1/media/thumbnail/example.org/{media}"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(png.clone()))
+                .expect(times.clone())
+                .mount(fixture.server.server())
+                .await;
+            thumbnails.insert(media, png);
+        }
+        thumbnails
+    }
+
+    async fn media(fixture: &ColdFixture, content: Option<&serde_json::Value>) -> super::PushMedia {
+        super::cold_push_media(
+            &fixture.data_dir,
+            "@alice:example.org",
+            "A",
+            COLD_ROOM,
+            Some("@sender:example.org"),
+            content,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn one_push_session_fetches_the_event_and_its_media() {
+        let fixture = ColdFixture::new("session", media_room(None), None).await;
+        let thumbnails = mount_thumbnails(&fixture, 0..=1).await;
+        let message = json!({"type": "m.room.message", "event_id": "$session",
+            "sender": "@sender:example.org", "origin_server_ts": 1,
+            "content": {"msgtype": "m.image", "body": "cat.png", "url": "mxc://example.org/cat"}});
+        let _sync = mount_fetch(&fixture, &message).await;
+
+        let session = super::PushSession::open(
+            &cold_push_store_dir(&fixture.data_dir),
+            "@alice:example.org",
+            "A",
+            COLD_ROOM,
+        )
+        .await
         .unwrap();
-        let seeded = crate::session::restore_client(store_dir.to_str().unwrap(), &persisted, true)
+        let PushFetchView::Event { event } = session.fetch("$session").await else {
+            panic!("the session must fetch the pushed event");
+        };
+        let media = session
+            .media(Some(&event.sender), Some(&event.content))
+            .await;
+        assert_eq!(
+            std::fs::read(media.image.unwrap().path).unwrap(),
+            thumbnails["cat"]
+        );
+
+        drop(session);
+        tokio::fs::remove_dir_all(&fixture.data_dir).await.unwrap();
+    }
+
+    async fn session(fixture: &ColdFixture) -> super::PushSession {
+        super::cold_push_session(&fixture.data_dir, "@alice:example.org", "A", COLD_ROOM)
             .await
-            .unwrap();
-        crate::session::restore_credentials(&seeded, &persisted)
-            .await
-            .unwrap();
-        drop(seeded);
-        let store = FileSessionStore::new(&store_dir);
-        store
-            .save(serde_json::to_vec(&persisted).unwrap())
-            .await
-            .unwrap();
-        Mock::given(method("POST"))
-            .and(path("/_matrix/client/v3/refresh"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                json!({"access_token": "new-access", "refresh_token": "new-refresh"}),
+            .unwrap()
+    }
+
+    async fn mount_notified_event(fixture: &ColdFixture, thread_root: Option<&EventId>) {
+        let message = matrix_sdk_test::event_factory::EventFactory::new()
+            .room(room_id!("!cold:example.org"))
+            .sender(user_id!("@sender:example.org"))
+            .text_msg("hi")
+            .event_id(event_id!("$notified"));
+        let message = match thread_root {
+            Some(root) => message.in_thread(root, root),
+            None => message,
+        };
+        fixture
+            .server
+            .mock_room_event()
+            .expect_access_token("test-token")
+            .match_event_id()
+            .ok(message.into_event())
+            .mount()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_notification_reply_sends_the_text_then_reads_the_main_timeline() {
+        use matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType;
+        use matrix_sdk::ruma::events::receipt::ReceiptThread;
+
+        let fixture = ColdFixture::new("reply", media_room(None), None).await;
+        mount_notified_event(&fixture, None).await;
+        fixture
+            .server
+            .mock_room_state_encryption()
+            .expect_access_token("test-token")
+            .plain()
+            .mount()
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path_regex(
+                r"^/_matrix/client/v3/rooms/.*/send/m\.room\.message/reply-1$",
             ))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"msgtype": "m.text", "body": "on my way"}),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(json!({"event_id": "$reply"})),
+            )
             .expect(1)
-            .mount(server.server())
+            .mount(fixture.server.server())
+            .await;
+        fixture
+            .server
+            .mock_send_receipt(ReceiptType::Read)
+            .expect_access_token("test-token")
+            .match_thread(ReceiptThread::Main)
+            .match_event_id(event_id!("$notified"))
+            .ok()
+            .expect(1)
+            .mount()
             .await;
 
-        let client = restore_push_client(&store_dir, "@alice:example.org", "A")
-            .await
-            .unwrap();
-        Mock::given(method("GET"))
-            .and(path("/_matrix/client/v3/account/whoami"))
-            .and(header("authorization", "Bearer old-access"))
-            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
-                "errcode": "M_UNKNOWN_TOKEN", "error": "expired"
-            })))
-            .mount(server.server())
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/_matrix/client/v3/account/whoami"))
-            .and(header("authorization", "Bearer new-access"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "user_id": "@alice:example.org", "device_id": "A"
-            })))
-            .mount(server.server())
-            .await;
-        client.retry(|| client.whoami()).await.unwrap();
-
-        let saved = store.load().await.unwrap().unwrap();
-        let (accounts, _) =
-            crate::session::AccountRegistry::from_bytes(&saved, store_dir.to_str().unwrap())
-                .unwrap();
-        let session = serde_json::to_value(&accounts.accounts[0].session).unwrap();
-        assert_eq!(session["credentials"]["refresh_token"], "new-refresh");
         assert!(
-            FileSessionStore::try_exclusive(&store_dir)
-                .unwrap()
-                .is_none()
-        );
-        let lingering = client.client.clone();
-        drop(client);
-        assert!(
-            FileSessionStore::try_exclusive(&store_dir)
-                .unwrap()
-                .is_some()
+            session(&fixture)
+                .await
+                .reply("on my way", "reply-1", "$notified", false,)
+                .await
         );
 
-        drop(lingering);
-        tokio::fs::remove_dir_all(&data_dir).await.unwrap();
+        tokio::fs::remove_dir_all(&fixture.data_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_notification_mark_read_stays_in_the_events_thread_and_privacy() {
+        use matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType;
+        use matrix_sdk::ruma::events::receipt::ReceiptThread;
+
+        let fixture = ColdFixture::new("mark-read", media_room(None), None).await;
+        let root = event_id!("$root");
+        mount_notified_event(&fixture, Some(root)).await;
+        fixture
+            .server
+            .mock_send_receipt(ReceiptType::ReadPrivate)
+            .expect_access_token("test-token")
+            .match_thread(ReceiptThread::Thread(root.to_owned()))
+            .match_event_id(event_id!("$notified"))
+            .ok()
+            .expect(1)
+            .mount()
+            .await;
+
+        assert!(session(&fixture).await.mark_read("$notified", true,).await);
+
+        tokio::fs::remove_dir_all(&fixture.data_dir).await.unwrap();
+    }
+
+    const OAUTH_USER: &str = "@example:localhost";
+    const OAUTH_DEVICE: &str = "DEVICEID";
+
+    fn oauth_session(server: &MatrixMockServer) -> PersistedSession {
+        use matrix_sdk::test_utils::client::{mock_prev_session_tokens_with_refresh, oauth};
+
+        PersistedSession {
+            oauth_issuer: None,
+            oauth_redirect_uri: None,
+            resolved_homeserver: Some(server.uri().parse().unwrap()),
+            homeserver: server.uri(),
+            credentials: crate::session::Credentials::oauth(oauth::mock_session(
+                mock_prev_session_tokens_with_refresh(),
+            )),
+        }
     }
 
     async fn seeded_cold_store(
-        server: &MatrixMockServer,
+        persisted: &PersistedSession,
         name: &str,
     ) -> (std::path::PathBuf, std::path::PathBuf, FileSessionStore) {
         let data_dir = std::env::temp_dir().join(format!("sable-{name}-{}", std::process::id()));
         let store_dir = cold_push_store_dir(&data_dir);
-        let persisted: PersistedSession = serde_json::from_value(json!({
-            "homeserver": server.uri(), "resolved_homeserver": server.uri(),
-            "credentials": {"kind": "password", "user_id": "@alice:example.org",
-                "device_id": "A", "access_token": "old-access", "refresh_token": "old-refresh"}
-        }))
-        .unwrap();
-        let seeded = crate::session::restore_client(store_dir.to_str().unwrap(), &persisted, true)
+        let seeded = crate::session::restore_client(store_dir.to_str().unwrap(), persisted, true)
             .await
             .unwrap();
-        crate::session::restore_credentials(&seeded, &persisted)
+        crate::session::restore_credentials(&seeded, persisted)
             .await
             .unwrap();
         drop(seeded);
         let store = FileSessionStore::new(&store_dir);
         store
-            .save(serde_json::to_vec(&persisted).unwrap())
+            .save(serde_json::to_vec(persisted).unwrap())
             .await
             .unwrap();
         (data_dir, store_dir, store)
@@ -1378,43 +2709,92 @@ mod tests {
         let (accounts, _) =
             crate::session::AccountRegistry::from_bytes(&saved, store_dir.to_str().unwrap())
                 .unwrap();
-        let session = serde_json::to_value(&accounts.accounts[0].session).unwrap();
-        session["credentials"]["refresh_token"]
-            .as_str()
+        let account = &accounts.accounts[0];
+        crate::credentials::LoginTokens::new(store_dir)
+            .load(
+                &account.account_id,
+                &account.session.credentials.device_id(),
+            )
+            .unwrap_or_else(|| account.session.credentials.tokens())
+            .refresh_token
             .unwrap()
-            .to_owned()
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_cold_push_cut_short_still_saves_the_rotated_tokens() {
+    async fn mount_oauth_refresh(
+        server: &MatrixMockServer,
+        expected: u64,
+        delay: std::time::Duration,
+    ) {
+        use wiremock::{
+            Mock, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        server.oauth().mock_server_metadata().ok().mount().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"access_token": "new-access", "expires_in": 300,
+                        "refresh_token": "new-refresh", "token_type": "Bearer"}))
+                    .set_delay(delay),
+            )
+            .expect(expected)
+            .mount(server.server())
+            .await;
+    }
+
+    async fn mount_whoami(server: &MatrixMockServer) {
         use wiremock::{
             Mock, ResponseTemplate,
             matchers::{header, method, path},
         };
 
-        let server = MatrixMockServer::new().await;
-        server.mock_versions().ok().mount().await;
-        let (data_dir, store_dir, store) = seeded_cold_store(&server, "cold-push-cut-short").await;
-        Mock::given(method("POST"))
-            .and(path("/_matrix/client/v3/refresh"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(
-                        json!({"access_token": "new-access", "refresh_token": "new-refresh"}),
-                    )
-                    .set_delay(std::time::Duration::from_millis(1500)),
-            )
-            .expect(1)
-            .mount(server.server())
-            .await;
         Mock::given(method("GET"))
             .and(path("/_matrix/client/v3/account/whoami"))
-            .and(header("authorization", "Bearer old-access"))
+            .and(header("authorization", "Bearer prev-access-token"))
             .respond_with(ResponseTemplate::new(401).set_body_json(json!({
                 "errcode": "M_UNKNOWN_TOKEN", "error": "expired"
             })))
             .mount(server.server())
             .await;
+        Mock::given(method("GET"))
+            .and(path("/_matrix/client/v3/account/whoami"))
+            .and(header("authorization", "Bearer new-access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "user_id": OAUTH_USER, "device_id": OAUTH_DEVICE
+            })))
+            .mount(server.server())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_cold_push_saves_the_tokens_it_refreshes() {
+        let server = MatrixMockServer::new().await;
+        server.mock_versions().ok().mount().await;
+        let (data_dir, store_dir, store) =
+            seeded_cold_store(&oauth_session(&server), "cold-push-refresh").await;
+        mount_oauth_refresh(&server, 1, std::time::Duration::ZERO).await;
+        mount_whoami(&server).await;
+
+        let client = restore_push_client(&store_dir, OAUTH_USER, OAUTH_DEVICE)
+            .await
+            .unwrap();
+        client.retry(|| client.whoami()).await.unwrap();
+
+        assert_eq!(saved_refresh_token(&store, &store_dir).await, "new-refresh");
+        drop(client);
+        tokio::fs::remove_dir_all(&data_dir).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cold_push_cut_short_still_saves_the_rotated_tokens() {
+        let server = MatrixMockServer::new().await;
+        server.mock_versions().ok().mount().await;
+        let (data_dir, store_dir, store) =
+            seeded_cold_store(&oauth_session(&server), "cold-push-cut-short").await;
+        mount_oauth_refresh(&server, 1, std::time::Duration::from_millis(1500)).await;
+        mount_whoami(&server).await;
 
         let cold_dir = store_dir.clone();
         tokio::task::spawn_blocking(move || {
@@ -1425,7 +2805,7 @@ mod tests {
                 .block_on(super::settle_refreshes(tokio::time::timeout(
                     std::time::Duration::from_millis(500),
                     async {
-                        let client = restore_push_client(&cold_dir, "@alice:example.org", "A")
+                        let client = restore_push_client(&cold_dir, OAUTH_USER, OAUTH_DEVICE)
                             .await
                             .unwrap();
                         let _ = client.retry(|| client.whoami()).await;
@@ -1449,24 +2829,18 @@ mod tests {
 
         let server = MatrixMockServer::new().await;
         server.mock_versions().ok().mount().await;
-        let (data_dir, store_dir, store) = seeded_cold_store(&server, "cold-push-live-token").await;
+        let (data_dir, store_dir, store) =
+            seeded_cold_store(&oauth_session(&server), "cold-push-live-token").await;
         Mock::given(method("GET"))
             .and(path("/_matrix/client/v3/account/whoami"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "user_id": "@alice:example.org", "device_id": "A"
+                "user_id": OAUTH_USER, "device_id": OAUTH_DEVICE
             })))
             .mount(server.server())
             .await;
-        Mock::given(method("POST"))
-            .and(path("/_matrix/client/v3/refresh"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                json!({"access_token": "new-access", "refresh_token": "new-refresh"}),
-            ))
-            .expect(0)
-            .mount(server.server())
-            .await;
+        mount_oauth_refresh(&server, 0, std::time::Duration::ZERO).await;
 
-        let client = restore_push_client(&store_dir, "@alice:example.org", "A")
+        let client = restore_push_client(&store_dir, OAUTH_USER, OAUTH_DEVICE)
             .await
             .unwrap();
         client
@@ -1474,36 +2848,32 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(saved_refresh_token(&store, &store_dir).await, "old-refresh");
+        assert_eq!(
+            saved_refresh_token(&store, &store_dir).await,
+            "prev-refresh-token"
+        );
         drop(client);
         tokio::fs::remove_dir_all(&data_dir).await.unwrap();
     }
 
     #[tokio::test]
-    async fn a_cold_client_does_not_refresh_while_the_foreground_owns_credentials() {
+    async fn a_push_client_never_refreshes_a_password_session() {
         use wiremock::{
             Mock, ResponseTemplate,
             matchers::{method, path},
         };
-        let dir = tempfile::tempdir().unwrap();
+
         let server = MatrixMockServer::new().await;
         server.mock_versions().ok().mount().await;
-        let store = FileSessionStore::exclusive(dir.path()).unwrap();
         let persisted: PersistedSession = serde_json::from_value(json!({
             "homeserver": server.uri(), "resolved_homeserver": server.uri(),
             "credentials": {"kind": "password", "user_id": "@alice:example.org",
                 "device_id": "A", "access_token": "old-access", "refresh_token": "old-refresh"}
         }))
         .unwrap();
-        let seeded = crate::session::restore_client(dir.path().to_str().unwrap(), &persisted, true)
-            .await
-            .unwrap();
-        crate::session::restore_credentials(&seeded, &persisted)
-            .await
-            .unwrap();
-        drop(seeded);
-        let bytes = serde_json::to_vec(&persisted).unwrap();
-        store.save(bytes.clone()).await.unwrap();
+        let (data_dir, store_dir, store) =
+            seeded_cold_store(&persisted, "cold-push-password").await;
+        let saved = store.load().await.unwrap();
         Mock::given(method("GET"))
             .and(path("/_matrix/client/v3/account/whoami"))
             .respond_with(
@@ -1521,11 +2891,105 @@ mod tests {
             .expect(0)
             .mount(server.server())
             .await;
-        let client = restore_push_client(dir.path(), "@alice:example.org", "A")
+
+        let client = restore_push_client(&store_dir, "@alice:example.org", "A")
             .await
             .unwrap();
         client.retry(|| client.whoami()).await.unwrap_err();
-        assert_eq!(store.load().await.unwrap(), Some(bytes));
+
+        assert_eq!(store.load().await.unwrap(), saved);
+        drop(client);
+        tokio::fs::remove_dir_all(&data_dir).await.unwrap();
+    }
+
+    struct SharedLogin {
+        _data_dir: tempfile::TempDir,
+        base: std::path::PathBuf,
+        core: std::sync::Arc<crate::Core>,
+        account: crate::session::PersistedAccount,
+        server: MatrixMockServer,
+    }
+
+    impl SharedLogin {
+        async fn new() -> Self {
+            let data_dir = tempfile::tempdir().unwrap();
+            let server = MatrixMockServer::new().await;
+            server.mock_versions().ok().mount().await;
+            mount_oauth_refresh(&server, 1, std::time::Duration::ZERO).await;
+            mount_whoami(&server).await;
+            let account = saved_login_as(data_dir.path(), oauth_session(&server)).await;
+            let core = core_of(data_dir.path());
+            core.accounts().await.unwrap();
+            Self {
+                base: cold_push_store_dir(data_dir.path()),
+                _data_dir: data_dir,
+                core,
+                account,
+                server,
+            }
+        }
+
+        async fn app_client(&self) -> matrix_sdk::Client {
+            let lease = crate::session::store_lease(&self.account.store_id).await;
+            self.core
+                .saved_account_client(&self.account, &lease)
+                .await
+                .unwrap()
+        }
+
+        async fn push_client(&self) -> super::PushClient {
+            super::open_push_client(
+                &self.base,
+                OAUTH_USER,
+                OAUTH_DEVICE,
+                matrix_sdk::store::RoomLoadSettings::default(),
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn saved_refresh_token(&self) -> String {
+            saved_refresh_token(&FileSessionStore::new(&self.base), &self.base).await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_app_picks_up_the_tokens_a_push_client_refreshed() {
+        let login = SharedLogin::new().await;
+        let app = login.app_client().await;
+        let push = login.push_client().await;
+        let registry = std::fs::read(login.base.join("session.json")).unwrap();
+
+        push.retry(|| push.whoami()).await.unwrap();
+        assert_eq!(login.saved_refresh_token().await, "new-refresh");
+        assert_eq!(
+            std::fs::read(login.base.join("session.json")).unwrap(),
+            registry
+        );
+
+        app.oauth().refresh_access_token().await.unwrap();
+        assert_eq!(
+            app.session_tokens().unwrap().refresh_token.as_deref(),
+            Some("new-refresh")
+        );
+        drop((push, login.server));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_push_client_picks_up_the_tokens_the_app_refreshed() {
+        let login = SharedLogin::new().await;
+        let app = login.app_client().await;
+        let push = login.push_client().await;
+
+        app.oauth().refresh_access_token().await.unwrap();
+        assert_eq!(login.saved_refresh_token().await, "new-refresh");
+
+        push.retry(|| push.whoami()).await.unwrap();
+        assert_eq!(
+            push.session_tokens().unwrap().refresh_token.as_deref(),
+            Some("new-refresh")
+        );
+        drop((push, login.server));
     }
 
     fn stub(event_type: &str, content: &serde_json::Value) -> serde_json::Value {
@@ -1583,12 +3047,12 @@ mod tests {
 
     #[test]
     fn a_replayed_event_is_backfill_and_a_recent_one_is_not() {
-        let start = ts(120_000);
-        assert!(is_backfill(start, ts(1_000)));
-        assert!(!is_backfill(start, ts(120_000)));
-        assert!(!is_backfill(start, ts(200_000)));
-        assert!(!is_backfill(start, ts(61_000)));
-        assert!(is_backfill(start, ts(59_000)));
+        let now = ts(120_000);
+        assert!(is_backfill(now, ts(1_000)));
+        assert!(!is_backfill(now, ts(120_000)));
+        assert!(!is_backfill(now, ts(200_000)));
+        assert!(!is_backfill(now, ts(61_000)));
+        assert!(is_backfill(now, ts(59_000)));
     }
 
     #[test]

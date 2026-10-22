@@ -3,7 +3,7 @@ import QuickLRU from 'quick-lru';
 import { CoreError } from '#src/transport';
 import { mediaFailureHold } from '#lib/ui/media-retry.js';
 import type { CoreClient } from '#lib/core/client.svelte.js';
-import type { CoreCommands } from '#lib/core/commands.svelte.js';
+import type { CoreMedia } from '#lib/core/media.svelte.js';
 
 /* Not `SvelteMap`: callers read the cache from inside an effect, so a reactive
    miss re-runs every waiting media element each time any other one resolves. */
@@ -22,7 +22,7 @@ const MAX_OBJECT_URLS = 512;
 const MAX_OBJECT_URL_BYTES = 32 * 1024 * 1024;
 const MAX_MEDIA_METADATA = 512;
 const MEDIA_FAILURE_MEMORY_MS = 30 * 60_000;
-/* A deadline, not a verdict: `Unavailable` covers a blip as well as a 404. */
+/* Failures expire at `until`; `Unavailable` covers a blip as well as a 404. */
 const failures = new QuickLRU<string, { count: number; until: number }>({
   maxSize: MAX_MEDIA_METADATA,
   maxAge: MEDIA_FAILURE_MEMORY_MS,
@@ -74,20 +74,46 @@ export function imageMime(bytes: Uint8Array): string | undefined {
   return undefined;
 }
 
+export function isAnimatedImage(bytes: Uint8Array): boolean {
+  const type = imageMime(bytes);
+  if (type === 'image/gif') return true;
+  const head = new TextDecoder('latin1').decode(bytes);
+  if (type === 'image/png') {
+    const frames = head.indexOf('acTL');
+    return frames !== -1 && (head.indexOf('IDAT') === -1 || frames < head.indexOf('IDAT'));
+  }
+  return type === 'image/webp' && head.startsWith('VP8X', 12) && (bytes[20] & 0x02) !== 0;
+}
+
+function videoMime(bytes: Uint8Array): string | undefined {
+  if (startsWith(bytes, [0x1a, 0x45, 0xdf, 0xa3])) return 'video/webm';
+  if (!startsWith(bytes, [0x66, 0x74, 0x79, 0x70], 4)) return undefined;
+  const brand = String.fromCharCode(...bytes.subarray(8, 12));
+  if (['avif', 'avis', 'heic', 'heix', 'mif1', 'msf1'].includes(brand)) return undefined;
+  return brand === 'qt  ' ? 'video/quicktime' : 'video/mp4';
+}
+
+function blobType(mime: string | null | undefined, bytes: Uint8Array): string {
+  if (mime && mime !== 'application/octet-stream') return mime;
+  return imageMime(bytes) ?? videoMime(bytes) ?? '';
+}
+
 function measure(key: string, type: string, blob: Blob): Promise<void> | null {
   // An empty type is a sniffer miss: encrypted attachments often carry no mime.
   const worthDecoding = type === '' || type.startsWith('image/');
   if (!worthDecoding || aspectRatios.has(key) || typeof createImageBitmap !== 'function') {
     return null;
   }
-  return createImageBitmap(blob)
+  return createImageBitmap(blob, { imageOrientation: 'from-image' })
     .then((bitmap) => {
       if (bitmap.width > 0 && bitmap.height > 0) {
         aspectRatios.set(key, bitmap.width / bitmap.height);
       }
       bitmap.close();
     })
-    .catch(() => {});
+    .catch((error: unknown) => {
+      console.debug('[sable media] the aspect ratio could not be measured', error);
+    });
 }
 
 export function mediaAspectRatio(
@@ -186,12 +212,10 @@ export function discardMediaUrl(
 }
 
 /**
- * Media needs the access token, which never leaves the core, so the bytes come
- * back through a command and get wrapped in an object URL. One URL per source
- * and size, shared by every message referencing it.
+ * Fetches media through a command, since the access token stays in the core, and wraps it in an object URL shared per source and size.
  */
 export type MediaFetcher = Pick<CoreClient, 'session'> & {
-  commands: Pick<CoreCommands, 'fetchMedia'>;
+  media: Pick<CoreMedia, 'fetchMedia'>;
 };
 
 export function loadMediaUrl(
@@ -207,10 +231,10 @@ export function loadMediaUrl(
   }
   const joined = pending.get(key);
   if (joined !== undefined) return joined;
-  const request = core.commands
+  const request = core.media
     .fetchMedia(source, width, height)
     .then((bytes) => {
-      const type = mime ?? imageMime(bytes) ?? '';
+      const type = blobType(mime, bytes);
       const blob = new Blob([bytes], { type });
       const publish = (): string => {
         const objectUrl = URL.createObjectURL(blob);

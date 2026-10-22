@@ -10,7 +10,7 @@
 
 <script lang="ts">
   import { Dialog } from 'bits-ui';
-  import { setContext, untrack } from 'svelte';
+  import { untrack } from 'svelte';
   import ArrowLeftIcon from 'phosphor-svelte/lib/ArrowLeftIcon';
   import XIcon from 'phosphor-svelte/lib/XIcon';
 
@@ -19,7 +19,7 @@
   import { shouldReduceMotion } from '#lib/ui/motion.js';
   import { SwipeBack } from '#lib/ui/swipe-back.svelte.js';
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
-  import { settingsChoices } from '#lib/ui/primitives/Switcher.svelte';
+  import { setSettingsChoices } from '#lib/ui/primitives/Switcher.svelte';
   import SettingsJumpSheet from './SettingsJumpSheet.svelte';
   import SettingsOutline from './SettingsOutline.svelte';
   import { OutlineTracker } from './settings-outline.svelte.js';
@@ -53,7 +53,7 @@
     onBack,
     onClose,
   }: Props = $props();
-  setContext(settingsChoices, true);
+  setSettingsChoices(true);
   const SWIPE_IGNORE = '.slider, [data-sheet-no-drag]';
   const outline = new OutlineTracker();
   const pages = createMasterDetail(
@@ -93,18 +93,16 @@
 
 {#snippet currentOutline(entry: { label: string })}
   {#if outline.entries.length > 0}
-    <SettingsOutline {outline} label={$i18n.t('settings.outlineLabel', { section: entry.label })} />
+    <SettingsOutline {outline} label={i18n.t('settings.outlineLabel', { section: entry.label })} />
   {/if}
 {/snippet}
 
-<div class="settings-shell" class:paged={!pages.desktop}>
+<div class={['settings-shell', { paged: !pages.desktop }]}>
   <Dialog.Description class="screen-reader-only">{description}</Dialog.Description>
 
   {#if pages.showList || revealed}
     <aside
-      class="settings-nav"
-      class:settings-nav-paged={!pages.desktop}
-      class:swiping={listSwipe.swiping}
+      class={['settings-nav', { 'settings-nav-paged': !pages.desktop, swiping: listSwipe.swiping }]}
       aria-label={label}
       style:transform={listSwipe.transform}
       bind:this={list}
@@ -115,9 +113,11 @@
     >
       <div class="settings-title settings-nav-header">
         <Dialog.Title class="settings-heading">{@render heading()}</Dialog.Title>
-        <IconButton variant="ghost" size="small" label={closeLabel} onclick={onClose}
-          ><XIcon /></IconButton
-        >
+        {#if !pages.desktop || !pages.openSection}
+          <IconButton variant="ghost" size="small" label={closeLabel} onclick={onClose}
+            ><XIcon /></IconButton
+          >
+        {/if}
       </div>
       {@render nav({
         desktop: pages.desktop,
@@ -129,11 +129,8 @@
 
   {#if pages.showContent && pages.openSection}
     <section
-      class="settings-content"
+      class={['settings-content', { swiping: pageSwipe.swiping, swiped: revealed, entering }]}
       aria-label={activeLabel}
-      class:swiping={pageSwipe.swiping}
-      class:swiped={revealed}
-      class:entering
       style:transform={pageSwipe.transform}
       bind:this={content}
       ontouchstart={pages.desktop ? undefined : pageSwipe.start}
@@ -156,6 +153,12 @@
               {activeLabel}
             {/if}
           </Dialog.Title>
+          <IconButton variant="ghost" size="small" label={closeLabel} onclick={onClose}
+            ><XIcon /></IconButton
+          >
+        </div>
+      {:else}
+        <div class="close-bar">
           <IconButton variant="ghost" size="small" label={closeLabel} onclick={onClose}
             ><XIcon /></IconButton
           >
@@ -238,6 +241,13 @@
     flex: 1;
     min-height: 0;
     overflow: auto;
+  }
+
+  .close-bar {
+    display: flex;
+    flex: 0 0 auto;
+    justify-content: flex-end;
+    padding: var(--space-200) var(--space-300) 0;
   }
 
   .section-bar {

@@ -14,7 +14,7 @@ import { core } from '#lib/core/__mocks__/context.js';
 import RoomAttachments from './RoomAttachments.svelte';
 
 const roomAttachments = vi.fn();
-Object.assign(core, { roomAttachments });
+Object.assign(core.rpc.rooms, { attachments: roomAttachments });
 
 afterEach(() => {
   roomAttachments.mockReset();
@@ -79,16 +79,31 @@ test('files are grouped by month, page on demand and open in the viewer', async 
   const onOpenMedia = vi.fn();
   setup({ onOpenMedia });
   await vi.waitFor(() => {
-    expect(roomAttachments).toHaveBeenCalledWith('!room:example.org', 'media', 30, null);
+    expect(roomAttachments).toHaveBeenCalledWith({
+      room_id: '!room:example.org',
+      kind: 'media',
+      limit: 30,
+      from: null,
+    });
   });
 
   await user.click(tab('Files'));
   expect(await screen.findByRole('button', { name: /notes\.pdf/ })).toBeInTheDocument();
-  expect(roomAttachments).toHaveBeenLastCalledWith('!room:example.org', 'file', 30, null);
+  expect(roomAttachments).toHaveBeenLastCalledWith({
+    room_id: '!room:example.org',
+    kind: 'file',
+    limit: 30,
+    from: null,
+  });
 
   await user.click(screen.getByRole('button', { name: 'Load more' }));
   expect(await screen.findByRole('button', { name: /slides\.pdf/ })).toBeInTheDocument();
-  expect(roomAttachments).toHaveBeenLastCalledWith('!room:example.org', 'file', 30, 'next');
+  expect(roomAttachments).toHaveBeenLastCalledWith({
+    room_id: '!room:example.org',
+    kind: 'file',
+    limit: 30,
+    from: 'next',
+  });
   expect(screen.getAllByRole('heading', { level: 3 })).toHaveLength(2);
   expect(screen.queryByRole('button', { name: 'Load more' })).not.toBeInTheDocument();
 
@@ -149,7 +164,7 @@ test('links show the host, cap the list and keep a named way back to the message
   });
   const [first] = screen.getAllByRole('link');
   expect(first).toHaveAttribute('href', 'https://example.org/a');
-  expect(first).toHaveAttribute('rel', 'noopener noreferrer');
+  expect(first).toHaveAttribute('rel', 'external noopener noreferrer');
   expect(first.querySelector('.link-host')).toHaveTextContent('example.org');
   expect(screen.getByText('+1 more link')).toBeInTheDocument();
 
@@ -290,7 +305,7 @@ test('a matrix.to link routes inside the app instead of opening a tab', async ()
 
   expect(await fireEvent.click(link)).toBe(false);
   expect(onMatrixLink).toHaveBeenCalledWith(
-    expect.objectContaining({ kind: 'event', eventId: '$target' }),
+    expect.objectContaining({ kind: 'event', event_id: '$target' }),
     expect.any(HTMLAnchorElement)
   );
 });

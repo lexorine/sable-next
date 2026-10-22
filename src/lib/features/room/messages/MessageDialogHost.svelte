@@ -9,6 +9,8 @@
     TimelineItemView,
   } from '#src/generated/protocol';
 
+  import { formattedForEditing } from '#lib/composer/composer-context.js';
+  import { editMessage } from '#lib/core/api/messages.svelte.js';
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
   import { projectPersona } from '#lib/personas/persona.js';
@@ -91,20 +93,24 @@
   function failed(action: string): (error: unknown) => void {
     return (error) => {
       console.warn(`[sable timeline] ${action} failed`, error);
-      toasts.error($i18n.t('errors.actionFailed'));
+      toasts.error(i18n.t('errors.actionFailed'));
     };
   }
 
   function report(item: TimelineItemView, reason: string | null): void {
     if (!item.event_id) return;
-    void core.commands.reportMessage(roomId, item.event_id, reason).catch(failed('report'));
+    void core.rpc.messages
+      .report({ room_id: roomId, event_id: item.event_id, reason })
+      .catch(failed('report'));
   }
 
   function forward(item: TimelineItemView, toRoomIds: string[]): void {
     const eventId = item.event_id;
     if (!eventId) return;
     for (const toRoomId of toRoomIds) {
-      void core.commands.forwardMessage(roomId, eventId, toRoomId).catch(failed('forward'));
+      void core.rpc.messages
+        .forward({ room_id: roomId, event_id: eventId, to_room_id: toRoomId })
+        .catch(failed('forward'));
     }
   }
 
@@ -115,15 +121,33 @@
   }
 
   function reproxy(item: TimelineItemView, persona: PersonaView | null): void {
-    if (!item.event_id || item.content.kind !== 'message') return;
-    void core.commands
-      .editMessage(roomId, item.event_id, item.content.body, {
-        formatted: item.content.html,
-        kind: reproxyKind(item.content),
-        threadRoot: item.thread_root ?? null,
-        persona: persona ? projectPersona(persona, preferences.personaFallback) : null,
-      })
-      .catch(failed('reproxy'));
+    const content = item.content;
+    if (!item.event_id) return;
+    const media =
+      content.kind === 'image' ||
+      content.kind === 'video' ||
+      content.kind === 'audio' ||
+      content.kind === 'file';
+    if (content.kind === 'gallery' || content.kind === 'location') {
+      void core.rpc.messages
+        .reprofile({
+          room_id: roomId,
+          event_id: item.event_id,
+          thread_root: item.thread_root ?? null,
+          persona: $state.snapshot(persona ? projectPersona(persona, false) : null),
+        })
+        .catch(failed('reproxy'));
+      return;
+    }
+    if (content.kind !== 'message' && !media) return;
+    const body = content.kind === 'message' ? content.body : (content.caption ?? '');
+    void editMessage(core.rpc, roomId, item.event_id, body, {
+      formatted: formattedForEditing(content.html),
+      kind: reproxyKind(content),
+      mediaCaption: media,
+      threadRoot: item.thread_root ?? null,
+      persona: persona ? projectPersona(persona, preferences.personaFallback && body !== '') : null,
+    }).catch(failed('reproxy'));
   }
 
   function replyToVersion(item: TimelineItemView, version: EditVersionView): void {
@@ -135,6 +159,7 @@
       emote: false,
       notice: false,
       edited: false,
+      jumbo: null,
     });
     onReply(version.event_id, { of: item.event_id, body, html: version.html });
   }
@@ -146,7 +171,12 @@
     if (!open) dialogs.close(entry.key);
   }}
   {#if entry.kind === 'source'}
-    <MessageSourceDialog bind:open={() => true, setOpen} source={entry.source} />
+    <MessageSourceDialog
+      bind:open={() => true, setOpen}
+      source={entry.source}
+      encrypted={entry.encrypted}
+      original={entry.original}
+    />
   {:else if entry.kind === 'edit-history'}
     <EditHistoryDialog
       bind:open={() => true, setOpen}
@@ -211,6 +241,7 @@
       {currentUserId}
       {canRedactOwn}
       {canRedactOthers}
+      {onReply}
       onMemberProfile={onSenderProfile}
     />
   {:else if entry.kind === 'receipts'}

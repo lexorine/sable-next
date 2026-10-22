@@ -49,16 +49,52 @@ afterEach(() => {
 
 test('plays at the chosen volume', async () => {
   const { preferences } = await import('#lib/settings/preferences.svelte.js');
-  preferences.notificationSoundVolume = 0.35;
+  preferences.soundsNotificationVolume = 0.35;
 
-  await playNotificationSound();
+  await playNotificationSound('notification');
 
   expect(gains[0]?.gain.value).toBe(0.35);
 });
 
 test('plays the notification sound', async () => {
-  await playNotificationSound();
+  await playNotificationSound('notification');
 
-  expect(fetch).toHaveBeenCalledWith('/sound/notification.ogg');
+  expect(fetch).toHaveBeenCalledWith('/sound/msg.webm');
   expect(start).toHaveBeenCalledOnce();
+});
+
+test('decodes each sound once', async () => {
+  const { playSound } = await import('./sound');
+  await playSound('call_join');
+  await playSound('call_join');
+
+  expect(fetch).toHaveBeenCalledOnce();
+  expect(start).toHaveBeenCalledTimes(2);
+});
+
+test('loads the sound again after a failed fetch', async () => {
+  vi.mocked(fetch).mockRejectedValueOnce(new Error('offline'));
+
+  await expect(playNotificationSound('notification')).rejects.toThrow('offline');
+  await playNotificationSound('notification');
+
+  expect(fetch).toHaveBeenCalledTimes(2);
+  expect(start).toHaveBeenCalledOnce();
+});
+
+test('plays through the native notification stream on Android', async () => {
+  const playNativeChime = vi.fn<(volume: number) => Promise<void>>().mockResolvedValue(undefined);
+  vi.resetModules();
+  vi.doMock('#lib/platform/os.js', () => ({ isAndroid: () => true }));
+  vi.doMock('#lib/platform/native-notifications.js', () => ({ playNativeChime }));
+  const { preferences } = await import('#lib/settings/preferences.svelte.js');
+  preferences.soundsNotificationVolume = 0.5;
+  ({ playNotificationSound } = await import('./sound'));
+
+  await playNotificationSound('notification');
+
+  expect(playNativeChime).toHaveBeenCalledWith(0.5);
+  expect(fetch).not.toHaveBeenCalled();
+  vi.doUnmock('#lib/platform/os.js');
+  vi.doUnmock('#lib/platform/native-notifications.js');
 });

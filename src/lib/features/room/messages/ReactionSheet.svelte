@@ -1,11 +1,11 @@
 <script lang="ts">
+  import { MediaQuery } from 'svelte/reactivity';
   import type { PackImageView } from '#src/generated/protocol';
 
   import { i18n } from '#lib/i18n.js';
   import { rememberReaction } from '#lib/emoji/recents.svelte.js';
   import { BREAKPOINTS } from '#lib/ui/breakpoints.js';
   import type { CursorAnchor } from '#lib/ui/cursor-anchor.js';
-  import { createMediaQuery } from '#lib/ui/media-query.svelte.js';
   import BottomSheet from '#lib/ui/primitives/BottomSheet.svelte';
   import EmoteBoard from '#lib/ui/primitives/EmoteBoard.svelte';
 
@@ -20,12 +20,16 @@
 
   let { open = $bindable(false), roomId, anchor = null, onPick }: Props = $props();
 
-  const appLayout = createMediaQuery(BREAKPOINTS.appLayout);
-  let sheet = $derived(!appLayout.matches);
+  const appLayout = new MediaQuery(BREAKPOINTS.appLayout);
+  let sheet = $derived(!appLayout.current);
 
-  function pick(key: string, sourcePack: PackImageView['source_pack'] = null): void {
+  function pick(
+    key: string,
+    sourcePack: PackImageView['source_pack'] = null,
+    keepOpen = false
+  ): void {
     rememberReaction(key);
-    open = false;
+    if (!keepOpen) open = false;
     onPick(key, sourcePack);
   }
 </script>
@@ -33,24 +37,27 @@
 {#if sheet}
   <BottomSheet
     bind:open
-    label={$i18n.t('timeline.addReaction')}
-    closeLabel={$i18n.t('timeline.closeMenu')}
+    label={i18n.t('timeline.addReaction')}
+    closeLabel={i18n.t('timeline.closeMenu')}
   >
     <EmoteBoard
       {roomId}
       variant="sheet"
       unicode
       stickers={false}
-      onPick={(image: PackImageView) => {
-        pick(image.url, image.source_pack);
+      reactions
+      onPick={(image: PackImageView, _usage, keepOpen) => {
+        pick(image.url, image.source_pack, keepOpen);
       }}
-      onPickUnicode={pick}
+      onPickUnicode={(emoji, keepOpen) => {
+        pick(emoji, null, keepOpen);
+      }}
     />
   </BottomSheet>
 {:else}
   <ReactionPicker
     bind:open
-    label={$i18n.t('timeline.addReaction')}
+    label={i18n.t('timeline.addReaction')}
     {roomId}
     {anchor}
     onPick={pick}

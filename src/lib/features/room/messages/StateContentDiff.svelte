@@ -18,7 +18,7 @@
 
 <div class="state-diff">
   {#if changes.length === 0}
-    <p class="unchanged">{$i18n.t('timeline.stateUnchanged')}</p>
+    <p class="unchanged">{i18n.t('timeline.stateUnchanged')}</p>
   {:else}
     <ul>
       {#each shown as change, index (change.path.join('\u0000') + index)}
@@ -42,8 +42,8 @@
         }}
       >
         {expanded
-          ? $i18n.t('timeline.stateChangesLess')
-          : $i18n.t('timeline.stateChangesMore', { count: changes.length - LIMIT })}
+          ? i18n.t('timeline.stateChangesLess')
+          : i18n.t('timeline.stateChangesMore', { count: changes.length - LIMIT })}
       </button>
     {/if}
   {/if}
@@ -80,6 +80,7 @@
   del,
   ins {
     font-family: var(--font-family-mono);
+    font-variant-ligatures: none;
   }
 
   .path {

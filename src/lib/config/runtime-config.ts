@@ -1,10 +1,6 @@
 import { asset } from '$app/paths';
 
-import {
-  gifProviderIds,
-  type GifProviderId,
-  type GifsConfig,
-} from '#lib/features/gif/providers.js';
+import { gifProviderIds, type GifProviderId, type GifsConfig } from '#lib/gif/providers.js';
 
 /** Key names follow v1's `config.json` so a deployment can carry its file over. */
 export type PushDetails = {
@@ -13,7 +9,6 @@ export type PushDetails = {
   webPushAppID: string;
   nativePushAppID: string | null;
   iosPushAppID?: string | null;
-  iosVoipPushAppID?: string | null;
   unifiedPushEmbeddedServerUrl?: string | null;
   unifiedPushGatewayUrl?: string | null;
 };
@@ -33,11 +28,17 @@ export type SupporterConfig = {
   keys: Readonly<Record<string, string>>;
 };
 
+export type EmbedsConfig = {
+  serviceUrl: string | null;
+};
+
 export type RuntimeConfig = {
   push: PushDetails | null;
+  embeds: EmbedsConfig;
   supporter: SupporterConfig | null;
   gifs: GifsConfig;
   homeservers: HomeserversConfig;
+  exploreServers: string[];
   calls: CallsConfig;
   disableAccountSwitcher: boolean;
   settingsDefaults: Record<string, unknown>;
@@ -60,11 +61,15 @@ export const BUILT_IN_HOMESERVERS: HomeserversConfig = {
 
 const NO_CALLS: CallsConfig = { livekitServiceUrl: null };
 
+const NO_EMBEDS: EmbedsConfig = { serviceUrl: null };
+
 const EMPTY: RuntimeConfig = {
   push: null,
+  embeds: NO_EMBEDS,
   supporter: null,
   gifs: NO_GIFS,
   homeservers: BUILT_IN_HOMESERVERS,
+  exploreServers: [],
   calls: NO_CALLS,
   disableAccountSwitcher: false,
   settingsDefaults: {},
@@ -94,7 +99,6 @@ function parsePush(raw: unknown): PushDetails | null {
     webPushAppID,
     nativePushAppID: text(source.nativePushAppID),
     ...(text(source.iosPushAppID) ? { iosPushAppID: text(source.iosPushAppID) } : {}),
-    ...(text(source.iosVoipPushAppID) ? { iosVoipPushAppID: text(source.iosVoipPushAppID) } : {}),
     ...(text(source.unifiedPushEmbeddedServerUrl)
       ? { unifiedPushEmbeddedServerUrl: text(source.unifiedPushEmbeddedServerUrl) }
       : {}),
@@ -140,6 +144,13 @@ function parseGifs(raw: unknown): GifsConfig {
   };
 }
 
+function parseEmbeds(raw: unknown): EmbedsConfig {
+  if (typeof raw !== 'object' || raw === null) return NO_EMBEDS;
+
+  const serviceUrl = text((raw as Record<string, unknown>).serviceUrl)?.replace(/\/+$/, '');
+  return { serviceUrl: serviceUrl && /^https?:\/\//.test(serviceUrl) ? serviceUrl : null };
+}
+
 function parseCalls(raw: unknown): CallsConfig {
   if (typeof raw !== 'object' || raw === null) return NO_CALLS;
 
@@ -156,7 +167,16 @@ function parseHomeservers(raw: unknown, allowCustom: unknown): HomeserversConfig
   return { list, default: list[0], allowCustom: custom };
 }
 
+function parseExploreServers(raw: unknown): string[] {
+  if (typeof raw !== 'object' || raw === null) return [];
+  const servers = (raw as Record<string, unknown>).servers;
+  return Array.isArray(servers)
+    ? [...new Set(servers.map(text).filter((server): server is string => server !== null))]
+    : [];
+}
+
 function withDefaultAt(homeservers: HomeserversConfig, index: unknown): HomeserversConfig {
+  if (index === null) return { ...homeservers, default: '' };
   if (typeof index !== 'number' || !Number.isInteger(index)) return homeservers;
   if (index < 0 || index >= homeservers.list.length) return homeservers;
 
@@ -169,12 +189,14 @@ export function parseRuntimeConfig(raw: unknown): RuntimeConfig {
   const source = raw as Record<string, unknown>;
   return {
     push: parsePush(source.pushNotificationDetails),
+    embeds: parseEmbeds(source.embeds),
     supporter: parseSupporter(source.supporterAwards),
     gifs: parseGifs(source.gifs),
     homeservers: withDefaultAt(
       parseHomeservers(source.homeserverList, source.allowCustomHomeservers),
       source.defaultHomeserver
     ),
+    exploreServers: parseExploreServers(source.featuredCommunities),
     calls: parseCalls(source.calls),
     disableAccountSwitcher: source.disableAccountSwitcher === true,
     settingsDefaults:
@@ -195,7 +217,8 @@ export function runtimeConfig(): Promise<RuntimeConfig> {
   loading ??= fetch(asset('config.json'), { cache: 'no-cache' })
     .then((response) => (response.ok ? (response.json() as Promise<unknown>) : null))
     .then(parseRuntimeConfig)
-    .catch(() => {
+    .catch((error: unknown) => {
+      console.debug('[sable config] runtime config unavailable', error);
       loading = null;
       return EMPTY;
     });

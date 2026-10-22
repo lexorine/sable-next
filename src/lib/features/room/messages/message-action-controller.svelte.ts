@@ -1,3 +1,4 @@
+import { copyText as writeClipboard } from '#lib/platform/clipboard.js';
 import type { TimelineItemView, ImageSourcePackView } from '#src/generated/protocol';
 import type { CoreClient } from '#lib/core/client.svelte.js';
 import type { PersonaStore } from '#lib/personas/personas.svelte.js';
@@ -5,14 +6,16 @@ import type { CursorAnchor } from '#lib/ui/cursor-anchor.js';
 import { t } from '#lib/i18n.js';
 import { toasts } from '#lib/ui/toasts.svelte.js';
 import { saveBytes, savesNatively } from '#lib/platform/files.js';
-import { favoriteGifs, isFavorite, toggleFavorite } from '#lib/features/gif/favorites.svelte.js';
-import { gifFromProxiedMxc } from '#lib/features/gif/providers.js';
+import { favoriteGifs, isFavorite, toggleFavorite } from '#lib/gif/favorites.svelte.js';
+import { preferences } from '#lib/settings/preferences.svelte.js';
+import { gifFromProxiedMxc } from '#lib/gif/providers.js';
 import { downloadCandidates, emoteCandidates } from '#lib/features/emotes/steal-emotes.js';
 import { pinErrorMessage, type PinnedEvents } from '../timeline/pinned-events.svelte.js';
 import type { Bookmarks } from '#lib/rooms/bookmarks.svelte.js';
 import type { MessageDialogs } from './message-dialogs.svelte.js';
 import type { ReplyVersion } from './reply-preview';
 import { messageActionPolicy } from './message-action-policy';
+import { redactedReveal, revealRedacted } from './redacted-reveals.svelte.js';
 
 export interface MessageCallbacks {
   onToggleReaction?: (
@@ -22,6 +25,7 @@ export interface MessageCallbacks {
   ) => void;
   onMarkUnread?: (eventId: string) => void;
   onReply?: (eventId: string, version?: ReplyVersion) => void;
+  onCancelContext?: () => void;
   onEdit?: (eventId: string, body: string, html: string | null, mediaCaption?: boolean) => void;
   onDelete?: (eventId: string, reason: string | null) => void;
   onOpenThread?: (rootEventId: string) => void;
@@ -120,7 +124,7 @@ export class MessageActionExecutor {
         this.savingSlow = true;
       }, SAVE_FEEDBACK_DELAY_MS);
       try {
-        const bytes = await core.commands.fetchMedia(media.source, 0, 0).finally(() => {
+        const bytes = await core.media.fetchMedia(media.source, 0, 0).finally(() => {
           clearTimeout(slow);
           this.savingSource = null;
           this.savingSlow = false;
@@ -128,7 +132,8 @@ export class MessageActionExecutor {
         const outcome = await saveBytes(
           bytes,
           media.filename || 'attachment',
-          media.mime ?? 'application/octet-stream'
+          media.mime ?? 'application/octet-stream',
+          preferences.askDownloadLocation
         );
         if (outcome === 'saved' && savesNatively()) toasts.info(t('viewer.saved'));
         if (outcome === 'failed') toasts.error(t('errors.actionFailed'));
@@ -169,8 +174,12 @@ export class MessageActionExecutor {
 
     async function openSource(eventId: string): Promise<void> {
       try {
-        const source = await core.commands.eventSource(roomId, eventId);
-        dialogs.open(item, { kind: 'source', source });
+        const { source, encrypted, original } = await core.rpc.timeline.eventSource({
+          room_id: roomId,
+          event_id: eventId,
+          include_original: true,
+        });
+        dialogs.open(item, { kind: 'source', source, encrypted, original });
       } catch (error) {
         console.warn('[sable timeline] source unavailable', error);
         toasts.error(t('errors.actionFailed'));
@@ -179,7 +188,10 @@ export class MessageActionExecutor {
 
     async function openEditHistory(eventId: string): Promise<void> {
       try {
-        const versions = await core.commands.editHistory(roomId, eventId);
+        const versions = await core.rpc.timeline.editHistory({
+          room_id: roomId,
+          event_id: eventId,
+        });
         dialogs.open(item, { kind: 'edit-history', versions, senderTimezone });
       } catch (error) {
         console.warn('[sable timeline] edit history unavailable', error);
@@ -189,7 +201,11 @@ export class MessageActionExecutor {
 
     async function removeLinkPreviews(eventId: string): Promise<void> {
       try {
-        await core.commands.removeLinkPreviews(roomId, eventId, item.thread_root);
+        await core.rpc.messages.removeLinkPreviews({
+          room_id: roomId,
+          event_id: eventId,
+          thread_root: item.thread_root,
+        });
       } catch (error) {
         console.warn('[sable timeline] removing link previews failed', error);
         toasts.error(t('errors.actionFailed'));
@@ -197,10 +213,9 @@ export class MessageActionExecutor {
     }
 
     async function copyText(): Promise<void> {
-      if (item.content.kind === 'message') await navigator.clipboard.writeText(item.content.body);
+      if (policy.body) await writeClipboard(policy.body);
     }
     return {
-      loadImagePacks: (targetRoomId: string) => core.commands.imagePacks(targetRoomId),
       roomId,
       onReact: policy.react
         ? (
@@ -303,6 +318,13 @@ export class MessageActionExecutor {
         : undefined,
       onEditHistory: policy.editHistory ? () => void openEditHistory(policy.eventId) : undefined,
       onViewSource: policy.viewSource ? () => void openSource(policy.eventId) : undefined,
+      onViewRedacted:
+        item.content.kind === 'redacted' &&
+        canRedactOthers &&
+        policy.viewSource &&
+        redactedReveal(roomId, policy.eventId)?.kind !== 'shown'
+          ? () => void revealRedacted(core.rpc, roomId, policy.eventId)
+          : undefined,
       onReport: policy.report
         ? () => {
             dialogs.open(item, { kind: 'report' });

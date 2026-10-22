@@ -5,9 +5,13 @@
   import MagnifyingGlassIcon from 'phosphor-svelte/lib/MagnifyingGlassIcon';
   import PlusIcon from 'phosphor-svelte/lib/PlusIcon';
   import ArrowRightIcon from 'phosphor-svelte/lib/ArrowRightIcon';
+  import XIcon from 'phosphor-svelte/lib/XIcon';
 
   import { goto } from '$app/navigation';
+  import { runtimeConfig } from '#lib/config/runtime-config.js';
   import { useCoreClient } from '#lib/core/context.js';
+  import { joinRoom, knockRoom } from '#lib/core/api/rooms.js';
+  import { userIdServer } from '#lib/features/auth/login/login-identifier.js';
   import { i18n } from '#lib/i18n.js';
   import { joinErrorMessage } from '#lib/rooms/join-errors.js';
   import { roomSectionPath } from '#lib/rooms/permalink.js';
@@ -17,21 +21,34 @@
   import Button from '#lib/ui/primitives/Button.svelte';
   import EmptyState from '#lib/ui/primitives/EmptyState.svelte';
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
+  import Pill from '#lib/ui/primitives/Pill.svelte';
   import Select from '#lib/ui/primitives/Select.svelte';
   import Spinner from '#lib/ui/primitives/Spinner.svelte';
   import TextInput from '#lib/ui/primitives/TextInput.svelte';
 
+  import {
+    addServer,
+    exploreServers,
+    isServerName,
+    readAddedServers,
+    removeServer,
+  } from './explore-servers.js';
   import { RoomDirectory } from './room-directory.svelte.js';
   import { lobbyAction } from '../spaces/space-hierarchy';
 
   const core = useCoreClient();
   const roomList = useRoomList();
-  const directory = new RoomDirectory(core.commands);
+  const directory = new RoomDirectory(core.rpc.rooms);
   const joining = new SvelteSet<string>();
   const knocked = new SvelteSet<string>();
 
   let search = $state('');
-  let server = $state('');
+  let server = $state<string | null>(null);
+  let featured = $state.raw<string[]>([]);
+  let added = $state.raw<string[]>([]);
+  let adding = $state(false);
+  let newServer = $state('');
+  let serverError = $state<string | null>(null);
   let kind = $state<'all' | 'rooms' | 'spaces'>('all');
   let failedJoin = $state<string | null>(null);
 
@@ -42,14 +59,52 @@
     new Set(roomList.rooms.filter((room) => room.state === 'invited').map((room) => room.room_id))
   );
 
+  let ownServer = $derived(userIdServer(core.session?.user_id ?? ''));
+  let servers = $derived(exploreServers(ownServer, featured, added));
+
   $effect(() => {
     void directory.search({ server: null, search: '' });
+    void runtimeConfig().then((config) => {
+      featured = config.exploreServers;
+    });
+    readAddedServers(core.rpc.account)
+      .then((servers) => {
+        added = servers;
+      })
+      .catch((error: unknown) => {
+        console.warn('[sable directory] added servers are unavailable', error);
+      });
   });
 
+  function browse(name: string): void {
+    server = name === ownServer ? null : name;
+    runSearch();
+  }
+
+  async function saveServer(event: SubmitEvent): Promise<void> {
+    event.preventDefault();
+    const name = newServer.trim();
+    if (!isServerName(name)) {
+      serverError = 'room.directoryInvalidServer';
+      return;
+    }
+    serverError = null;
+    added = await addServer(core.rpc.account, name);
+    adding = false;
+    newServer = '';
+    browse(name);
+  }
+
+  async function forgetServer(name: string): Promise<void> {
+    added = await removeServer(core.rpc.account, name);
+    if (server !== name) return;
+    server = null;
+    runSearch();
+  }
+
   function runSearch(): void {
-    const trimmed = server.trim();
     void directory.search({
-      server: trimmed === '' ? null : trimmed,
+      server,
       search: search.trim(),
       roomType: kind === 'all' ? null : kind,
     });
@@ -65,6 +120,7 @@
   }
 
   async function open(room: PublicRoomView): Promise<void> {
+    // eslint-disable-next-line svelte/no-navigation-without-resolve -- roomSectionPath() resolves the route itself
     await goto(roomSectionPath(roomList.rooms, room.room_id));
   }
 
@@ -77,12 +133,13 @@
     failedJoin = null;
     try {
       if (knocking) {
-        await core.commands.knockRoom(address);
+        await knockRoom(core.rpc, address);
         knocked.add(room.room_id);
         return;
       }
 
-      const roomId = await core.commands.joinRoom(address);
+      const roomId = await joinRoom(core.rpc, address);
+      // eslint-disable-next-line svelte/no-navigation-without-resolve -- roomSectionPath() resolves the route itself
       await goto(roomSectionPath(roomList.rooms, roomId));
     } catch (error) {
       console.warn('[sable directory] join failed', error);
@@ -94,30 +151,89 @@
 </script>
 
 <section class="directory">
+  <div class="servers" role="group" aria-label={i18n.t('room.directoryServerLabel')}>
+    {#each servers as name (name)}
+      {@const selected = (server ?? ownServer) === name}
+      <span class="server">
+        <Pill
+          variant={selected ? 'primary' : 'outline'}
+          aria-pressed={selected}
+          onclick={() => {
+            browse(name);
+          }}>{name}</Pill
+        >
+        {#if added.includes(name) && name !== ownServer}
+          <IconButton
+            variant="ghost"
+            size="small"
+            label={i18n.t('room.directoryRemoveServer', { server: name })}
+            onclick={() => {
+              forgetServer(name).catch((error: unknown) => {
+                console.warn('[sable directory] the server was not removed', error);
+              });
+            }}
+          >
+            <XIcon />
+          </IconButton>
+        {/if}
+      </span>
+    {/each}
+    {#if adding}
+      <form
+        class="add-server"
+        onsubmit={(event) => {
+          saveServer(event).catch((error: unknown) => {
+            console.warn('[sable directory] the server was not saved', error);
+          });
+        }}
+      >
+        <TextInput
+          bind:value={newServer}
+          autocomplete="off"
+          autocapitalize="none"
+          spellcheck={false}
+          aria-label={i18n.t('room.directoryAddServerLabel')}
+          placeholder="example.org"
+        />
+        <Button type="submit" size="small">{i18n.t('common.add')}</Button>
+        <Button
+          variant="ghost"
+          size="small"
+          onclick={() => {
+            adding = false;
+            newServer = '';
+            serverError = null;
+          }}>{i18n.t('common.cancel')}</Button
+        >
+      </form>
+    {:else}
+      <Pill
+        onclick={() => {
+          adding = true;
+        }}><PlusIcon size={14} />{i18n.t('room.directoryAddServer')}</Pill
+      >
+    {/if}
+  </div>
+  {#if serverError}
+    <Alert variant="critical" role="alert">{i18n.t(serverError)}</Alert>
+  {/if}
+
   <form class="filters" onsubmit={submit}>
     <TextInput
       bind:value={search}
       type="search"
       autocomplete="off"
-      aria-label={$i18n.t('room.directorySearchLabel')}
-      placeholder={$i18n.t('room.directorySearchPlaceholder')}
-    />
-    <TextInput
-      bind:value={server}
-      autocomplete="off"
-      autocapitalize="none"
-      spellcheck={false}
-      aria-label={$i18n.t('room.directoryServerLabel')}
-      placeholder={$i18n.t('room.directoryServerPlaceholder')}
+      aria-label={i18n.t('room.directorySearchLabel')}
+      placeholder={i18n.t('common.searchRooms')}
     />
     <Select
       class="directory-kind"
       value={kind}
-      aria-label={$i18n.t('room.directoryKind')}
+      aria-label={i18n.t('room.directoryKind')}
       items={[
-        { value: 'all', label: $i18n.t('room.directoryKindAll') },
-        { value: 'rooms', label: $i18n.t('room.directoryKindRooms') },
-        { value: 'spaces', label: $i18n.t('room.directoryKindSpaces') },
+        { value: 'all', label: i18n.t('room.directoryKindAll') },
+        { value: 'rooms', label: i18n.t('room.directoryKindRooms') },
+        { value: 'spaces', label: i18n.t('room.directoryKindSpaces') },
       ]}
       onValueChange={(next) => {
         kind = next === 'rooms' || next === 'spaces' ? next : 'all';
@@ -125,16 +241,16 @@
       }}
     />
     <Button type="submit" variant="primary" loading={directory.loading}>
-      <MagnifyingGlassIcon size={16} />{$i18n.t('room.directorySearch')}
+      <MagnifyingGlassIcon size={16} />{i18n.t('room.directorySearch')}
     </Button>
   </form>
 
   {#if directory.total !== null}
-    <p class="count">{$i18n.t('room.directoryTotal', { count: directory.total })}</p>
+    <p class="count">{i18n.t('room.directoryTotal', { count: directory.total })}</p>
   {/if}
 
   {#if directory.error}
-    <Alert variant="critical" role="alert">{$i18n.t(directory.error)}</Alert>
+    <Alert variant="critical" role="alert">{i18n.t(directory.error)}</Alert>
   {/if}
   {#if failedJoin !== null}
     <Alert variant="critical" role="alert">{failedJoin}</Alert>
@@ -150,12 +266,13 @@
           <div class="room-text">
             <span class="room-name">
               {label(room)}
-              {#if room.is_space}<span class="badge">{$i18n.t('nav.space')}</span>{/if}
-              {#if room.is_voice}<span class="badge">{$i18n.t('nav.voiceRoom')}</span>{/if}
+              {#if room.room_kind === 'space'}<span class="badge">{i18n.t('nav.space')}</span>{/if}
+              {#if room.room_kind === 'voice'}<span class="badge">{i18n.t('common.voiceRoom')}</span
+                >{/if}
             </span>
             <span class="room-meta">
               <span class="members"
-                >{$i18n.t('room.lobbyMembers', { count: room.num_joined_members })}</span
+                >{i18n.t('room.lobbyMembers', { count: room.num_joined_members })}</span
               >
               {#if room.canonical_alias}
                 <span class="divider" aria-hidden="true">|</span><span class="alias"
@@ -170,7 +287,7 @@
               <IconButton
                 variant="ghost"
                 size="small"
-                label={$i18n.t('room.lobbyOpen')}
+                label={i18n.t('room.lobbyOpen')}
                 onclick={() => {
                   void open(room);
                 }}
@@ -186,12 +303,12 @@
                   void join(room);
                 }}
               >
-                <PlusIcon size={14} />{$i18n.t(
+                <PlusIcon size={14} />{i18n.t(
                   knocked.has(room.room_id)
                     ? 'room.lobbyKnockSent'
                     : action === 'knock'
-                      ? 'room.lobbyKnock'
-                      : 'room.lobbyJoin'
+                      ? 'common.askToJoin'
+                      : 'common.join'
                 )}
               </Button>
             {/if}
@@ -208,15 +325,15 @@
           void directory.loadMore();
         }}
       >
-        {$i18n.t('room.directoryMore')}
+        {i18n.t('common.loadMore')}
       </Button>
     {/if}
   {:else if directory.loading}
-    <div class="loading"><Spinner label={$i18n.t('a11y.loading')} /></div>
+    <div class="loading"><Spinner label={i18n.t('a11y.loading')} /></div>
   {:else if !directory.error}
     <EmptyState
-      title={$i18n.t('room.directoryEmptyTitle')}
-      description={$i18n.t('room.directoryEmptyBody')}
+      title={i18n.t('room.directoryEmptyTitle')}
+      description={i18n.t('room.directoryEmptyBody')}
     />
   {/if}
 </section>
@@ -232,7 +349,25 @@
     align-items: end;
     display: grid;
     gap: var(--space-300);
-    grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) auto auto;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+  }
+
+  .servers {
+    align-items: center;
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-200);
+  }
+
+  .server {
+    align-items: center;
+    display: inline-flex;
+  }
+
+  .add-server {
+    align-items: center;
+    display: flex;
+    gap: var(--space-200);
   }
 
   @media (width < 40rem) {

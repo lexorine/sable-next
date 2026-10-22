@@ -2,12 +2,11 @@
   import type { UrlPreviewView } from '#src/generated/protocol';
 
   import { useCoreClient } from '#lib/core/context.js';
-  import { preferences } from '#lib/settings/preferences.svelte.js';
   import MediaContent from '#lib/ui/MediaContent.svelte';
   import MediaImage from '#lib/ui/MediaImage.svelte';
 
   import { imageMimeFromUrl } from './link-preview.js';
-  import { loadUrlPreview } from './link-preview-cache';
+  import { previewSources, resolveUrlPreview } from './link-preview-cache';
   import { findLinkPresentation } from './link-presentations';
   import { hasMediaViewerOpener, useMediaViewerOpener } from './media-viewer-opener.svelte.js';
   import { hasRoomMediaPreviews, useRoomMediaPreviews } from './room-media-previews.svelte.js';
@@ -21,12 +20,10 @@
   let { url, encrypted, bundled = null }: Props = $props();
   const core = useCoreClient();
   let preview = $state<UrlPreviewView | null>(null);
-  let allowed = $derived(
-    encrypted === false ? preferences.urlPreviews : preferences.encryptedUrlPreviews
-  );
+  let sources = $derived(previewSources(encrypted));
 
   $effect(() => {
-    if (!allowed) {
+    if (!sources.server && !sources.client) {
       preview = null;
       return;
     }
@@ -37,7 +34,7 @@
 
     let cancelled = false;
     preview = null;
-    void loadUrlPreview(core.commands, url).then((result) => {
+    void resolveUrlPreview(core.rpc.messages, url, sources).then((result) => {
       if (!cancelled) preview = result;
     });
     return () => {
@@ -116,9 +113,10 @@
   />
 {:else if preview}
   <div
-    class="link-preview"
-    class:compact={compactImage && !preview.video}
-    class:accented={preview.theme_color !== null}
+    class={[
+      'link-preview',
+      { compact: compactImage && !preview.video, accented: preview.theme_color !== null },
+    ]}
     style:--link-preview-accent={preview.theme_color}
   >
     {#if preview.video && !mediaHidden}
@@ -150,7 +148,7 @@
       class="link-preview-text"
       href={url}
       target="_blank"
-      rel="noopener noreferrer"
+      rel="external noopener noreferrer"
       aria-label={title}
     >
       {#if preview.site_name}<span class="link-preview-site">{preview.site_name}</span>{/if}

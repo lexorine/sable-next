@@ -5,6 +5,7 @@
 
   import type { ForumThread } from './forum-threads';
   import ForumThreadItem from './ForumThreadItem.svelte';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
 
   const MAX_PINNED = 3;
 
@@ -18,7 +19,6 @@
     onDelete: (eventId: string, reason: string | null) => void;
     roomId: string;
     onReact?: (eventId: string, key: string) => void;
-    loadImagePacks: (roomId: string) => Promise<import('#src/generated/protocol').ImagePackView[]>;
     onCopyLink: (eventId: string) => void;
     onLoadMore: () => void;
     isPinned?: (eventId: string) => boolean;
@@ -35,7 +35,6 @@
     onDelete,
     roomId,
     onReact,
-    loadImagePacks,
     onCopyLink,
     onLoadMore,
     isPinned = () => false,
@@ -49,12 +48,12 @@
   let otherThreads = $derived(threads.filter((thread) => !pinnedIds.has(thread.id)));
 </script>
 
-<div class="forum-thread-list">
+<div class="forum-thread-list" {@attach scrollHint}>
   {#if threads.length === 0 && !loading}
-    <p class="forum-thread-list-empty">{$i18n.t('forum.empty')}</p>
+    <p class="forum-thread-list-empty">{i18n.t('forum.empty')}</p>
   {:else if threads.length > 0}
     {#if pinnedThreads.length > 0}
-      <ul aria-label={$i18n.t('forum.pinned')}>
+      <ul aria-label={i18n.t('forum.pinned')}>
         {#each pinnedThreads as thread (thread.id)}
           <ForumThreadItem
             {thread}
@@ -64,7 +63,6 @@
             {onDelete}
             {roomId}
             {onReact}
-            {loadImagePacks}
             {onCopyLink}
             {onPin}
             pinned
@@ -72,7 +70,7 @@
         {/each}
       </ul>
     {/if}
-    <ul aria-label={$i18n.t('forum.threads')}>
+    <ul aria-label={i18n.t('forum.threads')}>
       {#each otherThreads as thread (thread.id)}
         <ForumThreadItem
           {thread}
@@ -82,7 +80,6 @@
           {onDelete}
           {roomId}
           {onReact}
-          {loadImagePacks}
           {onCopyLink}
           {onPin}
           pinned={isPinned(thread.eventId)}
@@ -93,12 +90,12 @@
   {#if canLoadMore}
     <div class="forum-thread-list-more">
       <Button variant="ghost" size="small" onclick={onLoadMore} {loading}>
-        {$i18n.t('forum.loadMore')}
+        {i18n.t('forum.loadMore')}
       </Button>
     </div>
   {:else if loading}
     <div class="forum-thread-list-more">
-      <Spinner small label={$i18n.t('a11y.loading')} />
+      <Spinner small label={i18n.t('a11y.loading')} />
     </div>
   {/if}
 </div>

@@ -9,7 +9,8 @@ use wiremock::{
     matchers::{method, path_regex},
 };
 
-use super::{StickySync, live_events, send, send_delayed};
+use super::{LeaveCode, LeaveOut, StickySync, live_events, send, send_delayed};
+use crate::delayed_events::DelayedEventsSupport;
 
 async fn room() -> (MatrixMockServer, matrix_sdk::Room) {
     let server = MatrixMockServer::new().await;
@@ -18,6 +19,24 @@ async fn room() -> (MatrixMockServer, matrix_sdk::Room) {
         .sync_joined_room(&client, room_id!("!sticky:example.org"))
         .await;
     (server, room)
+}
+
+#[test]
+fn test_a_leave_names_the_member_and_why_it_left() {
+    let leave = |code| serde_json::to_value(LeaveOut::new(Some("member".to_owned()), code));
+    assert_eq!(
+        leave(LeaveCode::Leave).unwrap(),
+        json!({
+            "slot_id": "m.call#ROOM",
+            "member": {"id": "member", "membership": "leave"},
+            "leave_reason": {"code": "leave"},
+            "msc4354_sticky_key": "member",
+        })
+    );
+    assert_eq!(
+        leave(LeaveCode::DelayedLeave).unwrap()["leave_reason"]["code"],
+        "delayed_leave"
+    );
 }
 
 #[async_test]
@@ -83,6 +102,7 @@ async fn test_delayed_send_includes_delay_and_sticky_duration() {
 
     send_delayed(
         &room.client(),
+        DelayedEventsSupport::default(),
         &room,
         json!({"msc4354_sticky_key": "call"}),
         Duration::from_secs(20),
@@ -143,6 +163,11 @@ async fn test_sticky_sync_sends_bounded_extensions_and_parses_both_event_locatio
     assert_eq!(
         body["room_subscriptions"][room.room_id().as_str()]["timeline_limit"],
         0
+    );
+    assert_eq!(
+        body["room_subscriptions"][room.room_id().as_str()]["required_state"],
+        json!([["m.room.create", ""]]),
+        "Synapse rejects a room subscription without required_state"
     );
     assert_eq!(body["extensions"]["to_device"]["enabled"], false);
     assert_eq!(
@@ -329,6 +354,7 @@ async fn test_delayed_send_refreshes_expired_credentials_and_preserves_sticky_qu
     assert_eq!(
         send_delayed(
             &client,
+            DelayedEventsSupport::default(),
             &room,
             json!({"msc4354_sticky_key":"call"}),
             Duration::from_secs(20)

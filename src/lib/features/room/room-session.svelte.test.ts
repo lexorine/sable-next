@@ -28,7 +28,7 @@ function opened(eventId: string): RoomOpenView {
       can_change_power_levels: false,
       can_manage_children: false,
     },
-    power_level_tags: null,
+    power_level_tags: {},
     widgets: [],
     pinned_event_ids: [eventId],
     predecessor: null,
@@ -36,9 +36,9 @@ function opened(eventId: string): RoomOpenView {
 }
 
 function fixture() {
-  const commands = {
-    roomOpen: vi.fn(() => Promise.resolve(opened('$new'))),
-    roomPowerLevels: vi.fn((): Promise<RoomPowerLevelsView> =>
+  const rooms = { open: vi.fn(() => Promise.resolve(opened('$new'))) };
+  const members = {
+    powerLevels: vi.fn((): Promise<RoomPowerLevelsView> =>
       Promise.resolve({
         ban: 50,
         kick: 50,
@@ -52,12 +52,23 @@ function fixture() {
         notifications_room: 50,
       })
     ),
-    roomStateEvent: vi.fn((): Promise<unknown> => Promise.resolve(null)),
-    roomStateEvents: vi.fn((): Promise<RoomStateEventView[]> => Promise.resolve([])),
-    sendStateEvent: vi.fn((..._args: unknown[]) => Promise.resolve('$created')),
+  };
+  const roomState = {
+    event: vi.fn((..._args: unknown[]): Promise<unknown> => Promise.resolve(null)),
+    memberListThreshold: vi.fn((..._args: unknown[]): Promise<number | null> =>
+      Promise.resolve(null)
+    ),
+    events: vi.fn((..._args: unknown[]): Promise<RoomStateEventView[]> => Promise.resolve([])),
+    addWidget: vi.fn((..._args: unknown[]) => Promise.resolve('new')),
+    removeWidget: vi.fn((..._args: unknown[]) => Promise.resolve(null)),
   };
   const pins = { set: vi.fn() };
-  return { commands, pins, session: new RoomSession(commands, pins) };
+  return {
+    roomState,
+    rooms,
+    pins,
+    session: new RoomSession({ room_state: roomState, rooms, members }, pins),
+  };
 }
 
 async function settle() {
@@ -65,11 +76,11 @@ async function settle() {
 }
 
 test('opening a room loads the saved founder flair', async () => {
-  const { commands, session } = fixture();
-  commands.roomOpen.mockResolvedValueOnce({
+  const { rooms, session } = fixture();
+  rooms.open.mockResolvedValueOnce({
     ...opened('$new'),
     power_level_tags: {
-      [FOUNDER_POWER_LEVEL]: { name: 'Founder', color: '#ff0000', icon: { key: '👑' } },
+      [String(FOUNDER_POWER_LEVEL)]: { name: 'Founder', color: '#ff0000', icon: '👑' },
     },
   });
 
@@ -84,9 +95,9 @@ test('opening a room loads the saved founder flair', async () => {
 });
 
 test('room changes discard stale details and pin updates', async () => {
-  const { commands, pins, session } = fixture();
+  const { rooms, pins, session } = fixture();
   const old = deferred<RoomOpenView>();
-  commands.roomOpen.mockReturnValueOnce(old.promise);
+  rooms.open.mockReturnValueOnce(old.promise);
   session.sync('!old', false, 0);
   session.sync('!new', false, 0);
   await settle();
@@ -98,9 +109,9 @@ test('room changes discard stale details and pin updates', async () => {
 });
 
 test('disposing a room discards its pending requests', async () => {
-  const { commands, pins, session } = fixture();
+  const { rooms, pins, session } = fixture();
   const request = deferred<RoomOpenView>();
-  commands.roomOpen.mockReturnValueOnce(request.promise);
+  rooms.open.mockReturnValueOnce(request.promise);
   session.sync('!room', false, 0);
   session.dispose();
   request.resolve(opened('$late'));
@@ -111,9 +122,9 @@ test('disposing a room discards its pending requests', async () => {
 });
 
 test('widget removal cannot populate the next room with the previous room widgets', async () => {
-  const { commands, session } = fixture();
+  const { roomState, session } = fixture();
   const widgets = deferred<RoomStateEventView[]>();
-  commands.roomStateEvents.mockReturnValueOnce(widgets.promise);
+  roomState.events.mockReturnValueOnce(widgets.promise);
   session.sync('!old', false, 0);
   await settle();
   const removal = session.details.removeWidget('widget');
@@ -127,26 +138,23 @@ test('widget removal cannot populate the next room with the previous room widget
     },
   ]);
   await removal;
-  expect(commands.sendStateEvent).toHaveBeenCalledWith(
-    '!old',
-    'im.vector.modular.widgets',
-    'widget',
-    {}
-  );
+  expect(roomState.removeWidget).toHaveBeenCalledWith({
+    room_id: '!old',
+    widget_id: 'widget',
+  });
   expect(session.widgets).toEqual([]);
 });
 
 test('tombstone completion and member settings are cancelled on room change', async () => {
-  const { commands, session } = fixture();
+  const { roomState, session } = fixture();
   const tombstone = deferred<unknown>();
-  const listing = deferred<unknown>();
-  commands.roomStateEvent
-    .mockReturnValueOnce(listing.promise)
-    .mockReturnValueOnce(tombstone.promise);
+  const listing = deferred<number | null>();
+  roomState.memberListThreshold.mockReturnValueOnce(listing.promise);
+  roomState.event.mockReturnValueOnce(tombstone.promise);
   session.sync('!old', true, 0);
   session.sync('!new', false, 1);
   tombstone.resolve({ replacement_room: '!replacement', body: 'old' });
-  listing.resolve({});
+  listing.resolve(50);
   await settle();
   expect(session.tombstoneReplacementId).toBeNull();
   expect(session.tombstoneChecked).toBe(false);
@@ -154,44 +162,39 @@ test('tombstone completion and member settings are cancelled on room change', as
 });
 
 test('a member list revision keeps the current setting until the new one lands', async () => {
-  const { commands, session } = fixture();
-  commands.roomStateEvent.mockResolvedValueOnce({ always_listed_from: 50 });
+  const { roomState, session } = fixture();
+  roomState.memberListThreshold.mockResolvedValueOnce(50);
   session.sync('!room', false, 0);
   await settle();
   expect(session.alwaysListedFrom).toBe(50);
 
-  const next = deferred<unknown>();
-  commands.roomStateEvent.mockReturnValueOnce(next.promise);
+  const next = deferred<number | null>();
+  roomState.memberListThreshold.mockReturnValueOnce(next.promise);
   session.sync('!room', false, 1);
   expect(session.alwaysListedFrom).toBe(50);
 
-  next.resolve({ always_listed_from: 100 });
+  next.resolve(100);
   await settle();
   expect(session.alwaysListedFrom).toBe(100);
 });
 
-test('adding a widget writes an enriched widget state event and reloads the list', async () => {
-  const { commands, session } = fixture();
-  commands.roomStateEvents.mockResolvedValueOnce([
-    { state_key: 'new', content: { type: 'm.custom', url: 'https://example.org/widget' } },
+test('adding a widget goes through the core and reloads the list', async () => {
+  const { roomState, session } = fixture();
+  roomState.events.mockResolvedValueOnce([
+    {
+      state_key: 'new',
+      content: { type: 'm.custom', url: 'https://example.org/widget' },
+    },
   ]);
   session.sync('!room', false, 0);
   await settle();
 
-  await session.details.addWidget('Doom', 'https://example.org/widget', '@erwan:example.org');
+  await session.details.addWidget('Doom', 'https://example.org/widget');
 
-  const [roomId, type, , content] = commands.sendStateEvent.mock.calls[0] as [
-    string,
-    string,
-    string,
-    { url: string; type: string; name: string; creatorUserId: string },
-  ];
-  expect([roomId, type]).toEqual(['!room', 'im.vector.modular.widgets']);
-  expect(content).toMatchObject({
-    type: 'm.custom',
+  expect(roomState.addWidget).toHaveBeenCalledWith({
+    room_id: '!room',
     name: 'Doom',
-    creatorUserId: '@erwan:example.org',
+    url: 'https://example.org/widget',
   });
-  expect(content.url).toContain('https://example.org/widget?matrix_user_id=$matrix_user_id');
   expect(session.widgets).toHaveLength(1);
 });

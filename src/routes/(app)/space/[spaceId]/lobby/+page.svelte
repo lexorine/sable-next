@@ -9,26 +9,22 @@
   const roomList = useRoomList();
   let spaceId = $derived(page.params.spaceId ?? '');
   let space = $derived(findRoomByPathId(roomList.rooms, spaceId) ?? null);
-
-  let listed = $state(false);
-  $effect(() => {
-    void roomList
-      .start()
-      .then(() => (listed = true))
-      .catch(() => {});
-  });
 </script>
 
 <svelte:head>
-  <title>{space?.name ?? $i18n.t('nav.lobby')} - Sable</title>
+  <title>{space?.name ?? i18n.t('nav.lobby')} - Sable</title>
 </svelte:head>
 
 <main class="lobby-page">
   <div class="lobby-column">
-    {#if space !== null || !listed}
+    {#if (space !== null && space.state === 'joined') || !roomList.settled}
       <SpaceLobby {space} />
     {:else}
-      <JoinBeforeNavigate roomId={spaceId} via={page.url.searchParams.getAll('via')} />
+      <JoinBeforeNavigate
+        roomId={spaceId}
+        via={page.url.searchParams.getAll('via')}
+        membership={space?.state}
+      />
     {/if}
   </div>
 </main>

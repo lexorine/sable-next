@@ -1,14 +1,33 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  fittingPillCount,
+  parsePronouns,
   preferredPronouns,
   pronounPillLimit,
   splitDisplayNamePronouns,
+  splitPluralkitNamePronouns,
   visiblePronouns,
   withDisplayNamePronouns,
 } from './pronouns';
 
 const set = (summary: string, language: string | null) => ({ summary, language });
+
+describe('parsePronouns', () => {
+  it('reads a language prefix', () => {
+    expect(parsePronouns('en:she/her, pl: ona/jej')).toEqual([
+      set('she/her', 'en'),
+      set('ona/jej', 'pl'),
+    ]);
+  });
+
+  it('reads a parenthesised language and an untagged set', () => {
+    expect(parsePronouns('she/her (EN), they/them')).toEqual([
+      set('she/her', 'en'),
+      set('they/them', null),
+    ]);
+  });
+});
 
 describe('splitDisplayNamePronouns', () => {
   it('splits a parenthesised pronoun set out of the name', () => {
@@ -37,6 +56,33 @@ describe('splitDisplayNamePronouns', () => {
     for (const name of ['sugary ()', 'sugary (2019)', 'sugary (away)', 'sugary (a/b/c/d)']) {
       expect(splitDisplayNamePronouns(name)).toEqual({ name, pronouns: [] });
     }
+  });
+});
+
+describe('splitPluralkitNamePronouns', () => {
+  it('collects every group and the sets inside a group', () => {
+    expect(splitPluralkitNamePronouns('sugary (she/her) [it/its, they/them]')).toEqual({
+      name: 'sugary',
+      pronouns: [set('she/her', null), set('it/its', null), set('they/them', null)],
+    });
+  });
+
+  it('accepts accents, hyphens, digits and four forms', () => {
+    expect(splitPluralkitNamePronouns('Zoë (ey/em/eir/eirs) (xe-1/xem)')).toEqual({
+      name: 'Zoë',
+      pronouns: [set('ey/em/eir/eirs', null), set('xe-1/xem', null)],
+    });
+  });
+
+  it('leaves a group that is not entirely pronoun sets in the name', () => {
+    expect(splitPluralkitNamePronouns('sugary (she/her, away)')).toEqual({
+      name: 'sugary (she/her, away)',
+      pronouns: [],
+    });
+  });
+
+  it('keeps a name that is only pronouns', () => {
+    expect(splitPluralkitNamePronouns('(she/it)')).toEqual({ name: '(she/it)', pronouns: [] });
   });
 });
 
@@ -119,5 +165,43 @@ describe('visiblePronouns', () => {
       visible: pronouns,
       overflow: [],
     });
+  });
+});
+
+describe('fittingPillCount', () => {
+  const widths = [50, 60, 70];
+
+  it('shows every pill when they all fit without an overflow pill', () => {
+    expect(fittingPillCount(widths, 20, 4, 188)).toBe(3);
+  });
+
+  it('reserves room for the overflow pill when pills are hidden', () => {
+    expect(fittingPillCount(widths, 20, 4, 130)).toBe(1);
+    expect(fittingPillCount(widths, 20, 4, 138)).toBe(2);
+  });
+
+  it('shows nothing when not even one pill and the overflow pill fit', () => {
+    expect(fittingPillCount(widths, 20, 4, 73)).toBe(0);
+  });
+
+  it('always needs the overflow pill when pills were already cut by the limit', () => {
+    expect(fittingPillCount(widths, 20, 4, 188, true)).toBe(2);
+  });
+
+  it('does not fit a pill that is under a pixel too wide', () => {
+    expect(fittingPillCount(widths, 20, 4, 187.9)).toBe(2);
+  });
+
+  it('counts the gap between pills and before the overflow pill', () => {
+    expect(fittingPillCount([10, 10, 10], 10, 0, 39)).toBe(3);
+    expect(fittingPillCount([10, 10, 10], 10, 5, 39)).toBe(1);
+  });
+
+  it('shows everything when the overflow pill would be wider than the last pill', () => {
+    expect(fittingPillCount([10, 10, 10], 50, 0, 30)).toBe(3);
+  });
+
+  it('returns 0 for no pills', () => {
+    expect(fittingPillCount([], 20, 4, 500)).toBe(0);
   });
 });

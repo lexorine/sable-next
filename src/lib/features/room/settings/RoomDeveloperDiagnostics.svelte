@@ -1,5 +1,6 @@
 <script lang="ts">
-  import type { RoomSummary } from '#src/generated/protocol';
+  import { copyText } from '#lib/platform/clipboard.js';
+  import type { RoomListItemView, UnreadDiagnosticsView } from '#src/generated/protocol';
   import CopyIcon from 'phosphor-svelte/lib/CopyIcon';
 
   import { useCoreClient } from '#lib/core/context.js';
@@ -13,13 +14,14 @@
   import '#lib/ui/primitives/settings-row.css';
 
   interface Props {
-    room: RoomSummary;
+    room: RoomListItemView;
   }
 
   let { room }: Props = $props();
   const core = useCoreClient();
 
   let fullyRead = $state<string | null>(null);
+  let readState = $state<UnreadDiagnosticsView | null>(null);
 
   let diagnostics = $derived({
     room_id: room.room_id,
@@ -33,6 +35,7 @@
     latest_event_id: room.latest_event?.event_id ?? null,
     fully_read: fullyRead,
     read_latest: fullyRead !== null && fullyRead === (room.latest_event?.event_id ?? null),
+    read_state: readState,
   });
 
   $effect(() => {
@@ -46,9 +49,29 @@
     };
   });
 
+  $effect(() => {
+    const target = room.room_id;
+    void room.unread;
+    let current = true;
+    core.rpc.timeline
+      .unreadDiagnostics({ room_id: target })
+      .then((state) => {
+        if (current) readState = state;
+      })
+      .catch((error: unknown) => {
+        console.debug('[sable room] unread diagnostics unavailable', error);
+      });
+    return () => {
+      current = false;
+    };
+  });
+
   async function readFullyRead(target: string): Promise<string | null> {
     try {
-      const content = await core.commands.roomAccountData(target, 'm.fully_read');
+      const content = await core.rpc.room_state.accountData({
+        room_id: target,
+        event_type: 'm.fully_read',
+      });
       const eventId = (content as { event_id?: unknown } | null)?.event_id;
       return typeof eventId === 'string' ? eventId : null;
     } catch (error) {
@@ -59,22 +82,22 @@
 
   async function copy(text: string): Promise<void> {
     try {
-      await navigator.clipboard.writeText(text);
-      toasts.info($i18n.t('room.devCopied'));
+      await copyText(text);
+      toasts.info(i18n.t('common.copied'));
     } catch (error) {
       console.warn('[sable room] copy failed', error);
-      toasts.error($i18n.t('errors.actionFailed'));
+      toasts.error(i18n.t('errors.actionFailed'));
     }
   }
 </script>
 
-<SettingsSection headingId="room-developer-room" title={$i18n.t('room.devRoomTitle')}>
+<SettingsSection headingId="room-developer-room" title={i18n.t('room.devRoomTitle')}>
   <ul class="settings-rows">
-    <SettingsRow title={$i18n.t('room.devRoomId')} description={room.room_id}>
+    <SettingsRow title={i18n.t('room.devRoomId')} description={room.room_id}>
       <IconButton
         variant="subtle"
         size="small"
-        label={$i18n.t('room.devCopyRoomId')}
+        label={i18n.t('room.menuCopyId')}
         onclick={() => void copy(room.room_id)}
       >
         <CopyIcon />
@@ -85,17 +108,17 @@
 
 <SettingsSection
   headingId="room-developer-diagnostics"
-  title={$i18n.t('room.devDiagnosticsTitle')}
-  description={$i18n.t('room.devDiagnosticsDescription')}
+  title={i18n.t('room.devDiagnosticsTitle')}
+  description={i18n.t('room.devDiagnosticsDescription')}
 >
   <ul class="settings-rows">
-    <SettingsRow title={$i18n.t('room.devDiagSync')}>
+    <SettingsRow title={i18n.t('room.devDiagSync')}>
       <code>{diagnostics.sync} · {diagnostics.core_status}</code>
     </SettingsRow>
-    <SettingsRow title={$i18n.t('room.devDiagMembership')}>
+    <SettingsRow title={i18n.t('room.devDiagMembership')}>
       <code>{diagnostics.membership}</code>
     </SettingsRow>
-    <SettingsRow title={$i18n.t('room.devDiagUnread')}>
+    <SettingsRow title={i18n.t('room.devDiagUnread')}>
       <code
         >{diagnostics.unread} / {diagnostics.notifying} / {diagnostics.highlight}{diagnostics.marked_unread
           ? ' · marked'
@@ -103,15 +126,36 @@
       >
     </SettingsRow>
     <SettingsRow
-      title={$i18n.t('room.devDiagFullyRead')}
+      title={i18n.t('room.devDiagFullyRead')}
       description={diagnostics.fully_read ?? '-'}
     />
     <SettingsRow
-      title={$i18n.t('room.devDiagLatest')}
+      title={i18n.t('room.devDiagLatest')}
       description={`${diagnostics.latest_event_id ?? '-'} · ${
-        diagnostics.read_latest ? $i18n.t('room.devDiagRead') : $i18n.t('room.devDiagNotRead')
+        diagnostics.read_latest ? i18n.t('room.devDiagRead') : i18n.t('room.devDiagNotRead')
       }`}
     />
+    {#if readState}
+      <SettingsRow
+        title={i18n.t('room.devDiagMain')}
+        description={readState.main.receipt_event_id ?? '-'}
+      >
+        <code
+          >{readState.main.unread} / {readState.main.notifying} / {readState.main.highlight}</code
+        >
+      </SettingsRow>
+      <SettingsRow title={i18n.t('room.devDiagServer')}>
+        <code>{readState.server_notifications} / {readState.server_highlights}</code>
+      </SettingsRow>
+      {#each readState.threads as thread (thread.root_event_id)}
+        <SettingsRow
+          title={i18n.t('room.devDiagThread')}
+          description={`${thread.root_event_id} · ${thread.receipt_event_id ?? '-'}`}
+        >
+          <code>{thread.unread} / {thread.notifying} / {thread.highlight}</code>
+        </SettingsRow>
+      {/each}
+    {/if}
   </ul>
   <div class="settings-form">
     <div>
@@ -120,7 +164,7 @@
         variant="secondary"
         onclick={() => void copy(JSON.stringify(diagnostics, null, 2))}
       >
-        {$i18n.t('room.devDiagCopy')}
+        {i18n.t('room.devDiagCopy')}
       </Button>
     </div>
   </div>

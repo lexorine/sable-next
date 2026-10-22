@@ -17,15 +17,15 @@ export class AuthFlow {
 
   constructor(private readonly page: Page) {
     this.heading = page.getByRole('heading', { level: 1 });
-    this.homeserver = page.getByLabel('Account provider');
+    this.homeserver = page.getByLabel('Account provider', { exact: true });
     this.redirectSignInButton = page.getByRole('button', { name: /^Sign in with http/ });
     this.username = page.getByLabel('Username');
     this.password = page.getByRole('textbox', { name: 'Password' });
     this.moreMethodsButton = page.getByRole('button', { name: 'More ways to sign in' });
     this.passwordSignInButton = page.getByRole('button', { name: 'Sign in with password' });
     this.setupCard = page.locator('.auth-card.active');
-    const stages = page.getByRole('navigation', { name: en.auth.stageNavigation });
-    this.previousStageButton = stages.getByRole('button', { name: en.auth.back, exact: true });
+    const stages = page.getByRole('group', { name: en.auth.stageNavigation });
+    this.previousStageButton = stages.getByRole('button', { name: en.common.back, exact: true });
     this.nextStageButton = stages.getByRole('button', { name: en.auth.next, exact: true });
   }
 

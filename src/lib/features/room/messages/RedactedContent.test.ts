@@ -1,11 +1,11 @@
 // @vitest-environment happy-dom
 
 import { render, screen } from '@testing-library/svelte';
-import { userEvent } from '@testing-library/user-event';
 import { tick } from 'svelte';
-import { afterEach, expect, test, vi } from 'vitest';
+import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 
-import type { TimelineItemContentView, TimelineItemView } from '#src/generated/protocol';
+import type { Rpc, TimelineItemView } from '#src/generated/protocol';
+import { CoreError } from '#src/transport';
 
 vi.mock('#lib/core/context.js');
 
@@ -15,26 +15,51 @@ vi.mock('#lib/rooms/room-list.svelte.js', () => ({
   useRoomList: () => ({ rooms: [] }),
 }));
 
+import { setPreference } from '#lib/settings/preferences.svelte.js';
+import { withRowFields } from '#lib/features/room/timeline/row-fixtures.js';
 import MessageBody from './MessageBody.svelte';
+import { resetRedactedReveals, revealRedacted } from './redacted-reveals.svelte.js';
 
-const redacted = vi.fn<(...args: never[]) => Promise<unknown>>();
+const ROOM = '!room:example.org';
+const EVENT = '$redacted';
+const redactedContent = core.rpc.messages.redactedContent;
+const rpc = core.rpc as unknown as Rpc;
+const observerBackup = globalThis.IntersectionObserver;
 
-afterEach(() => {
-  redacted.mockReset();
-  Object.assign(core.commands, { redactedContent: redacted });
+const secret = {
+  content: {
+    kind: 'message' as const,
+    body: 'the secret',
+    html: '<p>the secret</p>',
+    emote: false,
+    notice: false,
+    edited: false,
+    jumbo: null,
+  },
+  per_message_profile: null,
+};
+
+beforeEach(() => {
+  resetRedactedReveals();
 });
 
-function tombstoned(): TimelineItemView {
-  return {
+afterEach(() => {
+  redactedContent.mockReset();
+  setPreference('autoRevealRedacted', false);
+  globalThis.IntersectionObserver = observerBackup;
+});
+
+function tombstone(): TimelineItemView {
+  return withRowFields({
     id: 'item',
-    event_id: '$redacted',
+    event_id: EVENT,
     transaction_id: null,
     send_state: null,
     sender: '@alice:example.org',
     sender_name: 'Alice',
     sender_avatar: null,
     timestamp: 0,
-    content: { kind: 'redacted', reason: 'spam' },
+    content: { kind: 'redacted', reason: 'spam', redacted_by: null },
     in_reply_to: null,
     thread_root: null,
     thread_summary: null,
@@ -48,136 +73,88 @@ function tombstoned(): TimelineItemView {
     mention: 'none',
     forwarded: null,
     forum_title: null,
-  };
-}
-
-function message(body: string): TimelineItemContentView {
-  return {
-    kind: 'message',
-    body,
-    html: `<p>${body}</p>`,
-    emote: false,
-    notice: false,
-    edited: false,
-  };
-}
-
-/** Renders the tombstone with the affordance either offered or withheld. */
-function renderTombstone(canRedactOthers: boolean) {
-  return render(MessageBody, {
-    item: tombstoned(),
-    canRedactOthers,
-    roomId: '!room:example.org',
   });
 }
 
-test('a user without the redact level is never offered the original content', async () => {
-  renderTombstone(false);
+async function renderTombstone(canRedactOthers = true) {
+  const view = render(MessageBody, { item: tombstone(), canRedactOthers, roomId: ROOM });
   await tick();
+  return view;
+}
+
+function visibleImmediately() {
+  globalThis.IntersectionObserver = class {
+    readonly callback: IntersectionObserverCallback;
+    constructor(callback: IntersectionObserverCallback) {
+      this.callback = callback;
+    }
+    observe() {
+      this.callback(
+        [{ isIntersecting: true } as IntersectionObserverEntry],
+        this as unknown as IntersectionObserver
+      );
+    }
+    disconnect() {}
+  } as unknown as typeof IntersectionObserver;
+}
+
+test('stays collapsed until revealed', async () => {
+  visibleImmediately();
+  await renderTombstone();
 
   expect(screen.getByText(/spam/)).toBeInTheDocument();
-  expect(screen.queryByRole('button', { name: /deleted content/i })).not.toBeInTheDocument();
-  expect(redacted).not.toHaveBeenCalled();
+  expect(redactedContent).not.toHaveBeenCalled();
 });
 
-test('a moderator is offered the original content and gets it on click', async () => {
-  redacted.mockResolvedValue({ content: message('the secret'), per_message_profile: null });
-  const user = userEvent.setup();
-  renderTombstone(true);
+test('a reveal shows the original under the trash-icon tombstone', async () => {
+  redactedContent.mockResolvedValue(secret);
+  await renderTombstone();
+  await revealRedacted(rpc, ROOM, EVENT);
   await tick();
 
-  const button = screen.getByRole('button', { name: /deleted content/i });
-  await user.click(button);
-  await tick();
-
-  expect(redacted).toHaveBeenCalledWith('!room:example.org', '$redacted');
-  expect(await screen.findByText('the secret')).toBeInTheDocument();
-  // The tombstone stays: the point is to see what was deleted, not to un-delete
-  // it in the timeline.
+  expect(redactedContent).toHaveBeenCalledWith({ room_id: ROOM, event_id: EVENT });
+  expect(screen.getByText('the secret')).toBeInTheDocument();
   expect(screen.getByText(/spam/)).toBeInTheDocument();
 });
 
-test('a homeserver with no such endpoint stops offering it', async () => {
-  // A server that ignores the query parameter answers with nothing to show,
-  // which is the same end state as a permanent refusal.
-  redacted.mockResolvedValue({ content: null, per_message_profile: null });
-  const user = userEvent.setup();
-  renderTombstone(true);
-  await tick();
+test('auto mode fetches once when visible, and only for moderators', async () => {
+  setPreference('autoRevealRedacted', true);
+  visibleImmediately();
+  redactedContent.mockResolvedValue(secret);
 
-  await user.click(screen.getByRole('button', { name: /deleted content/i }));
-  await tick();
+  const hidden = await renderTombstone(false);
+  expect(redactedContent).not.toHaveBeenCalled();
+  hidden.unmount();
 
-  expect(await screen.findByText(/cannot show deleted content/i)).toBeInTheDocument();
-  expect(screen.queryByText('the secret')).not.toBeInTheDocument();
+  await renderTombstone();
+  await renderTombstone();
+  await vi.waitFor(() => expect(screen.getAllByText('the secret')).toHaveLength(2));
+  expect(redactedContent).toHaveBeenCalledTimes(1);
 });
 
-test('a refusal ends the affordance rather than inviting a retry', async () => {
-  redacted.mockRejectedValue({ detail: { code: 'denied' } });
-  const user = userEvent.setup();
-  renderTombstone(true);
-  await tick();
+test('auto mode stops asking once the server lacks MSC2815', async () => {
+  setPreference('autoRevealRedacted', true);
+  visibleImmediately();
+  redactedContent.mockRejectedValue(new CoreError({ code: 'unsupported' }));
 
-  await user.click(screen.getByRole('button', { name: /deleted content/i }));
-  await tick();
+  await renderTombstone();
+  await vi.waitFor(() => expect(screen.getByText(/cannot show deleted/i)).toBeInTheDocument());
+  await revealRedacted(rpc, ROOM, '$other', true);
 
-  expect(await screen.findByText(/don't have permission/i)).toBeInTheDocument();
-  expect(screen.queryByRole('button', { name: /deleted content/i })).not.toBeInTheDocument();
+  expect(redactedContent).toHaveBeenCalledTimes(1);
 });
 
-test('erased content is reported as permanent, not retryable', async () => {
-  redacted.mockRejectedValue({ detail: { code: 'unsupported' } });
-  const user = userEvent.setup();
-  renderTombstone(true);
-  await tick();
+test('a manual reveal retries an outage but not a refusal', async () => {
+  redactedContent.mockRejectedValue(new CoreError({ code: 'unavailable' }));
+  await revealRedacted(rpc, ROOM, EVENT);
+  await revealRedacted(rpc, ROOM, EVENT, true);
+  expect(redactedContent).toHaveBeenCalledTimes(1);
 
-  await user.click(screen.getByRole('button', { name: /deleted content/i }));
-  await tick();
+  redactedContent.mockRejectedValue(new CoreError({ code: 'denied' }));
+  await revealRedacted(rpc, ROOM, EVENT);
+  await revealRedacted(rpc, ROOM, EVENT);
+  expect(redactedContent).toHaveBeenCalledTimes(2);
 
-  expect(await screen.findByText(/cannot show deleted content/i)).toBeInTheDocument();
-  expect(screen.queryByRole('button', { name: /deleted content/i })).not.toBeInTheDocument();
-});
-
-test('an unrecognised failure is retryable, since something else may be wrong', async () => {
-  redacted.mockRejectedValue({ detail: { code: 'something_new' } });
-  const user = userEvent.setup();
-  renderTombstone(true);
-  await tick();
-
-  await user.click(screen.getByRole('button', { name: /deleted content/i }));
-  await tick();
-
-  expect(screen.getByRole('button', { name: /deleted content/i })).toBeInTheDocument();
-});
-
-test('a homeserver outage keeps the button so the read can be retried', async () => {
-  redacted.mockRejectedValue({ detail: { code: 'unavailable' } });
-  const user = userEvent.setup();
-  renderTombstone(true);
-  await tick();
-
-  await user.click(screen.getByRole('button', { name: /deleted content/i }));
-  await tick();
-
-  expect(screen.getByRole('button', { name: /deleted content/i })).toBeInTheDocument();
-});
-
-test('one failure does not send a second request', async () => {
-  redacted.mockResolvedValue({ content: null, per_message_profile: null });
-  const user = userEvent.setup();
-  renderTombstone(true);
-  await tick();
-
-  await user.click(screen.getByRole('button', { name: /deleted content/i }));
-  await tick();
-
-  expect(redacted).toHaveBeenCalledTimes(1);
-});
-
-test('no affordance without a room, since there is nothing to address the request to', async () => {
-  render(MessageBody, { item: tombstoned(), canRedactOthers: true, roomId: '' });
-  await tick();
-
-  expect(screen.getByText(/spam/)).toBeInTheDocument();
-  expect(screen.queryByRole('button', { name: /deleted content/i })).not.toBeInTheDocument();
+  await renderTombstone();
+  expect(screen.getByText(/don’t have permission/i)).toBeInTheDocument();
 });

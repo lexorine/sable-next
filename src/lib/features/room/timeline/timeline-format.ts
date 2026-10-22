@@ -8,42 +8,29 @@ import type { ReplyPreviewStyle, TimelinePreferences } from '#lib/settings/prefe
 
 export { senderColor } from '#lib/ui/primitives/identity-color.js';
 
-const MESSAGE_ROW_KINDS = [
-  'message',
-  'image',
-  'video',
-  'audio',
-  'file',
-  'sticker',
-  'gallery',
-  'location',
-  'live_location',
-  'poll',
-  'redacted',
-] as const satisfies readonly TimelineItemContentView['kind'][];
-
 export type MessageContent = Extract<
   TimelineItemContentView,
-  { kind: (typeof MESSAGE_ROW_KINDS)[number] }
+  {
+    kind:
+      | 'message'
+      | 'image'
+      | 'video'
+      | 'audio'
+      | 'file'
+      | 'sticker'
+      | 'gallery'
+      | 'location'
+      | 'live_location'
+      | 'poll'
+      | 'redacted';
+  }
 >;
 
+export type MessageItem = TimelineItemView & { content: MessageContent };
+
 /** Rows that carry a sender, a hover menu and reactions. */
-export function isMessageRow(content: TimelineItemContentView): content is MessageContent {
-  return (MESSAGE_ROW_KINDS as readonly string[]).includes(content.kind);
-}
-
-const FORWARDABLE_KINDS = [
-  'message',
-  'image',
-  'video',
-  'audio',
-  'file',
-  'location',
-  'gallery',
-] as const satisfies readonly TimelineItemContentView['kind'][];
-
-export function canForward(content: TimelineItemContentView): boolean {
-  return (FORWARDABLE_KINDS as readonly string[]).includes(content.kind);
+export function isMessageRow(item: TimelineItemView): item is MessageItem {
+  return item.row === 'message';
 }
 
 export function canRedact(
@@ -51,57 +38,15 @@ export function canRedact(
   canRedactOwn: boolean,
   canRedactOthers: boolean
 ): boolean {
-  if (isAnnotation(item) || item.content.kind === 'redacted') return false;
-  return item.is_own ? canRedactOwn : canRedactOthers;
-}
-
-const EMOJI_ONLY = /^(?:\p{Extended_Pictographic}|\p{Emoji_Component}|\s)+$/u;
-const PICTOGRAPHIC = /\p{Extended_Pictographic}/u;
-const IMAGE_TAG = /<img\b(?:"[^"]*"|'[^']*'|[^>"'])*>/giu;
-const MXC_IMAGE_SOURCE = /\bsrc=(?:"mxc:|'mxc:)/i;
-const LINE_BREAK = /<br\b[^>]*>/giu;
-const NO_BREAK_SPACE = /&(?:nbsp|#160);/giu;
-const JUMBO_MAX = 8;
-
-function jumboLevel(count: number): 1 | 2 | 3 | 4 | null {
-  if (count === 0 || count > JUMBO_MAX) return null;
-  if (count === 1) return 1;
-  if (count === 2) return 2;
-  return count <= 4 ? 3 : 4;
-}
-
-export function jumboEmojiLevel(body: string): 1 | 2 | 3 | 4 | null {
-  const trimmed = body.trim();
-  if (!trimmed || !PICTOGRAPHIC.test(trimmed) || !EMOJI_ONLY.test(trimmed)) return null;
-
-  const segmenter = new Intl.Segmenter();
-  const count = [...segmenter.segment(trimmed)].filter((unit) => unit.segment.trim()).length;
-  return jumboLevel(count);
-}
-
-export function jumboEmoticonLevel(html: string): 1 | 2 | 3 | 4 | null {
-  const unwrapped = html
-    .trim()
-    .replace(/^<p[^>]*>/iu, '')
-    .replace(/<\/p>$/iu, '');
-  const images = unwrapped.match(IMAGE_TAG) ?? [];
-  if (images.length === 0 || !images.every((image) => MXC_IMAGE_SOURCE.test(image))) return null;
-  const residue = unwrapped
-    .replace(IMAGE_TAG, '')
-    .replace(LINE_BREAK, '')
-    .replace(NO_BREAK_SPACE, ' ')
-    .trim();
-  if (residue !== '') return null;
-  return jumboLevel(images.length);
+  return item.redactable && (item.is_own ? canRedactOwn : canRedactOthers);
 }
 
 export function isAnnotation(item: TimelineItemView): boolean {
-  const kind = item.content.kind;
-  return kind === 'date_divider' || kind === 'read_marker' || kind === 'timeline_start';
+  return item.row === 'annotation';
 }
 
 export function isEventRow(item: TimelineItemView): boolean {
-  return !isMessageRow(item.content) && !isAnnotation(item);
+  return item.row === 'event';
 }
 
 export interface TimelineFilterContext {
@@ -114,22 +59,26 @@ function isVisibleEvent(
   context: TimelineFilterContext
 ): boolean {
   const memberEventsHidden = Boolean(context.readOnly) && preferences.hideMemberInReadOnly;
-  switch (item.content.kind) {
+  switch (item.visibility) {
     case 'membership':
-      if (preferences.hideMembershipEvents || memberEventsHidden) return false;
-      return item.content.change !== 'other' || preferences.showHiddenEvents;
+      return !preferences.hideMembershipEvents && !memberEventsHidden;
+    case 'membership_other':
+      return (
+        !preferences.hideMembershipEvents && !memberEventsHidden && preferences.showHiddenEvents
+      );
     case 'profile_change':
       return !preferences.hideProfileChanges && !memberEventsHidden;
-    case 'redacted':
+    case 'tombstone':
       return preferences.showTombstoneEvents;
-    case 'state_event':
-      if (item.content.change) return true;
+    case 'hidden':
       return preferences.showHiddenEvents && preferences.hiddenEventOther;
-    case 'hidden_event':
-      return preferences.showHiddenEvents && preferences.hiddenEventOther;
-    default:
-      return true;
+    case 'always':
+      return !(preferences.hideTopicChanges && isTopicChange(item));
   }
+}
+
+function isTopicChange(item: TimelineItemView): boolean {
+  return item.content.kind === 'state_event' && item.content.change?.kind === 'room_topic';
 }
 
 export function visibleAggregations(
@@ -172,7 +121,12 @@ export function mergeAggregations(
   const merged: TimelineItemView[] = [];
   let next = 0;
   for (const item of items) {
-    while (next < pending.length && pending[next].timestamp <= item.timestamp) {
+    const dateDivider = item.content.kind === 'date_divider';
+    const boundary = dateDivider ? new Date(item.timestamp).setHours(0, 0, 0, 0) : item.timestamp;
+    while (
+      next < pending.length &&
+      (dateDivider ? pending[next].timestamp < boundary : pending[next].timestamp <= boundary)
+    ) {
       merged.push(pending[next]);
       next += 1;
     }
@@ -187,13 +141,25 @@ export function visibleTimelineItems(
   context: TimelineFilterContext = {}
 ): TimelineItemView[] {
   const shown = new Set<string>();
-  const kept = items.filter((item) => {
+  const kept: TimelineItemView[] = [];
+  let lastEvent = -1;
+  for (const item of items) {
     if (item.event_id) {
-      if (shown.has(item.event_id)) return false;
+      if (shown.has(item.event_id)) continue;
       shown.add(item.event_id);
     }
-    return isVisibleEvent(item, preferences, context);
-  });
+    if (isVisibleEvent(item, preferences, context)) {
+      kept.push(item);
+      if (item.event_id) lastEvent = kept.length - 1;
+    } else if (item.read_by.length > 0 && lastEvent >= 0) {
+      const holder = kept[lastEvent];
+      kept[lastEvent] = {
+        ...holder,
+        read_by: [...holder.read_by, ...item.read_by],
+        read_timestamps: { ...holder.read_timestamps, ...item.read_timestamps },
+      };
+    }
+  }
 
   const visible: TimelineItemView[] = [];
   let hasEventBelow = false;
@@ -250,6 +216,10 @@ export function withReadMarkerBefore(
   if (index < 0) return rest;
   const marker = items.find((item) => item.content.kind === 'read_marker') ?? {
     id: 'unread-marker',
+    row: 'annotation',
+    forwardable: false,
+    redactable: false,
+    visibility: 'always',
     event_id: null,
     transaction_id: null,
     send_state: null,
@@ -300,7 +270,7 @@ export function personaLookup(
 function personaKey(item: TimelineItemView): string {
   const profile = item.per_message_profile;
   if (!profile) return '';
-  return profile.id ?? profile.display_name ?? '';
+  return (profile.id ?? profile.display_name ?? '') + (profile.avatar_url ?? ''); // add avatar_url to differentiate alternate avatar PMPs
 }
 
 export function isCollapsed(
@@ -314,18 +284,17 @@ export function isCollapsed(
   if (isEventRow(current) && isEventRow(previous)) return true;
   if (replyPreviewStyle === 'connected' && current.in_reply_to) return false;
   return (
-    isMessageRow(current.content) &&
-    isMessageRow(previous.content) &&
+    isMessageRow(current) &&
+    isMessageRow(previous) &&
     current.sender !== null &&
     current.sender === previous.sender &&
     personaKey(current) === personaKey(previous) &&
-    current.timestamp - previous.timestamp < 120_000
+    Math.abs(current.timestamp - previous.timestamp) < 120_000
   );
 }
 
 /**
- * Readers whose latest receipt is on this item or a later one. The SDK moves a
- * receipt to its newest event, so an old message otherwise loses its readers.
+ * Readers whose latest receipt is on this item or a later one.
  */
 export function cumulativeReadBy(
   items: readonly TimelineItemView[]
@@ -379,7 +348,7 @@ export type ReplyDirection = 'older' | 'newer';
 function isReplyTarget(item: TimelineItemView, showHiddenEvents: boolean): boolean {
   if (item.event_id === null || isAnnotation(item) || item.content.kind === 'redacted')
     return false;
-  return isMessageRow(item.content) || showHiddenEvents;
+  return isMessageRow(item) || showHiddenEvents;
 }
 
 export function replyTarget(
@@ -406,8 +375,7 @@ export function eventBefore(items: readonly TimelineItemView[], eventId: string)
 }
 
 /**
- * The newest event scrolled past, never an older one: history loading below the
- * reader, or a jump back up, would otherwise walk the receipt backwards.
+ * The newest event scrolled past, so history loading below the reader never moves the receipt back.
  */
 export function readReceiptEventId(
   items: readonly TimelineItemView[],

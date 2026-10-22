@@ -1,11 +1,18 @@
+use crate::api::session::SearchTuning;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use matrix_sdk::deserialized_responses::{
+    TimelineEvent, UnableToDecryptInfo, UnableToDecryptReason,
+};
 use matrix_sdk::executor::{JoinHandleExt, spawn};
-use matrix_sdk::room::MessagesOptions;
+use matrix_sdk::ruma::api::Direction;
+use matrix_sdk::ruma::api::client::message::get_message_events;
 use matrix_sdk::ruma::api::error::{ErrorKind, RetryAfter};
+use matrix_sdk::ruma::events::AnyTimelineEvent;
+use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, OwnedRoomId, RoomId, UInt};
 use matrix_sdk::{EncryptionState, Room, RoomState};
 use tracing::warn;
@@ -14,7 +21,6 @@ use super::persist::{self, StoredCrawlRoom};
 use crate::Core;
 use crate::protocol::{
     CoreEvent, SearchCoverageState, SearchCoverageView, SearchCrawlPhase, SearchMetricsView,
-    SearchTuning,
 };
 
 const CRAWL_BATCH: u16 = 100;
@@ -100,6 +106,7 @@ pub(crate) struct CrawlProgress {
     tokens: HashMap<OwnedRoomId, Option<String>>,
     probed: HashSet<OwnedRoomId>,
     blind: HashMap<OwnedRoomId, usize>,
+    lost_sessions: HashSet<(OwnedRoomId, String)>,
     stalled: HashMap<OwnedRoomId, u32>,
     discarded: HashSet<OwnedRoomId>,
     awaiting: HashMap<OwnedRoomId, u64>,
@@ -656,6 +663,55 @@ impl Core {
         }
     }
 
+    async fn crawl_page(
+        &self,
+        room: &Room,
+        request: get_message_events::v3::Request,
+    ) -> matrix_sdk::Result<CrawlPage> {
+        let response = room.client().send(request).await?;
+        let mut chunk = Vec::with_capacity(response.chunk.len());
+        for event in response.chunk {
+            chunk.push(self.crawl_event(room, event).await);
+        }
+        Ok(CrawlPage {
+            chunk,
+            end: response.end,
+        })
+    }
+
+    async fn crawl_event(&self, room: &Room, event: Raw<AnyTimelineEvent>) -> TimelineEvent {
+        let Some(session_id) = megolm_session(&event) else {
+            return TimelineEvent::from_plaintext(event.cast());
+        };
+        let session = (room.room_id().to_owned(), session_id);
+        if self
+            .search_crawl
+            .lock()
+            .await
+            .lost_sessions
+            .contains(&session)
+        {
+            return TimelineEvent::from_utd(
+                event.cast(),
+                UnableToDecryptInfo {
+                    session_id: Some(session.1),
+                    reason: UnableToDecryptReason::MissingMegolmSession {
+                        withheld_code: None,
+                    },
+                },
+            );
+        }
+        match room.decrypt_event(event.cast_ref_unchecked(), None).await {
+            Ok(decrypted) => {
+                if decrypted.kind.is_utd() {
+                    self.search_crawl.lock().await.lost_sessions.insert(session);
+                }
+                decrypted
+            }
+            Err(_) => TimelineEvent::from_plaintext(event.cast()),
+        }
+    }
+
     pub(super) async fn crawl_once(
         &self,
         client: &matrix_sdk::Client,
@@ -673,11 +729,17 @@ impl Core {
             )
         };
 
-        let mut options = MessagesOptions::backward().from(from.as_deref());
-        options.limit = UInt::from(batch);
-        options.filter.not_types = vec!["m.reaction".to_owned()];
+        let mut request =
+            get_message_events::v3::Request::new(room_id.clone(), Direction::Backward);
+        request.from = from;
+        request.limit = UInt::from(batch);
+        request.filter.not_types = vec!["m.reaction".to_owned()];
         let requested = now_ms();
-        let Some(messages) = self.search_network.run(room.messages(options)).await else {
+        let Some(messages) = self
+            .search_network
+            .run(self.crawl_page(&room, request))
+            .await
+        else {
             return Ok(CrawlOutcome::Paused);
         };
         let messages = messages?;
@@ -799,6 +861,27 @@ fn crawls_first(room: &Room) -> bool {
         || room.direct_targets_length() > 0
 }
 
+struct CrawlPage {
+    chunk: Vec<TimelineEvent>,
+    end: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct EncryptedContent {
+    session_id: String,
+}
+
+fn megolm_session(event: &Raw<AnyTimelineEvent>) -> Option<String> {
+    if event.get_field::<String>("type").ok().flatten().as_deref() != Some("m.room.encrypted") {
+        return None;
+    }
+    event
+        .get_field::<EncryptedContent>("content")
+        .ok()
+        .flatten()
+        .map(|content| content.session_id)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -833,7 +916,7 @@ mod tests {
 
     #[test]
     fn test_tuning_is_clamped_so_the_crawl_cannot_be_driven_out_of_bounds() {
-        let wild = crate::protocol::SearchTuning {
+        let wild = crate::api::session::SearchTuning {
             crawl_pause_ms: 0,
             trickle_pause_ms: u32::MAX,
             flush_interval_secs: 0,
@@ -848,21 +931,21 @@ mod tests {
         assert_eq!(tuning.batch, u32::from(CRAWL_BATCH));
         assert!(tuning.max_events >= tuning.base_events);
         assert_eq!(
-            crate::protocol::SearchTuning::default().clamped(),
-            crate::protocol::SearchTuning::default()
+            crate::api::session::SearchTuning::default().clamped(),
+            crate::api::session::SearchTuning::default()
         );
     }
 
     #[test]
     fn test_only_a_batch_with_an_undecryptable_event_earns_the_long_pause() {
-        let tuning = crate::protocol::SearchTuning {
+        let tuning = crate::api::session::SearchTuning {
             crawl_pause_ms: 1_000,
-            ..crate::protocol::SearchTuning::default()
+            ..crate::api::session::SearchTuning::default()
         };
         assert_eq!(outcome(true).pause(&tuning), Duration::from_secs(1));
         assert_eq!(outcome(false).pause(&tuning), CRAWL_PAUSE);
         assert_eq!(
-            outcome(true).pause(&crate::protocol::SearchTuning::default()),
+            outcome(true).pause(&crate::api::session::SearchTuning::default()),
             CRAWL_READABLE_PAUSE
         );
     }
@@ -907,7 +990,6 @@ mod tests {
     async fn test_the_metrics_count_batches_and_pushbacks() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
         let room_id = room();
         server.sync_joined_room(&client, &room_id).await;
         server
@@ -937,6 +1019,71 @@ mod tests {
         assert_eq!(metrics.average_request_ms, metrics.last_request_ms);
         assert_eq!(metrics.rooms_joined, 1);
         assert_eq!(metrics.event_budget, MAX_CRAWLED_EVENTS);
+    }
+
+    fn encrypted(
+        event_id: &str,
+        session_id: &str,
+    ) -> matrix_sdk::ruma::serde::Raw<matrix_sdk::ruma::events::AnyTimelineEvent> {
+        matrix_sdk::ruma::serde::Raw::new(&serde_json::json!({
+            "type": "m.room.encrypted",
+            "event_id": event_id,
+            "room_id": room(),
+            "sender": "@bridge:localhost",
+            "origin_server_ts": super::now_ms(),
+            "content": {
+                "algorithm": "m.megolm.v1.aes-sha2",
+                "ciphertext": "AwgAEhAA",
+                "device_id": "BRIDGE",
+                "sender_key": "DeHIg4gwhClxzFYcmNntPNF9YtsdZbmMy8+3kzCMXHA",
+                "session_id": session_id
+            }
+        }))
+        .expect("event")
+        .cast_unchecked()
+    }
+
+    #[async_test]
+    async fn test_a_session_that_failed_once_is_not_decrypted_again() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room();
+        server.sync_joined_room(&client, &room_id).await;
+        server
+            .mock_room_messages()
+            .ok(RoomMessagesResponseTemplate::default()
+                .events(vec![encrypted("$a", "lost"), encrypted("$b", "lost")])
+                .end_token("older"))
+            .mock_once()
+            .mount()
+            .await;
+        server
+            .mock_room_messages()
+            .ok(RoomMessagesResponseTemplate::default()
+                .events(vec![encrypted("$c", "lost")])
+                .end_token("oldest"))
+            .mock_once()
+            .mount()
+            .await;
+        let (core, _events) = crate::Core::new(
+            "crawl-lost-sessions",
+            Box::new(crate::store::MemorySessionStore::default()),
+        );
+
+        for _ in 0..2 {
+            let Ok(CrawlOutcome::Batch(batch)) = core.crawl_once(&client, &room_id).await else {
+                panic!("the batch should land");
+            };
+            assert!(!batch.readable);
+        }
+
+        assert!(
+            core.search_crawl
+                .lock()
+                .await
+                .lost_sessions
+                .contains(&(room_id, "lost".to_owned()))
+        );
     }
 
     #[test]
@@ -972,7 +1119,6 @@ mod tests {
     async fn test_metered_crawl_pauses_and_resumes() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
         let room_id = room();
         server.sync_joined_room(&client, &room_id).await;
         server
@@ -1035,9 +1181,8 @@ mod tests {
         server.sync_joined_room(&client, &room_id).await;
         server
             .mock_room_messages()
-            .ok(RoomMessagesResponseTemplate::default()
-                .end_token("older")
-                .with_delay(Duration::from_secs(30)))
+            .with_delay(Duration::from_secs(30))
+            .ok(RoomMessagesResponseTemplate::default().end_token("older"))
             .mock_once()
             .mount()
             .await;
@@ -1085,7 +1230,6 @@ mod tests {
     async fn test_a_room_without_a_cursor_starts_behind_what_sync_delivered() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
         let room_id = room();
         let joined = server
             .sync_room(
@@ -1163,7 +1307,6 @@ mod tests {
     async fn test_a_server_error_backs_the_crawl_off_instead_of_dropping_the_room() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
         let room_id = room();
         server.sync_joined_room(&client, &room_id).await;
         server.mock_room_messages().error500().mount().await;
@@ -1328,7 +1471,6 @@ mod tests {
     async fn test_a_checkpoint_is_not_persisted_ahead_of_the_documents_it_skips() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room();
         let factory = EventFactory::new()
@@ -1386,7 +1528,6 @@ mod tests {
     async fn test_the_crawl_stops_a_room_below_its_floor() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room();
         let factory = EventFactory::new()
@@ -1447,7 +1588,6 @@ mod tests {
     async fn test_the_crawl_stops_a_room_older_than_its_age_limit() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room();
         let factory = EventFactory::new()
@@ -1504,7 +1644,6 @@ mod tests {
     async fn test_a_room_that_is_gone_is_not_written_off_for_good() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let (core, _events) = crate::Core::new(
             "crawl-gone",
@@ -1532,7 +1671,6 @@ mod tests {
     async fn test_the_crawl_reaches_an_encrypted_room_before_one_the_server_can_search() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let sender = user_id!("@erwan:localhost");
         let plain_id = room_id!("!plain:localhost").to_owned();
@@ -1594,5 +1732,35 @@ mod tests {
         );
 
         drop((plain, secret));
+    }
+
+    #[test]
+    fn a_megolm_session_is_read_only_from_an_encrypted_event_with_a_string_id() {
+        let event = |value: serde_json::Value| {
+            super::Raw::<serde_json::Value>::new(&value)
+                .unwrap()
+                .cast_unchecked::<super::AnyTimelineEvent>()
+        };
+        let encrypted = |content: serde_json::Value| {
+            event(serde_json::json!({"type": "m.room.encrypted", "content": content}))
+        };
+        assert_eq!(
+            super::megolm_session(&encrypted(serde_json::json!({"session_id": "s"}))).as_deref(),
+            Some("s")
+        );
+        assert_eq!(
+            super::megolm_session(&encrypted(serde_json::json!({"session_id": 1}))),
+            None
+        );
+        assert_eq!(
+            super::megolm_session(&encrypted(serde_json::json!("x"))),
+            None
+        );
+        assert_eq!(
+            super::megolm_session(&event(
+                serde_json::json!({"type": "m.room.message", "content": {"session_id": "s"}})
+            )),
+            None
+        );
     }
 }

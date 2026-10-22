@@ -12,6 +12,22 @@ describe('previewableLinks', () => {
     expect(previewableLinks(html)).toEqual(['https://example.org/loud']);
   });
 
+  it('skips a link the body wraps in angle brackets, which markdown consumes', () => {
+    const html =
+      '<a href="https://example.org/quiet">https://example.org/quiet</a> <a href="https://example.org/loud">loud</a>';
+    const body = '<https://example.org/quiet> [loud](https://example.org/loud)';
+
+    expect(previewableLinks(html, body)).toEqual(['https://example.org/loud']);
+  });
+
+  it('skips a markdown link whose destination is bracketed', () => {
+    const html = '<a href="https://example.org/quiet">https://example.org/quiet</a>';
+
+    expect(
+      previewableLinks(html, '[https://example.org/quiet](<https://example.org/quiet>)')
+    ).toEqual([]);
+  });
+
   it('finds the only link', () => {
     expect(
       previewableLinks('<span data-plain-body>see <a href="https://example.org/a">a</a></span>')
@@ -49,6 +65,13 @@ describe('previewableLinks', () => {
   it('skips a matrix.to permalink', () => {
     const html =
       '<a href="https://matrix.to/#/%23room:example.org">room</a> <a href="https://example.org/x">x</a>';
+    expect(previewableLinks(html)).toEqual(['https://example.org/x']);
+  });
+
+  it('skips a settings link', () => {
+    const html =
+      '<a href="https://next.sable.moe/settings/media?focus=url-previews&amp;moe.sable.client.action=settings">s</a> ' +
+      `<a href="${location.origin}/settings/appearance">s</a> <a href="https://example.org/x">x</a>`;
     expect(previewableLinks(html)).toEqual(['https://example.org/x']);
   });
 

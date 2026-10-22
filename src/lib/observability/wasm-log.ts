@@ -1,6 +1,7 @@
 import { scrubMatrixIds } from './scrubbers';
 
 const TITLE_LIMIT = 600;
+const OLM_ACCOUNT = 'matrix_sdk_crypto::olm::account:';
 
 export type WasmLogLevel = 'error' | 'warn' | 'info';
 
@@ -11,10 +12,42 @@ export function wasmLogLevel(line: string): WasmLogLevel {
   return 'info';
 }
 
+/** Only a warning in the SDK, but the room keys it carried are lost. */
+export function isUndecryptableToDevice(line: string): boolean {
+  return wasmLogLevel(line) === 'warn' && line.includes(OLM_ACCOUNT);
+}
+
+const REPORTABLE_WARNINGS = [
+  'unable to decrypt a message',
+  'no call media key has arrived',
+  'a call media key is still unresolved',
+  'ignoring a call media key',
+  'a call member did not receive the media key',
+  'some call members did not receive the media key',
+  'could not send the call media key',
+  'call member device is unknown',
+  'matrix_sdk_crypto::session_manager::sessions:',
+  'matrix_sdk_crypto::session_manager::group_sessions:',
+  'matrix_sdk_crypto::gossiping::',
+];
+
+/** Warnings that explain a message or a call that could not be decrypted. */
+export function isReportableCoreWarning(line: string): boolean {
+  return wasmLogLevel(line) === 'warn' && REPORTABLE_WARNINGS.some((part) => line.includes(part));
+}
+
+export function isExpectedCoreFailure(line: string): boolean {
+  if (line.includes('reqwest::Error') && /Failed to fetch|Load failed|NetworkError/.test(line)) {
+    return true;
+  }
+  return /status_code:\s*5\d\d|invalid_grant|refresh token was rejected/.test(line);
+}
+
 export function wasmErrorTitle(line: string): string {
   const message = scrubMatrixIds(
     line
-      .replace(/^\s*ERROR\s+/, '')
+      .replace(/^\s*(?:ERROR|WARN)\s+/, '')
+      .replace(/"?JsValue\([^]*$/, '')
       .replace(/\s+/g, ' ')
       .trim()
   );

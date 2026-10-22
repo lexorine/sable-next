@@ -16,8 +16,8 @@ const core = Object.assign(baseCore, {
   setPinned: vi.fn(() => Promise.resolve<string[]>([])),
   bookmarks: vi.fn(() => Promise.resolve([])),
   setBookmark: vi.fn(() => Promise.resolve(false)),
-  withdrawVerification,
 });
+Object.assign(core.rpc.encryption, { withdrawVerification });
 
 vi.mock('#lib/rooms/room-list.svelte.js', () => ({
   useRoomList: () => ({ rooms: [] }),
@@ -35,9 +35,10 @@ vi.mock('#lib/rooms/presence.svelte.js', async () => {
 });
 
 import TimelineItemHarness from './TimelineItemHarness.test.svelte';
+import { withRowFields } from '#lib/features/room/timeline/row-fixtures.js';
 
 function failed(blocked: NonNullable<TimelineItemView['send_state']>): TimelineItemView {
-  return {
+  return withRowFields({
     id: 'item',
     event_id: null,
     transaction_id: 'txn',
@@ -53,6 +54,7 @@ function failed(blocked: NonNullable<TimelineItemView['send_state']>): TimelineI
       emote: false,
       notice: false,
       edited: false,
+      jumbo: null,
     },
     in_reply_to: null,
     thread_root: null,
@@ -67,7 +69,7 @@ function failed(blocked: NonNullable<TimelineItemView['send_state']>): TimelineI
     mention: 'none',
     forwarded: null,
     forum_title: null,
-  };
+  });
 }
 
 test('a send blocked by a changed identity explains why and can go out anyway', async () => {
@@ -92,7 +94,7 @@ test('a send blocked by a changed identity explains why and can go out anyway', 
   expect(screen.getByText(/reset their encryption identity/)).toBeInTheDocument();
   await fireEvent.click(screen.getByRole('button', { name: 'Send anyway' }));
 
-  expect(withdrawVerification).toHaveBeenCalledWith('@bob:example.org');
+  expect(withdrawVerification).toHaveBeenCalledWith({ user_id: '@bob:example.org' });
   await vi.waitFor(() => {
     expect(onRetrySend).toHaveBeenCalledWith('txn');
   });

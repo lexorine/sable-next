@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { RoomPowerLevelsView, RoomSummary } from '#src/generated/protocol';
+  import type { RoomPowerLevelsView, RoomListItemView } from '#src/generated/protocol';
 
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
@@ -8,13 +8,13 @@
   import SettingsRow from '#lib/ui/primitives/SettingsRow.svelte';
   import StatusBadge from '#lib/ui/primitives/StatusBadge.svelte';
 
+  import RoomKeyExportDialog from './RoomKeyExportDialog.svelte';
   import { canSendState } from './permission-groups';
 
   const EVENT_TYPE = 'm.room.encryption';
-  const ALGORITHM = 'm.megolm.v1.aes-sha2';
 
   interface Props {
-    room: RoomSummary | null;
+    room: RoomListItemView | null;
     levels: RoomPowerLevelsView | null;
     ownPowerLevel: number;
   }
@@ -25,6 +25,7 @@
   let confirming = $state(false);
   let enabling = $state(false);
   let failed = $state(false);
+  let exportOpen = $state(false);
 
   let roomId = $derived(room?.room_id ?? null);
   let enabled = $derived(room?.encrypted === true);
@@ -37,7 +38,7 @@
     enabling = true;
     failed = false;
     try {
-      await core.commands.sendStateEvent(target, EVENT_TYPE, '', { algorithm: ALGORITHM });
+      await core.rpc.room_state.enableEncryption({ room_id: target });
       confirming = false;
     } catch (error) {
       console.warn('[sable room] enabling encryption failed', error);
@@ -49,11 +50,11 @@
 </script>
 
 <SettingsRow
-  title={$i18n.t('room.encryptionTitle')}
-  description={enabled ? $i18n.t('room.encryptionOn') : $i18n.t('room.encryptionOff')}
+  title={i18n.t('common.endToEndEncryption')}
+  description={enabled ? i18n.t('room.encryptionOn') : i18n.t('room.encryptionOff')}
 >
   {#if enabled}
-    <StatusBadge variant="success" label={$i18n.t('room.encryptionEnabled')} />
+    <StatusBadge variant="success" label={i18n.t('room.encryptionEnabled')} />
   {:else if canEnable}
     <Button
       size="small"
@@ -61,20 +62,35 @@
         confirming = true;
       }}
     >
-      {$i18n.t('room.encryptionEnable')}
+      {i18n.t('room.permEncryption')}
     </Button>
   {/if}
 </SettingsRow>
 
+{#if enabled && roomId}
+  <SettingsRow title={i18n.t('room.exportKeys')} description={i18n.t('room.exportKeysHint')}>
+    <Button
+      size="small"
+      variant="secondary"
+      onclick={() => {
+        exportOpen = true;
+      }}
+    >
+      {i18n.t('settings.roomKeysExportAction')}
+    </Button>
+  </SettingsRow>
+  <RoomKeyExportDialog bind:open={exportOpen} {roomId} />
+{/if}
+
 <ConfirmDialog
   bind:open={confirming}
-  title={$i18n.t('room.encryptionEnable')}
-  description={$i18n.t('room.encryptionConfirm')}
-  confirmLabel={$i18n.t('room.encryptionEnable')}
+  title={i18n.t('room.permEncryption')}
+  description={i18n.t('room.encryptionConfirm')}
+  confirmLabel={i18n.t('room.permEncryption')}
   confirmVariant="secondary"
-  cancelLabel={$i18n.t('room.encryptionCancel')}
+  cancelLabel={i18n.t('common.cancel')}
   busy={enabling}
-  error={failed ? $i18n.t('room.encryptionFailed') : null}
+  error={failed ? i18n.t('room.encryptionFailed') : null}
   onConfirm={() => {
     void enable();
   }}

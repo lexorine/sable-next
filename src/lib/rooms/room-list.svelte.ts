@@ -1,10 +1,9 @@
 import { createContext, untrack } from 'svelte';
-import { SvelteMap } from 'svelte/reactivity';
 
 import type {
   CoreEvent,
   NotificationModeView,
-  RoomSummary,
+  RoomListItemView,
   SubscriptionId,
 } from '#src/generated/protocol';
 import { applyDiffs } from '#src/transport';
@@ -20,7 +19,6 @@ import { quietRoomIds } from './spaces.js';
 import {
   applyBadgeMode,
   badgeModeFor,
-  type NotificationModeResolver,
   quietUnread,
   roomNotifications,
   type RoomUnread,
@@ -29,12 +27,33 @@ import {
 
 type RoomListDiffs = Extract<CoreEvent, { type: 'room_list_diff' }>['diffs'];
 
-type RoomNotificationModes = { room: NotificationModeView | null; fallback: NotificationModeView };
-const NOTIFICATION_MODE_BATCH = 200;
 const SNAPSHOT_WRITE_DELAY_MS = 1_000;
+const WARM_ROOM_LIMIT = 32;
+const WARM_BATCH_MS = 100;
 
-export function roomPathId(room: RoomSummary): string {
-  return room.canonical_alias ?? room.room_id;
+/** Only use an alias when it resolves locally to this room. */
+const aliasOwners = new WeakMap<readonly RoomListItemView[], Map<string, string>>();
+
+function aliasOwner(rooms: readonly RoomListItemView[], alias: string): string | undefined {
+  let owners = aliasOwners.get(rooms);
+  if (owners === undefined) {
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity -- a lookup index for one immutable rooms array
+    owners = new Map();
+    for (const room of rooms) {
+      const owned = room.canonical_alias;
+      if (!room.is_tombstoned && owned && !owners.has(owned)) owners.set(owned, room.room_id);
+    }
+    aliasOwners.set(rooms, owners);
+  }
+  return owners.get(alias);
+}
+
+export function roomPathId(room: RoomListItemView, rooms: readonly RoomListItemView[]): string {
+  const alias = room.canonical_alias;
+  if (!room.is_tombstoned && alias && aliasOwner(rooms, alias) === room.room_id) {
+    return alias;
+  }
+  return room.room_id;
 }
 
 /** `resolve()` inserts route parameters verbatim, including `#`. */
@@ -42,59 +61,63 @@ export function roomPathParamFromId(roomId: string): string {
   return encodeURIComponent(roomId);
 }
 
-export function roomPathParam(room: RoomSummary): string {
-  return roomPathParamFromId(roomPathId(room));
+export function roomPathParam(room: RoomListItemView, rooms: readonly RoomListItemView[]): string {
+  return roomPathParamFromId(roomPathId(room, rooms));
 }
 
-function directPeer(room: RoomSummary): string | null {
+function directPeer(room: RoomListItemView): string | null {
   return room.is_direct && room.direct_targets.length === 1 ? room.direct_targets[0] : null;
 }
 
-export function roomLabel(room: RoomSummary): string {
+export function roomLabel(room: RoomListItemView): string {
   const label = room.name ?? room.canonical_alias ?? room.room_id;
   const peer = directPeer(room);
   return peer === null ? label : profileOverrides.name(peer, label);
 }
 
-export function roomAvatarUrl(room: RoomSummary): string | null {
+export function roomAvatarUrl(room: RoomListItemView): string | null {
   const peer = directPeer(room);
   return peer === null ? room.avatar_url : profileOverrides.avatar(peer, room.avatar_url);
 }
 
+export function hasDirectRoom(rooms: readonly RoomListItemView[], userId: string): boolean {
+  return rooms.some(
+    (room) => room.is_direct && !room.is_tombstoned && room.direct_targets.includes(userId)
+  );
+}
+
 export function findRoomByPathId(
-  rooms: readonly RoomSummary[],
+  rooms: readonly RoomListItemView[],
   pathId: string | undefined
-): RoomSummary | undefined {
-  return rooms.find((room) => room.room_id === pathId || room.canonical_alias === pathId);
+): RoomListItemView | undefined {
+  if (pathId === undefined) return undefined;
+  return rooms.find(
+    (room) => room.room_id === pathId || (!room.is_tombstoned && room.canonical_alias === pathId)
+  );
 }
 
 const NOBODY_TYPING: readonly string[] = [];
 
 export class RoomList {
-  rooms = $state.raw<RoomSummary[]>([]);
+  rooms = $state.raw<RoomListItemView[]>([]);
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   typingUsers = $state.raw<ReadonlyMap<string, readonly string[]>>(new Map());
 
   private subscription: SubscriptionId | null = null;
   private unsubscribeEvents: (() => void) | null = null;
-  private unsubscribeNotificationSettings: (() => void) | null = null;
   private unsubscribeTyping: (() => void) | null = null;
   private startPromise: Promise<void> | null = null;
   private generation = 0;
-  /* eslint-disable svelte/prefer-svelte-reactivity -- rows read the published snapshot, not these */
-  private readonly notificationModes = new Map<string, RoomNotificationModes>();
-  private readonly notificationModeVersions = new Map<string, number>();
-  private readonly loadingNotificationModes = new Set<string>();
-  /* eslint-enable svelte/prefer-svelte-reactivity */
-  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- replaced wholesale, never mutated
-  private publishedModes = $state.raw<ReadonlyMap<string, RoomNotificationModes>>(new Map());
-  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- replaced wholesale, never mutated
-  private publishedLoadingModes = $state.raw<ReadonlySet<string>>(new Set());
   private snapshotAccountId: string | null = null;
   private snapshotWriteTimer: ReturnType<typeof setTimeout> | undefined;
   private snapshotDirty = false;
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- resolved from setRooms, never rendered
+  private readonly listedWaiters = new Set<{ roomId: string; resolve: () => void }>();
   private presentationActive = true;
   private live = $state(false);
+  private warmed: string[] = [];
+  private pendingWarm: string[] = [];
+  private warmTimer: ReturnType<typeof setTimeout> | undefined;
 
   // eslint-disable-next-line svelte/prefer-svelte-reactivity -- rebuilt wholesale, never mutated
   private readonly roomsById = $derived(new Map(this.rooms.map((room) => [room.room_id, room])));
@@ -103,16 +126,46 @@ export class RoomList {
   constructor(private readonly core: CoreClient) {}
 
   get settled(): boolean {
-    return this.live && this.publishedLoadingModes.size === 0;
+    return this.live;
   }
 
-  byId(roomId: string | null | undefined): RoomSummary | undefined {
+  byId(roomId: string | null | undefined): RoomListItemView | undefined {
     return roomId === null || roomId === undefined ? undefined : this.roomsById.get(roomId);
+  }
+
+  whenListed(roomId: string, timeoutMs: number): Promise<void> {
+    if (this.rooms.some((room) => room.room_id === roomId)) return Promise.resolve();
+    return new Promise((resolve) => {
+      const waiter = { roomId, resolve: finish };
+      const timer = setTimeout(finish, timeoutMs);
+      this.listedWaiters.add(waiter);
+      const waiters = this.listedWaiters;
+      function finish(): void {
+        clearTimeout(timer);
+        waiters.delete(waiter);
+        resolve();
+      }
+    });
   }
 
   labelFor(roomId: string): string {
     const room = this.byId(roomId);
     return room ? roomLabel(room) : roomId;
+  }
+
+  warm(roomId: string): void {
+    if (this.warmed.includes(roomId)) return;
+    this.warmed.push(roomId);
+    if (this.warmed.length > WARM_ROOM_LIMIT) this.warmed.shift();
+    this.pendingWarm.push(roomId);
+    this.warmTimer ??= setTimeout(() => {
+      this.warmTimer = undefined;
+      const roomIds = this.pendingWarm;
+      this.pendingWarm = [];
+      this.core.rpc.timeline.warmRooms({ room_ids: roomIds }).catch((error: unknown) => {
+        console.debug('[sable rooms] rooms not warmed', error);
+      });
+    }, WARM_BATCH_MS);
   }
 
   setPresentationActive(active: boolean): void {
@@ -125,37 +178,29 @@ export class RoomList {
   }
 
   notificationOverride(roomId: string): NotificationModeView | null {
-    return this.publishedModes.get(roomId)?.room ?? null;
+    return this.byId(roomId)?.notification.room ?? null;
   }
 
   notificationMode(roomId: string): NotificationModeView | null {
-    const mode = this.publishedModes.get(roomId);
-    return mode?.room ?? mode?.fallback ?? null;
+    const notification = this.byId(roomId)?.notification;
+    return notification ? (notification.room ?? notification.default) : null;
   }
 
-  readonly notificationModeOf: NotificationModeResolver = (roomId) => this.notificationMode(roomId);
-
-  readonly unreadFor: RoomUnread = (room) =>
-    this.notificationModeIsLoading(room.room_id)
-      ? { unread: 0, highlight: 0, marked: room.marked_unread, notifying: 0 }
-      : roomUnread(room, this.notificationMode(room.room_id));
+  readonly unreadFor: RoomUnread = roomUnread;
 
   readonly badgeUnreadFor: RoomUnread = (room) => {
-    const counts = this.unreadFor(room);
+    const counts = roomUnread(room);
     if (this.quietRoomIds.has(room.room_id)) return quietUnread(counts);
     return applyBadgeMode(
       counts,
-      badgeModeFor(room, this.notificationOverride(room.room_id), {
+      badgeModeFor(room, room.notification.room, {
         direct: preferences.badgeDefaultDirect,
         group: preferences.badgeDefaultGroup,
       })
     );
   };
 
-  readonly notificationsFor: RoomUnread = (room) =>
-    this.notificationModeIsLoading(room.room_id)
-      ? { unread: 0, highlight: 0, marked: room.marked_unread }
-      : roomNotifications(room, this.notificationMode(room.room_id));
+  readonly notificationsFor: RoomUnread = roomNotifications;
 
   async start(): Promise<void> {
     if (this.subscription !== null) return;
@@ -182,31 +227,30 @@ export class RoomList {
     });
     this.live = false;
     this.snapshotAccountId = null;
+    clearTimeout(this.warmTimer);
+    this.warmTimer = undefined;
+    this.warmed = [];
+    this.pendingWarm = [];
     this.rooms = [];
     // eslint-disable-next-line svelte/prefer-svelte-reactivity
     this.typingUsers = new Map();
-    this.notificationModes.clear();
-    this.notificationModeVersions.clear();
-    this.loadingNotificationModes.clear();
-    // eslint-disable-next-line svelte/prefer-svelte-reactivity -- replaced wholesale, never mutated
-    this.publishedModes = new Map();
-    // eslint-disable-next-line svelte/prefer-svelte-reactivity -- replaced wholesale, never mutated
-    this.publishedLoadingModes = new Set();
     this.unsubscribeEvents?.();
     this.unsubscribeEvents = null;
-    this.unsubscribeNotificationSettings?.();
-    this.unsubscribeNotificationSettings = null;
     this.unsubscribeTyping?.();
     this.unsubscribeTyping = null;
 
     const subscription = this.subscription;
     this.subscription = null;
-    if (subscription !== null) this.core.commands.unsubscribe(subscription).catch(() => {});
+    if (subscription !== null) {
+      this.core.rpc.timeline.unsubscribe({ subscription }).catch((error: unknown) => {
+        console.debug('[sable rooms] room list not unsubscribed', error);
+      });
+    }
   }
 
   private async startSubscription(): Promise<void> {
     const generation = this.generation;
-    const buffered = bufferSubscription<CoreEvent, RoomListDiffs[number], RoomSummary>(
+    const buffered = bufferSubscription<CoreEvent, RoomListDiffs[number], RoomListItemView>(
       (listener) => this.core.subscribeEvents(listener),
       (event) => (event.type === 'room_list_diff' ? event : null),
       applyDiffs,
@@ -217,14 +261,18 @@ export class RoomList {
 
     let response;
     try {
-      response = await this.core.commands.subscribeRoomList();
+      response = await this.core.rpc.timeline.subscribeRoomList();
     } catch (error) {
       buffered.stop();
       throw error;
     }
 
     if (generation !== this.generation) {
-      this.core.commands.unsubscribe(response.subscription).catch(() => {});
+      this.core.rpc.timeline
+        .unsubscribe({ subscription: response.subscription })
+        .catch((error: unknown) => {
+          console.debug('[sable rooms] stale room list not unsubscribed', error);
+        });
       buffered.stop();
       return;
     }
@@ -233,10 +281,6 @@ export class RoomList {
     const rooms = buffered.activate(response.subscription, response.rooms);
     if (rooms.length > 0 || !this.snapshotPainted()) this.setRooms(rooms);
     this.unsubscribeEvents = buffered.stop;
-    this.unsubscribeNotificationSettings = this.core.subscribeEvents((event) => {
-      if (event.type === 'notification_settings_changed')
-        void this.loadNotificationModes(this.rooms);
-    });
     this.unsubscribeTyping = this.core.subscribeEvents((event) => {
       if (event.type !== 'typing') return;
 
@@ -287,84 +331,13 @@ export class RoomList {
     this.snapshotDirty = false;
   }
 
-  private setRooms(rooms: RoomSummary[]): void {
+  private setRooms(rooms: RoomListItemView[]): void {
     this.live = true;
     this.rooms = rooms;
+    for (const waiter of this.listedWaiters) {
+      if (rooms.some((room) => room.room_id === waiter.roomId)) waiter.resolve();
+    }
     this.scheduleSnapshotWrite();
-    void this.loadNotificationModes(
-      rooms.filter((room) => !this.notificationModes.has(room.room_id))
-    );
-  }
-
-  private async loadNotificationModes(rooms: readonly RoomSummary[]): Promise<void> {
-    const generation = this.generation;
-    const pending = rooms.filter((room) => !this.loadingNotificationModes.has(room.room_id));
-    const requestedVersions = new SvelteMap(
-      pending.map((room) => [room.room_id, this.notificationModeVersions.get(room.room_id) ?? 0])
-    );
-    for (const room of pending) this.loadingNotificationModes.add(room.room_id);
-    this.publishLoadingModes();
-    const modes: { roomId: string; mode: RoomNotificationModes }[] = [];
-    for (let index = 0; index < pending.length; index += NOTIFICATION_MODE_BATCH) {
-      const batch = pending
-        .slice(index, index + NOTIFICATION_MODE_BATCH)
-        .map((room) => room.room_id);
-      try {
-        for (const entry of await this.core.commands.roomNotificationModes(batch)) {
-          modes.push({
-            roomId: entry.room_id,
-            mode: { room: entry.room, fallback: entry.default },
-          });
-        }
-      } catch (error) {
-        console.debug('[sable rooms] notification modes unavailable', error);
-      }
-    }
-    for (const room of pending) this.loadingNotificationModes.delete(room.room_id);
-    this.publishLoadingModes();
-    if (generation !== this.generation) return;
-
-    let changed = false;
-    for (const { roomId, mode } of modes) {
-      if ((this.notificationModeVersions.get(roomId) ?? 0) !== requestedVersions.get(roomId))
-        continue;
-
-      const previous = this.notificationModes.get(roomId);
-      if (previous?.room === mode.room && previous.fallback === mode.fallback) continue;
-
-      this.notificationModes.set(roomId, mode);
-      changed = true;
-    }
-    if (!changed) return;
-
-    // eslint-disable-next-line svelte/prefer-svelte-reactivity -- replaced wholesale, never mutated
-    this.publishedModes = new Map(this.notificationModes);
-  }
-
-  setNotificationOverride(roomId: string, room: NotificationModeView | null): void {
-    const previous = this.notificationModes.get(roomId);
-    if (!previous || previous.room === room) return;
-    this.notificationModeVersions.set(roomId, (this.notificationModeVersions.get(roomId) ?? 0) + 1);
-    this.notificationModes.set(roomId, { ...previous, room });
-    // eslint-disable-next-line svelte/prefer-svelte-reactivity -- replaced wholesale, never mutated
-    this.publishedModes = new Map(this.notificationModes);
-  }
-
-  private publishLoadingModes(): void {
-    // eslint-disable-next-line svelte/prefer-svelte-reactivity -- replaced wholesale, never mutated
-    const firstRead = new Set<string>();
-    for (const roomId of this.loadingNotificationModes) {
-      if (!this.notificationModes.has(roomId)) firstRead.add(roomId);
-    }
-    const published = this.publishedLoadingModes;
-    if (firstRead.size === published.size && [...firstRead].every((id) => published.has(id)))
-      return;
-
-    this.publishedLoadingModes = firstRead;
-  }
-
-  private notificationModeIsLoading(roomId: string): boolean {
-    return this.publishedLoadingModes.has(roomId) && !this.publishedModes.has(roomId);
   }
 }
 

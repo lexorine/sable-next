@@ -4,9 +4,10 @@ import type { CoreEvent, TimelineFocusView, TimelineItemView } from '#src/genera
 import type { CoreClient } from '#lib/core/client.svelte.js';
 
 import { RoomTimeline } from './timeline.svelte';
+import { withRowFields } from '#lib/features/room/timeline/row-fixtures.js';
 
 function item(id: string): TimelineItemView {
-  return {
+  return withRowFields({
     id,
     event_id: `$${id}`,
     transaction_id: null,
@@ -15,7 +16,15 @@ function item(id: string): TimelineItemView {
     sender_name: 'Alice',
     sender_avatar: null,
     timestamp: 0,
-    content: { kind: 'message', body: id, html: id, emote: false, notice: false, edited: false },
+    content: {
+      kind: 'message',
+      body: id,
+      html: id,
+      emote: false,
+      notice: false,
+      edited: false,
+      jumbo: null,
+    },
     in_reply_to: null,
     thread_root: null,
     thread_summary: null,
@@ -29,7 +38,7 @@ function item(id: string): TimelineItemView {
     mention: 'none',
     forwarded: null,
     forum_title: null,
-  };
+  });
 }
 
 class FakeCore {
@@ -40,10 +49,6 @@ class FakeCore {
 
   readMarker(_roomId: string): Promise<string | null> {
     return Promise.resolve('$read');
-  }
-
-  eventCached(_roomId: string, _eventId: string): Promise<boolean> {
-    return Promise.resolve(false);
   }
 
   subscribeEvents(listener: (event: CoreEvent) => void) {
@@ -85,8 +90,17 @@ class FakeCore {
     for (const listener of this.listeners) listener(event);
   }
 
-  get commands(): this {
-    return this;
+  get rpc() {
+    return {
+      timeline: {
+        subscribe: (params: { room_id: string; focus: TimelineFocusView }) =>
+          this.subscribeTimeline(params.room_id, params.focus),
+        paginate: (params: { subscription: number; direction: 'backward' | 'forward' }) =>
+          this.paginate(params.subscription, params.direction),
+        unsubscribe: () => this.unsubscribe(),
+        readMarker: (params: { room_id: string }) => this.readMarker(params.room_id),
+      },
+    };
   }
 }
 
@@ -145,7 +159,7 @@ test('an updated aggregation replaces the previous version of the event', async 
   const core = new FakeCore();
   const timeline = new RoomTimeline(core as unknown as CoreClient);
   await timeline.start('!room:example.org');
-  const reaction = {
+  const reaction = withRowFields({
     ...item('reaction'),
     content: {
       kind: 'hidden_event',
@@ -153,7 +167,7 @@ test('an updated aggregation replaces the previous version of the event', async 
       content: { 'm.relates_to': { event_id: '$initial', key: '👍', rel_type: 'm.annotation' } },
       redacts: null,
     },
-  } as TimelineItemView;
+  }) as TimelineItemView;
   const redacted = {
     ...reaction,
     content: { kind: 'hidden_event', event_type: 'm.reaction', content: {}, redacts: null },
@@ -195,34 +209,45 @@ test('opens unread at its marker without paginating through the backlog', async 
   expect(core.subscribeCalls.at(-1)?.focus).toEqual({ kind: 'live' });
 });
 
-test('opens a cached unread marker on the live timeline by paging from the cache', async () => {
+test('an unread marker outside the snapshot opens its context without paging', async () => {
   const core = new FakeCore();
-  vi.spyOn(core, 'eventCached').mockResolvedValue(true);
-  vi.spyOn(core, 'paginate').mockImplementation((subscription, direction) => {
-    core.emit({
-      type: 'timeline_diff',
-      subscription,
-      diffs: [{ op: 'push_front', value: item('read') }],
-    });
-    return Promise.resolve({ direction, reached_end: false });
-  });
-  const timeline = new RoomTimeline(core as unknown as CoreClient);
-  await timeline.start('!room:example.org', null, false, true);
-  expect(core.subscribeCalls).toEqual([{ roomId: '!room:example.org', focus: { kind: 'live' } }]);
-  expect(timeline.mode).toEqual({ kind: 'live' });
-  expect(timeline.items.map((entry) => entry.event_id)).toEqual(['$read', '$initial']);
-});
-
-test('a cached unread marker out of paging reach opens its context', async () => {
-  const core = new FakeCore();
-  vi.spyOn(core, 'eventCached').mockResolvedValue(true);
   const timeline = new RoomTimeline(core as unknown as CoreClient);
   await timeline.start('!room:example.org', null, false, true);
   expect(core.subscribeCalls.map((call) => call.focus)).toEqual([
     { kind: 'live' },
     { kind: 'event', event_id: '$read' },
   ]);
+  expect(core.paginateCalls).toBe(0);
   expect(timeline.mode).toEqual({ kind: 'unread', eventId: '$read' });
+});
+
+test('a notified event outside the live snapshot opens its context without paging', async () => {
+  const core = new FakeCore();
+  const timeline = new RoomTimeline(core as unknown as CoreClient);
+  await timeline.start('!room:example.org', null, false, false, '$notified');
+  expect(core.subscribeCalls.map((call) => call.focus)).toEqual([
+    { kind: 'live' },
+    { kind: 'event', event_id: '$notified' },
+  ]);
+  expect(core.paginateCalls).toBe(0);
+  expect(timeline.mode).toEqual({ kind: 'unread', eventId: '$notified' });
+});
+
+test('a notified event in the live snapshot keeps the live timeline', async () => {
+  const core = new FakeCore();
+  const timeline = new RoomTimeline(core as unknown as CoreClient);
+  await timeline.start('!room:example.org', null, false, false, '$initial');
+  expect(core.subscribeCalls.map((call) => call.focus)).toEqual([{ kind: 'live' }]);
+  expect(timeline.mode).toEqual({ kind: 'live' });
+});
+
+test('requesting the context that is already open does not resubscribe', async () => {
+  const core = new FakeCore();
+  const timeline = new RoomTimeline(core as unknown as CoreClient);
+  await timeline.start('!room:example.org', null, false, false, '$notified');
+  await timeline.startUnread('!room:example.org', '$notified');
+  expect(core.subscribeCalls).toHaveLength(2);
+  expect(timeline.mode).toEqual({ kind: 'unread', eventId: '$notified' });
 });
 
 test('repeating the room opening after a summary update keeps its unread context', async () => {
@@ -234,37 +259,30 @@ test('repeating the room opening after a summary update keeps its unread context
   expect(timeline.mode.kind).toBe('unread');
 });
 
-test('returning from unread preserves the reader and includes arrivals during the reload', async () => {
+test('returning from unread opens live at its latest messages without paging', async () => {
   const core = new FakeCore();
-  let subscriptions = 0;
-  vi.spyOn(core, 'subscribeTimeline').mockImplementation((_roomId, focus) => {
-    subscriptions += 1;
-    return Promise.resolve({
-      subscription: subscriptions,
-      items:
-        focus.kind === 'event'
-          ? [item('read'), item('anchor'), item('end')]
-          : subscriptions === 1
-            ? [item('end')]
-            : [item('end'), item('arrived')],
+  vi.spyOn(core, 'subscribeTimeline')
+    .mockResolvedValueOnce({ subscription: 1, items: [item('end')], aggregations: [] })
+    .mockResolvedValueOnce({
+      subscription: 2,
+      items: [item('read'), item('anchor')],
+      aggregations: [],
+    })
+    .mockResolvedValueOnce({
+      subscription: 3,
+      items: [item('end'), item('arrived')],
       aggregations: [],
     });
-  });
+  const paginate = vi.spyOn(core, 'paginate');
   const timeline = new RoomTimeline(core as unknown as CoreClient);
   await timeline.start('!room:example.org', null, false, true);
-  const paginate = vi.spyOn(core, 'paginate').mockImplementation((subscription, direction) => {
-    expect(timeline.items.map((entry) => entry.id)).toEqual(['read', 'anchor', 'end']);
-    core.emit({
-      type: 'timeline_diff',
-      subscription,
-      diffs: [{ op: 'push_front', value: item('anchor') }],
-    });
-    return Promise.resolve({ direction, reached_end: false });
-  });
-  await timeline.resumeLive(() => '$anchor');
-  expect(paginate).toHaveBeenCalledTimes(1);
+
+  await timeline.resumeLive();
+
+  expect(paginate).not.toHaveBeenCalled();
   expect(timeline.mode).toEqual({ kind: 'live' });
-  expect(timeline.items.map((entry) => entry.id)).toEqual(['anchor', 'end', 'arrived']);
+  expect(timeline.items.map((entry) => entry.id)).toEqual(['end', 'arrived']);
+  expect(timeline.resumingLive).toBe(false);
   core.emit({
     type: 'timeline_diff',
     subscription: 3,
@@ -273,12 +291,11 @@ test('returning from unread preserves the reader and includes arrivals during th
   expect(timeline.items.at(-1)?.id).toBe('next');
 });
 
-test('queues live diffs while its replacement snapshot is loading and shares the handoff', async () => {
+test('returning to live keeps the unread context on screen until the live snapshot arrives', async () => {
   const core = new FakeCore();
-  const snapshot = { subscription: 3, items: [item('anchor'), item('end')], aggregations: [] };
-  const pending = Promise.withResolvers<typeof snapshot>();
-  const subscribe = vi
-    .spyOn(core, 'subscribeTimeline')
+  const live = { subscription: 3, items: [item('end'), item('arrived')], aggregations: [] };
+  const pending = Promise.withResolvers<typeof live>();
+  vi.spyOn(core, 'subscribeTimeline')
     .mockResolvedValueOnce({ subscription: 1, items: [item('end')], aggregations: [] })
     .mockResolvedValueOnce({
       subscription: 2,
@@ -288,169 +305,60 @@ test('queues live diffs while its replacement snapshot is loading and shares the
     .mockReturnValueOnce(pending.promise);
   const timeline = new RoomTimeline(core as unknown as CoreClient);
   await timeline.start('!room:example.org', null, false, true);
-  const handoff = timeline.resumeLive(() => '$anchor');
-  expect(timeline.resumeLive(() => '$anchor')).toBe(handoff);
-  await vi.waitFor(() => {
-    expect(subscribe).toHaveBeenCalledTimes(3);
-  });
-  core.emit({
-    type: 'timeline_diff',
-    subscription: 3,
-    diffs: [{ op: 'push_back', value: item('arrived') }],
-  });
   expect(timeline.items.map((entry) => entry.id)).toEqual(['read', 'anchor']);
-  pending.resolve(snapshot);
+
+  const handoff = timeline.resumeLive();
+  await vi.waitFor(() => {
+    expect(timeline.resumingLive).toBe(true);
+  });
+
+  expect(timeline.items.map((entry) => entry.id)).toEqual(['read', 'anchor']);
+  expect(timeline.hasSnapshot).toBe(true);
+  pending.resolve(live);
   await handoff;
-  expect(timeline.items.map((entry) => entry.id)).toEqual(['anchor', 'end', 'arrived']);
-  expect(timeline.resumingLive).toBe(false);
+  expect(timeline.items.map((entry) => entry.id)).toEqual(['end', 'arrived']);
 });
 
-test('keeps the displayed rows after a failed anchor page and retries the same live subscription', async () => {
+test('concurrent returns to live share one subscription', async () => {
   const core = new FakeCore();
+  const snapshot = { subscription: 3, items: [item('end')], aggregations: [] };
+  const pending = Promise.withResolvers<typeof snapshot>();
   const subscribe = vi
     .spyOn(core, 'subscribeTimeline')
     .mockResolvedValueOnce({ subscription: 1, items: [item('end')], aggregations: [] })
-    .mockResolvedValueOnce({
-      subscription: 2,
-      items: [item('read'), item('anchor')],
-      aggregations: [],
-    })
-    .mockResolvedValueOnce({ subscription: 3, items: [item('end')], aggregations: [] });
-  vi.spyOn(core, 'paginate')
-    .mockRejectedValueOnce(new Error('offline'))
-    .mockImplementationOnce((subscription, direction) => {
-      core.emit({
-        type: 'timeline_diff',
-        subscription,
-        diffs: [{ op: 'push_front', value: item('anchor') }],
-      });
-      return Promise.resolve({ direction, reached_end: false });
-    });
+    .mockResolvedValueOnce({ subscription: 2, items: [item('read')], aggregations: [] })
+    .mockReturnValueOnce(pending.promise);
   const timeline = new RoomTimeline(core as unknown as CoreClient);
   await timeline.start('!room:example.org', null, false, true);
-  await expect(timeline.resumeLive(() => '$anchor')).rejects.toThrow('offline');
-  expect(timeline.items.map((entry) => entry.id)).toEqual(['read', 'anchor']);
+
+  const handoff = timeline.resumeLive();
+  expect(timeline.resumeLive()).toBe(handoff);
   expect(timeline.resumingLive).toBe(true);
-  await timeline.resumeLive(() => '$anchor');
+  pending.resolve(snapshot);
+  await handoff;
+
   expect(subscribe).toHaveBeenCalledTimes(3);
-  expect(timeline.items.map((entry) => entry.id)).toEqual(['anchor', 'end']);
   expect(timeline.resumingLive).toBe(false);
 });
 
-test('shows the live rows when the anchor is not in the live history', async () => {
+test('a failed return to live reports the error on the live timeline', async () => {
   const core = new FakeCore();
   vi.spyOn(core, 'subscribeTimeline')
     .mockResolvedValueOnce({ subscription: 1, items: [item('end')], aggregations: [] })
-    .mockResolvedValueOnce({
-      subscription: 2,
-      items: [item('read'), item('anchor')],
-      aggregations: [],
-    })
-    .mockResolvedValueOnce({ subscription: 3, items: [item('end')], aggregations: [] });
-  vi.spyOn(core, 'paginate').mockImplementationOnce((subscription, direction) => {
-    core.emit({
-      type: 'timeline_diff',
-      subscription,
-      diffs: [{ op: 'push_front', value: item('oldest') }],
-    });
-    return Promise.resolve({ direction, reached_end: true });
-  });
+    .mockResolvedValueOnce({ subscription: 2, items: [item('read')], aggregations: [] })
+    .mockRejectedValueOnce(new Error('offline'));
   const timeline = new RoomTimeline(core as unknown as CoreClient);
   await timeline.start('!room:example.org', null, false, true);
-  await expect(timeline.resumeLive(() => '$anchor')).rejects.toThrow('Unable to restore');
-  expect(timeline.items.map((entry) => entry.id)).toEqual(['oldest', 'end']);
+
+  await expect(timeline.resumeLive()).rejects.toThrow('Unable to load live messages');
+
   expect(timeline.mode).toEqual({ kind: 'live' });
-  expect(timeline.resumingLive).toBe(false);
-  core.emit({
-    type: 'timeline_diff',
-    subscription: 3,
-    diffs: [{ op: 'push_back', value: item('arrived') }],
-  });
-  expect(timeline.items.at(-1)?.id).toBe('arrived');
-});
-
-test('restoring the anchor waits for the page diff without polling', async () => {
-  vi.useFakeTimers();
-  try {
-    const core = new FakeCore();
-    vi.spyOn(core, 'subscribeTimeline')
-      .mockResolvedValueOnce({ subscription: 1, items: [item('end')], aggregations: [] })
-      .mockResolvedValueOnce({ subscription: 2, items: [item('anchor')], aggregations: [] })
-      .mockResolvedValueOnce({ subscription: 3, items: [item('end')], aggregations: [] });
-    vi.spyOn(core, 'paginate').mockImplementationOnce((_subscription, direction) =>
-      Promise.resolve({ direction, reached_end: false })
-    );
-    const timeline = new RoomTimeline(core as unknown as CoreClient);
-    await timeline.start('!room:example.org', null, false, true);
-    const handoff = timeline.resumeLive(() => '$anchor');
-    await vi.waitFor(() => {
-      expect(timeline.backwardPagination).toBe('loading');
-    });
-    expect(vi.getTimerCount()).toBe(1);
-    core.emit({
-      type: 'timeline_diff',
-      subscription: 3,
-      diffs: [{ op: 'push_front', value: item('anchor') }],
-    });
-    await handoff;
-    expect(timeline.items.map((entry) => entry.id)).toEqual(['anchor', 'end']);
-    expect(vi.getTimerCount()).toBe(0);
-  } finally {
-    vi.useRealTimers();
-  }
-});
-
-test('keeps paging for the anchor while history is still loading', async () => {
-  const core = new FakeCore();
-  vi.spyOn(core, 'subscribeTimeline')
-    .mockResolvedValueOnce({ subscription: 1, items: [item('end')], aggregations: [] })
-    .mockResolvedValueOnce({ subscription: 2, items: [item('anchor')], aggregations: [] })
-    .mockResolvedValueOnce({ subscription: 3, items: [item('end')], aggregations: [] });
-  const paginate = vi.spyOn(core, 'paginate').mockImplementation((subscription, direction) => {
-    const page = paginate.mock.calls.length;
-    core.emit({
-      type: 'timeline_diff',
-      subscription,
-      diffs: [{ op: 'push_front', value: item(page === 12 ? 'anchor' : `older-${page}`) }],
-    });
-    return Promise.resolve({ direction, reached_end: false });
-  });
-  const timeline = new RoomTimeline(core as unknown as CoreClient);
-  await timeline.start('!room:example.org', null, false, true);
-  await timeline.resumeLive(() => '$anchor');
-  expect(paginate).toHaveBeenCalledTimes(12);
-  expect(timeline.items[0]?.id).toBe('anchor');
+  expect(timeline.error).toBe('load_failed');
+  expect(timeline.items).toEqual([]);
   expect(timeline.resumingLive).toBe(false);
 });
 
-test('recovers the row the reader scrolled to during the handoff', async () => {
-  const core = new FakeCore();
-  vi.spyOn(core, 'subscribeTimeline')
-    .mockResolvedValueOnce({ subscription: 1, items: [item('end')], aggregations: [] })
-    .mockResolvedValueOnce({
-      subscription: 2,
-      items: [item('earlier'), item('middle'), item('end')],
-      aggregations: [],
-    })
-    .mockResolvedValueOnce({ subscription: 3, items: [item('end')], aggregations: [] });
-  let reader = '$middle';
-  vi.spyOn(core, 'paginate').mockImplementation((subscription, direction) => {
-    const loaded = reader.slice(1);
-    reader = '$earlier';
-    core.emit({
-      type: 'timeline_diff',
-      subscription,
-      diffs: [{ op: 'push_front', value: item(loaded) }],
-    });
-    return Promise.resolve({ direction, reached_end: false });
-  });
-  const timeline = new RoomTimeline(core as unknown as CoreClient);
-  await timeline.start('!room:example.org', null, false, true);
-  await timeline.resumeLive(() => reader);
-  expect(timeline.items.map((entry) => entry.id)).toEqual(['earlier', 'middle', 'end']);
-});
-
-test('opening another room cancels a handoff waiting to unsubscribe', async () => {
+test('opening another room cancels a return to live', async () => {
   const core = new FakeCore();
   const unsubscribed = Promise.withResolvers<undefined>();
   vi.spyOn(core, 'unsubscribe')
@@ -460,37 +368,31 @@ test('opening another room cancels a handoff waiting to unsubscribe', async () =
     .mockResolvedValueOnce({ subscription: 1, items: [item('end')], aggregations: [] })
     .mockResolvedValueOnce({ subscription: 2, items: [item('anchor')], aggregations: [] })
     .mockResolvedValueOnce({ subscription: 3, items: [item('other-room')], aggregations: [] });
-  const paginate = vi.spyOn(core, 'paginate');
   const timeline = new RoomTimeline(core as unknown as CoreClient);
   await timeline.start('!room:example.org', null, false, true);
-  const handoff = timeline.resumeLive(() => '$anchor');
+  const handoff = timeline.resumeLive();
   const cancelled = expect(handoff).rejects.toThrow('Room changed');
   const other = timeline.start('!other:example.org');
   unsubscribed.resolve(undefined);
   await other;
   await cancelled;
-  expect(paginate).not.toHaveBeenCalled();
   expect(timeline.items.map((entry) => entry.id)).toEqual(['other-room']);
   expect(timeline.resumingLive).toBe(false);
 });
 
-test('a late live snapshot cannot replace the room opened during a handoff', async () => {
+test('a late live snapshot cannot replace the room opened during a return to live', async () => {
   const core = new FakeCore();
   const snapshot = { subscription: 3, items: [item('anchor')], aggregations: [] };
   const pending = Promise.withResolvers<typeof snapshot>();
   const subscribe = vi
     .spyOn(core, 'subscribeTimeline')
     .mockResolvedValueOnce({ subscription: 1, items: [item('end')], aggregations: [] })
-    .mockResolvedValueOnce({
-      subscription: 2,
-      items: [item('read'), item('anchor')],
-      aggregations: [],
-    })
+    .mockResolvedValueOnce({ subscription: 2, items: [item('read')], aggregations: [] })
     .mockReturnValueOnce(pending.promise)
     .mockResolvedValueOnce({ subscription: 4, items: [item('other-room')], aggregations: [] });
   const timeline = new RoomTimeline(core as unknown as CoreClient);
   await timeline.start('!room:example.org', null, false, true);
-  const handoff = timeline.resumeLive(() => '$anchor');
+  const handoff = timeline.resumeLive();
   const cancelled = expect(handoff).rejects.toThrow('Room changed');
   await vi.waitFor(() => {
     expect(subscribe).toHaveBeenCalledTimes(3);
@@ -511,11 +413,11 @@ test.each(['marker', 'event'] as const)(
       subscription: 1,
       items: [
         boundary === 'marker'
-          ? {
+          ? withRowFields({
               ...item('marker'),
               event_id: null,
               content: { kind: 'read_marker' },
-            }
+            })
           : item('read'),
         item('first'),
       ],
@@ -604,62 +506,47 @@ test('paginates a focused timeline forwards independently', async () => {
   expect(timeline.forwardPagination).toBe('end');
 });
 
-test('forward pagination waits for the newer messages after the command response', async () => {
+test('a forward page is done when its command replies and its messages land after', async () => {
   const core = new FakeCore();
   const timeline = new RoomTimeline(core as unknown as CoreClient);
   await timeline.start('!room:example.org', '$initial');
-  const paginate = vi
-    .spyOn(core, 'paginate')
-    .mockResolvedValue({ direction: 'forward', reached_end: false });
-  await timeline.paginateForward(25);
+  const reply = deferred<{ direction: 'forward' | 'backward'; reached_end: boolean }>();
+  const paginate = vi.spyOn(core, 'paginate').mockReturnValue(reply.promise);
+  const page = timeline.paginateForward(25);
   expect(timeline.forwardPagination).toBe('loading');
   await timeline.paginateForward(25);
   expect(paginate).toHaveBeenCalledTimes(1);
+
+  reply.resolve({ direction: 'forward', reached_end: false });
+  await page;
+  expect(timeline.forwardPagination).toBe('idle');
   core.emit({
     type: 'timeline_diff',
     subscription: 1,
     diffs: [{ op: 'push_back', value: item('newer') }],
   });
-  expect(timeline.forwardPagination).toBe('idle');
+  expect(timeline.items.at(-1)?.id).toBe('newer');
   await timeline.stop();
 });
 
-test('the last forward page waits for its messages before treating the snapshot as latest', async () => {
+test('the last forward page reports the latest on its reply', async () => {
   const core = new FakeCore();
   const timeline = new RoomTimeline(core as unknown as CoreClient);
   await timeline.start('!room:example.org', '$initial');
   vi.spyOn(core, 'paginate').mockResolvedValue({ direction: 'forward', reached_end: true });
   await timeline.paginateForward(25);
-  expect(timeline.forwardPagination).toBe('loading');
-  core.emit({
-    type: 'timeline_diff',
-    subscription: 1,
-    diffs: [{ op: 'push_back', value: item('latest') }],
-  });
   expect(timeline.forwardPagination).toBe('end');
   await timeline.stop();
 });
 
-test('an empty forward page becomes retryable without leaving a timer in the next room', async () => {
-  vi.useFakeTimers();
-  try {
-    const core = new FakeCore();
-    const timeline = new RoomTimeline(core as unknown as CoreClient);
-    await timeline.start('!room:example.org', '$initial');
-    vi.spyOn(core, 'paginate').mockResolvedValue({ direction: 'forward', reached_end: false });
-    await timeline.paginateForward(25);
-    await vi.advanceTimersByTimeAsync(2_000);
-    expect(timeline.forwardPagination).toBe('idle');
-    await timeline.paginateForward(25);
-    expect(vi.getTimerCount()).toBe(1);
-    await timeline.stop();
-    expect(vi.getTimerCount()).toBe(0);
-    await timeline.start('!other:example.org', '$initial');
-    expect(timeline.forwardPagination).toBe('idle');
-    await timeline.stop();
-  } finally {
-    vi.useRealTimers();
-  }
+test('an empty forward page is retryable at once', async () => {
+  const core = new FakeCore();
+  const timeline = new RoomTimeline(core as unknown as CoreClient);
+  await timeline.start('!room:example.org', '$initial');
+  vi.spyOn(core, 'paginate').mockResolvedValue({ direction: 'forward', reached_end: false });
+  await timeline.paginateForward(25);
+  expect(timeline.forwardPagination).toBe('idle');
+  await timeline.stop();
 });
 
 test('a failed forward page rejects and remains manually retryable', async () => {
@@ -799,86 +686,42 @@ test('applies a delayed initial history diff after pagination settles', async ()
   expect(timeline.items.map((entry) => entry.id)).toEqual(['history-1', 'history-2', 'latest']);
 });
 
-class EventSettledPaginationCore extends FakeCore {
-  override paginate(subscription: number, direction: 'backward' | 'forward') {
-    this.paginateCalls += 1;
-    this.paginateSubscriptions.push(subscription);
-    this.emit({ type: 'timeline_pagination', subscription, loading: true, reached_start: false });
-    return Promise.resolve({ direction, reached_end: false });
-  }
-}
-
-test('settles live pagination when the oldest event changes after the response', async () => {
-  const core = new EventSettledPaginationCore();
+test('a live page is done when its command replies and its diff lands after', async () => {
+  const core = new FakeCore();
+  vi.spyOn(core, 'paginate').mockResolvedValue({ direction: 'backward', reached_end: false });
   const timeline = new RoomTimeline(core as unknown as CoreClient);
   await timeline.start('!room:example.org');
 
   await timeline.paginateBackward(25);
-  expect(timeline.backwardPagination).toBe('loading');
+  expect(timeline.backwardPagination).toBe('idle');
 
   core.emit({
     type: 'timeline_diff',
     subscription: 1,
     diffs: [{ op: 'push_front', value: item('history') }],
   });
-  core.emit({
-    type: 'timeline_pagination',
-    subscription: 1,
-    loading: false,
-    reached_start: false,
-  });
-
-  expect(timeline.backwardPagination).toBe('idle');
   expect(timeline.items.map((entry) => entry.id)).toEqual(['history', 'initial']);
 });
 
-class UnchangedPaginationCore extends EventSettledPaginationCore {
-  override paginate(subscription: number, direction: 'backward' | 'forward') {
-    this.paginateCalls += 1;
-    this.paginateSubscriptions.push(subscription);
-    return Promise.resolve({ direction, reached_end: false });
-  }
-}
-
-test('settles an unchanged live page after the diff fallback timeout', async () => {
-  vi.useFakeTimers();
-  try {
-    const core = new UnchangedPaginationCore();
-    const timeline = new RoomTimeline(core as unknown as CoreClient);
-    await timeline.start('!room:example.org');
-
-    await timeline.paginateBackward(25);
-    expect(timeline.backwardPagination).toBe('loading');
-    await vi.advanceTimersByTimeAsync(2_000);
-
-    expect(timeline.backwardPagination).toBe('idle');
-  } finally {
-    vi.useRealTimers();
-  }
-});
-
-class ReachedEndPaginationCore extends EventSettledPaginationCore {
-  override paginate(subscription: number, direction: 'backward' | 'forward') {
-    this.paginateCalls += 1;
-    this.paginateSubscriptions.push(subscription);
-    return Promise.resolve({ direction, reached_end: true });
-  }
-}
-
-test('settles a reached-end live page after its diff arrives', async () => {
-  const core = new ReachedEndPaginationCore();
+test('a live page that reached the start ends on its reply', async () => {
+  const core = new FakeCore();
+  vi.spyOn(core, 'paginate').mockResolvedValue({ direction: 'backward', reached_end: true });
   const timeline = new RoomTimeline(core as unknown as CoreClient);
   await timeline.start('!room:example.org');
 
   await expect(timeline.paginateBackward(25)).resolves.toBe(true);
+
+  expect(timeline.backwardPagination).toBe('end');
+});
+
+test('the SDK status drives a live timeline between commands', async () => {
+  const core = new FakeCore();
+  const timeline = new RoomTimeline(core as unknown as CoreClient);
+  await timeline.start('!room:example.org');
+
+  core.emit({ type: 'timeline_pagination', subscription: 1, loading: true, reached_start: false });
   expect(timeline.backwardPagination).toBe('loading');
-
-  core.emit({
-    type: 'timeline_diff',
-    subscription: 1,
-    diffs: [{ op: 'push_front', value: item('history') }],
-  });
-
+  core.emit({ type: 'timeline_pagination', subscription: 1, loading: false, reached_start: true });
   expect(timeline.backwardPagination).toBe('end');
 });
 
@@ -902,7 +745,7 @@ class PendingPaginationCore extends FakeCore {
   }
 }
 
-test('settles live pagination when the oldest event changes before the response', async () => {
+test('a live page applies diffs that land before its reply', async () => {
   const core = new PendingPaginationCore();
   const timeline = new RoomTimeline(core as unknown as CoreClient);
   await timeline.start('!room:example.org');
@@ -981,8 +824,15 @@ class SwitchingCore {
     for (const listener of this.listeners) listener(event);
   }
 
-  get commands(): this {
-    return this;
+  get rpc() {
+    return {
+      timeline: {
+        subscribe: (params: { room_id: string }) => this.subscribeTimeline(params.room_id),
+        paginate: (params: { subscription: number; direction: 'backward' | 'forward' }) =>
+          this.paginate(params.subscription, params.direction),
+        unsubscribe: (params: { subscription: number }) => this.unsubscribe(params.subscription),
+      },
+    };
   }
 }
 
@@ -1180,6 +1030,29 @@ test('a clear mid-pagination discards the answer that pagination brings back', a
   expect(timeline.backwardPagination).toBe('idle');
 });
 
+test('a clear mid forward page discards its answer and leaves forward paging retryable', async () => {
+  type PaginateResponse = { direction: 'forward'; reached_end: boolean };
+  const pending: { settle: (response: PaginateResponse) => void } = { settle: () => {} };
+  const core = new FakeCore();
+  core.paginate = () =>
+    new Promise((resolve) => {
+      pending.settle = resolve;
+    });
+  const timeline = new RoomTimeline(core as unknown as CoreClient);
+
+  await timeline.start('!room:example.org', '$event:example.org');
+  const pagination = timeline.paginateForward(25);
+  expect(timeline.forwardPagination).toBe('loading');
+
+  core.emit({ type: 'timeline_diff', subscription: 1, diffs: [{ op: 'clear' }] });
+  expect(timeline.forwardPagination).toBe('idle');
+
+  pending.settle({ direction: 'forward', reached_end: true });
+  await pagination;
+
+  expect(timeline.forwardPagination).toBe('idle');
+});
+
 test('a thread subscribes to its root and reports the mode', async () => {
   const core = new FakeCore();
   const timeline = new RoomTimeline(core as unknown as CoreClient);
@@ -1202,66 +1075,6 @@ test('reopening the same thread does not resubscribe', async () => {
   expect(core.subscribeCalls).toHaveLength(1);
 });
 
-test('loading a linked thread reply waits for pagination diffs', async () => {
-  const core = new FakeCore();
-  const paginate = vi.spyOn(core, 'paginate').mockResolvedValue({
-    direction: 'backward',
-    reached_end: false,
-  });
-  const timeline = new RoomTimeline(core as unknown as CoreClient);
-  await timeline.startThread('!room:example.org', '$root');
-
-  let loaded = false;
-  const loading = timeline.loadThreadEvent('$older', new AbortController().signal).then(() => {
-    loaded = true;
-  });
-  await Promise.resolve();
-  expect(paginate).toHaveBeenCalledTimes(1);
-  expect(loaded).toBe(false);
-  core.emit({
-    type: 'timeline_diff',
-    subscription: 1,
-    diffs: [{ op: 'push_front', value: item('older') }],
-  });
-  await loading;
-
-  expect(loaded).toBe(true);
-  expect(paginate).toHaveBeenCalledTimes(1);
-  expect(timeline.items[0].event_id).toBe('$older');
-});
-
-test('loading a missing thread reply stops at the start of the thread', async () => {
-  const core = new FakeCore();
-  const timeline = new RoomTimeline(core as unknown as CoreClient);
-  await timeline.startThread('!room:example.org', '$root');
-
-  await timeline.loadThreadEvent('$missing', new AbortController().signal);
-
-  expect(core.paginateCalls).toBe(1);
-  expect(timeline.backwardPagination).toBe('end');
-});
-
-test('leaving the thread cancels loading a linked reply', async () => {
-  const core = new FakeCore();
-  const navigation = new AbortController();
-  core.paginate = (subscription, direction) => {
-    core.paginateCalls += 1;
-    navigation.abort();
-    core.emit({
-      type: 'timeline_diff',
-      subscription,
-      diffs: [{ op: 'push_front', value: item('history') }],
-    });
-    return Promise.resolve({ direction, reached_end: false });
-  };
-  const timeline = new RoomTimeline(core as unknown as CoreClient);
-  await timeline.startThread('!room:example.org', '$root');
-
-  await timeline.loadThreadEvent('$older', navigation.signal);
-
-  expect(core.paginateCalls).toBe(1);
-});
-
 test('a different thread in the same room resubscribes', async () => {
   const core = new FakeCore();
   const timeline = new RoomTimeline(core as unknown as CoreClient);
@@ -1273,34 +1086,4 @@ test('a different thread in the same room resubscribes', async () => {
     { kind: 'thread', root_event_id: '$one' },
     { kind: 'thread', root_event_id: '$two' },
   ]);
-});
-
-test('a reply fallback fills the preview now and on every later diff', async () => {
-  const core = new FakeCore();
-  const timeline = new RoomTimeline(core as unknown as CoreClient);
-  await timeline.start('!room:example.org');
-  const reply = {
-    ...item('reply'),
-    in_reply_to: {
-      event_id: '$reaction',
-      sender: null,
-      sender_mentioned: false,
-      sender_name: null,
-      body: null,
-    },
-  };
-  core.emit({ type: 'timeline_diff', subscription: 1, diffs: [{ op: 'push_back', value: reply }] });
-
-  timeline.provideReplyFallback('$reaction', { sender: '@ana:example.org', body: 'Reacted' });
-  expect(timeline.items.at(-1)?.in_reply_to).toMatchObject({
-    sender: '@ana:example.org',
-    body: 'Reacted',
-  });
-
-  core.emit({
-    type: 'timeline_diff',
-    subscription: 1,
-    diffs: [{ op: 'set', index: 2, value: reply }],
-  });
-  expect(timeline.items.at(-1)?.in_reply_to?.body).toBe('Reacted');
 });

@@ -4,7 +4,7 @@ import { ACCOUNT_STEPS, type AccountStep, type SetupStep } from './setup-plan';
 
 export const ONBOARDING_ACCOUNT_DATA_TYPE = 'moe.sable.next.onboarding';
 
-const STEPS: readonly SetupStep[] = [
+const STEPS: ReadonlySet<SetupStep> = new Set([
   'device',
   'recovery',
   'profile',
@@ -14,7 +14,7 @@ const STEPS: readonly SetupStep[] = [
   'sync',
   'consent',
   'done',
-];
+]);
 
 export interface SetupRecord {
   full: boolean;
@@ -30,7 +30,7 @@ export function setupRecordKey(userId: string, deviceId: string): string {
 
 function stepList(value: unknown): SetupStep[] | null {
   if (!Array.isArray(value)) return null;
-  const steps = value.filter((step): step is SetupStep => STEPS.includes(step as SetupStep));
+  const steps = value.filter((step): step is SetupStep => STEPS.has(step as SetupStep));
   return steps.length === value.length ? steps : null;
 }
 
@@ -65,8 +65,9 @@ export function writeSetupRecord(
 ): void {
   try {
     storage.setItem(key, JSON.stringify(record));
-  } catch {
+  } catch (error) {
     /* The in-memory setup record remains usable. */
+    console.debug('[sable setup] setup record not persisted', error);
   }
 }
 
@@ -96,17 +97,19 @@ export function accountFinishedFrom(content: unknown): AccountStep[] {
 }
 
 export async function readAccountFinished(core: CoreClient): Promise<AccountStep[]> {
-  return accountFinishedFrom(await core.commands.accountData(ONBOARDING_ACCOUNT_DATA_TYPE));
+  return accountFinishedFrom(
+    await core.rpc.account.data({ event_type: ONBOARDING_ACCOUNT_DATA_TYPE })
+  );
 }
 
 export async function markAccountFinished(core: CoreClient, step: AccountStep): Promise<void> {
-  const content = await core.commands.accountData(ONBOARDING_ACCOUNT_DATA_TYPE);
+  const content = await core.rpc.account.data({ event_type: ONBOARDING_ACCOUNT_DATA_TYPE });
   const finished = finishedNames(content);
   if (finished.includes(step)) return;
   const base = typeof content === 'object' && content !== null ? content : {};
-  await core.commands.setAccountData(ONBOARDING_ACCOUNT_DATA_TYPE, {
-    ...base,
-    finished: [...finished, step],
+  await core.rpc.account.setData({
+    event_type: ONBOARDING_ACCOUNT_DATA_TYPE,
+    content: { ...base, finished: [...finished, step] },
   });
 }
 
@@ -116,9 +119,12 @@ export async function restartSetup(
   userId: string,
   deviceId: string
 ): Promise<void> {
-  const content = await core.commands.accountData(ONBOARDING_ACCOUNT_DATA_TYPE);
+  const content = await core.rpc.account.data({ event_type: ONBOARDING_ACCOUNT_DATA_TYPE });
   const base = typeof content === 'object' && content !== null ? content : {};
-  await core.commands.setAccountData(ONBOARDING_ACCOUNT_DATA_TYPE, { ...base, finished: [] });
+  await core.rpc.account.setData({
+    event_type: ONBOARDING_ACCOUNT_DATA_TYPE,
+    content: { ...base, finished: [] },
+  });
   writeSetupRecord(storage, setupRecordKey(userId, deviceId), {
     full: true,
     registering: true,

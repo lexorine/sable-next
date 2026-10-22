@@ -1,17 +1,24 @@
 <script lang="ts">
   import EyeSlashIcon from 'phosphor-svelte/lib/EyeSlashIcon';
   import FileIcon from 'phosphor-svelte/lib/FileIcon';
+  import SlidersHorizontalIcon from 'phosphor-svelte/lib/SlidersHorizontalIcon';
   import SubtitlesIcon from 'phosphor-svelte/lib/SubtitlesIcon';
   import SubtitlesSlashIcon from 'phosphor-svelte/lib/SubtitlesSlashIcon';
   import XIcon from 'phosphor-svelte/lib/XIcon';
 
   import { i18n } from '#lib/i18n.js';
-  import { preferences, setPreference } from '#lib/settings/preferences.svelte.js';
+  import {
+    preferences,
+    setPreference,
+    type ImageMetadata,
+  } from '#lib/settings/preferences.svelte.js';
   import { formatByteSize } from '#lib/ui/byte-size.js';
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
   import Button from '#lib/ui/primitives/Button.svelte';
 
-  import { previewKind, type StagedFile } from './composer-files';
+  import { previewKind, type StagedFile } from '#lib/composer/composer-files.js';
+  import StagedImageOptions from './StagedImageOptions.svelte';
+  import { canStrip } from './strip-metadata';
   import StagedMediaViewer from './StagedMediaViewer.svelte';
   import StagedThumbnail from './StagedThumbnail.svelte';
 
@@ -20,16 +27,17 @@
     disabled?: boolean;
     onRemove: (id: number) => void;
     onToggleSpoiler: (id: number) => void;
+    onSetMetadata: (id: number, metadata: ImageMetadata) => void;
   }
 
-  let { files, disabled = false, onRemove, onToggleSpoiler }: Props = $props();
+  let { files, disabled = false, onRemove, onToggleSpoiler, onSetMetadata }: Props = $props();
 
   let viewing = $state<number | null>(null);
   let media = $derived(files.filter((item) => previewKind(item.file) !== null));
 </script>
 
 <div class="attachments">
-  <ul class="staged" aria-label={$i18n.t('composer.stagedFiles')}>
+  <ul class="staged" aria-label={i18n.t('composer.stagedFiles')}>
     {#each files as item (item.id)}
       {@const kind = previewKind(item.file)}
       <li class={['staged-item', kind ? 'staged-media' : 'staged-file']}>
@@ -49,13 +57,32 @@
             class={['staged-control staged-spoiler', item.spoiler && 'staged-spoiler-on']}
             {disabled}
             aria-pressed={item.spoiler}
-            label={$i18n.t('composer.spoilerAttachment', { name: item.file.name })}
+            label={i18n.t('composer.spoilerAttachment', { name: item.file.name })}
             onclick={() => {
               onToggleSpoiler(item.id);
             }}
           >
             <EyeSlashIcon />
           </IconButton>
+          {#if kind === 'image' && canStrip(item.file)}
+            <StagedImageOptions {item} {onSetMetadata}>
+              {#snippet trigger({ props })}
+                <IconButton
+                  {...props}
+                  variant="ghost"
+                  size="small"
+                  class={[
+                    'staged-control staged-options',
+                    item.metadata !== preferences.imageMetadata && 'staged-spoiler-on',
+                  ]}
+                  {disabled}
+                  label={i18n.t('composer.imageOptions', { name: item.file.name })}
+                >
+                  <SlidersHorizontalIcon />
+                </IconButton>
+              {/snippet}
+            </StagedImageOptions>
+          {/if}
         {:else}
           <span class="staged-icon" aria-hidden="true"><FileIcon /></span>
           <span class="staged-text">
@@ -68,7 +95,7 @@
           size="small"
           class="staged-control staged-remove"
           {disabled}
-          label={$i18n.t('composer.removeAttachment', { name: item.file.name })}
+          label={i18n.t('composer.removeAttachment', { name: item.file.name })}
           onclick={() => {
             onRemove(item.id);
           }}
@@ -90,10 +117,10 @@
     >
       {#if preferences.sendAttachmentAsCaption}
         <SubtitlesIcon />
-        {$i18n.t('composer.caption')}
+        {i18n.t('composer.caption')}
       {:else}
         <SubtitlesSlashIcon />
-        {$i18n.t('composer.separateMessage')}
+        {i18n.t('composer.separateMessage')}
       {/if}
     </Button>
   {/if}
@@ -108,6 +135,7 @@
     }}
     {onRemove}
     {onToggleSpoiler}
+    {onSetMetadata}
   />
 {/if}
 
@@ -230,6 +258,11 @@
 
   .staged-item :global(.staged-spoiler) {
     inset-block-end: var(--radius-padding);
+    inset-inline-start: var(--radius-padding);
+  }
+
+  .staged-item :global(.staged-options) {
+    inset-block-start: var(--radius-padding);
     inset-inline-start: var(--radius-padding);
   }
 

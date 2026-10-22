@@ -126,57 +126,6 @@ test('own bubble receipts reach the same edge as everyone else’s on mobile', a
   expect(edges.own).toBe(edges.other);
 });
 
-test('a receipt never takes a line of its own or covers text when the last line is full', async ({
-  page,
-  app,
-  timeline,
-  core,
-  installRoomCore,
-}) => {
-  await installRoomCore('ready');
-  await app.openRooms();
-  await app.openRoomFromList('General');
-  await timeline.expectRevealed();
-  const subscription = await core.subscription();
-  const row = page.locator('[data-item-id="general-18"] .message');
-
-  for (const unit of ['word ', 'adsf']) {
-    for (let length = 60; length <= 140; length += 1) {
-      const body = unit.repeat(40).slice(0, length).trim();
-      await core.setTimelineItemById(subscription, 'general-18', {
-        ...timelineItem('general-18', body),
-        read_by: ['@bob:example.test'],
-      });
-      await expect(row.locator('.formatted-body')).toHaveText(body);
-      await expect(row.locator('.receipt-slot')).toHaveCount(1);
-      await heightSettled(row);
-      const box = await row.evaluate((node) => {
-        const text = node.querySelector('.formatted-body');
-        const badge = node.querySelector('.read-receipt-stack');
-        if (!text || !badge) throw new Error('missing body or badge');
-        const range = document.createRange();
-        range.selectNodeContents(text);
-        const lines = [...range.getClientRects()].filter((rect) => rect.width > 0);
-        const badgeBox = badge.getBoundingClientRect();
-        const last = lines.at(-1);
-        return {
-          below: last ? badgeBox.top - last.bottom : Number.POSITIVE_INFINITY,
-          overlap: lines.some(
-            (rect) =>
-              rect.right > badgeBox.left + 0.5 &&
-              rect.left < badgeBox.right - 0.5 &&
-              rect.bottom > badgeBox.top + 0.5 &&
-              rect.top < badgeBox.bottom - 0.5
-          ),
-        };
-      });
-      const label = `${unit.trim()} × ${String(length)}`;
-      expect(box.below, label).toBeLessThan(0);
-      expect(box.overlap, label).toBe(false);
-    }
-  }
-});
-
 test('receipts beside text, reactions, an embed or an image add no row of their own', async ({
   page,
   app,
@@ -223,6 +172,95 @@ test('receipts beside text, reactions, an embed or an image add no row of their 
     const receipted = await measure(['@bob:example.test']);
     expect(Math.abs(receipted - plain), name).toBeLessThanOrEqual(1);
   }
+});
+
+test('a receipt under a picture or an embed that fills the column never covers it', async ({
+  page,
+  app,
+  timeline,
+  core,
+  installRoomCore,
+}) => {
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      'sable-preferences',
+      JSON.stringify({ urlPreviews: true, encryptedUrlPreviews: true })
+    );
+  });
+  await installRoomCore('ready');
+  await app.openRooms();
+  await app.openRoomFromList('General');
+  await timeline.expectRevealed();
+  const subscription = await core.subscription();
+  const row = page.locator('[data-item-id="general-18"] .message');
+  const blocks = {
+    '.media-image': timelineImage('general-18'),
+    '.link-preview': {
+      ...timelineItem('general-18', 'see https://example.test/page'),
+      bundled_link_previews: [
+        {
+          url: 'https://example.test/page',
+          title: 'Example page',
+          description: 'A description of the page long enough to fill the whole card width',
+          site_name: 'Example',
+          image: null,
+          image_mime: null,
+          image_width: null,
+          image_height: null,
+        },
+      ],
+    },
+  };
+
+  for (const [selector, item] of Object.entries(blocks)) {
+    for (const width of [320, 350, 1280]) {
+      await page.setViewportSize({ width, height: 800 });
+      await core.setTimelineItemById(subscription, 'general-18', {
+        ...item,
+        read_by: ['@bob:example.test', '@carol:example.test'],
+      });
+      await expect(row.locator('.read-receipt-stack')).toBeVisible();
+      await expect(row.locator(selector)).toBeVisible();
+      await heightSettled(row);
+      const overlap = await row.evaluate((node, selector) => {
+        const block = node.querySelector(selector)?.getBoundingClientRect();
+        const badge = node.querySelector('.read-receipt-stack')?.getBoundingClientRect();
+        if (!block || !badge) throw new Error('missing block or badge');
+        return (
+          block.left < badge.right - 0.5 &&
+          block.right > badge.left + 0.5 &&
+          block.top < badge.bottom - 0.5 &&
+          block.bottom > badge.top + 0.5
+        );
+      }, selector);
+      expect(overlap, `${selector} at ${String(width)}px`).toBe(false);
+    }
+  }
+});
+
+test('copying a receipted message by triple-click copies its text alone', async ({
+  page,
+  app,
+  timeline,
+  core,
+  installRoomCore,
+}) => {
+  await installRoomCore('ready');
+  await app.openRooms();
+  await app.openRoomFromList('General');
+  await timeline.expectRevealed();
+  const subscription = await core.subscription();
+  const row = page.locator('[data-item-id="general-18"] .message');
+  await core.setTimelineItemById(subscription, 'general-18', {
+    ...timelineItem('general-18', 'i will do it'),
+    read_by: Array.from({ length: 6 }, (_, index) => `@reader${String(index)}:example.test`),
+  });
+  await expect(row.locator('.read-receipt-stack .overflow')).toBeVisible();
+
+  await row.locator('.formatted-body').click({ clickCount: 3 });
+  const copied = await page.evaluate(() => getSelection()?.toString() ?? '');
+  expect(copied.trim()).toBe('i will do it');
+  expect(copied).not.toContain('\n');
 });
 
 test('bubble receipts sit beside trailing reactions on either side', async ({

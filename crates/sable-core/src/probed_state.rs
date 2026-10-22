@@ -1,0 +1,340 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use matrix_sdk::ruma::api::client::state::get_state_events;
+use matrix_sdk::ruma::events::{AnyStateEvent, AnySyncStateEvent};
+use matrix_sdk::ruma::serde::Raw;
+use matrix_sdk::ruma::{OwnedRoomId, RoomId};
+use serde_json::Value;
+
+use crate::protocol::RoomStateEventView;
+
+const MAX_PROBED_ROOMS: usize = 32;
+
+#[derive(Default)]
+pub(crate) struct ProbedState {
+    rooms: HashMap<OwnedRoomId, ProbedRoom>,
+    tick: u64,
+    /// Our own writes, until their sync echo lands or `RECENT_STATE_MS` has
+    /// passed: state nobody syncs never echoes, and a probe re-reads the server.
+    written: HashMap<(OwnedRoomId, String, String), (u64, Value)>,
+}
+
+pub(crate) enum Probed {
+    Unknown,
+    Absent,
+    Present(Value),
+}
+
+#[derive(Default)]
+struct ProbedRoom {
+    full: Option<HashMap<String, Vec<RoomStateEventView>>>,
+    keys: HashMap<(String, String), Option<Value>>,
+    written: u64,
+}
+
+impl ProbedState {
+    pub(crate) fn events(
+        &self,
+        room_id: &RoomId,
+        event_type: &str,
+    ) -> Option<Vec<RoomStateEventView>> {
+        let full = self.rooms.get(room_id)?.full.as_ref()?;
+        Some(full.get(event_type).cloned().unwrap_or_default())
+    }
+
+    pub(crate) fn content(&self, room_id: &RoomId, event_type: &str, state_key: &str) -> Probed {
+        let Some(room) = self.rooms.get(room_id) else {
+            return Probed::Unknown;
+        };
+        if let Some(full) = &room.full {
+            return full
+                .get(event_type)
+                .and_then(|events| events.iter().find(|event| event.state_key == state_key))
+                .map_or(Probed::Absent, |event| {
+                    Probed::Present(event.content.clone())
+                });
+        }
+        match room
+            .keys
+            .get(&(event_type.to_owned(), state_key.to_owned()))
+        {
+            Some(Some(content)) => Probed::Present(content.clone()),
+            Some(None) => Probed::Absent,
+            None => Probed::Unknown,
+        }
+    }
+
+    pub(crate) fn remember_full(
+        &mut self,
+        room_id: &RoomId,
+        events: HashMap<String, Vec<RoomStateEventView>>,
+    ) {
+        let room = self.room_mut(room_id);
+        room.full = Some(events);
+        room.keys.clear();
+    }
+
+    pub(crate) fn remember_content(
+        &mut self,
+        room_id: &RoomId,
+        event_type: &str,
+        state_key: &str,
+        content: Option<Value>,
+    ) {
+        self.room_mut(room_id)
+            .keys
+            .insert((event_type.to_owned(), state_key.to_owned()), content);
+    }
+
+    fn room_mut(&mut self, room_id: &RoomId) -> &mut ProbedRoom {
+        self.tick += 1;
+        if !self.rooms.contains_key(room_id) && self.rooms.len() >= MAX_PROBED_ROOMS {
+            let oldest = self
+                .rooms
+                .iter()
+                .min_by_key(|(_, room)| room.written)
+                .map(|(room_id, _)| room_id.clone());
+            if let Some(oldest) = oldest {
+                self.rooms.remove(&oldest);
+            }
+        }
+        let room = self.rooms.entry(room_id.to_owned()).or_default();
+        room.written = self.tick;
+        room
+    }
+
+    pub(crate) fn written(
+        &self,
+        room_id: &RoomId,
+        event_type: &str,
+        state_key: &str,
+        now: u64,
+    ) -> Option<Value> {
+        self.written
+            .get(&(
+                room_id.to_owned(),
+                event_type.to_owned(),
+                state_key.to_owned(),
+            ))
+            .filter(|(at, _)| now.saturating_sub(*at) < RECENT_STATE_MS)
+            .map(|(_, content)| content.clone())
+    }
+
+    pub(crate) fn remember_written(
+        &mut self,
+        room_id: &RoomId,
+        event_type: &str,
+        state_key: &str,
+        content: Value,
+        now: u64,
+    ) {
+        self.written
+            .retain(|_, (at, _)| now.saturating_sub(*at) < RECENT_STATE_MS);
+        self.written.insert(
+            (
+                room_id.to_owned(),
+                event_type.to_owned(),
+                state_key.to_owned(),
+            ),
+            (now, content),
+        );
+    }
+
+    pub(crate) fn settle_written(&mut self, room_id: &RoomId, event_type: &str, state_key: &str) {
+        self.written.remove(&(
+            room_id.to_owned(),
+            event_type.to_owned(),
+            state_key.to_owned(),
+        ));
+    }
+
+    pub(crate) fn forget(&mut self, room_id: &RoomId, event_type: &str) {
+        if let Some(room) = self.rooms.get_mut(room_id) {
+            room.full = None;
+            room.keys
+                .retain(|(probed_type, _), _| probed_type != event_type);
+        }
+    }
+}
+
+impl crate::Core {
+    pub(crate) fn probed_state(&self) -> std::sync::MutexGuard<'_, ProbedState> {
+        self.probed_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+const RECENT_STATE_MS: u64 = 30_000;
+const RECENT_MEMBERS_MS: u64 = 60_000;
+
+pub(crate) type RoomStateSnapshot = Arc<Vec<Raw<AnyStateEvent>>>;
+
+#[derive(Default)]
+pub(crate) struct RecentState {
+    rooms: HashMap<OwnedRoomId, (u64, RoomStateSnapshot)>,
+    fetches: HashMap<OwnedRoomId, Arc<tokio::sync::Mutex<()>>>,
+    members: HashMap<OwnedRoomId, u64>,
+}
+
+impl crate::Core {
+    pub(crate) async fn room_state_snapshot(
+        &self,
+        client: &matrix_sdk::Client,
+        room_id: &RoomId,
+    ) -> matrix_sdk::Result<RoomStateSnapshot> {
+        let fetch = {
+            let mut recent = self.recent_state();
+            recent.fetches.retain(|_, lock| Arc::strong_count(lock) > 1);
+            recent
+                .fetches
+                .entry(room_id.to_owned())
+                .or_default()
+                .clone()
+        };
+        let _fetching = fetch.lock().await;
+        let now = now_ms();
+        {
+            let mut recent = self.recent_state();
+            recent
+                .rooms
+                .retain(|_, (fetched, _)| now.saturating_sub(*fetched) < RECENT_STATE_MS);
+            if let Some((_, snapshot)) = recent.rooms.get(room_id) {
+                return Ok(snapshot.clone());
+            }
+        }
+        let response = client
+            .send(get_state_events::v3::Request::new(room_id.to_owned()))
+            .await?;
+        let snapshot = Arc::new(response.room_state);
+        self.recent_state()
+            .rooms
+            .insert(room_id.to_owned(), (now_ms(), snapshot.clone()));
+        Ok(snapshot)
+    }
+
+    pub(crate) fn forget_room_state(&self, room_id: &RoomId, event_type: &str) {
+        if event_type != "m.room.member" {
+            self.probed_state().forget(room_id, event_type);
+        }
+        self.recent_state().rooms.remove(room_id);
+    }
+
+    pub(crate) fn watch_room_state(self: &Arc<Self>, client: &matrix_sdk::Client) {
+        let handle = client.add_event_handler({
+            let core = self.clone();
+            move |raw: Raw<AnySyncStateEvent>, room: matrix_sdk::Room| {
+                let core = core.clone();
+                async move {
+                    if let Some(event_type) = raw.get_field::<String>("type").ok().flatten() {
+                        core.forget_room_state(room.room_id(), &event_type);
+                        if let Some(state_key) = raw.get_field::<String>("state_key").ok().flatten()
+                        {
+                            core.probed_state().settle_written(
+                                room.room_id(),
+                                &event_type,
+                                &state_key,
+                            );
+                        }
+                    }
+                }
+            }
+        });
+        self.track_session_handler(client, handle);
+    }
+
+    pub(crate) fn members_recently_loaded(&self, room_id: &RoomId) -> bool {
+        self.recent_state()
+            .members
+            .get(room_id)
+            .is_some_and(|loaded| now_ms().saturating_sub(*loaded) < RECENT_MEMBERS_MS)
+    }
+
+    pub(crate) fn note_members_loaded(&self, room_id: &RoomId) {
+        let now = now_ms();
+        let mut recent = self.recent_state();
+        recent
+            .members
+            .retain(|_, loaded| now.saturating_sub(*loaded) < RECENT_MEMBERS_MS);
+        recent.members.insert(room_id.to_owned(), now);
+    }
+
+    pub(crate) fn forget_members_loaded(&self, room_id: &RoomId) {
+        self.recent_state().members.remove(room_id);
+    }
+
+    fn recent_state(&self) -> std::sync::MutexGuard<'_, RecentState> {
+        self.recent_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+pub(crate) fn now_ms() -> u64 {
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use matrix_sdk::ruma::RoomId;
+
+    use serde_json::json;
+
+    use super::{MAX_PROBED_ROOMS, Probed, ProbedState, RECENT_STATE_MS};
+
+    #[test]
+    fn a_write_shadows_the_store_only_until_it_could_have_echoed() {
+        let mut state = ProbedState::default();
+        let room_id = RoomId::parse("!room:example.org").unwrap();
+        state.remember_written(&room_id, "m.room.topic", "", json!({"topic": "new"}), 1_000);
+
+        assert_eq!(
+            state.written(&room_id, "m.room.topic", "", 1_000 + RECENT_STATE_MS - 1),
+            Some(json!({"topic": "new"}))
+        );
+        assert_eq!(
+            state.written(&room_id, "m.room.topic", "", 1_000 + RECENT_STATE_MS),
+            None
+        );
+
+        state.remember_written(
+            &room_id,
+            "m.room.name",
+            "",
+            json!({"name": "later"}),
+            1_000 + RECENT_STATE_MS,
+        );
+        assert_eq!(state.written.len(), 1);
+    }
+
+    #[test]
+    fn the_least_recently_written_room_is_dropped_past_the_cap() {
+        let mut state = ProbedState::default();
+        let ids: Vec<_> = (0..=MAX_PROBED_ROOMS)
+            .map(|index| RoomId::parse(format!("!r{index}:example.org")).unwrap())
+            .collect();
+        for room_id in &ids[..MAX_PROBED_ROOMS] {
+            state.remember_content(room_id, "m.room.topic", "", None);
+        }
+        state.remember_content(&ids[0], "m.room.name", "", None);
+        state.remember_content(&ids[MAX_PROBED_ROOMS], "m.room.topic", "", None);
+
+        assert!(matches!(
+            state.content(&ids[0], "m.room.topic", ""),
+            Probed::Absent
+        ));
+        assert!(matches!(
+            state.content(&ids[1], "m.room.topic", ""),
+            Probed::Unknown
+        ));
+        assert!(matches!(
+            state.content(&ids[MAX_PROBED_ROOMS], "m.room.topic", ""),
+            Probed::Absent
+        ));
+    }
+}

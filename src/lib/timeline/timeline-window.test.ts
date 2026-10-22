@@ -135,16 +135,6 @@ function fixture(
   };
 }
 
-test('holding an anchor skips rows the caller cannot restore', async () => {
-  const { window } = fixture();
-  await window.update(entries(200));
-  await window.jumpTo('80', 'start');
-  window.holdAnchor();
-  expect(window.state.pinned).toBe(false);
-  expect(window.anchorKey()).toBe('80');
-  expect(window.anchorKey((value) => value !== 80)).toBe('81');
-});
-
 test('a jump that clamps to the end re-pins when the offset rounds down to a whole pixel', async () => {
   const { window, viewport, resizeViewport } = fixture();
   await window.update(entries(10));
@@ -694,6 +684,20 @@ test('renders a bounded latest window and jumps to a stable key', async () => {
   expect(window.state.pinned).toBe(true);
 });
 
+test('a message at latest keeps the rows a settled window already dropped', async () => {
+  const { window, viewport, keys } = fixture();
+  await window.update(entries(1000));
+  viewport.dispatchEvent(new Event('scrollend'));
+  await vi.advanceTimersByTimeAsync(200);
+  const settled = keys();
+  expect(settled.length).toBeLessThan(80);
+
+  await window.update(entries(1001));
+
+  expect(keys()[0]).toBe(settled[0]);
+  expect(keys().at(-1)).toBe('1000');
+});
+
 test('a distant smooth jump animates the last viewport into its rendered destination', async () => {
   const { window, viewport } = fixture();
   const animate = vi.spyOn(viewport, 'scrollTo').mockImplementation(() => {});
@@ -1179,4 +1183,17 @@ test('a clustered photo dump does not shrink the scrollable extent', async () =>
 
   const error = Math.abs(viewport.scrollHeight - trueTotal) / trueTotal;
   expect(error).toBeLessThan(0.15);
+});
+
+test('the fully visible boundary excludes a partially visible last row', async () => {
+  const { window, viewport } = fixture();
+  await window.update(entries(60));
+  await window.jumpTo('20', 'start');
+  expect(window.state.firstVisible).toBe(20);
+  expect(window.state.lastFullyVisible).toBe(25);
+
+  viewport.scrollTop += 25;
+  viewport.dispatchEvent(new Event('scroll'));
+  expect(window.state.lastVisible).toBe(26);
+  expect(window.state.lastFullyVisible).toBe(25);
 });

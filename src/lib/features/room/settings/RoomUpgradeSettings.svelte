@@ -2,9 +2,14 @@
   import { goto } from '$app/navigation';
   import { afterOverlayPops } from '#lib/platform/overlay-back.svelte.js';
   import { resolve } from '$app/paths';
-  import type { RoomPowerLevelsView, RoomSummary, RoomVersionsView } from '#src/generated/protocol';
+  import type {
+    RoomPowerLevelsView,
+    RoomListItemView,
+    RoomVersionsView,
+  } from '#src/generated/protocol';
 
   import { useCoreClient } from '#lib/core/context.js';
+  import { createRoom } from '#lib/core/api/rooms.js';
   import { i18n } from '#lib/i18n.js';
   import { roomPathParamFromId } from '#lib/rooms/room-list.svelte.js';
   import Alert from '#lib/ui/primitives/Alert.svelte';
@@ -29,7 +34,7 @@
   import { canSendState } from './permission-groups';
 
   interface Props {
-    room: RoomSummary | null;
+    room: RoomListItemView | null;
     levels: RoomPowerLevelsView | null;
     ownPowerLevel: number;
     onClose: () => void;
@@ -59,7 +64,7 @@
   let run = 0;
 
   let roomId = $derived(room?.room_id ?? null);
-  let isSpace = $derived(room?.is_space ?? false);
+  let isSpace = $derived(room?.room_kind === 'space');
   let canUpgrade = $derived(canSendState(levels, ownPowerLevel, 'm.room.tombstone'));
   let allowCreators = $derived(mode === 'server' && additionalCreatorsSupported(target));
   let replacementId = $derived.by(() => {
@@ -69,39 +74,37 @@
   let replacementInvalid = $derived(replacementDraft.trim() !== '' && replacementId === null);
   let encryptable = $derived(room?.join_rule !== 'public');
   let defaultBody = $derived(
-    isSpace ? $i18n.t('room.upgradeReplacedSpace') : $i18n.t('room.upgradeReplacedRoom')
+    isSpace ? i18n.t('room.upgradeReplacedSpace') : i18n.t('room.upgradeReplacedRoom')
   );
   let modeOptions = $derived([
     {
       value: 'server' as const,
-      label: $i18n.t('room.upgradeModeServer'),
-      hint: $i18n.t('room.upgradeModeServerHint'),
+      label: i18n.t('room.upgradeModeServer'),
+      hint: i18n.t('room.upgradeModeServerHint'),
     },
     {
       value: 'custom' as const,
-      label: $i18n.t('room.upgradeModeCustom'),
-      hint: $i18n.t('room.upgradeModeCustomHint'),
+      label: i18n.t('room.upgradeModeCustom'),
+      hint: i18n.t('room.upgradeModeCustomHint'),
     },
     {
       value: 'redirect' as const,
-      label: $i18n.t('room.upgradeModeRedirect'),
-      hint: $i18n.t('room.upgradeModeRedirectHint'),
+      label: i18n.t('room.upgradeModeRedirect'),
+      hint: i18n.t('room.upgradeModeRedirectHint'),
     },
   ]);
   let actionLabel = $derived(
     mode === 'redirect'
-      ? $i18n.t('room.upgradeActionRedirect')
+      ? i18n.t('room.upgradeActionRedirect')
       : mode === 'custom'
-        ? $i18n.t('room.upgradeActionReplace')
-        : $i18n.t('room.upgradeAction')
+        ? i18n.t('room.upgradeActionReplace')
+        : i18n.t('room.upgradeAction')
   );
   let canSubmit = $derived(mode === 'redirect' ? replacementId !== null : target !== '');
   let versionOptions = $derived(
     (versions?.available ?? []).map((entry) => ({
       value: entry.id,
-      label: entry.stable
-        ? entry.id
-        : $i18n.t('room.upgradeVersionUnstable', { version: entry.id }),
+      label: entry.stable ? entry.id : i18n.t('room.upgradeVersionUnstable', { version: entry.id }),
     }))
   );
 
@@ -111,8 +114,16 @@
 
     const current = ++run;
     void Promise.all([
-      core.commands.roomStateEvent(id, 'm.room.create'),
-      core.commands.roomStateEvent(id, 'm.room.tombstone'),
+      core.rpc.room_state.event({
+        room_id: id,
+        event_type: 'm.room.create',
+        state_key: '',
+      }),
+      core.rpc.room_state.event({
+        room_id: id,
+        event_type: 'm.room.tombstone',
+        state_key: '',
+      }),
     ])
       .then(([create, tombstone]) => {
         if (current !== run) return;
@@ -142,7 +153,7 @@
 
     if (versions === null) {
       try {
-        versions = await core.commands.roomVersions();
+        versions = await core.rpc.rooms.versions();
       } catch (error) {
         console.warn('[sable room] room versions unavailable', error);
         failed = true;
@@ -165,8 +176,8 @@
   }
 
   async function replaceWithNewRoom(id: string): Promise<string> {
-    const kind = isSpace ? 'space' : room?.is_voice ? 'voice' : 'text';
-    const next = await core.commands.createRoom({
+    const kind = room?.room_kind ?? 'text';
+    const next = await createRoom(core.rpc, {
       name: room?.name,
       topic: room?.topic,
       kind,
@@ -175,9 +186,10 @@
       roomVersion: target,
       predecessor: id,
     });
-    await core.commands.sendStateEvent(id, 'm.room.tombstone', '', {
-      body: messageDraft.trim() || defaultBody,
+    await core.rpc.rooms.setTombstone({
+      room_id: id,
       replacement_room: next,
+      body: messageDraft.trim() || defaultBody,
     });
     return next;
   }
@@ -192,18 +204,24 @@
       let next: string;
       if (mode === 'redirect') {
         next = replacementId ?? '';
-        await core.commands.sendStateEvent(id, 'm.room.tombstone', '', {
-          body: messageDraft.trim() || defaultBody,
+        await core.rpc.rooms.setTombstone({
+          room_id: id,
           replacement_room: next,
+          body: messageDraft.trim() || defaultBody,
         });
       } else if (mode === 'custom') {
         next = await replaceWithNewRoom(id);
       } else {
-        next = await core.commands.upgradeRoom(id, target, allowCreators ? creators : []);
+        next = await core.rpc.rooms.upgrade({
+          room_id: id,
+          new_version: target,
+          additional_creators: allowCreators ? [...creators] : [],
+        });
       }
       open = false;
       onClose();
       await afterOverlayPops();
+      // eslint-disable-next-line svelte/no-navigation-without-resolve -- roomPath() resolves the route itself
       await goto(roomPath(next));
     } catch (error) {
       console.warn('[sable room] upgrade failed', error);
@@ -222,18 +240,19 @@
 
   function openRoom(id: string): void {
     onClose();
+    // eslint-disable-next-line svelte/no-navigation-without-resolve -- roomPath() resolves the route itself
     void afterOverlayPops().then(() => goto(roomPath(id)));
   }
 </script>
 
-<SettingsSection headingId="room-settings-upgrade" title={$i18n.t('room.settingsAdvanced')}>
+<SettingsSection headingId="room-settings-upgrade" title={i18n.t('room.settingsAdvanced')}>
   <ul class="settings-rows">
     <SettingsRow
-      title={isSpace ? $i18n.t('room.upgradeSpaceTitle') : $i18n.t('room.upgradeRoomTitle')}
+      title={isSpace ? i18n.t('room.upgradeSpaceTitle') : i18n.t('room.upgradeRoomTitle')}
       description={replacement
         ? (tombstoneBody ??
-          (isSpace ? $i18n.t('room.upgradeReplacedSpace') : $i18n.t('room.upgradeReplacedRoom')))
-        : $i18n.t('room.upgradeCurrentVersion', { version: version ?? '?' })}
+          (isSpace ? i18n.t('room.upgradeReplacedSpace') : i18n.t('room.upgradeReplacedRoom')))
+        : i18n.t('room.upgradeCurrentVersion', { version: version ?? '?' })}
     >
       {#if predecessor}
         {@const old = predecessor}
@@ -244,7 +263,7 @@
             openRoom(old);
           }}
         >
-          {isSpace ? $i18n.t('room.upgradeOldSpace') : $i18n.t('room.upgradeOldRoom')}
+          {isSpace ? i18n.t('room.upgradeOldSpace') : i18n.t('room.upgradeOldRoom')}
         </Button>
       {/if}
       {#if replacement}
@@ -255,7 +274,7 @@
             openRoom(next);
           }}
         >
-          {isSpace ? $i18n.t('room.upgradeOpenSpace') : $i18n.t('room.upgradeOpenRoom')}
+          {isSpace ? i18n.t('room.upgradeOpenSpace') : i18n.t('room.upgradeOpenRoom')}
         </Button>
       {:else}
         <Button
@@ -265,7 +284,7 @@
             void openDialog();
           }}
         >
-          {$i18n.t('room.upgradeAction')}
+          {i18n.t('room.upgradeAction')}
         </Button>
       {/if}
     </SettingsRow>
@@ -278,12 +297,12 @@
     open = next;
   }}
   variant="verification"
-  label={isSpace ? $i18n.t('room.upgradeSpaceTitle') : $i18n.t('room.upgradeRoomTitle')}
+  label={isSpace ? i18n.t('room.upgradeSpaceTitle') : i18n.t('room.upgradeRoomTitle')}
 >
   <div class="upgrade">
-    <h2>{isSpace ? $i18n.t('room.upgradeSpaceTitle') : $i18n.t('room.upgradeRoomTitle')}</h2>
+    <h2>{isSpace ? i18n.t('room.upgradeSpaceTitle') : i18n.t('room.upgradeRoomTitle')}</h2>
     <OptionCards
-      label={$i18n.t('room.upgradeMode')}
+      label={i18n.t('room.upgradeMode')}
       value={mode}
       disabled={upgrading}
       options={modeOptions}
@@ -294,8 +313,8 @@
     />
 
     {#if mode === 'redirect'}
-      <FormField fieldId="room-upgrade-replacement" label={$i18n.t('room.upgradeReplacement')}>
-        <p class="hint">{$i18n.t('room.upgradeReplacementHint')}</p>
+      <FormField fieldId="room-upgrade-replacement" label={i18n.t('room.upgradeReplacement')}>
+        <p class="hint">{i18n.t('room.upgradeReplacementHint')}</p>
         <TextInput
           id="room-upgrade-replacement"
           bind:value={replacementDraft}
@@ -306,11 +325,11 @@
           spellcheck={false}
         />
         {#if replacementInvalid}
-          <p class="error">{$i18n.t('room.upgradeReplacementInvalid')}</p>
+          <p class="error">{i18n.t('room.upgradeReplacementInvalid')}</p>
         {/if}
       </FormField>
     {:else}
-      <FormField fieldId="room-upgrade-version" label={$i18n.t('room.upgradeVersion')}>
+      <FormField fieldId="room-upgrade-version" label={i18n.t('room.upgradeVersion')}>
         <Select
           id="room-upgrade-version"
           bind:value={target}
@@ -323,19 +342,19 @@
     {#if mode === 'custom'}
       <div class="toggle-row">
         <div>
-          <p class="toggle-label">{$i18n.t('room.createEncryptionLabel')}</p>
+          <p class="toggle-label">{i18n.t('common.endToEndEncryption')}</p>
           <p class="hint">
             {!encryptable
-              ? $i18n.t('room.createEncryptionUnavailable')
+              ? i18n.t('room.createEncryptionUnavailable')
               : encrypted
-                ? $i18n.t('room.createEncryptionHint')
-                : $i18n.t('room.upgradeEncryptionOff')}
+                ? i18n.t('room.createEncryptionHint')
+                : i18n.t('room.upgradeEncryptionOff')}
           </p>
         </div>
         <Switch
           checked={encryptable && encrypted}
           disabled={upgrading || !encryptable}
-          label={$i18n.t('room.createEncryptionLabel')}
+          label={i18n.t('common.endToEndEncryption')}
           onCheckedChange={(next: boolean) => {
             encrypted = next;
           }}
@@ -344,7 +363,7 @@
     {/if}
 
     {#if mode !== 'server'}
-      <FormField fieldId="room-upgrade-message" label={$i18n.t('room.upgradeMessage')}>
+      <FormField fieldId="room-upgrade-message" label={i18n.t('room.upgradeMessage')}>
         <TextInput
           id="room-upgrade-message"
           bind:value={messageDraft}
@@ -355,13 +374,13 @@
     {/if}
 
     {#if allowCreators}
-      <FormField fieldId="room-upgrade-creator" label={$i18n.t('room.upgradeCreators')}>
-        <p class="hint">{$i18n.t('room.upgradeCreatorsHint')}</p>
+      <FormField fieldId="room-upgrade-creator" label={i18n.t('room.upgradeCreators')}>
+        <p class="hint">{i18n.t('room.upgradeCreatorsHint')}</p>
         <div class="creator-row">
           <TextInput
             id="room-upgrade-creator"
             bind:value={creatorDraft}
-            placeholder={$i18n.t('room.createInvitePlaceholder')}
+            placeholder={i18n.t('room.createInvitePlaceholder')}
             disabled={upgrading}
             onkeydown={(event: KeyboardEvent) => {
               if (event.key !== 'Enter') return;
@@ -370,11 +389,11 @@
             }}
           />
           <Button variant="secondary" disabled={upgrading} onclick={addCreator}>
-            {$i18n.t('room.createInviteAdd')}
+            {i18n.t('common.add')}
           </Button>
         </div>
         {#if creatorInvalid}
-          <p class="error">{$i18n.t('room.createInviteInvalid')}</p>
+          <p class="error">{i18n.t('common.userIdFormatHint')}</p>
         {/if}
         {#if creators.length > 0}
           <ul class="creators">
@@ -389,7 +408,7 @@
                     creators = creators.filter((entry) => entry !== creator);
                   }}
                 >
-                  {$i18n.t('room.upgradeCreatorRemove')}
+                  {i18n.t('common.remove')}
                 </Button>
               </li>
             {/each}
@@ -399,13 +418,13 @@
     {/if}
 
     {#if failed}
-      <Alert variant="critical" role="alert">{$i18n.t('room.upgradeFailed')}</Alert>
+      <Alert variant="critical" role="alert">{i18n.t('room.upgradeFailed')}</Alert>
     {/if}
 
     <Alert variant="warning" role="status">
       {mode === 'server'
-        ? $i18n.t('room.upgradeIrreversible')
-        : $i18n.t('room.upgradeIrreversibleManual')}
+        ? i18n.t('room.upgradeIrreversible')
+        : i18n.t('room.upgradeIrreversibleManual')}
     </Alert>
 
     <div class="actions">
@@ -416,7 +435,7 @@
           open = false;
         }}
       >
-        {$i18n.t('room.upgradeCancel')}
+        {i18n.t('common.cancel')}
       </Button>
       <Button
         variant="danger"

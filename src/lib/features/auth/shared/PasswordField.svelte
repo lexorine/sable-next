@@ -45,20 +45,18 @@
     class="password-toggle choice"
     type="button"
     {disabled}
-    aria-label={showPassword ? $i18n.t('auth.hidePassword') : $i18n.t('auth.showPassword')}
+    aria-label={showPassword ? i18n.t('auth.hidePassword') : i18n.t('auth.showPassword')}
     aria-pressed={showPassword}
     onclick={() => {
       showPassword = !showPassword;
     }}
   >
     <span class="password-toggle-icon" aria-hidden="true">
-      {#key showPassword}
-        {#if showPassword}
-          <EyeSlashIcon />
-        {:else}
-          <EyeIcon />
-        {/if}
-      {/key}
+      {#if showPassword}
+        <EyeSlashIcon />
+      {:else}
+        <EyeIcon />
+      {/if}
     </span>
   </button>
 </div>

@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
   import { i18n } from '#lib/i18n.js';
   import type { LoginFlowsView, RegistrationFlowsView } from '#src/generated/protocol';
   import Button from '#lib/ui/primitives/Button.svelte';
@@ -64,13 +63,9 @@
   }: Props = $props();
 
   const methodSlotId = $props.id();
-  let showAllRegistrationMethods = $state(false);
-
-  $effect(() => {
+  let showAllRegistrationMethods = $derived.by(() => {
     void homeserver;
-    untrack(() => {
-      showAllRegistrationMethods = false;
-    });
+    return false;
   });
 
   let uiaaAvailable = $derived(registrationFlows?.uiaa === true && !passwordFields.hidden);
@@ -106,7 +101,7 @@
             }}
             variant="primary"
           >
-            {$i18n.t('auth.createAccountOnServer', { server: serverLabel })}
+            {i18n.t('auth.createAccountOnServer', { server: serverLabel })}
           </Button>
         </LoginMethod>
       {/if}
@@ -124,7 +119,7 @@
                   }}
                   variant="primary"
                 >
-                  {$i18n.t('auth.continueWithProvider', { name: provider.name })}
+                  {i18n.t('auth.continueWithProvider', { name: provider.name })}
                 </Button>
               {/each}
             {:else}
@@ -136,7 +131,7 @@
                 }}
                 variant="primary"
               >
-                {$i18n.t('auth.createAccountOnServer', { server: serverLabel })}
+                {i18n.t('auth.createAccountOnServer', { server: serverLabel })}
               </Button>
             {/if}
           </div>
@@ -175,8 +170,8 @@
     <AuthMethodToggle
       expanded={showAllRegistrationMethods}
       controls={methodSlotId}
-      showLabel={$i18n.t('auth.moreWaysToCreateAccount')}
-      hideLabel={$i18n.t('auth.hideOtherWaysToCreateAccount')}
+      showLabel={i18n.t('auth.moreWaysToCreateAccount')}
+      hideLabel={i18n.t('auth.hideOtherWaysToCreateAccount')}
       onToggle={() => {
         showAllRegistrationMethods = !showAllRegistrationMethods;
       }}
@@ -184,7 +179,7 @@
   {/if}
 
   {#if availableRegistrationMethodCount === 0 && !isCheckingHomeserver}
-    <p class="muted">{$i18n.t('errors.registrationUnavailable')}</p>
+    <p class="muted">{i18n.t('errors.registrationUnavailable')}</p>
   {/if}
 </div>
 

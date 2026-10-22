@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { RoomPowerLevelsView, RoomSummary } from '#src/generated/protocol';
+  import type { RoomPowerLevelsView, RoomListItemView } from '#src/generated/protocol';
 
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
@@ -12,7 +12,7 @@
   const CANONICAL_EVENT_TYPE = 'm.room.canonical_alias';
 
   interface Props {
-    room: RoomSummary | null;
+    room: RoomListItemView | null;
     levels: RoomPowerLevelsView | null;
     ownPowerLevel: number;
   }
@@ -38,14 +38,14 @@
 
     const current = ++run;
     published = null;
-    void core.commands
-      .roomDirectoryVisibility(target)
+    void core.rpc.rooms
+      .directoryVisibility({ room_id: target })
       .then((next) => {
         if (current === run) published = next;
       })
       .catch((error: unknown) => {
         console.debug('[sable room] directory visibility unavailable', error);
-        toasts.error($i18n.t('errors.actionFailed'));
+        toasts.error(i18n.t('errors.actionFailed'));
       });
   });
 
@@ -57,7 +57,7 @@
     published = next;
     saving = true;
     try {
-      await core.commands.setRoomDirectoryVisibility(target, next);
+      await core.rpc.rooms.setDirectoryVisibility({ room_id: target, public: next });
     } catch (error) {
       console.warn('[sable room] directory visibility change failed', error);
       published = previous;
@@ -69,14 +69,14 @@
 
 {#if published !== null}
   <SettingsRow
-    title={$i18n.t('room.publishTitle')}
-    description={room?.is_space
-      ? $i18n.t('room.publishSpaceHint')
-      : $i18n.t('room.publishRoomHint')}
+    title={i18n.t('room.publishTitle')}
+    description={room?.room_kind === 'space'
+      ? i18n.t('room.publishSpaceHint')
+      : i18n.t('room.publishRoomHint')}
   >
     {#if canEdit}
       <Switch
-        label={$i18n.t('room.publishTitle')}
+        label={i18n.t('room.publishTitle')}
         checked={published}
         disabled={saving}
         onCheckedChange={(next: boolean) => {
@@ -85,7 +85,7 @@
       />
     {:else}
       <span class="value">
-        {published ? $i18n.t('room.publishOn') : $i18n.t('room.publishOff')}
+        {published ? i18n.t('room.publishOn') : i18n.t('room.publishOff')}
       </span>
     {/if}
   </SettingsRow>

@@ -1,16 +1,18 @@
 import { isTauri } from '@tauri-apps/api/core';
 
+import { electronBridge } from './electron.js';
+import type { FileFilter } from './file-dialog-types.js';
 import { isNativeMobile } from './os.js';
 import { rawInvoke } from './raw-invoke.js';
 
 export type SaveOutcome = 'saved' | 'cancelled' | 'failed';
 
 /**
- * A blob `<a download>` is a no-op in WKWebView and unreliable in Android's
- * WebView, so under Tauri the bytes go out through the native save dialog.
+ * A blob `<a download>` fails in WKWebView and Android's WebView, so the native apps save through the
+ * native dialog. Electron opens one too, over IPC.
  */
 export function savesNatively(): boolean {
-  return isTauri();
+  return isTauri() || electronBridge() !== undefined;
 }
 
 /** Desktop webviews open `<input type="file">` themselves; mobile ones do not. */
@@ -26,12 +28,34 @@ export function capturesFromCamera(): boolean {
   return !isTauri() && typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
 }
 
-export async function saveFile(url: string, filename: string): Promise<SaveOutcome> {
+export async function saveFile(
+  url: string,
+  filename: string,
+  askLocation = true
+): Promise<SaveOutcome> {
   try {
-    const bytes = new Uint8Array(await (await fetch(url)).arrayBuffer());
+    const blob = await (await fetch(url)).blob();
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    const mime =
+      [mimeFromName(filename), blob.type, sniffImageMime(bytes)].find(
+        (candidate) => candidate !== '' && candidate !== 'application/octet-stream'
+      ) ?? 'application/octet-stream';
+    const name = withExtension(safeFileName(filename), mime);
+
+    const electron = electronBridge();
+    if (electron) {
+      const saved = await electron.saveFile({
+        name,
+        bytes,
+        filters: filtersFor(mime) ?? [],
+        askLocation,
+      });
+      return saved === null ? 'cancelled' : 'saved';
+    }
+
     const { type } = await import('@tauri-apps/plugin-os');
     if (type() === 'android') {
-      await saveAndroidFile('Download', filename, mimeFromName(filename), bytes);
+      await saveAndroidFile('Download', name, mime, bytes);
       return 'saved';
     }
 
@@ -40,7 +64,19 @@ export async function saveFile(url: string, filename: string): Promise<SaveOutco
       import('@tauri-apps/plugin-fs'),
     ]);
 
-    const path = await save({ defaultPath: filename });
+    if (!askLocation) {
+      const { downloadDir, join } = await import('@tauri-apps/api/path');
+      const directory = await downloadDir();
+      const create = async (candidate: string) =>
+        writeFile(await join(directory, candidate), bytes, { createNew: true });
+      await create(name).catch((error: unknown) => {
+        console.debug('[sable files] download name is taken, retrying', error);
+        return create(timestamped(name));
+      });
+      return 'saved';
+    }
+
+    const path = await save({ defaultPath: name });
     if (path === null) return 'cancelled';
 
     await writeFile(path, bytes);
@@ -51,20 +87,29 @@ export async function saveFile(url: string, filename: string): Promise<SaveOutco
   }
 }
 
+export async function saveUrl(
+  url: string,
+  filename: string,
+  askLocation = true
+): Promise<SaveOutcome> {
+  if (savesNatively()) return saveFile(url, filename, askLocation);
+
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.click();
+  return 'saved';
+}
+
 export async function saveBytes(
   bytes: Uint8Array<ArrayBuffer>,
   filename: string,
-  mime: string
+  mime: string,
+  askLocation = true
 ): Promise<SaveOutcome> {
   const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
   try {
-    if (savesNatively()) return await saveFile(url, filename);
-
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = filename;
-    link.click();
-    return 'saved';
+    return await saveUrl(url, filename, askLocation);
   } finally {
     URL.revokeObjectURL(url);
   }
@@ -89,7 +134,7 @@ export async function saveImageToPhotos(
       [mime, blob.type, sniffImageMime(bytes)].find((candidate) =>
         candidate.startsWith('image/')
       ) ?? mime;
-    const name = withImageExtension(filename, imageMime);
+    const name = withExtension(safeFileName(filename), imageMime);
     const { type } = await import('@tauri-apps/plugin-os');
     if (type() === 'android') {
       await saveAndroidFile('Pictures', name, imageMime, bytes);
@@ -147,7 +192,11 @@ export async function shareFile(
         position: anchor && sharePosition(anchor, os === 'macos'),
       });
     } finally {
-      if (os === 'android' || os === 'ios') await remove(path).catch(() => {});
+      if (os === 'android' || os === 'ios') {
+        await remove(path).catch((error: unknown) => {
+          console.debug('[sable files] shared temp file not removed', path, error);
+        });
+      }
     }
     return 'saved';
   } catch (error) {
@@ -165,6 +214,12 @@ function sharePosition(anchor: DOMRect, fromBottom: boolean): { x: number; y: nu
   return { x: anchor.left, y: fromBottom ? window.innerHeight - anchor.bottom : anchor.top };
 }
 
+function timestamped(name: string): string {
+  const dot = name.lastIndexOf('.');
+  const stamp = `-${String(Date.now())}`;
+  return dot > 0 ? `${name.slice(0, dot)}${stamp}${name.slice(dot)}` : `${name}${stamp}`;
+}
+
 async function saveAndroidFile(
   directory: 'Download' | 'Pictures',
   filename: string,
@@ -172,35 +227,36 @@ async function saveAndroidFile(
   bytes: Uint8Array
 ): Promise<void> {
   const AndroidFs = await import('tauri-plugin-android-fs-api');
-  const uri =
+  const create = (name: string) =>
     directory === 'Pictures'
-      ? await AndroidFs.createNewPublicImageFile(
-          AndroidFs.PublicImageDir.Pictures,
-          filename,
-          mime,
-          {
-            isPending: true,
-            requestPermission: true,
-          }
-        )
-      : await AndroidFs.createNewPublicFile(
-          AndroidFs.PublicGeneralPurposeDir.Download,
-          filename,
-          mime,
-          { isPending: true, requestPermission: true }
-        );
+      ? AndroidFs.createNewPublicImageFile(AndroidFs.PublicImageDir.Pictures, name, mime, {
+          isPending: true,
+          requestPermission: true,
+        })
+      : AndroidFs.createNewPublicFile(AndroidFs.PublicGeneralPurposeDir.Download, name, mime, {
+          isPending: true,
+          requestPermission: true,
+        });
+  const uri = await create(filename).catch((error: unknown) => {
+    console.debug('[sable files] public file name is taken, retrying', error);
+    return create(timestamped(filename));
+  });
   try {
     await AndroidFs.writeFile(uri, bytes);
     await AndroidFs.setPublicFilePending(uri, false);
     await AndroidFs.scanPublicFile(uri);
   } catch (error) {
-    await AndroidFs.removeFile(uri).catch(() => {});
+    await AndroidFs.removeFile(uri).catch((removeError: unknown) => {
+      console.debug('[sable files] partial Android file not removed', removeError);
+    });
     throw error;
   }
 }
 
 const MIME_BY_EXTENSION: Record<string, string> = {
+  '3gp': 'video/3gpp',
   aac: 'audio/aac',
+  amr: 'audio/amr',
   apng: 'image/apng',
   avif: 'image/avif',
   flac: 'audio/flac',
@@ -212,6 +268,8 @@ const MIME_BY_EXTENSION: Record<string, string> = {
   json: 'application/json',
   m4a: 'audio/mp4',
   m4v: 'video/mp4',
+  mka: 'audio/x-matroska',
+  mkv: 'video/x-matroska',
   mov: 'video/quicktime',
   mp3: 'audio/mpeg',
   mp4: 'video/mp4',
@@ -224,8 +282,10 @@ const MIME_BY_EXTENSION: Record<string, string> = {
   svg: 'image/svg+xml',
   txt: 'text/plain',
   wav: 'audio/wav',
+  weba: 'audio/webm',
   webm: 'video/webm',
   webp: 'image/webp',
+  wma: 'audio/x-ms-wma',
   zip: 'application/zip',
 };
 
@@ -245,7 +305,11 @@ function sniffImageMime(bytes: Uint8Array): string {
   return '';
 }
 
-function withImageExtension(filename: string, mime: string): string {
+function safeFileName(name: string): string {
+  return name.replace(/[\\/:*?"<>|]/gu, '_').trim() || 'file';
+}
+
+function withExtension(filename: string, mime: string): string {
   if (mimeFromName(filename) === mime) return filename;
   const extension = Object.entries(MIME_BY_EXTENSION).find(([, type]) => type === mime)?.[0];
   return extension ? `${filename}.${extension}` : filename;
@@ -256,20 +320,54 @@ export function mimeFromName(name: string): string {
   return (extension && MIME_BY_EXTENSION[extension]) || 'application/octet-stream';
 }
 
+const AMBIGUOUS_MIMES = new Set(['', 'application/octet-stream', 'application/ogg']);
+
+export function withResolvedMime(file: File): File {
+  if (!AMBIGUOUS_MIMES.has(file.type)) return file;
+  const mime = mimeFromName(file.name);
+  if (mime === 'application/octet-stream') return file;
+  return new File([file], file.name, { type: mime, lastModified: file.lastModified });
+}
+
 /** `null` when the caller should fall back to `<input type="file">`. */
-export async function pickFiles(accept: string): Promise<File[] | null> {
+export async function pickFiles(
+  accept: string,
+  onFailure?: (error: unknown) => void
+): Promise<File[] | null> {
+  const electron = electronBridge();
+  if (electron) {
+    try {
+      const picked = await electron.pickFiles({
+        filters: filtersFor(accept) ?? [],
+        multiple: true,
+      });
+      if (picked === null) return [];
+      return picked.map(({ name, bytes }) => new File([bytes], name, { type: mimeFromName(name) }));
+    } catch (error) {
+      console.debug('[sable files] native pick failed', error);
+      onFailure?.(error);
+      return [];
+    }
+  }
+
   if (!(await picksNatively())) return null;
 
   try {
     const { type } = await import('@tauri-apps/plugin-os');
-    return await (type() === 'android' ? pickAndroidFiles(accept) : pickIosFiles(accept));
+    return await (type() === 'android'
+      ? pickAndroidFiles(accept, onFailure)
+      : pickIosFiles(accept, onFailure));
   } catch (error) {
     console.debug('[sable files] native pick failed', error);
-    return null;
+    onFailure?.(error);
+    return [];
   }
 }
 
-async function pickAndroidFiles(accept: string): Promise<File[]> {
+async function pickAndroidFiles(
+  accept: string,
+  onFailure?: (error: unknown) => void
+): Promise<File[]> {
   const AndroidFs = await import('tauri-plugin-android-fs-api');
   const documents = accept === '*' || accept === '*/*';
   const selected = await AndroidFs.showOpenFilePicker({
@@ -297,6 +395,7 @@ async function pickAndroidFiles(accept: string): Promise<File[]> {
           });
         } catch (error) {
           console.debug('[sable files] Android file read failed', uri.uri, error);
+          onFailure?.(error);
           return null;
         }
       })
@@ -304,7 +403,7 @@ async function pickAndroidFiles(accept: string): Promise<File[]> {
   return files.filter((file): file is File => file !== null);
 }
 
-async function pickIosFiles(accept: string): Promise<File[]> {
+async function pickIosFiles(accept: string, onFailure?: (error: unknown) => void): Promise<File[]> {
   const [{ open }, { readFile, remove }] = await Promise.all([
     import('@tauri-apps/plugin-dialog'),
     import('@tauri-apps/plugin-fs'),
@@ -326,6 +425,7 @@ async function pickIosFiles(accept: string): Promise<File[]> {
         return new File([bytes], name, { type: mimeFromName(name) });
       } catch (error) {
         console.debug('[sable files] iOS file read failed', path, error);
+        onFailure?.(error);
         return null;
       } finally {
         await remove(path).catch((error: unknown) => {
@@ -338,7 +438,7 @@ async function pickIosFiles(accept: string): Promise<File[]> {
 }
 
 /** Maps an `accept` attribute onto the extension lists the native dialog wants. */
-export function filtersFor(accept: string): { name: string; extensions: string[] }[] | undefined {
+export function filtersFor(accept: string): FileFilter[] | undefined {
   const wanted = accept
     .split(',')
     .map((entry) => entry.trim().toLowerCase())

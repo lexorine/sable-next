@@ -124,25 +124,40 @@ export function stripProxyHtml(
     return null;
   }
 
-  const textNodes = (): Text[] => {
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    const nodes: Text[] = [];
-    while (walker.nextNode()) nodes.push(walker.currentNode as Text);
+  const leaves = (): Node[] => {
+    const walker = document.createTreeWalker(
+      document.body,
+      NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT
+    );
+    const nodes: Node[] = [];
+    while (walker.nextNode()) {
+      const node = walker.currentNode;
+      if (node instanceof Text || node.childNodes.length === 0) nodes.push(node);
+    }
     return nodes;
   };
-  const remove = (count: number, reverse: boolean): void => {
-    for (const node of reverse ? textNodes().reverse() : textNodes()) {
-      if (count === 0) return;
+  const strip = (count: number, reverse: boolean): void => {
+    for (const node of reverse ? leaves().reverse() : leaves()) {
+      if (count === 0 || !(node instanceof Text)) return;
       const removed = Math.min(count, node.data.length);
       count -= removed;
       node.data = reverse ? node.data.slice(0, -removed) : node.data.slice(removed);
       if (node.data === '') node.remove();
     }
   };
+  const trim = (reverse: boolean): void => {
+    for (const node of reverse ? leaves().reverse() : leaves()) {
+      if (!(node instanceof Text)) return;
+      node.data = reverse ? node.data.trimEnd() : node.data.trimStart();
+      if (node.data !== '') return;
+      node.remove();
+    }
+  };
 
-  const body = text.slice(prefix.length, text.length - suffix.length);
-  remove(prefix.length + body.length - body.trimStart().length, false);
-  remove(suffix.length + body.length - body.trimEnd().length, true);
+  strip(prefix.length, false);
+  strip(suffix.length, true);
+  trim(false);
+  trim(true);
   return document.body.innerHTML;
 }
 

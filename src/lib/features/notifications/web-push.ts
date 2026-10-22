@@ -7,10 +7,22 @@ import { activeServiceWorker } from '#lib/platform/service-worker.js';
 import { preferences } from '#lib/settings/preferences.svelte.js';
 
 import { unregisterNativePush } from './native-push';
-import { hasCompleteOverride, pushConfig, type PushOverride, trimmed } from './push-config';
-import { forgetPushSession } from './room-names';
+import {
+  hasCompleteOverride,
+  pushConfig,
+  type PushOverride,
+  trimmed,
+} from '#lib/notifications/push-config.js';
+import { forgetPushSession } from '#lib/notifications/room-names.js';
 
 const REGISTERED_ENDPOINT = 'sable-push-endpoint';
+
+function fallback<T>(value: T, what: string): (error: unknown) => T {
+  return (error) => {
+    console.debug(`[sable notifications] ${what}`, error);
+    return value;
+  };
+}
 
 /** For a deployment that ships no gateway configuration at all. */
 export const WEBPUSH_APP_ID = 'moe.sable.webpush';
@@ -90,7 +102,9 @@ async function pushTarget(core: CoreClient, override: PushOverride): Promise<Pus
     return { gateway, appId, vapid };
   }
 
-  const { vapid } = await core.commands.webPusherSupport().catch(() => ({ vapid: null }));
+  const vapid = await core.rpc.push
+    .webPusherSupport()
+    .catch(fallback(null, 'server push support unavailable'));
   const { push } = await runtimeConfig();
   if (vapid !== null) {
     return { gateway: null, appId: push?.webPushAppID ?? WEBPUSH_APP_ID, vapid };
@@ -106,7 +120,7 @@ async function serverPusherActivated(
   pushkey: string,
   appId: string
 ): Promise<boolean | null> {
-  const pushers = await core.commands.webPushers().catch(() => []);
+  const pushers = await core.rpc.push.webPushers().catch(fallback([], 'listing pushers failed'));
   const mine = pushers.find(
     (pusher) =>
       pusher.pushkey === pushkey && pusher.app_id === appId && pusher.kind === SERVER_PUSHER_KIND
@@ -121,11 +135,13 @@ async function removeStaleGatewayPushers(
   pushkey: string,
   rekeyed: string | null
 ): Promise<void> {
-  const pushers = await core.commands.webPushers().catch(() => []);
+  const pushers = await core.rpc.push.webPushers().catch(fallback([], 'listing pushers failed'));
   for (const pusher of pushers) {
     if (pusher.app_id !== appId || pusher.kind !== GATEWAY_PUSHER_KIND) continue;
     if (pusher.pushkey !== pushkey && pusher.pushkey !== rekeyed) continue;
-    await core.commands.removePusher(pusher.pushkey, appId).catch(() => undefined);
+    await core.rpc.push
+      .removePusher({ pushkey: pusher.pushkey, app_id: appId })
+      .catch(fallback(undefined, 'removing stale pusher failed'));
   }
 }
 
@@ -167,16 +183,22 @@ export async function syncPushSubscription(
     if (!needsRegistering(marker, registered)) return;
 
     const abandoned = abandonedAppId(registered, target.appId);
-    if (abandoned) await core.commands.removePusher(keys.p256dh, abandoned).catch(() => undefined);
+    if (abandoned) {
+      await core.rpc.push
+        .removePusher({ pushkey: keys.p256dh, app_id: abandoned })
+        .catch(fallback(undefined, 'removing abandoned pusher failed'));
+    }
 
-    await core.commands.setPusher({
-      pushkey: keys.p256dh,
-      app_id: target.appId,
-      url: target.gateway,
-      device_display_name: name,
-      web_push: { endpoint, p256dh: keys.p256dh, auth: keys.auth },
-      event_id_only: eventIdOnly,
-      append: false,
+    await core.rpc.push.setPusher({
+      pusher: {
+        pushkey: keys.p256dh,
+        app_id: target.appId,
+        url: target.gateway,
+        device_display_name: name,
+        web_push: { endpoint, p256dh: keys.p256dh, auth: keys.auth },
+        event_id_only: eventIdOnly,
+        append: false,
+      },
     });
     localStorage.setItem(REGISTERED_ENDPOINT, marker);
     return;
@@ -184,20 +206,26 @@ export async function syncPushSubscription(
 
   if (needsRegistering(marker, registered)) {
     const abandoned = abandonedAppId(registered, target.appId);
-    if (abandoned) await core.commands.removePusher(keys.p256dh, abandoned).catch(() => undefined);
+    if (abandoned) {
+      await core.rpc.push
+        .removePusher({ pushkey: keys.p256dh, app_id: abandoned })
+        .catch(fallback(undefined, 'removing abandoned pusher failed'));
+    }
   } else {
     const activated = await serverPusherActivated(core, keys.p256dh, target.appId);
     if (activated === true) return;
   }
 
   await removeStaleGatewayPushers(core, target.appId, keys.p256dh, rekeyed);
-  await core.commands.setWebPusher({
-    pushkey: keys.p256dh,
-    app_id: target.appId,
-    device_display_name: name,
-    endpoint,
-    auth: keys.auth,
-    event_id_only: eventIdOnly,
+  await core.rpc.push.setWebPusher({
+    pusher: {
+      pushkey: keys.p256dh,
+      app_id: target.appId,
+      device_display_name: name,
+      endpoint,
+      auth: keys.auth,
+      event_id_only: eventIdOnly,
+    },
   });
   localStorage.setItem(REGISTERED_ENDPOINT, marker);
 }
@@ -206,7 +234,9 @@ export async function syncPushSubscription(
     own pushers carry; `null` where no service worker hosts a subscription. */
 export async function currentPushKey(): Promise<string | null> {
   if (!deliversWebPush()) return null;
-  const registration = await navigator.serviceWorker.getRegistration().catch(() => undefined);
+  const registration = await navigator.serviceWorker
+    .getRegistration()
+    .catch(fallback(undefined, 'service worker registration unavailable'));
   const subscription = (await registration?.pushManager.getSubscription()) ?? null;
   return subscription?.toJSON().keys?.p256dh ?? null;
 }
@@ -217,10 +247,14 @@ export async function dropPushSubscription(
   override: PushOverride
 ): Promise<void> {
   if (!deliversWebPush()) return;
-  const target = await pushTarget(core, override).catch(() => undefined);
+  const target = await pushTarget(core, override).catch(
+    fallback(undefined, 'push target unavailable')
+  );
   const { resolved: settings } = await pushConfig(override);
 
-  const registration = await navigator.serviceWorker.getRegistration().catch(() => undefined);
+  const registration = await navigator.serviceWorker
+    .getRegistration()
+    .catch(fallback(undefined, 'service worker registration unavailable'));
   localStorage.removeItem(REGISTERED_ENDPOINT);
   const subscription = await registration?.pushManager.getSubscription();
   if (!subscription) return;
@@ -228,7 +262,7 @@ export async function dropPushSubscription(
   const { keys } = subscription.toJSON();
   const appId = target?.appId ?? settings?.appId;
   if (keys?.p256dh && appId !== undefined) {
-    await core.commands.removePusher(keys.p256dh, appId);
+    await core.rpc.push.removePusher({ pushkey: keys.p256dh, app_id: appId });
   }
   await subscription.unsubscribe();
 }

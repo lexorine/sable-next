@@ -1,5 +1,4 @@
 import {
-  AudioPresets,
   ConnectionQuality,
   ConnectionState,
   LocalAudioTrack,
@@ -9,6 +8,8 @@ import {
   type TrackPublishOptions,
   type LocalParticipant,
   type RemoteParticipant,
+  CryptorError,
+  CryptorErrorReason,
   RoomEvent,
   Track,
   type TrackPublication,
@@ -16,10 +17,11 @@ import {
 
 import {
   captureScreenAudio,
-  type ScreenAudioChoice,
   screenAudioSupported,
   stopScreenAudio,
+  unmuteScreenAudio,
 } from '#lib/platform/screen-audio.js';
+import type { ScreenAudioChoice } from '#lib/platform/screen-audio-stream.js';
 import { startHdrShare, stopHdrShare } from '#lib/platform/hdr-share.js';
 import { preferences } from '#lib/settings/preferences.svelte.js';
 
@@ -35,7 +37,7 @@ import type {
 import { idleTransportState, ignoreError, ScreenAudioError } from './call-transport';
 import { MatrixKeyProvider } from './key-provider';
 import { createMicrophoneFilter, supportsVoiceFilter } from './voice-filter';
-import { videoPublishOptions, videoResolution } from './video-quality';
+import { screenCaptureOptions, videoPublishOptions, videoResolution } from './video-quality';
 import type { CallTelemetry } from './call-telemetry';
 
 const qualityOf = (quality: ConnectionQuality): CallConnectionQuality => {
@@ -60,9 +62,8 @@ const trackOf = (publication: TrackPublication | undefined): CallTrack | undefin
     subscribed: publication.isSubscribed,
   };
 
-const selfOf = (participant: LocalParticipant): CallParticipant => ({
+const participantOf = (participant: LocalParticipant | RemoteParticipant): CallParticipant => ({
   identity: participant.identity,
-  local: true,
   camera: trackOf(participant.getTrackPublication(Track.Source.Camera)),
   screenShare: trackOf(participant.getTrackPublication(Track.Source.ScreenShare)),
   screenShareAudio: trackOf(participant.getTrackPublication(Track.Source.ScreenShareAudio)),
@@ -71,14 +72,9 @@ const selfOf = (participant: LocalParticipant): CallParticipant => ({
   speaking: participant.isSpeaking,
 });
 
-const participantOf = (participant: RemoteParticipant): CallParticipant => ({
-  identity: participant.identity,
-  camera: trackOf(participant.getTrackPublication(Track.Source.Camera)),
-  screenShare: trackOf(participant.getTrackPublication(Track.Source.ScreenShare)),
-  screenShareAudio: trackOf(participant.getTrackPublication(Track.Source.ScreenShareAudio)),
-  microphone: trackOf(participant.getTrackPublication(Track.Source.Microphone)),
-  connectionQuality: qualityOf(participant.connectionQuality),
-  speaking: participant.isSpeaking,
+const selfOf = (participant: LocalParticipant): CallParticipant => ({
+  ...participantOf(participant),
+  local: true,
 });
 
 export type LivekitTransport = CallTransport & {
@@ -99,11 +95,12 @@ export type LivekitTransportOptions = {
 const defaultWorker = (): Worker =>
   new Worker(new URL('livekit-client/e2ee-worker', import.meta.url), { type: 'module' });
 
+// Chrome rejects a BUNDLE whose Opus sections share a payload type with different
+// fmtp, so these must keep the microphone's defaults.
 const SCREEN_AUDIO_PUBLISH: TrackPublishOptions = {
-  audioPreset: AudioPresets.musicHighQualityStereo,
-  forceStereo: true,
-  dtx: false,
-  red: false,
+  forceStereo: false,
+  dtx: true,
+  red: true,
 };
 
 const DISPLAY_AUDIO_CAPTURE: ScreenShareCaptureOptions = {
@@ -134,15 +131,16 @@ export function createLivekitTransport(options: LivekitTransportOptions): Liveki
     preferences.callCameraCodec,
     preferences.callSimulcast
   );
-  const screenCapture: ScreenShareCaptureOptions =
-    preferences.callScreenResolution === 'auto'
-      ? {}
-      : { resolution: videoResolution(preferences.callScreenResolution) };
+  const screenCapture: ScreenShareCaptureOptions = screenCaptureOptions(
+    preferences.callScreenResolution,
+    preferences.callScreenFramerate
+  );
   const screenPublish = videoPublishOptions(
     'screen',
     preferences.callScreenBitrate,
     preferences.callScreenCodec,
-    preferences.callSimulcast
+    preferences.callSimulcast,
+    preferences.callScreenFramerate
   );
 
   const room = (options.createRoom ?? ((config) => new LivekitRoom(config)))({
@@ -314,8 +312,8 @@ export function createLivekitTransport(options: LivekitTransportOptions): Liveki
     for (const listener of listeners) {
       try {
         listener(snapshot);
-      } catch {
-        ignoreError();
+      } catch (error) {
+        console.warn('[sable call] state listener failed', error);
       }
     }
   };
@@ -381,9 +379,17 @@ export function createLivekitTransport(options: LivekitTransportOptions): Liveki
       event('call.connection.state', { 'call.connection_state': connectionState });
     })
     .on(RoomEvent.EncryptionError, (error) => {
+      if (error instanceof CryptorError && error.reason === CryptorErrorReason.MissingKey) {
+        event('call.encryption.missing_key');
+        return;
+      }
       fail('call.encryption.error', error);
     })
     .on(RoomEvent.MediaDevicesError, (error) => {
+      if (error.name === 'NotAllowedError') {
+        event('call.media.device_denied');
+        return;
+      }
       fail('call.media.device_error', error);
     })
     .on(RoomEvent.TrackSubscriptionFailed, (_trackSid, _participant, reason) => {
@@ -520,9 +526,13 @@ export function createLivekitTransport(options: LivekitTransportOptions): Liveki
           ...SCREEN_AUDIO_PUBLISH,
           source: Track.Source.ScreenShareAudio,
         });
+        if (!isDisposed() && generation === screenAudioGeneration && screenAudio === track) {
+          await unmuteScreenAudio();
+        }
         return true;
       } catch (error) {
         if (isDisposed() || generation !== screenAudioGeneration) return true;
+        console.warn('[sable screen audio] sharing failed', error);
         fail('call.screen_share.audio', error);
         await stopSharingAudio();
         return false;

@@ -1,4 +1,8 @@
-use std::sync::{Arc, atomic::Ordering};
+use crate::api::encryption::ContinueIdentityResetParams;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 
 use base64::Engine;
@@ -13,7 +17,7 @@ use matrix_sdk::encryption::{
     CrossSigningResetAuthType, VerificationState, recovery::RecoveryState,
 };
 use matrix_sdk::executor::{JoinHandleExt, spawn};
-use matrix_sdk::ruma::api::client::uiaa::{AuthData, AuthType, OAuth, Password, UserIdentifier};
+use matrix_sdk::ruma::api::client::uiaa::{AuthData, AuthType, Password, UserIdentifier};
 use matrix_sdk::ruma::events::GlobalAccountDataEventType;
 use matrix_sdk::ruma::events::key::verification::VerificationMethod;
 use matrix_sdk::ruma::events::key::verification::request::ToDeviceKeyVerificationRequestEvent;
@@ -26,8 +30,8 @@ use qrcode::{Color, EcLevel, QrCode, Version};
 
 use crate::ResultExt;
 use crate::protocol::{
-    CommandErr, CoreEvent, DeviceView, EmojiView, EncryptionStatusView, IdentityResetStep,
-    QrCodeView, RecoveryStateView, SignOutSafetyView, SigningKeysView, UserDeviceView,
+    CoreEvent, DeviceView, EmojiView, EncryptionStatusView, IdentityResetStep, QrCodeView,
+    RecoveryStateView, RpcError, SignOutSafetyView, SigningKeysView, UserDeviceView,
     UserSecurityView, VerificationStateView, VerificationView,
 };
 
@@ -48,7 +52,7 @@ pub(crate) struct PendingIdentityReset {
 }
 
 impl Core {
-    pub(crate) async fn reset_identity(&self) -> Result<IdentityResetStep, CommandErr> {
+    pub(crate) async fn reset_identity(&self) -> Result<IdentityResetStep, RpcError> {
         let client = self.client().await?;
         let generation = self.session_generation.load(Ordering::SeqCst);
         self.cancel_identity_reset().await;
@@ -69,22 +73,7 @@ impl Core {
             CrossSigningResetAuthType::OAuth(info) => IdentityResetStep::Approve {
                 url: info.approval_url.to_string(),
             },
-            CrossSigningResetAuthType::Uiaa(uiaa) => {
-                if !uiaa
-                    .flows
-                    .iter()
-                    .any(|flow| flow.stages == [AuthType::Password])
-                {
-                    let stages = uiaa
-                        .flows
-                        .iter()
-                        .flat_map(|flow| &flow.stages)
-                        .map(|stage| stage.as_str().to_owned())
-                        .collect();
-                    return Err(CommandErr::InteractiveAuthRequired { stages });
-                }
-                IdentityResetStep::Password
-            }
+            CrossSigningResetAuthType::Uiaa(_) => IdentityResetStep::Password,
         };
 
         #[cfg_attr(
@@ -102,36 +91,32 @@ impl Core {
 
     pub(crate) async fn continue_identity_reset(
         &self,
-        password: Option<String>,
-    ) -> Result<String, CommandErr> {
+        ContinueIdentityResetParams { password }: ContinueIdentityResetParams,
+    ) -> Result<String, RpcError> {
         let client = self.client().await?;
         let generation = self.session_generation.load(Ordering::SeqCst);
         let handle = match &*self.pending_identity_reset.lock().await {
             Some(pending) if pending.generation == generation => pending.handle.clone(),
-            _ => return Err(CommandErr::Unavailable),
+            _ => return Err(RpcError::Unavailable),
         };
 
         let auth = match (handle.auth_type(), password) {
-            (CrossSigningResetAuthType::OAuth(info), _) => {
-                let mut oauth = OAuth::new();
-                oauth.session.clone_from(&info.session);
-                Some(AuthData::OAuth(oauth))
-            }
+            (CrossSigningResetAuthType::OAuth(info), _) => info.as_auth_data(),
             (CrossSigningResetAuthType::Uiaa(uiaa), Some(password)) => {
-                let user_id = client.user_id().ok_or(CommandErr::NotLoggedIn)?.to_owned();
+                let user_id = client.user_id().ok_or(RpcError::NotLoggedIn)?.to_owned();
                 let mut auth = Password::new(UserIdentifier::Matrix(user_id.into()), password);
-                auth.session.clone_from(&uiaa.session);
-                Some(AuthData::Password(auth))
+                auth.session = Some(uiaa.session.clone());
+                AuthData::Password(auth)
             }
             (CrossSigningResetAuthType::Uiaa(_), None) => {
-                return Err(CommandErr::InteractiveAuthRequired {
+                return Err(RpcError::InteractiveAuthRequired {
                     stages: vec![AuthType::Password.as_str().to_owned()],
                 });
             }
         };
 
         handle.reset(auth).await.map_err(|error| match &error {
-            RecoveryError::Sdk(sdk) if sdk.as_uiaa_response().is_some() => CommandErr::Denied,
+            RecoveryError::Sdk(sdk) if sdk.as_uiaa_response().is_some() => RpcError::Denied,
             _ => self.failed("reset_identity_auth", error),
         })?;
 
@@ -141,7 +126,7 @@ impl Core {
                 .as_ref()
                 .is_some_and(|pending| Arc::ptr_eq(&pending.handle, &handle))
             {
-                return Err(CommandErr::Unavailable);
+                return Err(RpcError::Unavailable);
             }
             pending.take();
         }
@@ -156,10 +141,7 @@ impl Core {
         }
     }
 
-    async fn enable_reset_recovery(
-        &self,
-        client: &matrix_sdk::Client,
-    ) -> Result<String, CommandErr> {
+    async fn enable_reset_recovery(&self, client: &matrix_sdk::Client) -> Result<String, RpcError> {
         let recovery_key = client
             .encryption()
             .recovery()
@@ -238,6 +220,7 @@ impl Core {
 
             let changes = request.changes();
             let mut changes = futures_util::stream::iter([request.state()]).chain(changes);
+            let current_sas = Arc::new(AtomicUsize::new(0));
 
             while let Some(state) = changes.next().await {
                 match state {
@@ -286,8 +269,14 @@ impl Core {
 
                     VerificationRequestState::Transitioned { verification, .. } => {
                         if let Some(sas) = verification.sas() {
-                            core.watch_sas(user_id.clone(), flow_id.clone(), sas);
-                            break;
+                            let generation = current_sas.fetch_add(1, Ordering::SeqCst) + 1;
+                            core.watch_sas(
+                                user_id.clone(),
+                                flow_id.clone(),
+                                sas,
+                                current_sas.clone(),
+                                generation,
+                            );
                         }
                     }
 
@@ -297,7 +286,9 @@ impl Core {
                             view,
                             VerificationView::Done | VerificationView::Cancelled { .. }
                         );
-                        core.emit_verification(&user_id, &flow_id, view);
+                        if current_sas.load(Ordering::SeqCst) == 0 {
+                            core.emit_verification(&user_id, &flow_id, view);
+                        }
 
                         if done {
                             break;
@@ -310,19 +301,27 @@ impl Core {
         self.track_session_task(task);
     }
 
-    fn watch_sas(self: &Arc<Self>, user_id: OwnedUserId, flow_id: String, sas: SasVerification) {
+    fn watch_sas(
+        self: &Arc<Self>,
+        user_id: OwnedUserId,
+        flow_id: String,
+        sas: SasVerification,
+        current_sas: Arc<AtomicUsize>,
+        generation: usize,
+    ) {
         let core = self.clone();
         let task = spawn(async move {
             let mut changes = sas.changes();
             core.emit_verification(&user_id, &flow_id, sas_view(&sas, &sas.state()));
 
-            if !sas.we_started()
-                && let Err(error) = sas.accept().await
-            {
+            if let Err(error) = sas.accept().await {
                 core.failed("verification_accept_sas", error);
             }
 
             while let Some(state) = changes.next().await {
+                if current_sas.load(Ordering::SeqCst) != generation {
+                    break;
+                }
                 let view = sas_view(&sas, &state);
                 let done = matches!(
                     view,
@@ -393,13 +392,13 @@ impl Core {
         &self,
         user_id: &UserId,
         flow_id: &str,
-    ) -> Result<VerificationRequest, CommandErr> {
+    ) -> Result<VerificationRequest, RpcError> {
         self.client()
             .await?
             .encryption()
             .get_verification_request(user_id, flow_id)
             .await
-            .ok_or(CommandErr::UnknownVerification)
+            .ok_or(RpcError::UnknownVerification)
     }
 
     pub(crate) async fn scan_verification_qr(
@@ -407,19 +406,19 @@ impl Core {
         user_id: OwnedUserId,
         flow_id: String,
         data: &str,
-    ) -> Result<(), CommandErr> {
+    ) -> Result<(), RpcError> {
         let data = base64::engine::general_purpose::STANDARD
             .decode(data)
             .ok()
             .and_then(|bytes| QrVerificationData::from_bytes(bytes).ok())
-            .ok_or(CommandErr::InvalidVerificationCode)?;
+            .ok_or(RpcError::InvalidVerificationCode)?;
         let qr = self
             .verification_request(&user_id, &flow_id)
             .await?
             .scan_qr_code(data)
             .await
             .or_failed(self, "scan_verification_qr")?
-            .ok_or(CommandErr::Unavailable)?;
+            .ok_or(RpcError::Unavailable)?;
         self.watch_qr(user_id, flow_id, qr);
         Ok(())
     }
@@ -428,28 +427,28 @@ impl Core {
         &self,
         user_id: &UserId,
         flow_id: &str,
-    ) -> Result<QrVerification, CommandErr> {
+    ) -> Result<QrVerification, RpcError> {
         self.client()
             .await?
             .encryption()
             .get_verification(user_id, flow_id)
             .await
             .and_then(matrix_sdk::encryption::verification::Verification::qr)
-            .ok_or(CommandErr::UnknownVerification)
+            .ok_or(RpcError::UnknownVerification)
     }
 
     pub(crate) async fn sas(
         &self,
         user_id: &UserId,
         flow_id: &str,
-    ) -> Result<SasVerification, CommandErr> {
+    ) -> Result<SasVerification, RpcError> {
         self.client()
             .await?
             .encryption()
             .get_verification(user_id, flow_id)
             .await
             .and_then(matrix_sdk::encryption::verification::Verification::sas)
-            .ok_or(CommandErr::UnknownVerification)
+            .ok_or(RpcError::UnknownVerification)
     }
 }
 
@@ -569,38 +568,58 @@ pub(crate) async fn own_devices(client: &matrix_sdk::Client) -> Vec<DeviceView> 
         Err(error) => {
             tracing::warn!(%error, "could not refresh devices; using the crypto store");
             encryption
-                .map(|devices| {
-                    devices
-                        .devices()
-                        .map(|device| DeviceView {
-                            is_own: Some(device.device_id()) == own_device_id,
-                            is_verified: device.is_verified(),
-                            cross_signed: device.is_cross_signed_by_owner(),
-                            has_keys: true,
-                            display_name: device.display_name().map(str::to_owned),
-                            device_id: device.device_id().to_owned(),
-                            last_seen_ts: None,
-                            last_seen_ip: None,
-                        })
-                        .collect()
-                })
+                .map(|devices| local_device_views(&devices, own_device_id))
                 .unwrap_or_default()
         }
     };
+    sort_devices(&mut views);
+    views
+}
 
+pub(crate) async fn local_own_devices(client: &matrix_sdk::Client) -> Vec<DeviceView> {
+    let Some(user_id) = client.user_id() else {
+        return Vec::new();
+    };
+    let Ok(devices) = client.encryption().get_user_devices(user_id).await else {
+        return Vec::new();
+    };
+    let mut views = local_device_views(&devices, client.device_id());
+    sort_devices(&mut views);
+    views
+}
+
+fn local_device_views(
+    devices: &matrix_sdk::encryption::identities::UserDevices,
+    own_device_id: Option<&matrix_sdk::ruma::DeviceId>,
+) -> Vec<DeviceView> {
+    devices
+        .devices()
+        .map(|device| DeviceView {
+            is_own: Some(device.device_id()) == own_device_id,
+            is_verified: device.is_verified(),
+            cross_signed: device.is_cross_signed_by_owner(),
+            has_keys: true,
+            display_name: device.display_name().map(str::to_owned),
+            device_id: device.device_id().to_owned(),
+            last_seen_ts: None,
+            last_seen_ip: None,
+        })
+        .collect()
+}
+
+fn sort_devices(views: &mut [DeviceView]) {
     views.sort_by(|a, b| {
         b.is_own
             .cmp(&a.is_own)
             .then(b.last_seen_ts.cmp(&a.last_seen_ts))
             .then(a.device_id.cmp(&b.device_id))
     });
-    views
 }
 
 pub(crate) async fn user_security(
     core: &Core,
     user_id: &UserId,
-) -> Result<UserSecurityView, CommandErr> {
+) -> Result<UserSecurityView, RpcError> {
     let client = core.client().await?;
     let encryption = client.encryption();
     let identity = match encryption
@@ -653,7 +672,7 @@ pub(crate) async fn set_device_blocked(
     user_id: &UserId,
     device_id: &DeviceId,
     blocked: bool,
-) -> Result<(), CommandErr> {
+) -> Result<(), RpcError> {
     let device = core
         .client()
         .await?
@@ -661,7 +680,7 @@ pub(crate) async fn set_device_blocked(
         .get_device(user_id, device_id)
         .await
         .or_failed(core, "set_device_blocked_device")?
-        .ok_or(CommandErr::Unavailable)?;
+        .ok_or(RpcError::Unavailable)?;
     if device.is_blacklisted() == blocked {
         return Ok(());
     }

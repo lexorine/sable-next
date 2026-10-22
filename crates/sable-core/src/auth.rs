@@ -1,6 +1,14 @@
+use crate::api::auth::AuthIntent;
+use crate::api::auth::CompleteOidcLoginParams;
+use crate::api::auth::CompleteSsoLoginParams;
+use crate::api::auth::LoginFlowsParams;
+use crate::api::auth::LoginIdentifier;
+use crate::api::auth::StartOidcLoginParams;
+use crate::api::auth::StartSsoLoginParams;
 use std::sync::Arc;
 
 use matrix_sdk::authentication::oauth::error::OAuthDiscoveryError;
+use matrix_sdk::ruma::OwnedUserId;
 use matrix_sdk::ruma::api::client::session::get_login_types::v3::LoginType;
 use matrix_sdk::ruma::api::client::uiaa::{
     EmailUserIdentifier, MatrixUserIdentifier, UserIdentifier,
@@ -10,7 +18,7 @@ use url::Url;
 
 use crate::ResultExt;
 use crate::errors::CoreError;
-use crate::protocol::{AuthIntent, CommandErr, CommandOk, LoginIdentifier};
+use crate::protocol::RpcError;
 
 use crate::session::{Credentials, PersistedSession};
 
@@ -21,7 +29,7 @@ impl Core {
     async fn reauthentication_account(
         &self,
         account_id: Option<String>,
-    ) -> Result<Option<session::PersistedAccount>, CommandErr> {
+    ) -> Result<Option<session::PersistedAccount>, RpcError> {
         let Some(account_id) = account_id else {
             return Ok(None);
         };
@@ -31,7 +39,7 @@ impl Core {
             .accounts
             .into_iter()
             .find(|account| account.account_id == account_id && account.needs_reauth)
-            .ok_or(CommandErr::NotLoggedIn)?;
+            .ok_or(RpcError::NotLoggedIn)?;
         if !account.device_invalidated {
             match session::validate_saved_crypto_store(&account.store_id, &account.session).await {
                 Ok(()) => {}
@@ -51,7 +59,7 @@ impl Core {
     async fn authentication_store(
         &self,
         account: Option<&session::PersistedAccount>,
-    ) -> Result<(String, String), CommandErr> {
+    ) -> Result<(String, String), RpcError> {
         match account {
             Some(account) if !account.device_invalidated => {
                 Ok((account.account_id.clone(), account.store_id.clone()))
@@ -65,7 +73,7 @@ impl Core {
         store_id: &str,
         homeserver: &str,
         account: Option<&session::PersistedAccount>,
-    ) -> Result<matrix_sdk::Client, CommandErr> {
+    ) -> Result<matrix_sdk::Client, RpcError> {
         let client = match account {
             Some(account) if !account.device_invalidated => {
                 session::restore_client(store_id, &account.session, self.persistent_event_cache)
@@ -82,7 +90,7 @@ impl Core {
         &self,
         expected: Option<&session::PersistedAccount>,
         client: &matrix_sdk::Client,
-    ) -> Result<(), CommandErr> {
+    ) -> Result<(), RpcError> {
         let Some(expected) = expected else {
             return Ok(());
         };
@@ -91,7 +99,7 @@ impl Core {
             .await
         {
             Err(error) => Err(error),
-            Ok(None) => Err(CommandErr::NotLoggedIn),
+            Ok(None) => Err(RpcError::NotLoggedIn),
             Ok(Some(account))
                 if client.user_id().map(ToString::to_string)
                     != Some(account.session.credentials.user_id())
@@ -102,7 +110,7 @@ impl Core {
                         && client.device_id().map(ToString::to_string)
                             == Some(account.session.credentials.device_id())) =>
             {
-                Err(CommandErr::Denied)
+                Err(RpcError::Denied)
             }
             Ok(Some(_)) => Ok(()),
         };
@@ -120,7 +128,7 @@ impl Core {
         identifier: LoginIdentifier,
         password: String,
         reauth_account_id: Option<String>,
-    ) -> Result<CommandOk, CommandErr> {
+    ) -> Result<OwnedUserId, RpcError> {
         let reauth = self.reauthentication_account(reauth_account_id).await?;
         let homeserver = reauth
             .as_ref()
@@ -165,39 +173,37 @@ impl Core {
         let user_id = matrix.meta.user_id.clone();
         self.validate_reauthentication(reauth.as_ref(), &client)
             .await?;
-        let generation = self.claim_session_generation().await;
-        self.persist(
-            &account_id,
-            &account_store_id,
-            &PersistedSession {
-                oauth_issuer: None,
-                resolved_homeserver: Some(endpoint),
-                homeserver: homeserver.clone(),
-                credentials: Credentials::Password(matrix),
-            },
-            reauth.as_ref(),
-        )
-        .await?;
-        self.retire_replaced_store(reauth.as_ref(), &account_store_id)
-            .await;
+        let _activation = self
+            .finish_sign_in(
+                client,
+                account_id.clone(),
+                &account_store_id,
+                PersistedSession {
+                    oauth_issuer: None,
+                    oauth_redirect_uri: None,
+                    resolved_homeserver: Some(endpoint),
+                    homeserver: homeserver.clone(),
+                    credentials: Credentials::Password(matrix),
+                },
+                reauth.as_ref(),
+            )
+            .await?;
         tracing::info!(
             operation = "password_login",
             homeserver,
             "session persisted; starting sync"
         );
-        self.start_session(client, homeserver, account_id.clone(), generation.value())
-            .await?;
         self.pending_login.lock().await.take();
         self.pending_registration.lock().await.take();
 
         tracing::info!(operation = "password_login", "login completed");
-        Ok(CommandOk::Login { user_id })
+        Ok(user_id)
     }
 
     pub(crate) async fn login_flows(
         self: &Arc<Self>,
-        homeserver: String,
-    ) -> Result<CommandOk, CommandErr> {
+        LoginFlowsParams { homeserver }: LoginFlowsParams,
+    ) -> Result<protocol::LoginFlowsView, RpcError> {
         tracing::info!(
             operation = "login_flows",
             homeserver,
@@ -212,6 +218,7 @@ impl Core {
             password: false,
             oidc: false,
             oidc_registration: false,
+            qr_login: false,
             sso: false,
             oauth_aware_preferred: false,
             sso_identity_providers: Vec::new(),
@@ -256,6 +263,7 @@ impl Core {
         match client.oauth().server_metadata().await {
             Ok(metadata) => {
                 flows.oidc = true;
+                flows.qr_login = metadata.device_authorization_endpoint.is_some();
                 flows.oidc_registration = metadata.prompt_values_supported.iter().any(|prompt| {
                     matches!(
                         prompt,
@@ -274,7 +282,7 @@ impl Core {
         }
 
         if !flows.password && !flows.sso && !flows.oidc {
-            return Err(CommandErr::Unsupported);
+            return Err(RpcError::Unsupported);
         }
 
         tracing::info!(
@@ -284,18 +292,20 @@ impl Core {
             sso = flows.sso,
             "sign-in methods discovered"
         );
-        Ok(CommandOk::LoginFlows { flows })
+        Ok(flows)
     }
 
     /// Parked in `pending_oidc` so step 2 finishes on the same `Client`: the
     /// PKCE verifier and CSRF state live inside it and cannot be rebuilt.
     pub(crate) async fn start_oidc_login(
         self: &Arc<Self>,
-        homeserver: String,
-        redirect_uri: String,
-        intent: AuthIntent,
-        reauth_account_id: Option<String>,
-    ) -> Result<CommandOk, CommandErr> {
+        StartOidcLoginParams {
+            homeserver,
+            redirect_uri,
+            intent,
+            reauth_account_id,
+        }: StartOidcLoginParams,
+    ) -> Result<String, RpcError> {
         let reauth = self.reauthentication_account(reauth_account_id).await?;
         let homeserver = reauth
             .as_ref()
@@ -312,9 +322,11 @@ impl Core {
         let registration = session::client_metadata(&redirect_uri).into();
         if let Some(account) = &reauth {
             if matches!(intent, AuthIntent::Register) {
-                return Err(CommandErr::Denied);
+                return Err(RpcError::Denied);
             }
-            if let Credentials::OAuth { client_id, .. } = &account.session.credentials {
+            if let Credentials::OAuth { client_id, .. } = &account.session.credentials
+                && session::registered_redirect_uri(&account.session, &redirect_uri) == redirect_uri
+            {
                 client.oauth().restore_registered_client(
                     matrix_sdk::authentication::oauth::ClientId::new(client_id.clone()),
                 );
@@ -355,7 +367,7 @@ impl Core {
         let authorization_url = authorization_url.to_string();
         let mut pending = self.pending_login.lock().await;
         if matches!(pending.as_ref(), Some(PendingLogin::Sso(_, _, _, _, _, _))) {
-            return Err(CommandErr::Unavailable);
+            return Err(RpcError::Unavailable);
         }
 
         if pending.is_some() {
@@ -374,13 +386,13 @@ impl Core {
             operation = "oidc_login",
             "OAuth login ready for browser redirect"
         );
-        Ok(CommandOk::StartOidcLogin { authorization_url })
+        Ok(authorization_url)
     }
 
     pub(crate) async fn complete_oidc_login(
         self: &Arc<Self>,
-        callback_url: String,
-    ) -> Result<CommandOk, CommandErr> {
+        CompleteOidcLoginParams { callback_url }: CompleteOidcLoginParams,
+    ) -> Result<OwnedUserId, RpcError> {
         tracing::info!(operation = "oidc_login", "completing OAuth login callback");
         let url = Url::parse(&callback_url).or_failed(self, "complete_oidc_login_callback_url")?;
 
@@ -388,7 +400,7 @@ impl Core {
         let Some(PendingLogin::Oidc(_, _, _, expected_redirect_uri, client, _)) = pending.as_ref()
         else {
             tracing::warn!("no pending OIDC login: it was started elsewhere or the core restarted");
-            return Err(CommandErr::Unavailable);
+            return Err(RpcError::Unavailable);
         };
 
         if !same_redirect_target(expected_redirect_uri, &url) {
@@ -405,10 +417,16 @@ impl Core {
             .await
             .or_failed(self, "complete_oidc_login")?;
 
-        let Some(PendingLogin::Oidc(account_id, account_store_id, homeserver, _, client, reauth)) =
-            pending.take()
+        let Some(PendingLogin::Oidc(
+            account_id,
+            account_store_id,
+            homeserver,
+            redirect_uri,
+            client,
+            reauth,
+        )) = pending.take()
         else {
-            return Err(CommandErr::Unavailable);
+            return Err(RpcError::Unavailable);
         };
         drop(pending);
 
@@ -420,51 +438,52 @@ impl Core {
         let user_id = full.user.meta.user_id.clone();
         self.validate_reauthentication(reauth.as_ref(), &client)
             .await?;
-        let generation = self.claim_session_generation().await;
-        self.persist(
-            &account_id,
-            &account_store_id,
-            &PersistedSession {
-                oauth_issuer: None,
-                resolved_homeserver: Some(client.homeserver()),
-                homeserver: homeserver.clone(),
-                credentials: Credentials::oauth(full),
-            },
-            reauth.as_ref(),
-        )
-        .await?;
-        self.retire_replaced_store(reauth.as_ref(), &account_store_id)
-            .await;
-        self.start_session(client, homeserver, account_id.clone(), generation.value())
+        let endpoint = client.homeserver();
+        let _activation = self
+            .finish_sign_in(
+                client,
+                account_id.clone(),
+                &account_store_id,
+                PersistedSession {
+                    oauth_issuer: None,
+                    oauth_redirect_uri: Some(redirect_uri),
+                    resolved_homeserver: Some(endpoint),
+                    homeserver,
+                    credentials: Credentials::oauth(full),
+                },
+                reauth.as_ref(),
+            )
             .await?;
         self.pending_login.lock().await.take();
         self.pending_registration.lock().await.take();
 
         tracing::info!(operation = "oidc_login", "OAuth login completed");
-        Ok(CommandOk::CompleteOidcLogin { user_id })
+        Ok(user_id)
     }
 
     pub(crate) async fn start_sso_login(
         self: &Arc<Self>,
-        homeserver: String,
-        redirect_uri: String,
-        idp_id: Option<String>,
-        intent: AuthIntent,
-        reauth_account_id: Option<String>,
-    ) -> Result<CommandOk, CommandErr> {
+        StartSsoLoginParams {
+            homeserver,
+            redirect_uri,
+            idp_id,
+            intent,
+            reauth_account_id,
+        }: StartSsoLoginParams,
+    ) -> Result<String, RpcError> {
         let reauth = self.reauthentication_account(reauth_account_id).await?;
         let homeserver = reauth
             .as_ref()
             .map_or(homeserver, |account| account.session.homeserver.clone());
         let (account_id, account_store_id) = self.authentication_store(reauth.as_ref()).await?;
         if reauth.is_some() && matches!(intent, AuthIntent::Register) {
-            return Err(CommandErr::Denied);
+            return Err(RpcError::Denied);
         }
         tracing::info!(operation = "sso_login", intent = ?intent, "starting SSO login");
         let redirect_uri =
             Url::parse(&redirect_uri).or_failed(self, "start_sso_login_redirect_uri")?;
         if !has_single_nonempty_query_parameter(&redirect_uri, "sable_sso_state") {
-            return Err(CommandErr::Denied);
+            return Err(RpcError::Denied);
         }
 
         let client = self
@@ -490,7 +509,7 @@ impl Core {
 
         let mut pending = self.pending_login.lock().await;
         if pending.is_some() {
-            return Err(CommandErr::Unavailable);
+            return Err(RpcError::Unavailable);
         }
         *pending = Some(PendingLogin::Sso(
             account_id,
@@ -505,28 +524,26 @@ impl Core {
             operation = "sso_login",
             "SSO login ready for browser redirect"
         );
-        Ok(CommandOk::StartSsoLogin {
-            authorization_url: authorization_url.to_string(),
-        })
+        Ok(authorization_url.to_string())
     }
 
     pub(crate) async fn complete_sso_login(
         self: &Arc<Self>,
-        callback_url: String,
-    ) -> Result<CommandOk, CommandErr> {
+        CompleteSsoLoginParams { callback_url }: CompleteSsoLoginParams,
+    ) -> Result<OwnedUserId, RpcError> {
         tracing::info!(operation = "sso_login", "completing SSO login callback");
         // The login token is single-use, so keep the client that created the
         // redirect and consume the pending flow exactly once.
         let callback_url =
             Url::parse(&callback_url).or_failed(self, "complete_sso_login_callback_url")?;
         if !has_single_nonempty_query_parameter(&callback_url, "loginToken") {
-            return Err(CommandErr::Denied);
+            return Err(RpcError::Denied);
         }
 
         let mut pending = self.pending_login.lock().await;
         let Some(PendingLogin::Sso(_, _, _, expected_redirect_uri, _, _)) = pending.as_ref() else {
             tracing::warn!("no pending SSO login: it was started elsewhere or the core restarted");
-            return Err(CommandErr::Unavailable);
+            return Err(RpcError::Unavailable);
         };
 
         if !same_redirect_target(expected_redirect_uri, &callback_url) {
@@ -540,7 +557,7 @@ impl Core {
         let Some(PendingLogin::Sso(account_id, account_store_id, homeserver, _, client, reauth)) =
             pending.take()
         else {
-            return Err(CommandErr::Unavailable);
+            return Err(RpcError::Unavailable);
         };
         drop(pending);
 
@@ -564,28 +581,26 @@ impl Core {
 
         self.validate_reauthentication(reauth.as_ref(), &client)
             .await?;
-        let generation = self.claim_session_generation().await;
-        self.persist(
-            &account_id,
-            &account_store_id,
-            &PersistedSession {
-                resolved_homeserver: Some(endpoint),
-                homeserver: homeserver.clone(),
-                credentials: Credentials::Password(matrix),
-                oauth_issuer: None,
-            },
-            reauth.as_ref(),
-        )
-        .await?;
-        self.retire_replaced_store(reauth.as_ref(), &account_store_id)
-            .await;
-        self.start_session(client, homeserver, account_id.clone(), generation.value())
+        let _activation = self
+            .finish_sign_in(
+                client,
+                account_id.clone(),
+                &account_store_id,
+                PersistedSession {
+                    oauth_issuer: None,
+                    oauth_redirect_uri: None,
+                    resolved_homeserver: Some(endpoint),
+                    homeserver,
+                    credentials: Credentials::Password(matrix),
+                },
+                reauth.as_ref(),
+            )
             .await?;
         self.pending_login.lock().await.take();
         self.pending_registration.lock().await.take();
 
         tracing::info!(operation = "sso_login", "SSO login completed");
-        Ok(CommandOk::CompleteSsoLogin { user_id })
+        Ok(user_id)
     }
 }
 
@@ -913,7 +928,7 @@ mod tests {
                 .login(server.server().uri(), identifier, "pw".to_owned(), None)
                 .await
                 .expect_err("the mock refuses every login");
-            assert!(matches!(error, CommandErr::Denied), "got {error:?}");
+            assert!(matches!(error, RpcError::Denied), "got {error:?}");
         }
 
         server.server().verify().await;
@@ -1037,7 +1052,7 @@ mod tests {
             .validate_reauthentication(Some(&account), &client)
             .await;
 
-        assert!(matches!(result, Err(CommandErr::Denied)));
+        assert!(matches!(result, Err(RpcError::Denied)));
         server.server().verify().await;
     }
 

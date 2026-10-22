@@ -1,11 +1,15 @@
 <script lang="ts">
   import { Dialog } from 'bits-ui';
+  import XIcon from 'phosphor-svelte/lib/XIcon';
 
   import type { UserDeviceView, UserSecurityView } from '#src/generated/protocol';
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
+  import { hasDirectRoom, useRoomList } from '#lib/rooms/room-list.svelte.js';
   import Alert from '#lib/ui/primitives/Alert.svelte';
   import Button from '#lib/ui/primitives/Button.svelte';
+  import ConfirmDialog from '#lib/ui/primitives/ConfirmDialog.svelte';
+  import IconButton from '#lib/ui/primitives/IconButton.svelte';
   import DialogFrame from '#lib/ui/primitives/DialogFrame.svelte';
   import Spinner from '#lib/ui/primitives/Spinner.svelte';
   import StatusBadge from '#lib/ui/primitives/StatusBadge.svelte';
@@ -19,6 +23,8 @@
 
   let { open, userId, displayName, onOpenChange }: Props = $props();
   const core = useCoreClient();
+  const roomList = useRoomList();
+  let confirmingDirect = $state(false);
   let security = $state<UserSecurityView | null>(null);
   let loading = $state(false);
   let error = $state(false);
@@ -41,12 +47,13 @@
     loading = true;
     error = false;
     security = null;
-    core.commands
-      .userSecurity(wanted)
+    core.rpc.encryption
+      .userSecurity({ user_id: wanted })
       .then((value) => {
         if (active) security = value;
       })
-      .catch(() => {
+      .catch((cause: unknown) => {
+        console.warn('[sable profile] loading user security failed', cause);
         if (active) error = true;
       })
       .finally(() => {
@@ -57,6 +64,11 @@
     };
   });
 
+  function startVerification(): void {
+    if (hasDirectRoom(roomList.rooms, userId)) void verify();
+    else confirmingDirect = true;
+  }
+
   async function verify(): Promise<void> {
     if (verifying) return;
     verifying = true;
@@ -64,7 +76,8 @@
     try {
       await core.requestVerification(userId);
       onOpenChange(false);
-    } catch {
+    } catch (cause) {
+      console.warn('[sable profile] requesting verification failed', cause);
       error = true;
     } finally {
       verifying = false;
@@ -76,9 +89,14 @@
     blocking = device.device_id;
     error = false;
     try {
-      await core.commands.setDeviceBlocked(userId, device.device_id, !device.blocked);
+      await core.rpc.encryption.setDeviceBlocked({
+        user_id: userId,
+        device_id: device.device_id,
+        blocked: !device.blocked,
+      });
       device.blocked = !device.blocked;
-    } catch {
+    } catch (cause) {
+      console.warn('[sable profile] blocking device failed', cause);
       error = true;
     } finally {
       blocking = null;
@@ -90,9 +108,10 @@
     accepting = true;
     error = false;
     try {
-      await core.commands.withdrawVerification(userId);
+      await core.rpc.encryption.withdrawVerification({ user_id: userId });
       revision += 1;
-    } catch {
+    } catch (cause) {
+      console.warn('[sable profile] withdrawing verification failed', cause);
       error = true;
     } finally {
       accepting = false;
@@ -103,12 +122,18 @@
 <DialogFrame {open} {onOpenChange} variant="settings" contentClass="user-security-dialog">
   <header class="security-header">
     <div>
-      <Dialog.Title
-        >{$i18n.t('timeline.profileEncryptionTitle', { name: displayName })}</Dialog.Title
+      <Dialog.Title>{i18n.t('timeline.profileEncryptionTitle', { name: displayName })}</Dialog.Title
       >
-      <Dialog.Description>{$i18n.t('timeline.profileEncryptionDescription')}</Dialog.Description>
+      <Dialog.Description>{i18n.t('timeline.profileEncryptionDescription')}</Dialog.Description>
     </div>
-    <Button size="small" onclick={() => onOpenChange(false)}>{$i18n.t('settings.close')}</Button>
+    <IconButton
+      size="small"
+      variant="ghost"
+      label={i18n.t('common.close')}
+      onclick={() => onOpenChange(false)}
+    >
+      <XIcon />
+    </IconButton>
   </header>
 
   <div class="security-body" style="overflow-y: auto">
@@ -117,9 +142,9 @@
     {:else if security}
       <section class="security-identity" aria-labelledby="security-identity-title">
         <div class="security-row">
-          <h3 id="security-identity-title">{$i18n.t('timeline.profileIdentity')}</h3>
+          <h3 id="security-identity-title">{i18n.t('timeline.profileIdentity')}</h3>
           <StatusBadge
-            label={$i18n.t(
+            label={i18n.t(
               security.verification === 'verified'
                 ? 'settings.verified'
                 : security.verification === 'unverified'
@@ -134,46 +159,45 @@
           />
         </div>
         {#if security.verification_violation}
-          <Alert variant="critical">{$i18n.t('timeline.profileIdentityChanged')}</Alert>
+          <Alert variant="critical">{i18n.t('timeline.profileIdentityChanged')}</Alert>
           <Button onclick={() => void acceptIdentity()} disabled={accepting}>
-            {$i18n.t('timeline.profileAcceptIdentity')}
+            {i18n.t('timeline.profileAcceptIdentity')}
           </Button>
         {/if}
         {#if security.verification !== 'verified'}
           <Button
             variant="primary"
-            onclick={() => void verify()}
+            onclick={startVerification}
             disabled={verifying || security.verification === 'unknown'}
           >
-            {$i18n.t('timeline.profileVerify')}
+            {i18n.t('timeline.profileVerify')}
           </Button>
         {/if}
       </section>
 
       <section aria-labelledby="security-devices-title">
-        <h3 id="security-devices-title">{$i18n.t('timeline.profileDevices')}</h3>
-        <p class="security-note">{$i18n.t('timeline.profileDevicePolicy')}</p>
+        <h3 id="security-devices-title">{i18n.t('timeline.profileDevices')}</h3>
+        <p class="security-note">{i18n.t('timeline.profileDevicePolicy')}</p>
         {#if security.devices.length === 0}
-          <p class="security-empty">{$i18n.t('timeline.profileNoDevices')}</p>
+          <p class="security-empty">{i18n.t('timeline.profileNoDevices')}</p>
         {:else}
           <ul class="security-devices">
             {#each security.devices as device (device.device_id)}
               <li>
                 <div class="security-device-name">
-                  <strong>{device.display_name?.trim() || $i18n.t('settings.unnamedDevice')}</strong
-                  >
+                  <strong>{device.display_name?.trim() || i18n.t('settings.unnamedDevice')}</strong>
                   <code>{device.device_id}</code>
                 </div>
                 <div class="security-device-actions">
                   {#if !device.cross_signed}
                     <StatusBadge
-                      label={$i18n.t('timeline.profileDeviceUnsigned')}
+                      label={i18n.t('timeline.profileDeviceUnsigned')}
                       variant="warning"
                     />
                   {/if}
                   {#if device.blocked}
                     <StatusBadge
-                      label={$i18n.t('timeline.profileDeviceBlocked')}
+                      label={i18n.t('timeline.profileDeviceBlocked')}
                       variant="critical"
                     />
                   {/if}
@@ -182,11 +206,7 @@
                     onclick={() => void setBlocked(device)}
                     disabled={blocking !== null}
                   >
-                    {$i18n.t(
-                      device.blocked
-                        ? 'timeline.profileUnblockDevice'
-                        : 'timeline.profileBlockDevice'
-                    )}
+                    {i18n.t(device.blocked ? 'common.unblock' : 'common.block')}
                   </Button>
                 </div>
               </li>
@@ -196,10 +216,21 @@
       </section>
     {/if}
 
-    {#if error}<Alert variant="critical" role="alert">{$i18n.t('settings.actionFailed')}</Alert
-      >{/if}
+    {#if error}<Alert variant="critical" role="alert">{i18n.t('settings.actionFailed')}</Alert>{/if}
   </div>
 </DialogFrame>
+
+<ConfirmDialog
+  bind:open={confirmingDirect}
+  title={i18n.t('direct.confirmTitle', { name: displayName })}
+  description={i18n.t('direct.confirmBody')}
+  confirmLabel={i18n.t('timeline.profileVerify')}
+  confirmVariant="primary"
+  onConfirm={() => {
+    confirmingDirect = false;
+    void verify();
+  }}
+/>
 
 <style>
   .security-header,
@@ -212,6 +243,7 @@
   }
 
   .security-header {
+    align-items: flex-start;
     border-bottom: var(--border-width) solid var(--surface-container-line);
     padding: var(--space-400);
   }

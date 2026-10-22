@@ -1,9 +1,95 @@
-use matrix_sdk::{Client, config::RequestConfig};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
-use crate::{Core, protocol::CommandErr};
+use matrix_sdk::executor::{JoinHandleExt, spawn};
+use matrix_sdk::{Client, config::RequestConfig};
+use matrix_sdk_ui::sync_service::{State, SyncService};
+
+use crate::{Core, ResultExt, protocol::RpcError};
+
+pub(crate) const SYNC_STALL: Duration = Duration::from_secs(90);
 
 impl Core {
-    pub(crate) async fn require_sliding_sync(&self, client: &Client) -> Result<(), CommandErr> {
+    /// The wasm HTTP client ignores request timeouts, so a long-poll on a connection that died
+    /// during sleep never returns.
+    pub(crate) fn watch_sync_stall(
+        self: &Arc<Self>,
+        client: &Client,
+        sync_service: &Arc<SyncService>,
+        stall: Duration,
+    ) {
+        let core = self.clone();
+        let client = client.clone();
+        let sync_service = sync_service.clone();
+
+        self.track_session_task(
+            spawn(async move {
+                loop {
+                    if matrix_sdk::timeout::timeout(client.wait_for_sync(), stall)
+                        .await
+                        .is_ok()
+                    {
+                        continue;
+                    }
+                    let _serial = core.activity_lock.lock().await;
+                    if matches!(sync_service.state().get(), State::Running)
+                        && !core.sync_suspended.load(Ordering::SeqCst)
+                        && !core.account_locked.load(Ordering::SeqCst)
+                    {
+                        tracing::warn!("no sync response for {stall:?}, restarting sync");
+                        sync_service.stop().await;
+                        sync_service.start().await;
+                    }
+                }
+            })
+            .abort_on_drop(),
+        );
+    }
+
+    pub(crate) fn watch_ignored_history(
+        self: &Arc<Self>,
+        client: &Client,
+        sync_service: &Arc<SyncService>,
+    ) {
+        let core = self.clone();
+        let client = client.clone();
+        let sync_service = sync_service.clone();
+        let mut changes = client.subscribe_to_ignore_user_list_changes();
+
+        self.track_session_task(
+            spawn(async move {
+                while changes.next().await.is_some() {
+                    let _serial = core.activity_lock.lock().await;
+                    let running = matches!(sync_service.state().get(), State::Running)
+                        && !core.sync_suspended.load(Ordering::SeqCst);
+                    if let Err(error) = client.event_cache().clear_all_rooms().await {
+                        tracing::warn!(%error, "clearing the event cache after an ignore change");
+                    }
+                    sync_service.expire_sessions().await;
+                    if running {
+                        sync_service.start().await;
+                    }
+                }
+            })
+            .abort_on_drop(),
+        );
+    }
+
+    pub(crate) async fn server_features(&self) -> Result<Vec<String>, RpcError> {
+        let features = self
+            .client()
+            .await?
+            .unstable_features()
+            .await
+            .or_failed(self, "server_features")?;
+        Ok(features
+            .iter()
+            .map(|feature| feature.as_str().to_owned())
+            .collect())
+    }
+
+    pub(crate) async fn require_sliding_sync(&self, client: &Client) -> Result<(), RpcError> {
         let versions = client
             .fetch_server_versions(Some(
                 RequestConfig::new()
@@ -19,7 +105,7 @@ impl Core {
         {
             Ok(())
         } else {
-            Err(CommandErr::SlidingSyncUnsupported)
+            Err(RpcError::SlidingSyncUnsupported)
         }
     }
 }
@@ -60,7 +146,7 @@ mod tests {
             if supported != Some(true) {
                 assert!(matches!(
                     outcome,
-                    Err(crate::protocol::CommandErr::SlidingSyncUnsupported)
+                    Err(crate::protocol::RpcError::SlidingSyncUnsupported)
                 ));
             }
         }
@@ -80,7 +166,7 @@ mod tests {
         );
         assert!(matches!(
             core.require_sliding_sync(&client).await,
-            Err(crate::protocol::CommandErr::Unavailable)
+            Err(crate::protocol::RpcError::Unavailable)
         ));
     }
 }

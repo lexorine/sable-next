@@ -9,9 +9,10 @@
   import TextArea from '#lib/ui/primitives/TextArea.svelte';
   import TextInput from '#lib/ui/primitives/TextInput.svelte';
   import '#lib/ui/primitives/settings-row.css';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
 
   const core = useCoreClient();
-  let types = $state<string[]>([]);
+  let types = $state.raw<string[]>([]);
   let selected = $state<string | null | undefined>(undefined);
   let eventType = $state('');
   let content = $state('{}');
@@ -23,7 +24,7 @@
   async function refresh(): Promise<void> {
     if (!core.session) return;
     try {
-      types = await core.commands.accountDataTypes();
+      types = await core.rpc.account.dataTypes();
     } catch {
       types = [];
     }
@@ -50,7 +51,7 @@
     }
     loading = true;
     try {
-      const value = await core.commands.accountData(type);
+      const value = await core.rpc.account.data({ event_type: type });
       content = JSON.stringify(value ?? {}, null, 2);
     } catch {
       error = 'failed';
@@ -74,7 +75,7 @@
     error = null;
     saved = false;
     try {
-      await core.commands.setAccountData(type, parsed);
+      await core.rpc.account.setData({ event_type: type, content: parsed });
       await refresh();
       selected = type;
       saved = true;
@@ -90,20 +91,20 @@
   <ul class="settings">
     <SettingsRow
       id="account-data-add"
-      title={$i18n.t('settings.developerAccountDataAdd')}
-      description={$i18n.t('settings.developerAccountDataDescription')}
+      title={i18n.t('settings.developerAccountDataAdd')}
+      description={i18n.t('settings.developerAccountDataDescription')}
     >
       <Button variant="secondary" size="small" onclick={() => void open(null)}>
-        {$i18n.t('settings.developerAccountDataAdd')}
+        {i18n.t('settings.developerAccountDataAdd')}
       </Button>
     </SettingsRow>
   </ul>
 
   <div class="settings-form account-data-body">
     {#if types.length === 0}
-      <p class="empty">{$i18n.t('settings.developerAccountDataEmpty')}</p>
+      <p class="empty">{i18n.t('settings.developerAccountDataEmpty')}</p>
     {:else}
-      <ul class="event-list">
+      <ul class="event-list" {@attach scrollHint}>
         {#each [...types].sort() as type (type)}
           <li>
             <Button
@@ -125,7 +126,7 @@
       <form class="editor" onsubmit={save}>
         <FormField
           fieldId="developer-account-data-type"
-          label={$i18n.t('settings.developerAccountDataType')}
+          label={i18n.t('settings.developerAccountDataType')}
         >
           <TextInput
             id="developer-account-data-type"
@@ -137,7 +138,7 @@
         </FormField>
         <FormField
           fieldId="developer-account-data-content"
-          label={$i18n.t('settings.developerAccountDataContent')}
+          label={i18n.t('settings.developerAccountDataContent')}
         >
           <TextArea
             id="developer-account-data-content"
@@ -149,18 +150,18 @@
           />
         </FormField>
         {#if error === 'json'}
-          <Alert variant="critical">{$i18n.t('settings.developerAccountDataInvalidJson')}</Alert>
+          <Alert variant="critical">{i18n.t('settings.developerAccountDataInvalidJson')}</Alert>
         {:else if error === 'failed'}
-          <Alert variant="critical">{$i18n.t('settings.developerAccountDataFailed')}</Alert>
+          <Alert variant="critical">{i18n.t('settings.developerAccountDataFailed')}</Alert>
         {:else if saved}
-          <Alert variant="success">{$i18n.t('settings.developerAccountDataSaved')}</Alert>
+          <Alert variant="success">{i18n.t('settings.developerAccountDataSaved')}</Alert>
         {/if}
         <div class="editor-actions">
           <Button variant="ghost" size="small" onclick={() => (selected = undefined)}>
-            {$i18n.t('settings.developerAccountDataClose')}
+            {i18n.t('common.close')}
           </Button>
           <Button type="submit" variant="primary" size="small" loading={saving}>
-            {$i18n.t('settings.developerAccountDataSave')}
+            {i18n.t('common.save')}
           </Button>
         </div>
       </form>
@@ -199,6 +200,7 @@
   :global(.account-data-content) {
     font-family: var(--font-family-mono);
     font-size: var(--font-size-small);
+    font-variant-ligatures: none;
   }
 
   .editor-actions {

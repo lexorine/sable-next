@@ -1,9 +1,9 @@
 <script lang="ts">
   import { resolve } from '$app/paths';
-  import type { RoomSummary } from '#src/generated/protocol';
+  import type { RoomListItemView } from '#src/generated/protocol';
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
-  import { roomLabel, roomPathParam } from '#lib/rooms/room-list.svelte.js';
+  import { roomLabel, roomPathParam, useRoomList } from '#lib/rooms/room-list.svelte.js';
   import { formatTime } from '#lib/ui/date-time.js';
   import CalendarBlankIcon from 'phosphor-svelte/lib/CalendarBlankIcon';
   import {
@@ -12,22 +12,23 @@
     startOfDay,
     type CalendarItem,
     type Occurrence,
-  } from './calendar-events.js';
+  } from '#lib/calendar/calendar-events.js';
 
   const LIMIT = 3;
 
   interface Props {
     spaceId: string;
-    rooms: readonly RoomSummary[];
+    rooms: readonly RoomListItemView[];
     onNavigate?: (href: string) => void;
   }
 
   let { spaceId, rooms, onNavigate }: Props = $props();
 
   const core = useCoreClient();
+  const roomList = useRoomList();
 
   interface Today {
-    room: RoomSummary;
+    room: RoomListItemView;
     occurrence: Occurrence;
   }
 
@@ -37,7 +38,7 @@
 
   async function load(roomId: string): Promise<void> {
     try {
-      const view = await core.commands.calendarEntries(roomId);
+      const view = await core.rpc.calendar.entries({ room_id: roomId });
       items = { ...items, [roomId]: readEntries(view.entries) };
       now = Date.now();
     } catch (error) {
@@ -74,24 +75,24 @@
 </script>
 
 {#if shown.length > 0}
-  <section class="space-events" aria-label={$i18n.t('calendar.spaceEvents')}>
+  <section class="space-events" aria-label={i18n.t('calendar.spaceEvents')}>
     <h3 class="space-events-heading">
       <CalendarBlankIcon aria-hidden="true" />
-      <span>{$i18n.t('calendar.today')}</span>
+      <span>{i18n.t('common.today')}</span>
     </h3>
     <ul class="space-events-list">
-      {#each shown as { room, occurrence } (`${room.room_id}|${occurrence.item.eventId}|${String(occurrence.start)}`)}
+      {#each shown as { room, occurrence } (`${room.room_id}|${occurrence.item.event_id}|${String(occurrence.start)}`)}
         {@const href = resolve('/(app)/space/[spaceId]/[roomId]', {
           spaceId,
-          roomId: roomPathParam(room),
+          roomId: roomPathParam(room, roomList.rooms),
         })}
         <li>
           <a class="space-event selection-layer" {href} onclick={() => onNavigate?.(href)}>
             <span class="space-event-time">
-              {occurrence.item.allDay ? $i18n.t('calendar.allDay') : formatTime(occurrence.start)}
+              {occurrence.item.all_day ? i18n.t('calendar.allDay') : formatTime(occurrence.start)}
             </span>
             <span class="space-event-title">
-              {occurrence.item.title || $i18n.t('calendar.untitled')}
+              {occurrence.item.title || i18n.t('calendar.untitled')}
             </span>
             {#if rooms.length > 1}
               <span class="space-event-room">{roomLabel(room)}</span>
@@ -102,7 +103,7 @@
     </ul>
     {#if today.length > shown.length}
       <p class="space-events-more">
-        {$i18n.t('calendar.more', { count: today.length - shown.length })}
+        {i18n.t('calendar.more', { count: today.length - shown.length })}
       </p>
     {/if}
   </section>

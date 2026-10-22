@@ -7,11 +7,14 @@ mod persist;
 mod server;
 mod tokenize;
 
+pub(crate) const MAX_SEARCH_RESULTS: usize = 200;
+
 pub(crate) use crawl::CrawlProgress;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) use persist::reset_state_cache;
 pub(crate) use server::ServerSearch;
 
+use crate::api::search::SearchOrder;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -45,9 +48,10 @@ use tracing::warn;
 use self::persist::ChunkId;
 use crate::Core;
 use crate::attachments::{attachment_contents, fits, link_urls};
+use crate::messages::raw_content;
 use crate::protocol::{
-    RoomAttachmentContentView, RoomAttachmentKind, RoomAttachmentView, SearchAttachment,
-    SearchFilter, SearchOrder,
+    self, RoomAttachmentContentView, RoomAttachmentKind, RoomAttachmentView, RpcError,
+    SearchAttachment,
 };
 
 const BODY_FIELD_COUNT: usize = 1;
@@ -57,6 +61,62 @@ const DOCUMENTS_PER_RESTORE_YIELD: usize = 256;
 const INGEST_WAIT: Duration = Duration::from_millis(25);
 const INGEST_WAIT_ATTEMPTS: usize = 200;
 const RETIRED_KEYS_BEFORE_VACUUM: usize = 64;
+
+/// [`protocol::SearchFilter`] with its ids parsed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct IndexFilter {
+    pub(crate) rooms: Vec<OwnedRoomId>,
+    pub(crate) senders: Vec<OwnedUserId>,
+    pub(crate) mentions: Vec<OwnedUserId>,
+    pub(crate) has: Vec<SearchAttachment>,
+    pub(crate) not_rooms: Vec<OwnedRoomId>,
+    pub(crate) not_senders: Vec<OwnedUserId>,
+    pub(crate) not_mentions: Vec<OwnedUserId>,
+    pub(crate) not_has: Vec<SearchAttachment>,
+    pub(crate) after_ts: Option<u64>,
+    pub(crate) before_ts: Option<u64>,
+    pub(crate) phrases: Vec<String>,
+    pub(crate) exclude: Vec<String>,
+    pub(crate) pinned: Option<bool>,
+    pub(crate) in_thread: Option<bool>,
+    pub(crate) file_types: Vec<String>,
+    pub(crate) not_file_types: Vec<String>,
+    pub(crate) pattern: Option<String>,
+    pub(crate) state_events: Option<bool>,
+}
+
+fn parsed_ids<T: TryFrom<String>>(ids: Vec<String>) -> Result<Vec<T>, RpcError> {
+    ids.into_iter()
+        .map(|id| T::try_from(id).map_err(|_| RpcError::InvalidSearchFilter))
+        .collect()
+}
+
+impl TryFrom<protocol::SearchFilter> for IndexFilter {
+    type Error = RpcError;
+
+    fn try_from(filter: protocol::SearchFilter) -> Result<Self, RpcError> {
+        Ok(Self {
+            rooms: parsed_ids(filter.rooms)?,
+            senders: parsed_ids(filter.senders)?,
+            mentions: parsed_ids(filter.mentions)?,
+            has: filter.has,
+            not_rooms: parsed_ids(filter.not_rooms)?,
+            not_senders: parsed_ids(filter.not_senders)?,
+            not_mentions: parsed_ids(filter.not_mentions)?,
+            not_has: filter.not_has,
+            after_ts: filter.after_ts,
+            before_ts: filter.before_ts,
+            phrases: filter.phrases,
+            exclude: filter.exclude,
+            pinned: filter.pinned,
+            in_thread: filter.in_thread,
+            file_types: filter.file_types,
+            not_file_types: filter.not_file_types,
+            pattern: filter.pattern,
+            state_events: filter.state_events,
+        })
+    }
+}
 
 const MEMORY_BUDGET: usize = 64 * 1024 * 1024;
 const DISK_BUDGET: usize = 512 * 1024 * 1024;
@@ -186,7 +246,7 @@ impl Document {
         })
     }
 
-    fn matches(&self, filter: &SearchFilter, terms: &FoldedTerms) -> bool {
+    fn matches(&self, filter: &IndexFilter, terms: &FoldedTerms) -> bool {
         if !filter.senders.is_empty() && !filter.senders.contains(&self.sender) {
             return false;
         }
@@ -322,7 +382,7 @@ impl BodyPattern {
 }
 
 impl FoldedTerms {
-    fn of(filter: &SearchFilter, pinned: HashSet<OwnedEventId>) -> Self {
+    fn of(filter: &IndexFilter, pinned: HashSet<OwnedEventId>) -> Self {
         Self {
             pinned,
             pattern: filter.pattern.as_deref().map(BodyPattern::of),
@@ -862,7 +922,7 @@ impl RoomIndex {
         &'index self,
         room_id: &'index OwnedRoomId,
         query: &str,
-        filter: &SearchFilter,
+        filter: &IndexFilter,
         terms: &FoldedTerms,
     ) -> Vec<Ranked<'index>> {
         if query.is_empty() {
@@ -1167,7 +1227,7 @@ impl MessageIndex {
     pub(crate) fn search(
         &self,
         query: &str,
-        filter: &SearchFilter,
+        filter: &IndexFilter,
         order: SearchOrder,
         limit: usize,
         offset: usize,
@@ -1178,7 +1238,7 @@ impl MessageIndex {
     pub(crate) fn search_pinned(
         &self,
         query: &str,
-        filter: &SearchFilter,
+        filter: &IndexFilter,
         pinned: HashSet<OwnedEventId>,
         order: SearchOrder,
         limit: usize,
@@ -1290,12 +1350,12 @@ impl MessageIndex {
         )
     }
 
-    fn in_scope(filter: &SearchFilter, room_id: &RoomId) -> bool {
+    fn in_scope(filter: &IndexFilter, room_id: &RoomId) -> bool {
         (filter.rooms.is_empty() || filter.rooms.iter().any(|wanted| wanted == room_id))
             && !filter.not_rooms.iter().any(|denied| denied == room_id)
     }
 
-    fn cold_queue(&self, filter: &SearchFilter) -> Vec<OlderCursor> {
+    fn cold_queue(&self, filter: &IndexFilter) -> Vec<OlderCursor> {
         let mut queue: Vec<OlderCursor> = self
             .rooms
             .iter()
@@ -1326,7 +1386,7 @@ impl MessageIndex {
         room_id: &OwnedRoomId,
         stored: &persist::StoredChunk,
         query: &str,
-        filter: &SearchFilter,
+        filter: &IndexFilter,
         terms: &FoldedTerms,
         window: ColdWindow,
     ) -> (Vec<Hit>, usize) {
@@ -1347,6 +1407,9 @@ impl MessageIndex {
             })
             .cloned()
             .collect();
+        if documents.is_empty() {
+            return (Vec::new(), 0);
+        }
         documents.sort_by(|left, right| {
             left.origin_server_ts
                 .cmp(&right.origin_server_ts)
@@ -2092,7 +2155,7 @@ fn page_ranked(
     ranked
 }
 
-fn edited_or_own_event_id(original: &OriginalSyncRoomMessageEvent) -> OwnedEventId {
+pub(super) fn edited_or_own_event_id(original: &OriginalSyncRoomMessageEvent) -> OwnedEventId {
     match &original.content.relates_to {
         Some(Relation::Replacement(replacement)) => replacement.event_id.clone(),
         _ => original.event_id.clone(),
@@ -2121,8 +2184,19 @@ fn indexable_body(body: &str) -> String {
     remove_plain_reply_fallback(body).to_owned()
 }
 
-fn message_text(msgtype: &MessageType) -> String {
-    let body = indexable_body(msgtype.body());
+fn without_profile_name(body: &str, raw: Option<&serde_json::Value>) -> String {
+    let Some(profile) = crate::view::per_message_profile(raw) else {
+        return body.to_owned();
+    };
+    crate::matrix_html::strip_profile_fallback_body(
+        body,
+        profile.display_name.as_deref(),
+        profile.has_fallback,
+    )
+}
+
+fn message_text(msgtype: &MessageType, raw: Option<&serde_json::Value>) -> String {
+    let body = indexable_body(&without_profile_name(msgtype.body(), raw));
     let filenames = match msgtype {
         MessageType::Gallery(gallery) => crate::view::gallery_filenames(gallery),
         MessageType::Image(image) => vec![image.filename()],
@@ -2143,7 +2217,7 @@ fn message_text(msgtype: &MessageType) -> String {
         .join("\n")
 }
 
-const fn replacement_of(
+pub(super) const fn replacement_of(
     message: &OriginalSyncRoomMessageEvent,
 ) -> Option<&Replacement<RoomMessageEventContentWithoutRelation>> {
     match &message.content.relates_to {
@@ -2152,19 +2226,11 @@ const fn replacement_of(
     }
 }
 
-fn raw_content(event: &TimelineEvent) -> Option<serde_json::Value> {
-    event
-        .raw()
-        .get_field::<serde_json::Value>("content")
-        .ok()
-        .flatten()
-}
-
 fn document_of(
     message: &OriginalSyncRoomMessageEvent,
     content: Option<&serde_json::Value>,
 ) -> Document {
-    let body = message_text(&message.content.msgtype);
+    let body = message_text(&message.content.msgtype, content);
     Document {
         event_id: message.event_id.clone(),
         has_link: contains_link(&body),
@@ -2311,7 +2377,7 @@ fn with_edit(
     }
 
     let content = &replacement.new_content;
-    document.body = message_text(&content.msgtype);
+    document.body = message_text(&content.msgtype, raw);
     document.has_link = contains_link(&document.body);
     document.attachments = attachments_of(&content.msgtype);
     document.mentions = mentioned_users(content.mentions.as_ref());
@@ -2368,6 +2434,18 @@ fn attachments_of(msgtype: &MessageType) -> Vec<SearchAttachment> {
 
 fn contains_link(body: &str) -> bool {
     LinkFinder::new().links(body).next().is_some()
+}
+
+pub(crate) async fn ignored_user_ids(client: &matrix_sdk::Client) -> Vec<OwnedUserId> {
+    client
+        .account()
+        .account_data::<IgnoredUserListEventContent>()
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| raw.deserialize().ok())
+        .map(|content| content.ignored_users.into_keys().collect())
+        .unwrap_or_default()
 }
 
 fn mentioned_users(mentions: Option<&Mentions>) -> Vec<OwnedUserId> {
@@ -2435,7 +2513,7 @@ impl Core {
     pub(crate) async fn search_messages(
         &self,
         query: &str,
-        filter: &SearchFilter,
+        filter: &IndexFilter,
         order: SearchOrder,
         limit: usize,
         offset: usize,
@@ -2481,7 +2559,7 @@ impl Core {
     pub(crate) async fn searches_locally(
         &self,
         query: &str,
-        filter: &SearchFilter,
+        filter: &IndexFilter,
         order: SearchOrder,
     ) -> bool {
         if order == SearchOrder::Oldest || !self.server_search_enabled.load(Ordering::Relaxed) {
@@ -2493,7 +2571,7 @@ impl Core {
         server::target(&client, query, filter).await.is_none()
     }
 
-    pub(crate) async fn older_start(&self, filter: &SearchFilter) -> Option<String> {
+    pub(crate) async fn older_start(&self, filter: &IndexFilter) -> Option<String> {
         let index = self.search_index.lock().await;
         (!index.cold_queue(filter).is_empty()).then(String::new)
     }
@@ -2501,7 +2579,7 @@ impl Core {
     pub(crate) async fn search_older(
         &self,
         query: &str,
-        filter: &SearchFilter,
+        filter: &IndexFilter,
         order: SearchOrder,
         limit: usize,
         cursor: &str,
@@ -2603,7 +2681,7 @@ impl Core {
         (hits, next)
     }
 
-    async fn pinned_in_scope(&self, filter: &SearchFilter) -> HashSet<OwnedEventId> {
+    async fn pinned_in_scope(&self, filter: &IndexFilter) -> HashSet<OwnedEventId> {
         let Ok(client) = self.client().await else {
             return HashSet::new();
         };
@@ -2631,15 +2709,7 @@ impl Core {
             return Vec::new();
         };
 
-        client
-            .account()
-            .account_data::<IgnoredUserListEventContent>()
-            .await
-            .ok()
-            .flatten()
-            .and_then(|raw| raw.deserialize().ok())
-            .map(|content| content.ignored_users.into_keys().collect())
-            .unwrap_or_default()
+        ignored_user_ids(&client).await
     }
 
     pub(crate) async fn restore_persisted_index(self: &Arc<Self>, client: &matrix_sdk::Client) {
@@ -2910,6 +2980,11 @@ impl Core {
         self.track_session_task(
             spawn(async move {
                 while changes.next().await.is_some() {
+                    let mut ignored = core.ignored_senders().await;
+                    ignored.sort();
+                    if persist::ignored_unchanged(&client, &ignored).await {
+                        continue;
+                    }
                     *core.search_index.lock().await = MessageIndex::new();
                     core.search_crawl.lock().await.reset();
                     core.server_search.lock().await.reset();
@@ -2928,6 +3003,7 @@ impl Core {
                             let _ = persist::forget(&client, &room_id).await;
                         }
                     }
+                    persist::save_ignored(&client, &ignored).await;
                 }
             })
             .abort_on_drop(),
@@ -3067,9 +3143,9 @@ mod tests {
     ) -> Vec<super::Hit> {
         index.search(
             query,
-            &super::SearchFilter {
+            &super::IndexFilter {
                 rooms: vec![room_id.clone()],
-                ..super::SearchFilter::default()
+                ..super::IndexFilter::default()
             },
             super::SearchOrder::Rank,
             limit,
@@ -3208,7 +3284,10 @@ mod tests {
 
         let document = super::sticker_document(&sticker);
         assert_eq!(document.body, "moai");
-        assert!(document.attachments.is_empty());
+        assert_eq!(
+            document.attachments,
+            [] as [sable_model::search_filter::SearchAttachment; 0]
+        );
     }
 
     #[test]
@@ -3226,12 +3305,38 @@ mod tests {
             ImageMessageEventContent::plain("Sunset at the pier".to_owned(), url.clone());
         captioned.filename = Some("holiday-2026.jpg".to_owned());
         assert_eq!(
-            super::message_text(&MessageType::Image(captioned)),
+            super::message_text(&MessageType::Image(captioned), None),
             "Sunset at the pier\nholiday-2026.jpg"
         );
 
         let bare = FileMessageEventContent::plain("report.pdf".to_owned(), url);
-        assert_eq!(super::message_text(&MessageType::File(bare)), "report.pdf");
+        assert_eq!(
+            super::message_text(&MessageType::File(bare), None),
+            "report.pdf"
+        );
+    }
+
+    #[test]
+    fn a_profile_name_fallback_is_not_indexed() {
+        use matrix_sdk::ruma::events::room::message::{MessageType, TextMessageEventContent};
+        use serde_json::json;
+
+        let text = |body: &str| MessageType::Text(TextMessageEventContent::plain(body));
+        let profiled =
+            json!({"m.per_message_profile": {"displayname": "Kris", "has_fallback": true}});
+
+        assert_eq!(
+            super::message_text(&text("Kris: hello"), Some(&profiled)),
+            "hello"
+        );
+        assert_eq!(
+            super::message_text(&text("Kris: hello"), None),
+            "Kris: hello"
+        );
+        assert_eq!(
+            super::message_text(&text("hello"), Some(&profiled)),
+            "hello"
+        );
     }
 
     fn picture(seed: &str, sender: &str, ts: u64) -> super::Document {
@@ -3447,14 +3552,14 @@ mod tests {
             ));
         let mut hits = index.search(
             "pipeline",
-            &super::SearchFilter::default(),
+            &super::IndexFilter::default(),
             super::SearchOrder::Rank,
             10,
             0,
         );
         hits.extend(index.search(
             "finished",
-            &super::SearchFilter::default(),
+            &super::IndexFilter::default(),
             super::SearchOrder::Rank,
             10,
             0,
@@ -3478,7 +3583,7 @@ mod tests {
         assert_eq!(ids(&hits[1].after), ["$screenshot"]);
     }
 
-    fn found(index: &MessageIndex, query: &str, filter: &super::SearchFilter) -> Vec<String> {
+    fn found(index: &MessageIndex, query: &str, filter: &super::IndexFilter) -> Vec<String> {
         index
             .search(query, filter, super::SearchOrder::Rank, 20, 0)
             .into_iter()
@@ -3493,9 +3598,9 @@ mod tests {
         let hits = found(
             &index,
             "deploy",
-            &super::SearchFilter {
+            &super::IndexFilter {
                 senders: vec![matrix_sdk::ruma::user_id!("@alice:localhost").to_owned()],
-                ..super::SearchFilter::default()
+                ..super::IndexFilter::default()
             },
         );
 
@@ -3510,9 +3615,9 @@ mod tests {
         let hits = found(
             &index,
             "deploy",
-            &super::SearchFilter {
+            &super::IndexFilter {
                 mentions: vec![matrix_sdk::ruma::user_id!("@erwan:localhost").to_owned()],
-                ..super::SearchFilter::default()
+                ..super::IndexFilter::default()
             },
         );
 
@@ -3527,9 +3632,9 @@ mod tests {
             found(
                 &index,
                 "deploy",
-                &super::SearchFilter {
+                &super::IndexFilter {
                     has: vec![super::SearchAttachment::Image],
-                    ..super::SearchFilter::default()
+                    ..super::IndexFilter::default()
                 }
             ),
             vec!["$screenshot"]
@@ -3538,9 +3643,9 @@ mod tests {
             found(
                 &index,
                 "deploy",
-                &super::SearchFilter {
+                &super::IndexFilter {
                     has: vec![super::SearchAttachment::Link],
-                    ..super::SearchFilter::default()
+                    ..super::IndexFilter::default()
                 }
             ),
             vec!["$alice"]
@@ -3554,10 +3659,10 @@ mod tests {
         let hits = found(
             &index,
             "deploy",
-            &super::SearchFilter {
+            &super::IndexFilter {
                 after_ts: Some(2_000),
                 before_ts: Some(3_000),
-                ..super::SearchFilter::default()
+                ..super::IndexFilter::default()
             },
         );
 
@@ -3573,9 +3678,9 @@ mod tests {
             found(
                 &index,
                 "deploy",
-                &super::SearchFilter {
+                &super::IndexFilter {
                     phrases: vec!["pipeline is broken".to_owned()],
-                    ..super::SearchFilter::default()
+                    ..super::IndexFilter::default()
                 }
             ),
             vec!["$erwan"]
@@ -3589,9 +3694,9 @@ mod tests {
         let hits = found(
             &index,
             "deploy",
-            &super::SearchFilter {
+            &super::IndexFilter {
                 exclude: vec!["screenshot".to_owned()],
-                ..super::SearchFilter::default()
+                ..super::IndexFilter::default()
             },
         );
 
@@ -3605,7 +3710,7 @@ mod tests {
         let hits: Vec<String> = index
             .search(
                 "deploy",
-                &super::SearchFilter::default(),
+                &super::IndexFilter::default(),
                 super::SearchOrder::Recent,
                 20,
                 0,
@@ -3624,9 +3729,9 @@ mod tests {
         let hits = found(
             &index,
             "",
-            &super::SearchFilter {
+            &super::IndexFilter {
                 senders: vec![matrix_sdk::ruma::user_id!("@alice:localhost").to_owned()],
-                ..super::SearchFilter::default()
+                ..super::IndexFilter::default()
             },
         );
 
@@ -3653,9 +3758,9 @@ mod tests {
         let hits = found(
             &index,
             "deploy",
-            &super::SearchFilter {
+            &super::IndexFilter {
                 rooms: vec![room],
-                ..super::SearchFilter::default()
+                ..super::IndexFilter::default()
             },
         );
 
@@ -3708,7 +3813,6 @@ mod tests {
     async fn test_a_room_with_no_new_activity_is_indexed_from_its_persisted_cache() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!quiet:localhost").to_owned();
         let factory = EventFactory::new()
@@ -3746,7 +3850,6 @@ mod tests {
     async fn test_search_watcher_releases_paginated_room_cache() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
         let room_id = room_id!("!retention:localhost").to_owned();
         let factory = EventFactory::new()
             .room(&room_id)
@@ -3826,7 +3929,6 @@ mod tests {
     async fn test_back_pagination_reaches_the_index_and_notifies_it() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!backfill:localhost").to_owned();
         let factory = EventFactory::new()
@@ -3876,7 +3978,7 @@ mod tests {
 
         let timeline = crate::timelines::build_room_timeline(
             &room,
-            &crate::protocol::TimelineFocusView::Live,
+            &crate::api::timeline::TimelineFocusView::Live,
             false,
         )
         .await
@@ -3907,7 +4009,6 @@ mod tests {
     async fn test_an_encrypted_rooms_plaintext_is_searchable_and_edits_replace_the_body() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!search:localhost").to_owned();
         let original_id = event_id!("$original");
@@ -3977,7 +4078,6 @@ mod tests {
     async fn test_an_edit_crawled_before_its_original_keeps_the_new_body() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!crawl:localhost").to_owned();
         let original_id = event_id!("$original");
@@ -4031,7 +4131,6 @@ mod tests {
     async fn test_a_thread_reply_is_marked_and_keeps_the_mark_through_an_edit() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!threads:localhost").to_owned();
         let thread_root = event_id!("$root");
@@ -4076,9 +4175,9 @@ mod tests {
             index
                 .search(
                     "deploy",
-                    &super::SearchFilter {
+                    &super::IndexFilter {
                         in_thread: Some(wanted),
-                        ..super::SearchFilter::default()
+                        ..super::IndexFilter::default()
                     },
                     super::SearchOrder::Rank,
                     10,
@@ -4104,9 +4203,9 @@ mod tests {
             index
                 .search_pinned(
                     "deploy",
-                    &super::SearchFilter {
+                    &super::IndexFilter {
                         pinned: Some(wanted),
-                        ..super::SearchFilter::default()
+                        ..super::IndexFilter::default()
                     },
                     pinned.clone(),
                     super::SearchOrder::Recent,
@@ -4129,7 +4228,7 @@ mod tests {
         let hits: Vec<String> = index
             .search(
                 "deploy",
-                &super::SearchFilter::default(),
+                &super::IndexFilter::default(),
                 super::SearchOrder::Oldest,
                 10,
                 0,
@@ -4162,7 +4261,6 @@ mod tests {
     async fn test_a_redaction_drops_the_message_from_the_index() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!redact:localhost").to_owned();
         let target_id = event_id!("$target");
@@ -4214,7 +4312,6 @@ mod tests {
     async fn test_pagination_walks_one_ordering_without_repeating_a_hit() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!paging:localhost").to_owned();
         let room = server.sync_joined_room(&client, &room_id).await;
@@ -4271,7 +4368,6 @@ mod tests {
     async fn test_leaving_a_room_forgets_its_documents() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!forget:localhost").to_owned();
         let room = server.sync_joined_room(&client, &room_id).await;
@@ -4303,7 +4399,7 @@ mod tests {
             index
                 .search(
                     "secret",
-                    &super::SearchFilter::default(),
+                    &super::IndexFilter::default(),
                     super::SearchOrder::Rank,
                     10,
                     0,
@@ -4321,10 +4417,10 @@ mod tests {
         let hits = found(
             &index,
             "deploy",
-            &super::SearchFilter {
+            &super::IndexFilter {
                 rooms: vec![room],
                 not_senders: vec![matrix_sdk::ruma::user_id!("@alice:localhost").to_owned()],
-                ..super::SearchFilter::default()
+                ..super::IndexFilter::default()
             },
         );
 
@@ -4405,46 +4501,46 @@ mod tests {
                 Vec::new(),
             )
         });
-        let filter = |filter: super::SearchFilter| {
+        let filter = |filter: super::IndexFilter| {
             found(
                 &index,
                 "deploy",
-                &super::SearchFilter {
+                &super::IndexFilter {
                     rooms: vec![room.clone()],
                     ..filter
                 },
             )
         };
 
-        let plain = filter(super::SearchFilter::default());
+        let plain = filter(super::IndexFilter::default());
         assert!(!plain.contains(&"$renamed".to_owned()));
         assert_eq!(
-            filter(super::SearchFilter {
+            filter(super::IndexFilter {
                 state_events: Some(true),
-                ..super::SearchFilter::default()
+                ..super::IndexFilter::default()
             }),
             vec!["$renamed".to_owned()]
         );
         assert_eq!(
-            filter(super::SearchFilter {
+            filter(super::IndexFilter {
                 file_types: vec!["PDF".to_owned()],
-                ..super::SearchFilter::default()
+                ..super::IndexFilter::default()
             }),
             vec!["$notes".to_owned()]
         );
         assert!(
-            filter(super::SearchFilter {
+            filter(super::IndexFilter {
                 pattern: Some(r"pipe\w+ is".to_owned()),
-                ..super::SearchFilter::default()
+                ..super::IndexFilter::default()
             })
             .contains(&"$erwan".to_owned())
         );
-        assert!(
-            filter(super::SearchFilter {
+        assert_eq!(
+            filter(super::IndexFilter {
                 pattern: Some("(unclosed".to_owned()),
-                ..super::SearchFilter::default()
-            })
-            .is_empty()
+                ..super::IndexFilter::default()
+            }),
+            [] as [String; 0]
         );
     }
 
@@ -4455,10 +4551,10 @@ mod tests {
         let hits = found(
             &index,
             "deploy",
-            &super::SearchFilter {
+            &super::IndexFilter {
                 rooms: vec![room],
                 not_has: vec![super::SearchAttachment::Image],
-                ..super::SearchFilter::default()
+                ..super::IndexFilter::default()
             },
         );
 
@@ -4473,10 +4569,10 @@ mod tests {
         let hits = found(
             &index,
             "deploy",
-            &super::SearchFilter {
+            &super::IndexFilter {
                 rooms: vec![room],
                 not_mentions: vec![matrix_sdk::ruma::user_id!("@erwan:localhost").to_owned()],
-                ..super::SearchFilter::default()
+                ..super::IndexFilter::default()
             },
         );
 
@@ -4503,9 +4599,9 @@ mod tests {
         let hits = found(
             &index,
             "deploy",
-            &super::SearchFilter {
+            &super::IndexFilter {
                 not_rooms: vec![other],
-                ..super::SearchFilter::default()
+                ..super::IndexFilter::default()
             },
         );
 
@@ -4651,6 +4747,27 @@ mod tests {
     }
 
     #[test]
+    fn test_a_cold_chunk_with_nothing_left_to_scan_finds_nothing() {
+        let room = room_id!("!room:localhost").to_owned();
+        let mut index = MessageIndex::new();
+        index.rooms.insert(room.clone(), super::RoomIndex::new());
+        let filter = super::IndexFilter::default();
+        let stored = super::persist::StoredChunk::new(Vec::new(), Vec::new());
+
+        let (hits, total) = index.scan_cold(
+            &room,
+            &stored,
+            "deploy",
+            &filter,
+            &super::FoldedTerms::of(&filter, std::collections::HashSet::new()),
+            super::ColdWindow::all(1),
+        );
+
+        assert!(hits.is_empty());
+        assert_eq!(total, 0);
+    }
+
+    #[test]
     fn test_a_pending_edit_lands_on_the_stored_original() {
         let mut stored = super::persist::StoredChunk::new(
             vec![document(
@@ -4763,7 +4880,7 @@ mod tests {
             let oldest = *room_index.chunks.values().next().expect("a chunk");
             room_index.unload(oldest);
         }
-        let filter = super::SearchFilter::default();
+        let filter = super::IndexFilter::default();
 
         let hot = core
             .search_messages("w1x", &filter, super::SearchOrder::Rank, 30, 0, 0)
@@ -4843,9 +4960,9 @@ mod tests {
                 super::SearchOrder::Recent,
                 super::SearchOrder::Oldest,
             ] {
-                let filter = super::SearchFilter {
+                let filter = super::IndexFilter {
                     rooms: scope.clone(),
-                    ..super::SearchFilter::default()
+                    ..super::IndexFilter::default()
                 };
                 let mut cursor = core.older_start(&filter).await.expect("a cold chunk");
                 let mut seen = std::collections::HashSet::new();
@@ -4934,7 +5051,7 @@ mod tests {
             .rooms
             .insert(room.clone(), room_index);
 
-        let filter = super::SearchFilter::default();
+        let filter = super::IndexFilter::default();
         let start = core
             .older_start(&filter)
             .await
@@ -4996,7 +5113,6 @@ mod tests {
     async fn test_the_gallery_fills_in_media_for_a_migrated_message() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
         let room_id = room_id!("!hydrate:localhost").to_owned();
         server.mock_room_state_encryption().plain().mount().await;
         let room = server
@@ -5074,7 +5190,6 @@ mod tests {
     async fn test_the_crawl_resumes_from_the_checkpoint_it_persisted() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!resume:localhost").to_owned();
         let factory = EventFactory::new()
@@ -5178,7 +5293,6 @@ mod tests {
     async fn test_the_crawler_deepens_a_room_and_records_reaching_its_start() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!crawl:localhost").to_owned();
         let factory = EventFactory::new()
@@ -5620,7 +5734,6 @@ mod tests {
     async fn test_only_the_crawl_rederives_classified_documents() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!rederive:localhost").to_owned();
         server.mock_room_state_encryption().plain().mount().await;
@@ -5830,7 +5943,10 @@ mod tests {
         );
         core.restore_persisted_index(&client).await;
 
-        assert!(super::persist::listed_rooms(&client).await.is_empty());
+        assert_eq!(
+            super::persist::listed_rooms(&client).await,
+            [] as [matrix_sdk::ruma::OwnedRoomId; 0]
+        );
         assert!(matches!(
             super::persist::open(&client, &left).await,
             super::persist::Opened::Absent
@@ -5841,7 +5957,6 @@ mod tests {
     async fn test_a_flushed_index_is_searchable_in_the_next_session() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!persisted:localhost").to_owned();
         let factory = EventFactory::new()
@@ -5933,7 +6048,10 @@ mod tests {
         );
 
         index.take_flush(&room);
-        assert!(index.rooms_due_to_flush().is_empty());
+        assert_eq!(
+            index.rooms_due_to_flush(),
+            [] as [matrix_sdk::ruma::OwnedRoomId; 0]
+        );
     }
 
     #[test]
@@ -5967,7 +6085,6 @@ mod tests {
     async fn test_a_restored_room_does_not_charge_the_crawl_budget_again() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!budget:localhost").to_owned();
         let factory = EventFactory::new()
@@ -6030,7 +6147,6 @@ mod tests {
     async fn test_a_failed_room_reports_partial_not_complete() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!failed:localhost").to_owned();
         server.mock_room_state_encryption().plain().mount().await;
@@ -6070,7 +6186,6 @@ mod tests {
     async fn test_a_room_walked_to_its_start_reports_complete() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!walked:localhost").to_owned();
         let factory = EventFactory::new()
@@ -6138,7 +6253,6 @@ mod tests {
     async fn test_a_spent_budget_reports_stopped_even_with_rooms_left() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!stopped:localhost").to_owned();
         server.mock_room_state_encryption().plain().mount().await;
@@ -6185,7 +6299,6 @@ mod tests {
     async fn test_the_crawl_serves_every_room_before_deepening_one() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let busy = room_id!("!busy:localhost").to_owned();
         let quiet = room_id!("!quiet:localhost").to_owned();
@@ -6306,10 +6419,10 @@ mod tests {
         })
     }
 
-    fn scoped_to(room_id: &matrix_sdk::ruma::OwnedRoomId) -> super::SearchFilter {
-        super::SearchFilter {
+    fn scoped_to(room_id: &matrix_sdk::ruma::OwnedRoomId) -> super::IndexFilter {
+        super::IndexFilter {
             rooms: vec![room_id.clone()],
-            ..super::SearchFilter::default()
+            ..super::IndexFilter::default()
         }
     }
 
@@ -6317,7 +6430,6 @@ mod tests {
     async fn test_an_unencrypted_room_is_searched_on_the_homeserver() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!plain:localhost").to_owned();
         server.mock_room_state_encryption().plain().mount().await;
@@ -6359,7 +6471,6 @@ mod tests {
     async fn test_an_encrypted_room_is_never_searched_on_the_homeserver() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!secret:localhost").to_owned();
         let sender = user_id!("@erwan:localhost");
@@ -6430,7 +6541,6 @@ mod tests {
 
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!attachments:localhost").to_owned();
         let factory = EventFactory::new()
@@ -6528,7 +6638,6 @@ mod tests {
 
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!gallery-attachments:localhost").to_owned();
         server.mock_room_state_encryption().plain().mount().await;
@@ -6604,9 +6713,9 @@ mod tests {
         assert_eq!(files[0]["content"]["filename"], "notes.pdf");
         assert_eq!(files[0]["content"]["size"], 4096);
 
-        let filter = super::SearchFilter {
+        let filter = super::IndexFilter {
             rooms: vec![room_id.clone()],
-            ..super::SearchFilter::default()
+            ..super::IndexFilter::default()
         };
         let hits = core
             .search_messages("notes", &filter, super::SearchOrder::Rank, 10, 0, 0)
@@ -6625,7 +6734,6 @@ mod tests {
     async fn test_a_homeserver_that_cannot_search_falls_back_to_the_local_index() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!plain:localhost").to_owned();
         server.mock_room_state_encryption().plain().mount().await;
@@ -6684,7 +6792,6 @@ mod tests {
     async fn test_a_dated_query_stays_local_even_for_an_unencrypted_room() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!plain:localhost").to_owned();
         server.mock_room_state_encryption().plain().mount().await;
@@ -6717,7 +6824,7 @@ mod tests {
             .expect("room event cache");
         reingest_whole_room(&mut *core.search_index.lock().await, &cache, &room_id).await;
 
-        let filter = super::SearchFilter {
+        let filter = super::IndexFilter {
             after_ts: Some(1_000),
             ..scoped_to(&room_id)
         };
@@ -6739,7 +6846,6 @@ mod tests {
     async fn test_a_filter_only_query_stays_local_even_for_an_unencrypted_room() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!plain:localhost").to_owned();
         let sender = user_id!("@erwan:localhost");
@@ -6772,7 +6878,7 @@ mod tests {
             .expect("room event cache");
         reingest_whole_room(&mut *core.search_index.lock().await, &cache, &room_id).await;
 
-        let filter = super::SearchFilter {
+        let filter = super::IndexFilter {
             senders: vec![sender.to_owned()],
             ..scoped_to(&room_id)
         };
@@ -6806,7 +6912,10 @@ mod tests {
             ));
         }
 
-        assert!(index.dirty_rooms().is_empty());
+        assert_eq!(
+            index.dirty_rooms(),
+            [] as [matrix_sdk::ruma::OwnedRoomId; 0]
+        );
         for _ in 0..super::TICKS_BEFORE_FLUSH {
             assert!(
                 index.rooms_due_to_flush().is_empty(),
@@ -6879,11 +6988,9 @@ mod tests {
 
         let core = logged_in(&server, &client, "search-ignored-store").await;
 
-        assert!(
-            client
-                .subscribe_to_ignore_user_list_changes()
-                .get()
-                .is_empty()
+        assert_eq!(
+            client.subscribe_to_ignore_user_list_changes().get(),
+            [] as [matrix_sdk::ruma::OwnedUserId; 0]
         );
         assert_eq!(
             core.ignored_senders().await,
@@ -6916,7 +7023,6 @@ mod tests {
 
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!edited:localhost").to_owned();
         let original_id = event_id!("$original");
@@ -6951,9 +7057,9 @@ mod tests {
 
         let hits = index.search(
             "deploy",
-            &super::SearchFilter {
+            &super::IndexFilter {
                 mentions: vec![alice.to_owned()],
-                ..super::SearchFilter::default()
+                ..super::IndexFilter::default()
             },
             super::SearchOrder::Rank,
             10,
@@ -6978,7 +7084,6 @@ mod tests {
     async fn test_an_edit_crawled_a_batch_before_its_original_is_fixed_up_when_it_lands() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!split:localhost").to_owned();
         let original_id = event_id!("$original");
@@ -7036,7 +7141,6 @@ mod tests {
     async fn test_an_edit_from_someone_else_is_ignored() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!forged:localhost").to_owned();
         let original_id = event_id!("$original");
@@ -7097,7 +7201,6 @@ mod tests {
     async fn test_redacting_an_edit_brings_the_previous_body_back() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-        client.event_cache().subscribe().expect("event cache");
 
         let room_id = room_id!("!unedited:localhost").to_owned();
         let original_id = event_id!("$original");
@@ -7318,9 +7421,9 @@ mod stress {
                     &room_id(),
                     &sample,
                     "deploy",
-                    &super::SearchFilter::default(),
+                    &super::IndexFilter::default(),
                     &super::FoldedTerms::of(
-                        &super::SearchFilter::default(),
+                        &super::IndexFilter::default(),
                         std::collections::HashSet::new(),
                     ),
                     super::ColdWindow::all(1),

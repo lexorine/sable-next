@@ -1,7 +1,6 @@
 <script lang="ts">
   import TrashIcon from 'phosphor-svelte/lib/TrashIcon';
-  import { onDestroy, tick, untrack } from 'svelte';
-  import { MediaQuery } from 'svelte/reactivity';
+  import { onDestroy, tick } from 'svelte';
 
   import {
     customThemes,
@@ -30,6 +29,7 @@
     themeSwatches,
   } from '#lib/settings/theme-file.js';
   import { pickFiles } from '#lib/platform/files.js';
+  import { systemDark } from '#lib/platform/system-theme.js';
   import { i18n, t } from '#lib/i18n.js';
   import { toasts } from '#lib/ui/toasts.svelte.js';
   import Button from '#lib/ui/primitives/Button.svelte';
@@ -40,7 +40,8 @@
 
   import ThemeCatalog from './ThemeCatalog.svelte';
   import ThemeTile from './ThemeTile.svelte';
-  import { fetchCatalogFile, type CatalogEntry } from './theme-catalog';
+  import { fetchCatalogFile, type CatalogEntry } from '#lib/settings/theme-catalog.js';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
 
   const SLOTS: readonly ResolvedTheme[] = ['light', 'dark'];
   const STEPS: Partial<Record<string, number>> = {
@@ -49,7 +50,6 @@
     ArrowLeft: -1,
     ArrowUp: -1,
   };
-  const systemDark = new MediaQuery('(prefers-color-scheme: dark)');
   let {
     onboarding = false,
     onThemeChosen,
@@ -71,8 +71,8 @@
 
   function slotLabel(kind: ResolvedTheme): string {
     return kind === 'light'
-      ? $i18n.t('settings.customThemesLightSlot')
-      : $i18n.t('settings.customThemesDarkSlot');
+      ? i18n.t('settings.customThemesLightSlot')
+      : i18n.t('settings.customThemesDarkSlot');
   }
 
   function offerUndo(message: string, revert: () => void): void {
@@ -85,7 +85,7 @@
     pendingReverts = [...carried, revert];
     const count = pendingReverts.length;
     const id = toasts.undoable(count > 1 ? t('settings.themeChanges', { count }) : message, {
-      label: t('settings.undo'),
+      label: t('common.undo'),
       onUndo: () => {
         const reverts = pendingReverts;
         pendingReverts = [];
@@ -104,11 +104,11 @@
   function install(css: string, fallback: string, source?: string, activate = false): boolean {
     const parsed = parseThemeFile(css, fallback);
     if (parsed === 'size') {
-      error = $i18n.t('settings.customThemesErrorSize');
+      error = i18n.t('settings.customThemesErrorSize');
       return false;
     }
     if (parsed === 'header') {
-      error = $i18n.t('settings.customThemesErrorHeader');
+      error = i18n.t('settings.customThemesErrorHeader');
       return false;
     }
     if (parsed.kind === 'tweak') {
@@ -175,11 +175,12 @@
     install(preview.css, preview.name, preview.source, true);
   }
 
-  $effect(() => {
-    if (catalogOpen) return;
-    untrack(revertPreview);
+  function setCatalogOpen(next: boolean): void {
+    catalogOpen = next;
+    if (next) return;
+    revertPreview();
     failed = null;
-  });
+  }
 
   onDestroy(revertPreview);
 
@@ -202,7 +203,7 @@
     error = null;
     for (const file of files) {
       if (!isThemeFileName(file.name)) {
-        error = $i18n.t('settings.customThemesErrorChoose');
+        error = i18n.t('settings.customThemesErrorChoose');
         continue;
       }
       install(await file.text(), themeFileBaseName(file.name));
@@ -304,19 +305,19 @@
   }
 </script>
 
-<div class="custom-themes settings-form" class:compact={onboarding}>
+<div class={['custom-themes settings-form', { compact: onboarding }]}>
   {#if onboarding}
     <div
       class="mode-choices"
       role="radiogroup"
-      aria-label={$i18n.t('setup.appearanceTitle')}
+      aria-label={i18n.t('setup.appearanceTitle')}
       tabindex={-1}
       onkeydown={moveMode}
     >
       {#each SLOTS as slot (slot)}
         {@const theme = customThemes.themes.find((item) => item.id === selectedCustomThemeId(slot))}
         <ThemeTile
-          name={$i18n.t(slot === 'light' ? 'settings.themeLight' : 'settings.themeDark')}
+          name={i18n.t(slot === 'light' ? 'common.light' : 'common.dark')}
           swatches={theme ? themeSwatches(theme.css) : DEFAULT_THEME_SWATCHES[slot]}
           radius={theme ? themeRadius(theme.css) : undefined}
           innerRadius={theme ? themeRadius(theme.css, 'radius-inner') : undefined}
@@ -327,23 +328,24 @@
       {/each}
     </div>
   {:else}
-    <p class="themes-hint">{$i18n.t('settings.customThemesSlotsHint')}</p>
+    <p class="themes-hint">{i18n.t('settings.customThemesSlotsHint')}</p>
     {#each SLOTS as slot (slot)}
       {@const themes = themesForSlot(slot)}
       {@const selected = selectedCustomThemeId(slot)}
       {@const slotName =
         slot === 'light'
-          ? $i18n.t('settings.customThemesLightSlot')
-          : $i18n.t('settings.customThemesDarkSlot')}
+          ? i18n.t('settings.customThemesLightSlot')
+          : i18n.t('settings.customThemesDarkSlot')}
       <div class="slot">
         <div class="slot-head">
           <span class="slot-name" id={`theme-slot-${slot}`}>{slotName}</span>
           {#if showing === slot}
-            <StatusBadge variant="primary" label={$i18n.t('settings.themeShowingNow')} />
+            <StatusBadge variant="primary" label={i18n.t('settings.themeShowingNow')} />
           {/if}
         </div>
         <ul
           class="tiles"
+          {@attach scrollHint}
           role="radiogroup"
           id={`theme-slot-${slot}-items`}
           aria-labelledby={`theme-slot-${slot}`}
@@ -352,7 +354,7 @@
         >
           <li role="none">
             <ThemeTile
-              name={$i18n.t('settings.themeSableDefault')}
+              name={i18n.t('settings.themeSableDefault')}
               swatches={DEFAULT_THEME_SWATCHES[slot]}
               selected={selected === null}
               tabindex={selected === null ? 0 : -1}
@@ -380,7 +382,7 @@
                     variant="ghost"
                     size="small"
                     tabindex={-1}
-                    label={$i18n.t('settings.customThemesRemove', { name: theme.name })}
+                    label={i18n.t('settings.customThemesRemove', { name: theme.name })}
                     onclick={() => {
                       removeTheme(theme);
                     }}
@@ -404,17 +406,19 @@
       aria-expanded={catalogOpen}
       onclick={openCatalog}
     >
-      {onboarding ? $i18n.t('setup.browseThemes') : $i18n.t('settings.themeCatalogTitle')}
+      {onboarding ? i18n.t('setup.browseThemes') : i18n.t('settings.themeCatalogTitle')}
     </Button>
     {#if !onboarding}
       <Button variant="secondary" onclick={() => void importTheme()}>
-        {$i18n.t('settings.customThemesImport')}
+        {i18n.t('settings.customThemesImport')}
       </Button>
       <input
         bind:this={picker}
         class="screen-reader-only"
         type="file"
         accept=".sable.css,text/css"
+        tabindex="-1"
+        aria-hidden="true"
         onchange={(event) => void importFiles(event.currentTarget.files ?? [])}
       />
     {/if}
@@ -426,18 +430,18 @@
       <ul class="tweaks">
         {#each customThemes.tweaks as tweak (tweak.id)}
           {@const description = themeFileMetadata(tweak.css).description}
-          <li class="tweak" class:inert-tweak={tweaksInert}>
+          <li class={['tweak', { 'inert-tweak': tweaksInert }]}>
             <span class="tweak-copy">
               <span class="tweak-name">{tweak.name}</span>
               {#if description}<span class="tweak-detail">{description}</span>{/if}
               {#if tweaksInert}
-                <span class="tweak-note">{$i18n.t('settings.tweakNeedsTheme')}</span>
+                <span class="tweak-note">{i18n.t('settings.tweakNeedsTheme')}</span>
               {/if}
             </span>
             <IconButton
               variant="ghost"
               size="small"
-              label={$i18n.t('settings.customThemesRemove', { name: tweak.name })}
+              label={i18n.t('settings.customThemesRemove', { name: tweak.name })}
               onclick={() => {
                 removeTweak(tweak);
               }}
@@ -460,7 +464,7 @@
 
 {#if catalogOpen}
   <ThemeCatalog
-    bind:open={catalogOpen}
+    bind:open={() => catalogOpen, setCatalogOpen}
     {installing}
     {previewing}
     failedEntry={failed}
@@ -526,6 +530,8 @@
   @media (width < 36rem) {
     .tiles {
       gap: var(--space-300);
+      max-block-size: none;
+      overflow-y: visible;
     }
   }
 

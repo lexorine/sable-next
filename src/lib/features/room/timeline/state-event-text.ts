@@ -1,4 +1,5 @@
 import { isRecord } from '#lib/guards.js';
+import { reactionKey } from '#lib/model/model.js';
 import type { StateChangeView, TimelineItemView } from '#src/generated/protocol';
 
 import { isCustomReaction } from '../messages/reaction-emote-label';
@@ -46,10 +47,8 @@ function text(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null;
 }
 
-export function reactionKey(content: unknown): string | null {
+export function reactionSource(content: unknown): string | null {
   if (!isRecord(content)) return null;
-  const shortcode = text(content.shortcode) ?? text(content['com.beeper.reaction.shortcode']);
-  if (shortcode) return `:${shortcode}:`;
   const relation = content['m.relates_to'];
   return isRecord(relation) ? text(relation.key) : null;
 }
@@ -93,6 +92,8 @@ const MODERATED: ReadonlySet<string> = new Set([
   'knock_denied',
 ]);
 
+const CUTE_TYPES: ReadonlySet<string> = new Set(['hug', 'cuddle', 'wave', 'poke', 'googly_eyes']);
+
 function membershipText(
   content: Extract<TimelineItemView['content'], { kind: 'membership' }>,
   item: TimelineItemView,
@@ -118,6 +119,18 @@ export function stateEventText(item: TimelineItemView, t: Translate): string {
       return t('timeline.callInvite', {
         user: item.sender_name ?? item.sender ?? t('timeline.unknownSender'),
       });
+    case 'verification_request':
+      return t('timeline.verificationRequest', {
+        user: item.sender_name ?? item.sender ?? t('timeline.unknownSender'),
+      });
+    case 'cute': {
+      const type =
+        content.cute_type && CUTE_TYPES.has(content.cute_type) ? content.cute_type : 'other';
+      return t(`timeline.cute.${type}`, {
+        user: item.sender_name ?? item.sender ?? t('timeline.unknownSender'),
+        body: content.body,
+      });
+    }
     case 'malformed':
       return t('timeline.malformedEvent', { type: content.event_type });
     case 'membership':

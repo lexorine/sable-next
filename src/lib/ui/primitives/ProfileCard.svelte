@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { copyText } from '#lib/platform/clipboard.js';
   import type { ClassValue } from 'svelte/elements';
   import type { Snippet } from 'svelte';
   import type { PresenceView } from '#src/generated/protocol';
@@ -8,6 +9,7 @@
   import { i18n } from '#lib/i18n.js';
   import { preferences } from '#lib/settings/preferences.svelte.js';
   import MediaImage from '#lib/ui/MediaImage.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
 
   import Avatar from './Avatar.svelte';
   import PresenceDot from './PresenceDot.svelte';
@@ -21,6 +23,7 @@
     nameColorOnLight,
     profilePalette,
   } from './readable-color.js';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
 
   interface Props {
     displayName: string;
@@ -28,6 +31,7 @@
     avatarUrl?: string | null;
     avatarLabel?: string;
     onAvatarClick?: (source: string, displayName: string) => void;
+    onAvatarEdit?: () => void;
     color: string;
     /** The owner's own choice, so only this one tints the card. `color` also
         covers the id-derived fallback. */
@@ -62,6 +66,7 @@
     avatarUrl = null,
     avatarLabel,
     onAvatarClick,
+    onAvatarEdit,
     color,
     pronouns,
     nameField,
@@ -104,9 +109,10 @@
       ink === BLACK ? (nameColorLight ?? nameColorDark) : (nameColorDark ?? nameColorLight);
     return palette && own ? nameColorOn(own, palette.ground) : null;
   });
-  let canOpenAvatar = $derived(Boolean(avatarUrl && onAvatarClick));
+  let canOpenAvatar = $derived(Boolean(onAvatarEdit ?? (avatarUrl && onAvatarClick)));
   function openAvatar(): void {
-    if (avatarUrl) onAvatarClick?.(avatarUrl, displayName);
+    if (onAvatarEdit) onAvatarEdit();
+    else if (avatarUrl) onAvatarClick?.(avatarUrl, displayName);
   }
   function openBanner(): void {
     if (banner) onAvatarClick?.(banner, displayName);
@@ -115,7 +121,7 @@
   const nameId = $props.id();
   let copied = $state(false);
   async function copyUserId(): Promise<void> {
-    await navigator.clipboard.writeText(userId);
+    await copyText(userId);
     copied = true;
     setTimeout(() => {
       copied = false;
@@ -130,16 +136,17 @@
 </script>
 
 <section
+  ondragstart={(event) => {
+    event.preventDefault();
+  }}
   aria-labelledby={nameField ? undefined : nameId}
   class={[
     'profile-card',
     `profile-card-${variant}`,
     { 'profile-card-inset-body': insetBody },
     className,
+    { tinted, 'tint-light': ink === BLACK, 'tint-dark': ink === WHITE },
   ]}
-  class:tinted
-  class:tint-light={ink === BLACK}
-  class:tint-dark={ink === WHITE}
   style:--profile-hero={palette?.ground}
   style:--profile-hero-panel={palette?.panel}
   style:--profile-hero-muted={palette?.muted}
@@ -148,12 +155,12 @@
   style:--profile-name-on-hero={nameOnHero}
   data-inset-owner={variant === 'sheet' ? 'bottom' : undefined}
 >
-  <div class="profile-card-cover" class:has-banner={banner} style:background={color}>
+  <div class={['profile-card-cover', { 'has-banner': banner }]} style:background={color}>
     {#if banner && onAvatarClick}
       <button
         class="profile-card-banner-button"
         type="button"
-        aria-label={$i18n.t('timeline.profileBanner', { name: displayName })}
+        aria-label={i18n.t('timeline.profileBanner', { name: displayName })}
         onclick={openBanner}
       >
         <MediaImage
@@ -233,7 +240,7 @@
           <p
             class="profile-card-status-text explicit-scrollbar"
             role="region"
-            aria-label={$i18n.t('settings.status')}
+            aria-label={i18n.t('settings.status')}
             tabindex="0"
           >
             {#if statusEmoji}<span class="profile-card-status-emoji">{statusEmoji}</span
@@ -249,26 +256,30 @@
         {#if nameField}
           <div class="profile-card-name-field">{@render nameField()}</div>
         {:else}
-          <h2 id={nameId} class="profile-card-name" class:tinted={nameColor}>
+          <h2 id={nameId} class={['profile-card-name', { tinted: nameColor }]}>
             {displayName}
           </h2>
         {/if}
         {#if pronouns}{@render pronouns()}{/if}
         {#if headerAction}{@render headerAction()}{/if}
       </div>
-      <button
-        class="profile-card-user-id"
-        type="button"
-        title={$i18n.t(copied ? 'settings.copied' : 'settings.copy')}
-        onclick={() => void copyUserId()}
-      >
-        {userId}
-        {#if copied}
-          <CheckIcon size="1em" aria-hidden="true" />
-        {:else}
-          <CopySimpleIcon size="1em" aria-hidden="true" />
-        {/if}
-      </button>
+      <Tooltip label={i18n.t(copied ? 'common.copied' : 'common.copy')}>
+        {#snippet trigger({ props })}
+          <button
+            {...props}
+            class="profile-card-user-id"
+            type="button"
+            onclick={() => void copyUserId()}
+          >
+            {userId}
+            {#if copied}
+              <CheckIcon size="1em" aria-hidden="true" />
+            {:else}
+              <CopySimpleIcon size="1em" aria-hidden="true" />
+            {/if}
+          </button>
+        {/snippet}
+      </Tooltip>
       {#if meta}
         <div class="profile-card-meta">{@render meta()}</div>
       {/if}
@@ -277,7 +288,7 @@
       {/if}
     </div>
     {#if children || footer}
-      <div class="profile-card-panel" class:framed={children}>
+      <div class={['profile-card-panel', { framed: children }]}>
         {#if children}
           <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
           <div
@@ -285,12 +296,13 @@
             role="region"
             aria-labelledby={nameField ? undefined : nameId}
             tabindex="0"
+            {@attach scrollHint}
           >
             {@render children()}
           </div>
         {/if}
         {#if footer}
-          <div class="profile-card-footer" class:divided={children}>{@render footer()}</div>
+          <div class={['profile-card-footer', { divided: children }]}>{@render footer()}</div>
         {/if}
       </div>
     {/if}
@@ -304,13 +316,18 @@
 </section>
 
 <style>
+  @media (pointer: fine) {
+    .profile-card {
+      user-select: text;
+    }
+  }
+
   .profile-card {
     /* --sec-main alone fails 4.5:1 on the light background at this text
        size, so small words get a stronger mix and it is left to icons. */
-    --profile-text-muted: color-mix(in oklab, var(--sec-main) 55%, var(--surface-on-container));
-    --profile-ink: var(--surface-on-container);
+    --profile-text-muted: var(--surface-on-container);
     --profile-icon: var(--sec-main);
-    --profile-line: var(--surface-container-line);
+    --profile-line: color-mix(in oklab, var(--profile-ink) 20%, var(--profile-card-ground));
     --profile-avatar-size: var(--avatar-size-large);
     --profile-cover-height: var(--avatar-size-large);
     --profile-bio-lines: 4;
@@ -322,8 +339,11 @@
     --pill-ink: var(--profile-ink, var(--bg-on-container));
     --pill-icon: var(--profile-icon);
     --pill-state: var(--profile-chip-state);
-    --profile-chip-state: var(--bg-on-container);
-    --profile-panel-ground: var(--surface-var-container);
+    --profile-panel-ground: color-mix(
+      in oklab,
+      var(--profile-chip-state) 8%,
+      var(--surface-container)
+    );
 
     background: var(--profile-card-ground);
     border: var(--border-width) solid var(--profile-line);
@@ -331,6 +351,16 @@
     color: var(--profile-ink);
     overflow: hidden;
     position: relative;
+  }
+
+  :root.dark .profile-card {
+    --profile-ink: var(--profile-ink-light);
+    --profile-chip-state: var(--profile-ink-dark);
+  }
+
+  :root.light .profile-card {
+    --profile-chip-state: var(--profile-ink-light);
+    --profile-ink: var(--profile-ink-dark);
   }
 
   .profile-card.tinted {
@@ -544,21 +574,21 @@
     padding: var(--space-300) var(--space-400) var(--space-400);
   }
 
-  .profile-card.tinted.profile-card-inset-body {
+  .profile-card.profile-card-inset-body {
     padding-bottom: var(--space-200);
   }
 
-  .profile-card-sheet.tinted.profile-card-inset-body {
+  .profile-card-sheet.profile-card-inset-body {
     padding-bottom: calc(var(--space-200) + var(--sheet-inset-bottom));
   }
 
-  .profile-card.tinted.profile-card-inset-body .profile-card-identity {
+  .profile-card.profile-card-inset-body .profile-card-identity {
     padding-inline: 0;
     padding-bottom: 0;
     padding-top: 0;
   }
 
-  .profile-card.tinted.profile-card-inset-body .profile-card-body {
+  .profile-card.profile-card-inset-body .profile-card-body {
     background: var(--profile-panel-ground);
     border: var(--border-width) solid var(--profile-line);
     border-radius: var(--radius-inner);
@@ -570,7 +600,8 @@
     align-items: baseline;
     display: flex;
     flex-flow: row wrap;
-    gap: var(--space-200);
+    gap: var(--space-100) var(--space-200);
+    margin-bottom: var(--space-100);
   }
 
   .profile-card-heading :global(.btn:last-child) {
@@ -583,16 +614,12 @@
   }
 
   .profile-card-name {
+    color: var(--profile-name-color);
     font-size: var(--font-size-heading);
     font-weight: var(--font-weight-bold);
     letter-spacing: -0.01em;
     min-width: 0;
     overflow-wrap: anywhere;
-  }
-
-  .profile-card-name.tinted,
-  :global(.profile-card-tinted) {
-    color: var(--profile-name-color);
   }
 
   .profile-card-user-id {
@@ -661,12 +688,12 @@
     margin: 0 var(--space-400) var(--space-300);
   }
 
-  .profile-card.tinted.profile-card-inset-body .profile-card-panel {
+  .profile-card.profile-card-inset-body .profile-card-panel {
     margin-inline: 0;
     margin-top: var(--space-200);
   }
 
-  /* Padding sits on the rows, not here, so the divider between them can reach
+  /* Padding sits on the rows so the divider between them can reach
      both edges of the panel. */
   .profile-card-panel.framed {
     background: var(--profile-panel-ground);
@@ -676,19 +703,19 @@
     overflow: clip;
   }
 
-  .profile-card.tinted .profile-card-status,
-  .profile-card.tinted .profile-card-panel.framed {
+  .profile-card .profile-card-status,
+  .profile-card .profile-card-panel.framed {
     color: var(--profile-ink);
   }
 
-  .profile-card.tinted.profile-card-inset-body .profile-card-panel.framed {
-    background: var(--profile-hero);
+  .profile-card.profile-card-inset-body .profile-card-panel.framed {
+    background: var(--profile-card-ground);
     border: 0;
     border-radius: var(--radii-400);
     box-shadow: inset 0 1px 2px color-mix(in srgb, var(--profile-ink) 12%, transparent);
   }
 
-  .profile-card.tinted.profile-card-inset-body .profile-card-footer {
+  .profile-card.profile-card-inset-body .profile-card-footer {
     display: flex;
     flex-direction: column;
     text-align: center;
@@ -720,7 +747,7 @@
     outline-offset: calc(-1 * var(--focus-ring-width));
   }
 
-  .profile-card.tinted.profile-card-inset-body .profile-card-bio {
+  .profile-card.profile-card-inset-body .profile-card-bio {
     margin-block: 0;
     max-height: 12.5rem;
     padding: var(--space-200);
@@ -730,18 +757,18 @@
     white-space: normal;
   }
 
-  .profile-card.tinted :global(.formatted-body a:not([data-matrix-link], [data-settings-link])) {
+  .profile-card :global(.formatted-body a:not([data-matrix-link], [data-settings-link])) {
     color: var(--profile-ink);
     text-decoration: underline;
   }
 
-  .profile-card.tinted :global(.formatted-body code:not(pre code)) {
+  .profile-card :global(.formatted-body code:not(pre code)) {
     background: var(--profile-card-ground);
     border-color: var(--profile-line);
     color: var(--profile-ink);
   }
 
-  .profile-card.tinted :global(.formatted-body .code-block) {
+  .profile-card :global(.formatted-body .code-block) {
     color: var(--surface-var-on-container);
   }
 
@@ -751,7 +778,7 @@
     padding: 0 var(--space-400) var(--space-400);
   }
 
-  .profile-card.tinted.profile-card-inset-body .profile-card-composer {
+  .profile-card.profile-card-inset-body .profile-card-composer {
     padding: var(--space-200) 0 0;
   }
 
@@ -759,7 +786,7 @@
     padding: 0 var(--space-400) var(--space-400);
   }
 
-  .profile-card.tinted.profile-card-inset-body .profile-card-below {
+  .profile-card.profile-card-inset-body .profile-card-below {
     padding: var(--space-200) 0 0;
   }
 
@@ -767,26 +794,22 @@
     border-top: var(--border-width) solid var(--profile-line);
   }
 
-  .profile-card.tinted.profile-card-inset-body .profile-card-footer.divided {
+  .profile-card.profile-card-inset-body .profile-card-footer.divided {
     border-top: 0;
   }
 
   @media (prefers-color-scheme: dark) {
-    :root:not(.light) .profile-card-name.tinted,
-    :root:not(.light) :global(.profile-card-tinted),
-    :root.dark .profile-card-name.tinted,
-    :root.dark :global(.profile-card-tinted) {
+    :root:not(.light) .profile-card-name,
+    :root.dark .profile-card-name {
       color: var(--profile-name-color-dark);
     }
   }
 
-  :root.dark .profile-card-name.tinted,
-  :root.dark :global(.profile-card-tinted) {
-    color: var(--profile-name-color-dark);
+  .profile-card .profile-card-name {
+    color: var(--profile-name-on-hero, var(--profile-ink));
   }
 
-  .profile-card.tinted .profile-card-name.tinted,
-  .profile-card.tinted :global(.profile-card-tinted) {
-    color: var(--profile-name-on-hero, var(--profile-ink));
+  :root.dark .profile-card-name {
+    color: var(--profile-name-color-dark);
   }
 </style>

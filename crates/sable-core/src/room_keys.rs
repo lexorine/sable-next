@@ -1,20 +1,28 @@
 use matrix_sdk::encryption::{KeyExportError, RoomKeyImportError};
+use matrix_sdk::ruma::RoomId;
 #[cfg(not(target_family = "wasm"))]
 use tempfile::NamedTempFile;
 
 use crate::Core;
 use crate::ResultExt;
-use crate::protocol::{CommandErr, CommandOk};
+use crate::api::encryption::ImportRoomKeysOk;
+use crate::protocol::RpcError;
 
 impl Core {
     #[cfg(not(target_family = "wasm"))]
-    pub(crate) async fn export_room_keys(&self, passphrase: &str) -> Result<CommandOk, CommandErr> {
+    pub(crate) async fn export_room_keys(
+        &self,
+        passphrase: &str,
+        room_id: Option<&RoomId>,
+    ) -> Result<String, RpcError> {
         let client = self.client().await?;
         let file = self.room_key_file()?;
 
         client
             .encryption()
-            .export_room_keys(file.path().to_owned(), passphrase, |_| true)
+            .export_room_keys(file.path().to_owned(), passphrase, |session| {
+                room_id.is_none_or(|room_id| session.room_id() == room_id)
+            })
             .await
             .or_failed(self, "export_room_keys")?;
 
@@ -22,7 +30,8 @@ impl Core {
             .await
             .or_failed(self, "export_room_keys")?;
 
-        Ok(CommandOk::ExportRoomKeys { export })
+        tracing::info!("room keys exported");
+        Ok(export)
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -30,7 +39,7 @@ impl Core {
         &self,
         export: &str,
         passphrase: &str,
-    ) -> Result<CommandOk, CommandErr> {
+    ) -> Result<ImportRoomKeysOk, RpcError> {
         let client = self.client().await?;
         let file = self.room_key_file()?;
 
@@ -44,27 +53,37 @@ impl Core {
             .await
             .map_err(|error| self.room_key_import_error(error))?;
 
-        Ok(CommandOk::ImportRoomKeys {
+        tracing::info!(
+            imported = result.imported_count,
+            total = result.total_count,
+            "room keys imported"
+        );
+        Ok(ImportRoomKeysOk {
             imported: result.imported_count as u64,
             total: result.total_count as u64,
         })
     }
 
     #[cfg(target_family = "wasm")]
-    pub(crate) async fn export_room_keys(&self, passphrase: &str) -> Result<CommandOk, CommandErr> {
+    pub(crate) async fn export_room_keys(
+        &self,
+        passphrase: &str,
+        room_id: Option<&RoomId>,
+    ) -> Result<String, RpcError> {
         let base = self.base_client().await?;
         let machine = base.olm_machine().await;
-        let machine = machine.as_ref().ok_or(CommandErr::NotLoggedIn)?;
+        let machine = machine.as_ref().ok_or(RpcError::NotLoggedIn)?;
 
         let keys = machine
             .store()
-            .export_room_keys(|_| true)
+            .export_room_keys(|session| room_id.is_none_or(|room_id| session.room_id() == room_id))
             .await
             .or_failed(self, "export_room_keys")?;
         let export = matrix_sdk_base::crypto::encrypt_room_key_export(&keys, passphrase, 500_000)
             .or_failed(self, "export_room_keys")?;
 
-        Ok(CommandOk::ExportRoomKeys { export })
+        tracing::info!("room keys exported");
+        Ok(export)
     }
 
     #[cfg(target_family = "wasm")]
@@ -72,10 +91,10 @@ impl Core {
         &self,
         export: &str,
         passphrase: &str,
-    ) -> Result<CommandOk, CommandErr> {
+    ) -> Result<ImportRoomKeysOk, RpcError> {
         let base = self.base_client().await?;
         let machine = base.olm_machine().await;
-        let machine = machine.as_ref().ok_or(CommandErr::NotLoggedIn)?;
+        let machine = machine.as_ref().ok_or(RpcError::NotLoggedIn)?;
 
         let keys = matrix_sdk_base::crypto::decrypt_room_key_export(export.as_bytes(), passphrase)
             .map_err(|error| self.room_key_import_error(RoomKeyImportError::Export(error)))?;
@@ -85,19 +104,24 @@ impl Core {
             .await
             .or_failed(self, "import_room_keys")?;
 
-        Ok(CommandOk::ImportRoomKeys {
+        tracing::info!(
+            imported = result.imported_count,
+            total = result.total_count,
+            "room keys imported"
+        );
+        Ok(ImportRoomKeysOk {
             imported: result.imported_count as u64,
             total: result.total_count as u64,
         })
     }
 
-    pub(crate) async fn base_client(&self) -> Result<crate::session::SharedBaseClient, CommandErr> {
+    pub(crate) async fn base_client(&self) -> Result<crate::session::SharedBaseClient, RpcError> {
         let account_id = self
             .session
             .read()
             .await
             .as_ref()
-            .ok_or(CommandErr::NotLoggedIn)?
+            .ok_or(RpcError::NotLoggedIn)?
             .account_id
             .clone();
         let store_id = self
@@ -112,29 +136,29 @@ impl Core {
                     .find(|account| account.account_id == account_id)
                     .map(|account| account.store_id.clone())
             })
-            .ok_or(CommandErr::NotLoggedIn)?;
-        crate::session::base_client(&store_id).ok_or(CommandErr::Unavailable)
+            .ok_or(RpcError::NotLoggedIn)?;
+        crate::session::base_client(&store_id).ok_or(RpcError::Unavailable)
     }
 
     #[cfg(not(target_family = "wasm"))]
-    fn room_key_file(&self) -> Result<NamedTempFile, CommandErr> {
+    fn room_key_file(&self) -> Result<NamedTempFile, RpcError> {
         tempfile::Builder::new()
             .prefix(".room-keys-")
             .tempfile_in(&self.store_id)
             .or_failed(self, "room_key_file")
     }
 
-    fn room_key_import_error(&self, error: RoomKeyImportError) -> CommandErr {
+    fn room_key_import_error(&self, error: RoomKeyImportError) -> RpcError {
         match error {
-            RoomKeyImportError::Export(KeyExportError::InvalidMac) => CommandErr::Denied,
-            RoomKeyImportError::Export(_) => CommandErr::InvalidKeyExport,
+            RoomKeyImportError::Export(KeyExportError::InvalidMac) => RpcError::Denied,
+            RoomKeyImportError::Export(_) => RpcError::InvalidKeyExport,
             error => self.failed("import_room_keys", error),
         }
     }
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
-#[expect(clippy::unwrap_used, clippy::panic, reason = "test code")]
+#[expect(clippy::unwrap_used, reason = "test code")]
 mod tests {
     use std::{sync::Arc, time::Duration};
 
@@ -159,10 +183,8 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::{
-        Core,
-        protocol::{CommandErr, CommandOk, TimelineFocusView},
-        session::Session,
-        store::MemorySessionStore,
+        Core, api::encryption::ImportRoomKeysOk, api::timeline::TimelineFocusView,
+        protocol::RpcError, session::Session, store::MemorySessionStore,
         timelines::build_room_timeline,
     };
 
@@ -254,7 +276,6 @@ ngjgWgEDc8qQHBtDJPz+m+yphv/xZAFw4Wldrz8mal3cudGfUnueAlwgf2wvzk2ZCT+kfo95tRqyWuhF
             matrix_sdk::ruma::TransactionId::new()
         );
         let client = crate::session::mock_account_client(server, &store_id).await;
-        client.event_cache().subscribe().unwrap();
         let sync_service = Arc::new(SyncService::builder(client.clone()).build().await.unwrap());
         let (core, _events) = Core::new(
             store.path().to_str().unwrap(),
@@ -290,11 +311,10 @@ ngjgWgEDc8qQHBtDJPz+m+yphv/xZAFw4Wldrz8mal3cudGfUnueAlwgf2wvzk2ZCT+kfo95tRqyWuhF
             .collect()
     }
 
-    async fn import(core: &Core, export: &str, passphrase: &str) -> Result<(u64, u64), CommandErr> {
-        match core.import_room_keys(export, passphrase).await? {
-            CommandOk::ImportRoomKeys { imported, total } => Ok((imported, total)),
-            other => panic!("unexpected response {other:?}"),
-        }
+    async fn import(core: &Core, export: &str, passphrase: &str) -> Result<(u64, u64), RpcError> {
+        let ImportRoomKeysOk { imported, total } =
+            core.import_room_keys(export, passphrase).await?;
+        Ok((imported, total))
     }
 
     fn outbound_session(room: &RoomId) -> (OutboundGroupSession, Ed25519PublicKey) {
@@ -363,13 +383,13 @@ ngjgWgEDc8qQHBtDJPz+m+yphv/xZAFw4Wldrz8mal3cudGfUnueAlwgf2wvzk2ZCT+kfo95tRqyWuhF
     }
 
     #[tokio::test]
-    async fn history_keys_keep_the_wire_field_other_clients_read() {
+    async fn history_keys_use_the_spec_wire_field() {
         let session = outbound_session(room_id!("!history:example.org"));
         let mut key = exported(&session).await;
         key.shared_history = true;
         let wire = serde_json::to_value(&key).unwrap();
-        assert_eq!(wire["m.shared_history"], true);
-        assert!(wire.get("shared_history").is_none());
+        assert_eq!(wire["shared_history"], true);
+        assert!(wire.get("m.shared_history").is_none());
     }
 
     async fn backup_metadata(
@@ -465,11 +485,7 @@ ngjgWgEDc8qQHBtDJPz+m+yphv/xZAFw4Wldrz8mal3cudGfUnueAlwgf2wvzk2ZCT+kfo95tRqyWuhF
             (102, 102, Some(103))
         );
         assert!(status.can_restore);
-        let CommandOk::DownloadKeyBackup { download } =
-            core.download_key_backup("retry".to_owned()).await.unwrap()
-        else {
-            panic!("unexpected response")
-        };
+        let download = core.download_key_backup("retry".to_owned()).await.unwrap();
         assert_eq!(
             (download.processed, download.imported, download.failed),
             (103, 0, 1)
@@ -547,19 +563,15 @@ ngjgWgEDc8qQHBtDJPz+m+yphv/xZAFw4Wldrz8mal3cudGfUnueAlwgf2wvzk2ZCT+kfo95tRqyWuhF
             sync_service: Arc::new(SyncService::builder(other.clone()).build().await.unwrap()),
             client: other.clone(),
         });
-        let CommandOk::DownloadKeyBackup { download } = restore.await.unwrap().unwrap() else {
-            panic!("unexpected response")
-        };
+        let download = restore.await.unwrap().unwrap();
         assert_eq!(download.account_id, "a1");
         assert_eq!(
             download.state,
             crate::protocol::KeyBackupDownloadState::Complete
         );
         assert_eq!(session_ids(&client).await.len(), 1);
-        assert!(session_ids(&other).await.is_empty());
-        let CommandOk::KeyBackupStatus { status } = core.key_backup_status().await.unwrap() else {
-            panic!("unexpected response")
-        };
+        assert_eq!(session_ids(&other).await, [] as [String; 0]);
+        let status = core.key_backup_status().await.unwrap();
         assert!(status.download.is_none());
     }
 
@@ -582,7 +594,7 @@ ngjgWgEDc8qQHBtDJPz+m+yphv/xZAFw4Wldrz8mal3cudGfUnueAlwgf2wvzk2ZCT+kfo95tRqyWuhF
         let _permit = core.key_backup_downloads.acquire().await.unwrap();
         assert!(matches!(
             core.download_key_backup("duplicate".to_owned()).await,
-            Err(CommandErr::Unavailable)
+            Err(RpcError::Unavailable)
         ));
         assert!(
             !server
@@ -642,11 +654,10 @@ ngjgWgEDc8qQHBtDJPz+m+yphv/xZAFw4Wldrz8mal3cudGfUnueAlwgf2wvzk2ZCT+kfo95tRqyWuhF
             .await
             .unwrap();
 
-        let CommandOk::ExportRoomKeys { export } =
-            source.export_room_keys("correct horse").await.unwrap()
-        else {
-            panic!("unexpected response");
-        };
+        let export = source
+            .export_room_keys("correct horse", None)
+            .await
+            .unwrap();
 
         assert!(export.starts_with("-----BEGIN MEGOLM SESSION DATA-----"));
         assert!(
@@ -662,6 +673,41 @@ ngjgWgEDc8qQHBtDJPz+m+yphv/xZAFw4Wldrz8mal3cudGfUnueAlwgf2wvzk2ZCT+kfo95tRqyWuhF
         assert_eq!(
             import(&target, &export, "correct horse").await.unwrap(),
             (0, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_export_for_one_room_leaves_the_others_out() {
+        let server = MatrixMockServer::new().await;
+        let (source, source_client, _source_store) = core_for(&server).await;
+        let (target, _target_client, _target_store) = core_for(&server).await;
+        let kept = room_id!("!kept:example.org");
+        source_client
+            .olm_machine_for_testing()
+            .await
+            .as_ref()
+            .unwrap()
+            .store()
+            .import_exported_room_keys(vec![exported(&outbound_session(kept)).await], |_, _| ())
+            .await
+            .unwrap();
+
+        let other = source
+            .export_room_keys("correct horse", Some(room_id!("!other:example.org")))
+            .await
+            .unwrap();
+        let wanted = source
+            .export_room_keys("correct horse", Some(kept))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            import(&target, &other, "correct horse").await.unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            import(&target, &wanted, "correct horse").await.unwrap(),
+            (1, 1)
         );
     }
 
@@ -683,23 +729,32 @@ ngjgWgEDc8qQHBtDJPz+m+yphv/xZAFw4Wldrz8mal3cudGfUnueAlwgf2wvzk2ZCT+kfo95tRqyWuhF
     async fn a_wrong_passphrase_is_denied_and_a_damaged_file_is_invalid() {
         let server = MatrixMockServer::new().await;
         let (core, client, store) = core_for(&server).await;
+        let listing = || {
+            let mut names: Vec<_> = std::fs::read_dir(store.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = listing();
 
         assert!(matches!(
             import(&core, ELEMENT_EXPORT, "wrong").await,
-            Err(CommandErr::Denied)
+            Err(RpcError::Denied)
         ));
         assert!(matches!(
             import(&core, "not a key export", "element passphrase").await,
-            Err(CommandErr::InvalidKeyExport)
+            Err(RpcError::InvalidKeyExport)
         ));
         let damaged =
             "-----BEGIN MEGOLM SESSION DATA-----\nnot*base64\n-----END MEGOLM SESSION DATA-----";
         assert!(matches!(
             import(&core, damaged, "element passphrase").await,
-            Err(CommandErr::InvalidKeyExport)
+            Err(RpcError::InvalidKeyExport)
         ));
-        assert!(session_ids(&client).await.is_empty());
-        assert_eq!(std::fs::read_dir(store.path()).unwrap().count(), 0);
+        assert_eq!(session_ids(&client).await, [] as [String; 0]);
+        assert_eq!(listing(), before);
     }
 
     #[tokio::test]

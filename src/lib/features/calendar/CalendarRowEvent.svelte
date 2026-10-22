@@ -2,7 +2,12 @@
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
   import { formatTime } from '#lib/ui/date-time.js';
-  import { agenda, readEntries, startOfDay, type CalendarItem } from './calendar-events.js';
+  import {
+    agenda,
+    readEntries,
+    startOfDay,
+    type CalendarItem,
+  } from '#lib/calendar/calendar-events.js';
 
   interface Props {
     roomId: string;
@@ -17,7 +22,7 @@
 
   async function load(): Promise<void> {
     try {
-      const view = await core.commands.calendarEntries(roomId);
+      const view = await core.rpc.calendar.entries({ room_id: roomId });
       items = readEntries(view.entries);
       now = Date.now();
     } catch (error) {
@@ -45,10 +50,10 @@
 
 {#if next}
   <span class="calendar-row-event">
-    {next.item.allDay ? $i18n.t('calendar.allDay') : formatTime(next.start)}
-    {next.item.title || $i18n.t('calendar.untitled')}
+    {next.item.all_day ? i18n.t('calendar.allDay') : formatTime(next.start)}
+    {next.item.title || i18n.t('calendar.untitled')}
     {#if today.length > 1}
-      · {$i18n.t('calendar.more', { count: today.length - 1 })}
+      · {i18n.t('calendar.more', { count: today.length - 1 })}
     {/if}
   </span>
 {/if}

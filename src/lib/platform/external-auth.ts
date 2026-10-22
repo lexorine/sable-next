@@ -1,16 +1,16 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 
+import { isElectron } from './electron';
+
 export interface ExternalAuthWindow {
   navigate: (url: string) => Promise<void>;
   close: () => void;
 }
 
 export function openExternalAuthWindow(name: string): ExternalAuthWindow | null {
-  if (isTauri()) {
+  if (isTauri() || isElectron()) {
     return {
-      navigate: async (url) => {
-        await invoke('open_external_url', { url });
-      },
+      navigate: openExternalAuthUrl,
       close: () => {},
     };
   }
@@ -38,4 +38,19 @@ export async function openExternalAuthUrl(url: string): Promise<void> {
   }
 
   window.open(url, '_blank', 'noopener');
+}
+
+export async function startInAppAuthSession(
+  authUrl: string,
+  callbackUri: string
+): Promise<string | null> {
+  if (!isTauri()) return null;
+  const { platform } = await import('@tauri-apps/plugin-os');
+  if (platform() !== 'ios') return null;
+
+  return invoke<string>('plugin:auth-session|start', {
+    authUrl,
+    callbackUrlScheme: new URL(callbackUri).protocol.slice(0, -1),
+    ephemeral: false,
+  });
 }

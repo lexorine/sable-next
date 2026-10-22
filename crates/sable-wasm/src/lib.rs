@@ -6,13 +6,13 @@ mod session_store;
 use std::{
     cell::{Cell, RefCell},
     io::{self, Write},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use js_sys::Function;
 use sable_core::{
     Core,
-    protocol::{Command, CommandErr, CoreEvent},
+    protocol::{CoreEvent, RpcError},
 };
 use session_store::JsSessionStore;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -43,17 +43,30 @@ fn encode_batch(batch: &[CoreEvent]) -> Option<String> {
     serde_json::to_string(&kept).ok()
 }
 
-fn js_err(error: &CommandErr) -> String {
+fn js_err(error: &RpcError) -> String {
     serde_json::to_string(error)
         .unwrap_or_else(|_| r#"{"code":"failed","log_id":"serialization failed"}"#.to_owned())
 }
 
 const DEFAULT_LOG_FILTER: &str = "info,matrix_sdk::http_client=off,matrix_sdk::latest_events::latest_event::builder=off,matrix_sdk_base::room::display_name=off";
 
+static LOG_FILTER: OnceLock<
+    tracing_subscriber::reload::Handle<
+        tracing_subscriber::filter::Targets,
+        tracing_subscriber::Registry,
+    >,
+> = OnceLock::new();
+
+fn log_targets(filter: &str) -> tracing_subscriber::filter::Targets {
+    filter.parse().unwrap_or_else(|_| {
+        tracing_subscriber::filter::Targets::new().with_default(tracing::Level::INFO)
+    })
+}
+
 /// Without this the core's `tracing` output is discarded and a
 /// `Failed { log_id }` names a line that was never written.
-fn init_tracing(filter: &str) {
-    use tracing_subscriber::{filter::Targets, prelude::*};
+fn init_tracing() {
+    use tracing_subscriber::prelude::*;
 
     let console_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
@@ -64,16 +77,18 @@ fn init_tracing(filter: &str) {
         .without_time()
         .with_writer(MakeJsLogWriter);
 
-    let targets = filter
-        .parse::<Targets>()
-        .unwrap_or_else(|_| Targets::new().with_default(tracing::Level::INFO));
+    let (targets, handle) = tracing_subscriber::reload::Layer::new(log_targets(DEFAULT_LOG_FILTER));
 
     // A second call fails, so a reconnecting port must stay harmless.
-    let _ = tracing_subscriber::registry()
+    if tracing_subscriber::registry()
+        .with(targets)
         .with(console_layer)
         .with(debug_layer)
-        .with(targets)
-        .try_init();
+        .try_init()
+        .is_ok()
+    {
+        let _ = LOG_FILTER.set(handle);
+    }
 }
 
 thread_local! {
@@ -127,9 +142,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MakeJsLogWriter {
         }
     }
 
-    /// Error lines always reach the page: the `Failed` command error only
-    /// carries a `log_id`, and the real cause lives in the log line that
-    /// Sentry's `reportCoreError` feeds on.
+    /// Error lines always reach the page, since `Failed` carries only a `log_id`.
     fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Self::Writer {
         JsLogWriter {
             capturing: LOG_CAPTURE.get() || meta.level() == &tracing::Level::ERROR,
@@ -163,6 +176,15 @@ pub fn set_log_handler(notify: Function) {
     LOG_NOTIFIER.with_borrow_mut(|slot| *slot = Some(notify));
 }
 
+/// `"info,matrix_sdk::http_client=debug"` is the only way to see the SDK's
+/// requests at all: a `SharedWorker`'s never reach the page's network panel.
+#[wasm_bindgen(js_name = setLogFilter)]
+pub fn set_log_filter(filter: &str) {
+    if let Some(handle) = LOG_FILTER.get() {
+        let _ = handle.reload(log_targets(filter));
+    }
+}
+
 #[wasm_bindgen(js_name = setLogCapture)]
 pub fn set_log_capture(enabled: bool) {
     LOG_CAPTURE.set(enabled);
@@ -180,25 +202,17 @@ pub struct SableCore {
 impl SableCore {
     /// `store_id` names the `IndexedDB` database, and the three functions are the
     /// session store, each of which must return a Promise.
-    ///
-    /// `"info,matrix_sdk::http_client=debug"` is the only way to see the SDK's
-    /// requests at all: a `SharedWorker`'s never reach the page's network panel.
     #[wasm_bindgen(constructor)]
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "wasm-bindgen maps the JS string boundary to an owned value"
-    )]
     #[must_use]
     pub fn new(
         store_id: String,
         load: Function,
         save: Function,
         clear: Function,
-        log_filter: Option<String>,
         persistent_event_cache: bool,
     ) -> SableCore {
         console_error_panic_hook::set_once();
-        init_tracing(log_filter.as_deref().unwrap_or(DEFAULT_LOG_FILTER));
+        init_tracing();
 
         let (core, events) = Core::new_with_event_cache(
             store_id,
@@ -212,21 +226,30 @@ impl SableCore {
         }
     }
 
-    /// Resolves with the JSON of `CommandOk`, rejects with that of `CommandErr`.
+    /// Runs `"<domain>.<method>"` on JSON params. Resolves with the JSON
+    /// result, rejects with that of `RpcError`.
     ///
     /// # Errors
     ///
-    /// Returns a JSON-encoded command error when parsing or dispatch fails.
-    #[wasm_bindgen(js_name = submitCommand)]
-    pub async fn submit_command(&self, command: String) -> Result<String, String> {
-        let command: Command = serde_json::from_str(&command)
-            .map_err(|error| js_err(&self.core.failed("submit_command", error)))?;
+    /// Returns a JSON-encoded command error when parsing or the call fails.
+    #[wasm_bindgen]
+    pub async fn call(&self, method: String, params: String) -> Result<String, String> {
+        Box::pin(self.core.call(&method, &params))
+            .await
+            .map(|json| Box::<str>::from(json).into_string())
+            .map_err(|error| js_err(&error))
+    }
 
-        match Box::pin(self.core.dispatch(command)).await {
-            Ok(response) => serde_json::to_string(&response)
-                .map_err(|error| js_err(&self.core.failed("submit_command", error))),
-            Err(error) => Err(js_err(&error)),
-        }
+    /// Stops syncing and refuses further calls, before another worker takes the stores.
+    #[wasm_bindgen]
+    pub async fn shutdown(&self) {
+        self.core.shutdown().await;
+    }
+
+    #[wasm_bindgen(js_name = setActive)]
+    pub async fn set_active(&self, active: bool) {
+        self.core.set_app_active(active);
+        self.core.apply_app_activity(active).await;
     }
 
     /// Resolves with the raw thumbnail bytes.
@@ -261,7 +284,7 @@ impl SableCore {
             .map_err(|error| js_err(&error))
     }
 
-    /// Resolves once the event is queued, not once the upload completes.
+    /// Resolves once the event is queued.
     ///
     /// # Errors
     ///
@@ -284,7 +307,7 @@ impl SableCore {
     pub async fn send_gallery(&self, request: String, items: String) -> Result<(), String> {
         let request = serde_json::from_str(&request)
             .map_err(|error| js_err(&self.core.failed("send_gallery", error)))?;
-        let items = serde_json::from_str(&items).map_err(|_| js_err(&CommandErr::InvalidMedia))?;
+        let items = serde_json::from_str(&items).map_err(|_| js_err(&RpcError::InvalidMedia))?;
         self.core
             .send_gallery(request, items)
             .await
@@ -302,8 +325,7 @@ impl SableCore {
             .map_err(|error| js_err(&error))
     }
 
-    /// Called once. Each call carries the JSON of a `CoreEvent[]`: whatever had
-    /// queued up when the batch was drained.
+    /// Called once; each call carries a `CoreEvent[]` as JSON.
     ///
     /// # Errors
     ///
@@ -342,7 +364,7 @@ mod tests {
 
     wasm_bindgen_test_configure!(run_in_shared_worker);
 
-    /// `CommandErr` is serialize-only, so the page's decoding is mirrored here
+    /// `RpcError` is serialize-only, so the page's decoding is mirrored here
     /// rather than reused.
     fn command_err(json: &str) -> serde_json::Value {
         let error: serde_json::Value = serde_json::from_str(json).expect("JSON");
@@ -356,17 +378,16 @@ mod tests {
             Function::new_no_args("return Promise.resolve(null);"),
             Function::new_with_args("bytes", "return Promise.resolve();"),
             Function::new_no_args("return Promise.resolve();"),
-            None,
             true,
         )
     }
 
     #[wasm_bindgen_test]
-    async fn an_unparseable_command_rejects_with_a_protocol_error() {
+    async fn unparseable_params_reject_with_a_protocol_error() {
         let rejection = core()
-            .submit_command("not json".to_owned())
+            .call("session.restore".to_owned(), "not json".to_owned())
             .await
-            .expect_err("an unparseable command must reject");
+            .expect_err("unparseable params must reject");
 
         let error = command_err(&rejection);
 

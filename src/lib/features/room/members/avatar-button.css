@@ -1,10 +1,14 @@
 .avatar-button {
+  align-self: start;
   background: none;
   border: 0;
   border-radius: var(--radius-pill);
   cursor: pointer;
-  display: block;
+  display: flex;
   flex: 0 0 auto;
-  height: var(--avatar-size-small);
   padding: 0;
+}
+
+:global(.compact-user) .avatar-button {
+  align-items: center;
 }

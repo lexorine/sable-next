@@ -12,7 +12,7 @@
   import UserPlusIcon from 'phosphor-svelte/lib/UserPlusIcon';
   import UsersIcon from 'phosphor-svelte/lib/UsersIcon';
   import WarningCircleIcon from 'phosphor-svelte/lib/WarningCircleIcon';
-  import { onDestroy, onMount, untrack } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import type { MemberView } from '#src/generated/protocol';
 
   import { memberIdentity, type MemberIdentity } from '#lib/features/room/members/members.js';
@@ -22,10 +22,14 @@
   import EmptyState from '#lib/ui/primitives/EmptyState.svelte';
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
   import Spinner from '#lib/ui/primitives/Spinner.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
 
   import CallControls from './CallControls.svelte';
+  import { preferences } from '#lib/settings/preferences.svelte.js';
+  import CallModeDebug from './CallModeDebug.svelte';
   import CallPlayback from './CallPlayback.svelte';
   import CallParticipantTile from './CallParticipantTile.svelte';
+  import CallTileGrid from './CallTileGrid.svelte';
   import {
     bestGrid,
     callTiles,
@@ -51,7 +55,7 @@
   const CHROME_IDLE_MS = 3500;
 
   let statusLabel = $derived(
-    $i18n.t(
+    i18n.t(
       callStatusKey({
         lifecycle: session.lifecycle,
         connection: session.transport.connection,
@@ -81,9 +85,9 @@
           (tile) => tile.participant.identity === identity && tile.participant.local === true
         );
         const device = local
-          ? $i18n.t('call.thisDevice')
+          ? i18n.t('call.thisDevice')
           : (session.members.find((member) => member.identity === identity)?.device_id ?? identity);
-        return [identity, $i18n.t('call.nameOnDevice', { name, device })];
+        return [identity, i18n.t('call.nameOnDevice', { name, device })];
       })
     );
   });
@@ -117,11 +121,8 @@
   let failed = $derived(session.failure !== null);
   let alone = $derived(ready && tiles.length === 1 && tiles[0].participant.local === true);
 
-  let pinned = $state<string | null>(untrack(() => session.layout.pinned));
-  let gridForced = $state(untrack(() => session.layout.gridForced));
-  $effect(() => {
-    session.layout = { pinned, gridForced };
-  });
+  let pinned = $derived(session.layout.pinned);
+  let gridForced = $derived(session.layout.gridForced);
   let featured = $derived(pinned === null && gridForced ? [] : featuredTiles(tiles, pinned));
   let spotlight = $derived(featured.length > 0);
   let strip = $derived(spotlight ? tiles.filter((tile) => !featured.includes(tile)) : []);
@@ -141,16 +142,11 @@
   );
 
   function pin(tile: CallTile): void {
-    ({ pinned, gridForced } = togglePin(tiles, featured, tile));
+    session.layout = togglePin(tiles, featured, tile);
   }
 
   function toggleLayout(): void {
-    if (spotlight) {
-      pinned = null;
-      gridForced = true;
-    } else {
-      gridForced = false;
-    }
+    session.layout = spotlight ? { pinned: null, gridForced: true } : { pinned, gridForced: false };
   }
 
   let now = $state(Date.now());
@@ -179,7 +175,10 @@
     else void stage?.requestFullscreen();
   }
 
-  let chromeVisible = $state(true);
+  let chromeVisible = $derived.by(() => {
+    void settled;
+    return true;
+  });
   let chromeHeld = $state(false);
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -195,10 +194,6 @@
     clearTimeout(idleTimer);
     if (settled && !chromeHeld) chromeVisible = false;
   }
-
-  $effect(() => {
-    if (!settled) chromeVisible = true;
-  });
 
   function trackOverflow(node: HTMLElement) {
     const observer = new ResizeObserver(() => {
@@ -229,9 +224,8 @@
 
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <section
-  class="stage"
-  class:resting={!chromeVisible}
-  aria-label={$i18n.t('call.title')}
+  class={['stage', { resting: !chromeVisible }]}
+  aria-label={i18n.t('call.title')}
   bind:this={stage}
   onpointermove={wake}
   onpointerdown={wake}
@@ -239,8 +233,8 @@
     if (event.pointerType === 'mouse') rest();
   }}
   onkeydown={wake}
-  onfocusin={() => {
-    chromeHeld = true;
+  onfocusin={(event) => {
+    chromeHeld = (event.target as HTMLElement).matches(':focus-visible');
     wake();
   }}
   onfocusout={() => (chromeHeld = false)}
@@ -254,24 +248,40 @@
       {/if}
       <span>{statusLabel}</span>
       {#if session.startedAt !== null && !failed}
-        <span class="meta" title={$i18n.t('call.duration')}>
-          <TimerIcon aria-hidden="true" weight="bold" />
-          <span class="screen-reader-only">{$i18n.t('call.duration')}</span>
-          {formatClockDuration(Math.max(0, Math.floor((now - session.startedAt) / 1000)))}
-        </span>
+        {@const startedAt = session.startedAt}
+        {@const durationLabel = i18n.t('call.duration')}
+        <Tooltip label={durationLabel}>
+          {#snippet trigger({ props })}
+            <span {...props} class="meta">
+              <TimerIcon aria-hidden="true" weight="bold" />
+              <span class="screen-reader-only">{durationLabel}</span>
+              {formatClockDuration(Math.max(0, Math.floor((now - startedAt) / 1000)))}
+            </span>
+          {/snippet}
+        </Tooltip>
       {/if}
       {#if ready && others > 0}
-        <span class="meta" title={$i18n.t('call.others', { count: others })}>
-          <UsersIcon aria-hidden="true" weight="bold" />
-          {others}
-          <span class="screen-reader-only">{$i18n.t('call.others', { count: others })}</span>
-        </span>
+        {@const othersLabel = i18n.t('call.others', { count: others })}
+        <Tooltip label={othersLabel}>
+          {#snippet trigger({ props })}
+            <span {...props} class="meta">
+              <UsersIcon aria-hidden="true" weight="bold" />
+              {others}
+              <span class="screen-reader-only">{othersLabel}</span>
+            </span>
+          {/snippet}
+        </Tooltip>
       {/if}
       {#if session.encryptsMedia && !failed}
-        <span class="encrypted" title={$i18n.t('call.encrypted')}>
-          <LockIcon aria-hidden="true" weight="bold" />
-          <span class="screen-reader-only">{$i18n.t('call.encrypted')}</span>
-        </span>
+        {@const encryptedLabel = i18n.t('call.encrypted')}
+        <Tooltip label={encryptedLabel}>
+          {#snippet trigger({ props })}
+            <span {...props} class="encrypted">
+              <LockIcon aria-hidden="true" weight="bold" />
+              <span class="screen-reader-only">{encryptedLabel}</span>
+            </span>
+          {/snippet}
+        </Tooltip>
       {/if}
     </p>
     <div class="top-actions">
@@ -279,7 +289,7 @@
         <IconButton
           variant="secondary"
           size="small"
-          label={$i18n.t(spotlight ? 'call.gridView' : 'call.focusView')}
+          label={i18n.t(spotlight ? 'call.gridView' : 'call.focusView')}
           onclick={toggleLayout}
         >
           {#if spotlight}
@@ -293,7 +303,7 @@
         <IconButton
           variant="secondary"
           size="small"
-          label={$i18n.t(fullscreen ? 'call.exitFullscreen' : 'call.fullscreen')}
+          label={i18n.t(fullscreen ? 'call.exitFullscreen' : 'call.fullscreen')}
           onclick={toggleFullscreen}
         >
           {#if fullscreen}
@@ -325,10 +335,12 @@
           ? undefined
           : (kind, deviceId) => void session.switchDevice(kind, deviceId)}
         onSwitchCamera={session.canSwitchCamera ? () => void session.switchCamera() : undefined}
+        audioRoutes={session.audioRoutes}
+        audioInputs={session.audioInputs}
         onOpenSettings={onOpenSettings ? openCallSettings : undefined}
       />
       {#if busy}
-        <p class="securing">{$i18n.t('call.controlsLocked')}</p>
+        <p class="securing">{i18n.t('call.controlsLocked')}</p>
       {/if}
     </div>
   {/if}
@@ -336,16 +348,16 @@
   <div class="notices" bind:clientHeight={noticeHeight}>
     {#if session.listenOnly}
       <Alert variant="warning" class="notice">
-        <p>{$i18n.t('call.listenOnly')}</p>
+        <p>{i18n.t('call.listenOnly')}</p>
       </Alert>
     {/if}
     {#if session.deviceError}
       <Alert variant="critical" class="notice" role="alert">
         <WarningCircleIcon aria-hidden="true" weight="fill" />
-        <p>{$i18n.t(DEVICE_ERROR_KEY[session.deviceError])}</p>
+        <p>{i18n.t(DEVICE_ERROR_KEY[session.deviceError])}</p>
         <div class="notice-actions">
           <Button variant="ghost" onclick={() => session.clearDeviceError()}>
-            {$i18n.t('call.dismiss')}
+            {i18n.t('common.dismiss')}
           </Button>
           {#if onOpenSettings}
             <Button
@@ -355,7 +367,7 @@
                 openCallSettings(event);
               }}
             >
-              {$i18n.t('call.openSettings')}
+              {i18n.t('call.openSettings')}
             </Button>
           {/if}
         </div>
@@ -364,36 +376,40 @@
     <CallPlayback rooms={session.rooms} telemetry={session.telemetry} />
   </div>
 
+  {#if preferences.developerTools && preferences.callDebugOverlay}
+    <CallModeDebug overlay />
+  {/if}
+
   <div
-    class="media"
-    class:with-notice={session.deviceError !== null || session.listenOnly}
-    class:locked={busy}
+    class={[
+      'media',
+      { 'with-notice': session.deviceError !== null || session.listenOnly, locked: busy },
+    ]}
     style:--tile-aspect={aspect}
     style:--notice-height="{noticeHeight}px"
   >
     {#if session.failure}
       {@const failure = session.failure}
       <div class="failed" role="alert">
-        <EmptyState title={$i18n.t('call.failed')} description={$i18n.t(callFailureKey(failure))}>
+        <EmptyState title={i18n.t('call.failed')} description={i18n.t(callFailureKey(failure))}>
           {#snippet actions()}
             <Button variant="secondary" onclick={() => session.clearFailure()}>
-              {$i18n.t('call.leave')}
+              {i18n.t('call.leave')}
             </Button>
             {#if failure !== 'busy'}
               <Button variant="primary" onclick={() => void session.retry()}>
-                {$i18n.t('call.retry')}
+                {i18n.t('common.tryAgain')}
               </Button>
             {/if}
           {/snippet}
         </EmptyState>
       </div>
     {:else if tiles.length === 0}
-      <p class="empty">{$i18n.t('call.noParticipants')}</p>
+      <p class="empty">{i18n.t('call.noParticipants')}</p>
     {:else if spotlight}
       <div class="focus">
         <ul
-          class="featured"
-          class:several={featured.length > 1}
+          class={['featured', { several: featured.length > 1 }]}
           bind:clientWidth={featuredWidth}
           bind:clientHeight={featuredHeight}
           style:--tile-width="{Math.floor(featuredGrid.width)}px"
@@ -406,7 +422,7 @@
         {#if strip.length > 0}
           <ul
             class="strip"
-            aria-label={$i18n.t('call.participants', { count: strip.length })}
+            aria-label={i18n.t('call.participants', { count: strip.length })}
             {@attach trackOverflow}
           >
             {#each strip as item (item.key)}
@@ -416,29 +432,27 @@
         {/if}
       </div>
     {:else}
-      <ul
-        class="grid"
-        class:alone
-        bind:clientWidth={mediaWidth}
-        bind:clientHeight={mediaHeight}
-        style:--tile-width="{Math.floor(grid.width)}px"
-        style:--grid-gap="{GRID_GAP_PX}px"
+      <CallTileGrid
+        {alone}
+        tileWidth={grid.width}
+        bind:width={mediaWidth}
+        bind:height={mediaHeight}
       >
         {#each tiles as item (item.key)}
           {@render tile(item, false)}
         {/each}
         {#if alone}
           <li class="waiting">
-            <p>{$i18n.t('call.noParticipants')}</p>
+            <p>{i18n.t('call.noParticipants')}</p>
             {#if onInvite}
               <Button variant="secondary" onclick={onInvite}>
                 <UserPlusIcon aria-hidden="true" weight="bold" />
-                {$i18n.t('call.invite')}
+                {i18n.t('common.invitePeople')}
               </Button>
             {/if}
           </li>
         {/if}
-      </ul>
+      </CallTileGrid>
     {/if}
   </div>
 
@@ -465,6 +479,7 @@
     source={item.source}
     room={session.roomFor(item.participant.backendId)}
     localVideo={item.participant.local ? session.localVideo : undefined}
+    remoteVideo={item.participant.local ? undefined : session.remoteVideo}
     name={tileNames.get(item.participant.identity) ?? profile.name}
     userId={profile.userId}
     avatar={profile.avatar}
@@ -506,7 +521,8 @@
   }
 
   .resting .chrome,
-  .resting :global(.tile .actions:not(:focus-within)) {
+  .resting :global(.tile .actions:not(:has(:focus-visible))),
+  .resting :global(.tile .tag) {
     opacity: 0;
     pointer-events: none;
   }
@@ -661,33 +677,6 @@
     color: var(--surface-var-on-container);
     font-size: var(--font-size-small);
     margin: auto;
-  }
-
-  .grid {
-    display: flex;
-    flex: 1;
-    flex-wrap: wrap;
-    gap: var(--grid-gap);
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    place-content: center;
-  }
-
-  .grid > :global(.tile) {
-    aspect-ratio: var(--tile-aspect);
-    inline-size: var(--tile-width);
-  }
-
-  .grid.alone {
-    align-content: center;
-    flex-flow: column nowrap;
-    gap: var(--space-400);
-  }
-
-  .grid.alone > :global(.tile) {
-    align-self: center;
-    inline-size: min(var(--tile-width), 26rem);
   }
 
   .waiting {

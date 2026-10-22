@@ -4,13 +4,14 @@
 
   import RoomOptionsMenu from './RoomOptionsMenu.svelte';
   import type { Component } from 'svelte';
-  import type { RoomSummary } from '#src/generated/protocol';
+  import type { RoomListItemView } from '#src/generated/protocol';
   import { resolve } from '$app/paths';
   import { afterNavigate, goto } from '$app/navigation';
   import { page } from '$app/state';
   import { i18n } from '#lib/i18n.js';
-  import { roomPathParam } from '#lib/rooms/room-list.svelte.js';
-  import { addUnread, type UnreadCount } from '#lib/rooms/spaces.js';
+  import { findRoomByPathId, roomPathParam, useRoomList } from '#lib/rooms/room-list.svelte.js';
+  import { addUnread } from '#lib/rooms/spaces.js';
+  import type { UnreadCount } from '#lib/rooms/unread.js';
   import { NO_UNREAD, roomUnread, type RoomUnread } from '#lib/rooms/unread.js';
   import {
     folderName,
@@ -76,12 +77,12 @@
 
   interface Props {
     pathname?: string;
-    spaces: readonly RoomSummary[];
+    spaces: readonly RoomListItemView[];
     spaceUnread?: ReadonlyMap<string, UnreadCount>;
     callSpaces?: ReadonlySet<string>;
     homeUnread?: UnreadCount;
     unspacedUnread?: UnreadCount;
-    directRooms?: readonly RoomSummary[];
+    directRooms?: readonly RoomListItemView[];
     directUnread?: UnreadCount;
     unreadFor?: RoomUnread;
     mobile?: boolean;
@@ -126,6 +127,7 @@
     onUnpin,
   }: Props = $props();
 
+  const roomList = useRoomList();
   const uid = $props.id();
 
   function unreadId(key: string): string {
@@ -134,9 +136,9 @@
 
   function unreadLabel(count: UnreadCount | undefined): string | undefined {
     if (!count) return undefined;
-    if (count.highlight > 0) return $i18n.t('nav.unreadMentions', { count: count.highlight });
-    if (count.unread > 0) return $i18n.t('nav.unreadMessages', { count: count.unread });
-    return count.marked ? $i18n.t('nav.markedUnread') : undefined;
+    if (count.highlight > 0) return i18n.t('nav.unreadMentions', { count: count.highlight });
+    if (count.unread > 0) return i18n.t('nav.unreadMessages', { count: count.unread });
+    return count.marked ? i18n.t('nav.markedUnread') : undefined;
   }
 
   function describedBy(props: Record<string, unknown>, id: string): string {
@@ -185,7 +187,7 @@
             href: resolve('/(app)/search'),
             activePrefix: '/search',
             icon: MagnifyingGlassIcon,
-            label: 'search.title',
+            label: 'common.searchMessages',
           } satisfies RailItem,
         ]
       : []),
@@ -194,7 +196,7 @@
       activePrefix: '/direct',
       navigateHref: sectionHref(DIRECT_PATHS_KEY, directRoot),
       icon: UsersIcon,
-      label: 'nav.direct',
+      label: 'common.directMessages',
       unread: directUnread,
       dm: true,
       section: 'direct',
@@ -211,7 +213,9 @@
   let directItems = $derived<RailItem[]>(
     directRooms.map((room) => {
       const name = spaceName(room.name, room.room_id);
-      const href = resolve('/(app)/direct/[roomId]', { roomId: roomPathParam(room) });
+      const href = resolve('/(app)/direct/[roomId]', {
+        roomId: roomPathParam(room, roomList.rooms),
+      });
 
       return {
         href,
@@ -227,8 +231,8 @@
   );
 
   const createEntries = [
-    { href: resolve('create-room'), label: 'nav.createRoom', icon: PlusIcon },
-    { href: resolve('create-space'), label: 'nav.createSpace', icon: HouseIcon },
+    { href: resolve('create-room'), label: 'common.createRoom', icon: PlusIcon },
+    { href: resolve('create-space'), label: 'common.createSpace', icon: HouseIcon },
     {
       href: `${resolve('explore')}#explore-join-by-address`,
       label: 'nav.joinWithAddress',
@@ -246,11 +250,29 @@
 
   function navigateTo(href: string): void {
     if (onNavigate) onNavigate(href);
+    // eslint-disable-next-line svelte/no-navigation-without-resolve -- every rail href is built with resolve()
     else void goto(href);
   }
 
   function under(path: string, root: string): boolean {
     return path === root || path.startsWith(`${root}/`);
+  }
+
+  function decodedSegment(path: string, root: string): string | null {
+    if (!path.startsWith(`${root}/`)) return null;
+    const segment = path.slice(root.length + 1);
+    if (segment.includes('/')) return null;
+    try {
+      return decodeURIComponent(segment);
+    } catch {
+      return null;
+    }
+  }
+
+  function samePathRoom(previous: string | null, current: string): boolean {
+    if (previous === null) return false;
+    const idOf = (pathId: string) => findRoomByPathId(roomList.rooms, pathId)?.room_id ?? pathId;
+    return idOf(previous) === idOf(current);
   }
 
   function sectionHref(key: string, root: string): string {
@@ -288,7 +310,7 @@
     { key: 'uniformIcons', label: 'settings.uniformIcons' },
   ] as const;
 
-  let contextSpace = $state<RoomSummary | null>(null);
+  let contextSpace = $state<RoomListItemView | null>(null);
   let contextAnchor = $state.raw<CursorAnchor | null>(null);
   let contextOpen = $state(false);
   let sectionMenu = $state.raw<{ section: RailSection; unread: UnreadCount; dm: boolean } | null>(
@@ -373,8 +395,12 @@
     if (space === undefined) return null;
 
     const name = spaceName(space.name, space.room_id);
-    const href = resolve('/(app)/space/[spaceId]', { spaceId: roomPathParam(space) });
-    const lobby = resolve('/(app)/space/[spaceId]/lobby', { spaceId: roomPathParam(space) });
+    const href = resolve('/(app)/space/[spaceId]', {
+      spaceId: roomPathParam(space, roomList.rooms),
+    });
+    const lobby = resolve('/(app)/space/[spaceId]/lobby', {
+      spaceId: roomPathParam(space, roomList.rooms),
+    });
     const savedPath = spacePaths[space.room_id];
 
     return {
@@ -392,7 +418,7 @@
 
   function folderLabel(folder: SidebarFolder): string {
     return (
-      folderName(folder, (roomId) => spacesById.get(roomId)?.name ?? null) ?? $i18n.t('nav.folder')
+      folderName(folder, (roomId) => spacesById.get(roomId)?.name ?? null) ?? i18n.t('nav.folder')
     );
   }
 
@@ -475,14 +501,16 @@
     const search = new URLSearchParams(kept).toString();
     const path = `${page.url.pathname}${search ? `?${search}` : ''}${page.url.hash}`;
     const space = spaces.find((candidate) => {
-      const href = resolve('/(app)/space/[spaceId]', { spaceId: roomPathParam(candidate) });
+      const href = resolve('/(app)/space/[spaceId]', {
+        spaceId: roomPathParam(candidate, roomList.rooms),
+      });
       return path === href || path.startsWith(`${href}/`);
     });
     const key = sectionRoots.find(([, root]) => under(path, root))?.[0] ?? space?.room_id;
     const spaceParam = page.params.spaceId;
     const bounced = spaceParam
-      ? sectionRoots.find(
-          ([, root]) => previousPath === `${root}/${encodeURIComponent(spaceParam)}`
+      ? sectionRoots.find(([, root]) =>
+          samePathRoom(decodedSegment(previousPath, root), spaceParam)
         )
       : undefined;
     previousPath = page.url.pathname;
@@ -533,9 +561,10 @@
   {@const active = isActive(item)}
   <a
     {...props}
-    class="rail-item nav-tab nav-tab-side selection-layer"
-    class:nav-tab-outlined={outlined(item)}
-    class:space-item={Boolean(item.initial)}
+    class={[
+      'rail-item nav-tab nav-tab-side selection-layer',
+      { 'nav-tab-outlined': outlined(item), 'space-item': Boolean(item.initial) },
+    ]}
     href={item.navigateHref ?? item.href}
     draggable={held ? 'false' : undefined}
     onclick={mobile
@@ -543,7 +572,7 @@
           navigate(item);
         }
       : undefined}
-    aria-label={$i18n.t(item.label)}
+    aria-label={i18n.t(item.label)}
     aria-describedby={describedBy(props, unreadId(item.roomId ?? item.href))}
     aria-current={active ? 'page' : undefined}
   >
@@ -555,7 +584,7 @@
   {#if mobile}
     {@render itemLink(item, {}, held)}
   {:else}
-    {@const label = $i18n.t(item.label)}
+    {@const label = i18n.t(item.label)}
     {#snippet trigger({ props }: { props: Record<string, unknown> })}
       {@render itemLink(item, props, held)}
     {/snippet}
@@ -568,7 +597,7 @@
     {...props}
     type="button"
     class="rail-item nav-tab nav-tab-side nav-tab-outlined selection-layer"
-    aria-label={$i18n.t('nav.add')}
+    aria-label={i18n.t('nav.add')}
     aria-haspopup="menu"
     aria-expanded={createOpen}
     onclick={openCreateMenu}
@@ -598,12 +627,16 @@
 
 {#snippet spaceSlotBody(item: RailItem, ref: LayoutRef, folderId?: string)}
   <div
-    class="rail-slot"
-    class:nested={folderId !== undefined}
-    class:drop-above={dropping(ref, 'above')}
-    class:drop-below={dropping(ref, 'below')}
-    class:drop-into={dropping(ref, 'into')}
-    class:dragged={isDragged(ref)}
+    class={[
+      'rail-slot',
+      {
+        nested: folderId !== undefined,
+        'drop-above': dropping(ref, 'above'),
+        'drop-below': dropping(ref, 'below'),
+        'drop-into': dropping(ref, 'into'),
+        dragged: isDragged(ref),
+      },
+    ]}
     {@attach dragSource(ref)}
     {@attach dropTarget(ref, folderId === undefined)}
   >
@@ -672,7 +705,7 @@
     class="rail-item folder-preview nav-tab nav-tab-side selection-layer"
     data-current={folderActive(folder) ? 'true' : undefined}
     aria-expanded="false"
-    aria-label={$i18n.t('nav.folderExpand', { name: folderLabel(folder) })}
+    aria-label={i18n.t('nav.folderExpand', { name: folderLabel(folder) })}
     aria-describedby={describedBy(props, unreadId(folder.id))}
     onclick={() => {
       onToggleFolder?.(folder.id);
@@ -686,11 +719,15 @@
 {#snippet closedFolder(folder: SidebarFolder)}
   {@const ref = { kind: 'folder', folderId: folder.id } satisfies LayoutRef}
   <div
-    class="rail-slot"
-    class:drop-above={dropping(ref, 'above')}
-    class:drop-below={dropping(ref, 'below')}
-    class:drop-into={dropping(ref, 'into')}
-    class:dragged={isDragged(ref)}
+    class={[
+      'rail-slot',
+      {
+        'drop-above': dropping(ref, 'above'),
+        'drop-below': dropping(ref, 'below'),
+        'drop-into': dropping(ref, 'into'),
+        dragged: isDragged(ref),
+      },
+    ]}
     role="presentation"
     oncontextmenu={mouseContextMenu((event) => {
       openFolderMenu(event, folder);
@@ -718,9 +755,10 @@
 {#snippet openFolder(folder: SidebarFolder)}
   {@const ref = { kind: 'folder', folderId: folder.id } satisfies LayoutRef}
   <div
-    class="folder-open"
-    class:drop-above={dropping(ref, 'above')}
-    class:drop-below={dropping(ref, 'below')}
+    class={[
+      'folder-open',
+      { 'drop-above': dropping(ref, 'above'), 'drop-below': dropping(ref, 'below') },
+    ]}
     {@attach dropTarget(ref, false)}
   >
     <div class="folder-card">
@@ -728,7 +766,7 @@
         type="button"
         class="folder-collapse"
         aria-expanded="true"
-        aria-label={$i18n.t('nav.folderCollapse', { name: folderLabel(folder) })}
+        aria-label={i18n.t('nav.folderCollapse', { name: folderLabel(folder) })}
         onclick={() => {
           onToggleFolder?.(folder.id);
         }}
@@ -789,7 +827,7 @@
           {#snippet trigger({ props }: { props: Record<string, unknown> })}
             {@render createButton(props)}
           {/snippet}
-          <Tooltip label={$i18n.t('nav.add')} side="right" {trigger} />
+          <Tooltip label={i18n.t('nav.add')} side="right" {trigger} />
         {/if}
       </li>
     </ul>
@@ -802,7 +840,7 @@
 {#if !mobile}
   <ActionMenu
     bind:open={displayOpen}
-    label={$i18n.t('nav.displayOptions')}
+    label={i18n.t('nav.displayOptions')}
     class="rail-display-menu"
     anchor={displayAnchor}
     side="right"
@@ -819,7 +857,7 @@
         }}
       >
         <span class="menu-check" aria-hidden="true">{on ? '✓' : ''}</span>
-        {$i18n.t(toggle.label)}
+        {i18n.t(toggle.label)}
       </ActionMenuItem>
     {/each}
 
@@ -835,7 +873,7 @@
         }}
       >
         <span class="menu-check" aria-hidden="true">{on ? '✓' : ''}</span>
-        {$i18n.t(toggle.label)}
+        {i18n.t(toggle.label)}
       </ActionMenuItem>
     {/each}
   </ActionMenu>
@@ -843,7 +881,7 @@
 
 <ActionMenu
   bind:open={createOpen}
-  label={$i18n.t('nav.add')}
+  label={i18n.t('nav.add')}
   anchor={createAnchor}
   side="right"
   align="end"
@@ -855,7 +893,7 @@
       }}
     >
       <entry.icon />
-      {$i18n.t(entry.label)}
+      {i18n.t(entry.label)}
     </ActionMenuItem>
   {/each}
 </ActionMenu>
@@ -864,7 +902,7 @@
   {@const menu = sectionMenu}
   <ActionMenu
     bind:open={sectionOpen}
-    label={$i18n.t('nav.listOptions')}
+    label={i18n.t('nav.listOptions')}
     anchor={sectionAnchor}
     side="right"
     align="start"
@@ -876,7 +914,7 @@
       }}
     >
       <ChecksIcon />
-      {$i18n.t('nav.markSectionRead')}
+      {i18n.t('common.markAsRead')}
     </ActionMenuItem>
   </ActionMenu>
 {/if}
@@ -885,7 +923,7 @@
   {@const folder = folderMenu}
   <ActionMenu
     bind:open={folderOptionsOpen}
-    label={$i18n.t('nav.listOptions')}
+    label={i18n.t('nav.listOptions')}
     anchor={folderAnchor}
     side="right"
     align="start"
@@ -896,7 +934,7 @@
       }}
     >
       <ChecksIcon />
-      {$i18n.t('nav.markSectionRead')}
+      {i18n.t('common.markAsRead')}
     </ActionMenuItem>
     <ActionMenuSeparator />
     <ActionMenuItem
@@ -905,7 +943,7 @@
       }}
     >
       <PencilSimpleIcon />
-      {$i18n.t('nav.folderRename')}
+      {i18n.t('nav.folderRename')}
     </ActionMenuItem>
     <ActionMenuItem
       onSelect={() => {
@@ -913,7 +951,7 @@
       }}
     >
       <FolderOpenIcon />
-      {$i18n.t('nav.folderUngroup')}
+      {i18n.t('nav.folderUngroup')}
     </ActionMenuItem>
   </ActionMenu>
 {/if}
@@ -925,10 +963,10 @@
     align="start"
     side="right"
     bind:open={contextOpen}
-    onSettings={(room: RoomSummary) => {
+    onSettings={(room: RoomListItemView) => {
       settingsRoomId = room.room_id;
     }}
-    onLeave={(room: RoomSummary) => {
+    onLeave={(room: RoomListItemView) => {
       leaveRoomId = room.room_id;
     }}
     onMoveUp={mobile && contextIndex > 0

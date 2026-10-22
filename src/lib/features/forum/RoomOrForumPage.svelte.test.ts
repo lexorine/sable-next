@@ -3,12 +3,13 @@
 import { render } from '@testing-library/svelte';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 
-import type { RoomSummary } from '#src/generated/protocol';
+import type { RoomListItemView } from '#src/generated/protocol';
 
-const state = vi.hoisted(() => ({ rooms: [] as RoomSummary[] }));
+const state = vi.hoisted(() => ({ rooms: [] as RoomListItemView[] }));
 const rendered = vi.hoisted(() => [] as string[]);
 
 vi.mock('$app/state', () => import('#lib/test-support/app-state.js'));
+vi.mock('#lib/core/context.js');
 vi.mock('#lib/rooms/room-list.svelte.js', async (importOriginal) => ({
   ...(await importOriginal<object>()),
   useRoomList: () => state,
@@ -28,7 +29,9 @@ import { visit } from '#lib/test-support/app-state.js';
 import RoomOrForumPage from './RoomOrForumPage.svelte';
 
 beforeEach(() => {
-  state.rooms = [{ room_id: '!forum:example.org', room_type: 'pl.chrome.forum' } as RoomSummary];
+  state.rooms = [
+    { room_id: '!forum:example.org', room_kind: 'forum' } as unknown as RoomListItemView,
+  ];
   rendered.length = 0;
 });
 

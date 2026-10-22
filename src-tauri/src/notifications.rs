@@ -1,17 +1,31 @@
-use sable_core::protocol::{CommandErr, NotificationView};
 #[cfg(any(mobile, test))]
-use sable_core::protocol::{WebPushKeys, WebPusherView};
+use sable_core::api::push::WebPusherView;
+#[cfg(any(mobile, test))]
+use sable_core::protocol::WebPushKeys;
+use sable_core::protocol::{NotificationView, RpcError};
 use sable_core::ruma::{EventId, owned_room_id, owned_user_id};
+#[cfg(not(target_os = "android"))]
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+#[cfg(not(target_os = "android"))]
+use std::sync::{LazyLock, Mutex};
+#[cfg(not(target_os = "android"))]
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Runtime};
-use tauri_plugin_notifications::{NotificationMessage, NotificationsExt};
+#[cfg(not(target_os = "android"))]
+use tauri_plugin_notifications::NotificationMessage;
+use tauri_plugin_notifications::NotificationsExt;
 
+#[cfg(not(target_os = "android"))]
 const MESSAGES_CHANNEL: &str = "messages.v2";
+#[cfg(not(target_os = "android"))]
 const NOTIFICATION_GROUP: &str = "matrix_messages";
+#[cfg(not(target_os = "android"))]
 const MESSAGE_ACTIONS: &str = "sable-message";
+#[cfg(not(target_os = "android"))]
 const MAX_CONVERSATION_LINES: usize = 8;
+#[cfg(not(target_os = "android"))]
+const NOTIFY_ONCE_WINDOW: Duration = Duration::from_mins(5);
 
 fn java_hash(text: &str) -> i32 {
     text.encode_utf16().fold(0i32, |hash, unit| {
@@ -26,10 +40,12 @@ pub fn room_notification_id(user_id: &str, room_id: &str) -> i32 {
     if hash == i32::MIN { 0 } else { hash.abs() }
 }
 
+#[cfg(not(target_os = "android"))]
 fn conversation_key(user_id: &str, room_id: &str) -> String {
     format!("{user_id}\0{room_id}")
 }
 
+#[cfg(not(target_os = "android"))]
 #[derive(Clone)]
 struct Line {
     sender_name: String,
@@ -39,7 +55,11 @@ struct Line {
     event_id: Option<String>,
 }
 
+#[cfg(not(target_os = "android"))]
 static CONVERSATIONS: LazyLock<Mutex<HashMap<String, Vec<Line>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(not(target_os = "android"))]
+static ALERTED: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 static PUSH_REGISTRATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -56,7 +76,7 @@ pub enum PushRegistrationError {
     Platform { message: String },
     NoGateway,
     NoAppId,
-    Homeserver { error: CommandErr },
+    Homeserver { error: RpcError },
     Ledger,
 }
 
@@ -72,20 +92,20 @@ struct RegisteredPusher {
     event_id_only: bool,
 }
 
-fn push_store<R: Runtime>(app: &AppHandle<R>) -> Result<std::path::PathBuf, CommandErr> {
+fn push_store<R: Runtime>(app: &AppHandle<R>) -> Result<std::path::PathBuf, RpcError> {
     use tauri::Manager;
     app.try_state::<PushStore>()
         .map(|store| store.0.clone())
-        .ok_or(CommandErr::Unavailable)
+        .ok_or(RpcError::Unavailable)
 }
 
 pub struct PushStore(pub std::path::PathBuf);
 
-fn registered_pushers(root: &std::path::Path) -> Result<Vec<RegisteredPusher>, CommandErr> {
+fn registered_pushers(root: &std::path::Path) -> Result<Vec<RegisteredPusher>, RpcError> {
     match std::fs::read(root.join("pushers.json")) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| CommandErr::Unavailable),
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| RpcError::Unavailable),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(_) => Err(CommandErr::Unavailable),
+        Err(_) => Err(RpcError::Unavailable),
     }
 }
 
@@ -102,7 +122,7 @@ pub fn device_pusher<R: Runtime>(
     app: &AppHandle<R>,
     user_id: &str,
     device_id: &str,
-) -> Result<Option<DevicePusher>, CommandErr> {
+) -> Result<Option<DevicePusher>, RpcError> {
     Ok(registered_pushers(&push_store(app)?)?
         .into_iter()
         .rev()
@@ -113,18 +133,18 @@ pub fn device_pusher<R: Runtime>(
         }))
 }
 
-fn save_pushers(root: &std::path::Path, pushers: &[RegisteredPusher]) -> Result<(), CommandErr> {
-    std::fs::create_dir_all(root).map_err(|_| CommandErr::Unavailable)?;
-    let bytes = serde_json::to_vec(pushers).map_err(|_| CommandErr::Unavailable)?;
-    std::fs::write(root.join("pushers.tmp"), bytes).map_err(|_| CommandErr::Unavailable)?;
+fn save_pushers(root: &std::path::Path, pushers: &[RegisteredPusher]) -> Result<(), RpcError> {
+    std::fs::create_dir_all(root).map_err(|_| RpcError::Unavailable)?;
+    let bytes = serde_json::to_vec(pushers).map_err(|_| RpcError::Unavailable)?;
+    std::fs::write(root.join("pushers.tmp"), bytes).map_err(|_| RpcError::Unavailable)?;
     std::fs::rename(root.join("pushers.tmp"), root.join("pushers.json"))
-        .map_err(|_| CommandErr::Unavailable)
+        .map_err(|_| RpcError::Unavailable)
 }
 
 async fn remove_saved_pusher(
     root: &std::path::Path,
     pusher: &RegisteredPusher,
-) -> Result<(), CommandErr> {
+) -> Result<(), RpcError> {
     let client = pusher_client(root, pusher).await?;
     client
         .retry(|| {
@@ -135,16 +155,16 @@ async fn remove_saved_pusher(
             )
         })
         .await
-        .map_err(|_| CommandErr::Unavailable)
+        .map_err(|_| RpcError::Unavailable)
 }
 
 async fn pusher_client(
     root: &std::path::Path,
     pusher: &RegisteredPusher,
-) -> Result<sable_core::notifications::PushClient, CommandErr> {
+) -> Result<sable_core::notifications::PushClient, RpcError> {
     sable_core::notifications::restore_push_client(root, &pusher.user_id, &pusher.device_id)
         .await
-        .ok_or(CommandErr::Unavailable)
+        .ok_or(RpcError::Unavailable)
 }
 
 #[cfg(target_os = "android")]
@@ -168,8 +188,9 @@ pub enum BackgroundPush {
 pub async fn maintain_background_push(
     root: &std::path::Path,
     operation: BackgroundPush,
-) -> Result<(), CommandErr> {
+) -> Result<(), RpcError> {
     let _guard = PUSH_REGISTRATION_LOCK.lock().await;
+    sable_core::notifications::evict_push_cache(root);
     let pushers = registered_pushers(root)?;
     match operation {
         BackgroundPush::Activate { app_id, ack_token } => {
@@ -189,7 +210,7 @@ pub async fn maintain_background_push(
                     return Ok(());
                 }
             }
-            Err(CommandErr::Unavailable)
+            Err(RpcError::Unavailable)
         }
         BackgroundPush::Rotate {
             user_id,
@@ -202,7 +223,7 @@ pub async fn maintain_background_push(
                 .iter()
                 .any(|pusher| pusher.user_id == user_id && pusher.device_id == device_id);
             if !known || !is_unified_push_endpoint(&endpoint) {
-                return Err(CommandErr::Unavailable);
+                return Err(RpcError::Unavailable);
             }
             let registration = Registration {
                 token: endpoint,
@@ -222,9 +243,11 @@ async fn rotate_pusher(
     root: &std::path::Path,
     pusher: &RegisteredPusher,
     registration: &Registration,
-) -> Result<(), CommandErr> {
-    use sable_core::protocol::{PusherView, WebPushKeys};
+) -> Result<(), RpcError> {
+    use sable_core::api::push::PusherView;
+    use sable_core::protocol::WebPushKeys;
     let client = pusher_client(root, pusher).await?;
+    let registration = &rotated_registration(&pusher.app_id, registration);
     let pushkey = if let Some(gateway) = &pusher.gateway {
         let key = registration
             .p256dh
@@ -237,7 +260,7 @@ async fn rotate_pusher(
                 auth: auth.clone(),
             }),
             (None, None) => None,
-            _ => return Err(CommandErr::Unavailable),
+            _ => return Err(RpcError::Unavailable),
         };
         client
             .retry(|| {
@@ -255,16 +278,16 @@ async fn rotate_pusher(
                 )
             })
             .await
-            .map_err(|_| CommandErr::Unavailable)?;
+            .map_err(|_| RpcError::Unavailable)?;
         key
     } else {
         let rotated = server_web_pusher(registration, &pusher.app_id, pusher.event_id_only)
-            .ok_or(CommandErr::Unavailable)?;
+            .ok_or(RpcError::Unavailable)?;
         let key = rotated.pushkey.clone();
         client
             .retry(|| sable_core::webpush::set_pusher(&client, rotated.clone()))
             .await
-            .map_err(|_| CommandErr::Unavailable)?;
+            .map_err(|_| RpcError::Unavailable)?;
         key
     };
     let identity = (pusher.user_id.clone(), pusher.device_id.clone());
@@ -280,6 +303,7 @@ async fn rotate_pusher(
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -288,6 +312,7 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
+#[cfg(not(target_os = "android"))]
 fn group_key(view: &NotificationView) -> String {
     if cfg!(any(target_os = "ios", target_os = "macos")) {
         conversation_key(view.user_id.as_str(), view.room_id.as_str())
@@ -296,14 +321,17 @@ fn group_key(view: &NotificationView) -> String {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 const fn shows_content(encrypted_room: bool, content: bool, encrypted_content: bool) -> bool {
     content && (!encrypted_room || encrypted_content)
 }
 
+#[cfg(not(target_os = "android"))]
 const fn alerts_silently(noisy: Option<bool>, sounds: bool) -> bool {
-    matches!(noisy, Some(false)) || !sounds
+    !sounds || (!cfg!(mobile) && matches!(noisy, Some(false)))
 }
 
+#[cfg(not(target_os = "android"))]
 fn line(view: &NotificationView, content: bool) -> Line {
     Line {
         sender_name: view
@@ -321,6 +349,7 @@ fn line(view: &NotificationView, content: bool) -> Line {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn remember(view: &NotificationView, content: bool) -> Option<Vec<Line>> {
     let fresh = line(view, content);
     let Ok(mut conversations) = CONVERSATIONS.lock() else {
@@ -348,12 +377,35 @@ fn remember(view: &NotificationView, content: bool) -> Option<Vec<Line>> {
     Some(lines.clone())
 }
 
+#[cfg(not(target_os = "android"))]
 fn forget(user_id: &str, room_id: &str) {
     if let Ok(mut conversations) = CONVERSATIONS.lock() {
         conversations.remove(&conversation_key(user_id, room_id));
     }
+    if let Ok(mut alerted) = ALERTED.lock() {
+        alerted.remove(&conversation_key(user_id, room_id));
+    }
 }
 
+#[cfg(not(target_os = "android"))]
+fn cooling(view: &NotificationView, now: Instant) -> bool {
+    if view.mention || view.noisy != Some(false) {
+        return false;
+    }
+    let Ok(mut alerted) = ALERTED.lock() else {
+        return false;
+    };
+    let key = conversation_key(view.user_id.as_str(), view.room_id.as_str());
+    let quiet = alerted
+        .get(&key)
+        .is_some_and(|at| now.saturating_duration_since(*at) < NOTIFY_ONCE_WINDOW);
+    if !quiet {
+        alerted.insert(key, now);
+    }
+    quiet
+}
+
+#[cfg(not(target_os = "android"))]
 fn conversation_message(line: &Line, encrypted: bool) -> Option<NotificationMessage> {
     serde_json::from_value(serde_json::json!({
         "body": line.body,
@@ -366,6 +418,7 @@ fn conversation_message(line: &Line, encrypted: bool) -> Option<NotificationMess
     .ok()
 }
 
+#[cfg(not(target_os = "android"))]
 fn collapsed(lines: &[Line]) -> String {
     lines
         .iter()
@@ -374,6 +427,7 @@ fn collapsed(lines: &[Line]) -> String {
         .join("\n")
 }
 
+#[cfg(not(target_os = "android"))]
 fn body(view: &NotificationView, content: bool) -> String {
     let sender = view
         .sender_name
@@ -396,7 +450,42 @@ pub async fn show<R: Runtime>(
     if !core.notifications_enabled() {
         return;
     }
+    #[cfg(target_os = "android")]
+    post_android(app, view).await;
+    #[cfg(not(target_os = "android"))]
+    show_generic(app, core, view).await;
+}
 
+#[cfg(target_os = "android")]
+async fn post_android<R: Runtime>(app: &AppHandle<R>, view: &NotificationView) {
+    use tauri_plugin_sable_push::SablePushExt;
+    let post = tauri_plugin_sable_push::Post {
+        user_id: view.user_id.to_string(),
+        room_id: view.room_id.to_string(),
+        event_id: view.event_id.as_ref().map(ToString::to_string),
+        room_name: view.room_name.clone(),
+        sender_name: Some(
+            view.sender_name
+                .clone()
+                .unwrap_or_else(|| view.sender.to_string()),
+        ),
+        body: view.body.clone(),
+        encrypted: view.encrypted,
+        direct: view.is_direct,
+        noisy: view.noisy.unwrap_or(false) || view.mention,
+        invite: view.event_id.is_none(),
+    };
+    if let Err(error) = app.sable_push().post(&post).await {
+        log::warn!("could not show a notification: {error}");
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+async fn show_generic<R: Runtime>(
+    app: &AppHandle<R>,
+    core: &sable_core::Core,
+    view: &NotificationView,
+) {
     let content = shows_content(
         view.encrypted,
         core.notification_content(),
@@ -435,7 +524,7 @@ pub async fn show<R: Runtime>(
     if let Some(icon) = linux_icon(app) {
         builder = builder.icon(icon);
     }
-    builder = builder.only_alert_once(core.notify_once() && !view.mention);
+    builder = builder.only_alert_once(core.notify_once() && cooling(view, Instant::now()));
     if alerts_silently(view.noisy, core.notification_sounds()) {
         builder = builder.silent();
     }
@@ -478,20 +567,6 @@ fn grant(
             log::debug!("could not read the notification permission: {error}");
             "prompt"
         }
-    }
-}
-
-#[cfg(target_os = "android")]
-pub async fn ensure_channel<R: Runtime>(app: &AppHandle<R>) {
-    let channel = tauri_plugin_notifications::Channel::builder(MESSAGES_CHANNEL, "Messages")
-        .description("Matrix message notifications")
-        .importance(tauri_plugin_notifications::Importance::High)
-        .visibility(tauri_plugin_notifications::Visibility::Private)
-        .vibration(true)
-        .build();
-
-    if let Err(error) = app.notifications().create_channel(channel).await {
-        log::warn!("could not create the message notification channel: {error}");
     }
 }
 
@@ -552,29 +627,57 @@ pub fn register_actions<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
-#[cfg_attr(
-    desktop,
-    expect(clippy::unused_async, reason = "mirrors the mobile signature")
-)]
-pub async fn allow_encrypted_content<R: Runtime>(app: &AppHandle<R>, allowed: bool) {
-    #[cfg(mobile)]
-    let result = app
-        .notifications()
-        .set_encrypted_content_allowed(allowed)
-        .await;
-    #[cfg(desktop)]
-    let result = app.notifications().set_encrypted_content_allowed(allowed);
-    if let Err(error) = result {
-        log::debug!("could not set the encrypted content policy: {error}");
+#[cfg(target_os = "android")]
+pub async fn set_open_conversation<R: Runtime>(
+    app: &AppHandle<R>,
+    user_id: Option<&str>,
+    room_id: Option<&str>,
+) {
+    use tauri_plugin_sable_push::SablePushExt;
+    if let Err(error) = app
+        .sable_push()
+        .set_open_conversation(user_id, room_id)
+        .await
+    {
+        log::debug!("could not tell the system which conversation is open: {error}");
     }
 }
 
-pub async fn dismiss<R: Runtime>(app: &AppHandle<R>, user_id: &str, room_id: &str) {
-    forget(user_id, room_id);
-    remove_posted(app, vec![room_notification_id(user_id, room_id)]).await;
+#[cfg(target_os = "android")]
+pub async fn forget_left_conversations<R: Runtime>(app: &AppHandle<R>, core: &sable_core::Core) {
+    use tauri_plugin_sable_push::SablePushExt;
+    let Ok((user_id, room_ids)) = core.left_rooms().await else {
+        return;
+    };
+    if room_ids.is_empty() {
+        return;
+    }
+    if let Err(error) = app
+        .sable_push()
+        .forget_conversations(&user_id, &room_ids)
+        .await
+    {
+        log::debug!("could not remove the conversations of left rooms: {error}");
+    }
+}
+
+pub async fn dismiss<R: Runtime>(app: &AppHandle<R>, user_id: &str, room_ids: &[String]) {
+    #[cfg(not(target_os = "android"))]
+    for room_id in room_ids {
+        forget(user_id, room_id);
+    }
+    if room_ids.is_empty() {
+        return;
+    }
+    let ids = room_ids
+        .iter()
+        .map(|room_id| room_notification_id(user_id, room_id))
+        .collect();
+    remove_posted(app, ids).await;
 }
 
 pub async fn dismiss_read<R: Runtime>(app: &AppHandle<R>, user_id: &str, room_ids: &[String]) {
+    #[cfg(not(target_os = "android"))]
     for room_id in room_ids {
         forget(user_id, room_id);
     }
@@ -583,12 +686,29 @@ pub async fn dismiss_read<R: Runtime>(app: &AppHandle<R>, user_id: &str, room_id
         .map(|room_id| room_notification_id(user_id, room_id))
         .collect();
     #[cfg(target_os = "android")]
-    let ids = shown_among(app, ids).await;
+    {
+        use tauri_plugin_sable_push::SablePushExt;
+        if !ids.is_empty()
+            && let Err(error) = app.sable_push().dismiss_shown(&ids).await
+        {
+            log::debug!("could not dismiss the read notifications: {error}");
+        }
+    }
+    #[cfg(not(target_os = "android"))]
     if !ids.is_empty() {
         remove_posted(app, ids).await;
     }
 }
 
+#[cfg(target_os = "android")]
+async fn remove_posted<R: Runtime>(app: &AppHandle<R>, ids: Vec<i32>) {
+    use tauri_plugin_sable_push::SablePushExt;
+    if let Err(error) = app.sable_push().dismiss(&ids).await {
+        log::debug!("could not dismiss a notification: {error}");
+    }
+}
+
+#[cfg(not(target_os = "android"))]
 #[cfg_attr(
     desktop,
     expect(clippy::unused_async, reason = "the mobile backend awaits the plugin")
@@ -604,28 +724,17 @@ async fn remove_posted<R: Runtime>(app: &AppHandle<R>, ids: Vec<i32>) {
     }
 }
 
-#[cfg(target_os = "android")]
-async fn shown_among<R: Runtime>(app: &AppHandle<R>, mut ids: Vec<i32>) -> Vec<i32> {
-    match app.notifications().active().await {
-        Ok(active) => {
-            let shown: std::collections::HashSet<i32> = active
-                .iter()
-                .map(tauri_plugin_notifications::ActiveNotification::id)
-                .collect();
-            ids.retain(|id| shown.contains(id));
-            ids
-        }
-        Err(error) => {
-            log::debug!("could not list the posted notifications: {error}");
-            Vec::new()
-        }
-    }
-}
-
 #[derive(serde::Deserialize)]
 #[cfg_attr(
     not(mobile),
     expect(dead_code, reason = "only a mobile build registers a pusher")
+)]
+#[cfg_attr(
+    all(mobile, not(target_os = "android")),
+    expect(
+        dead_code,
+        reason = "only android declares accounts to the push plugin"
+    )
 )]
 pub struct PushAccount {
     pub user_id: String,
@@ -648,6 +757,13 @@ pub struct PushConfig {
     pub user_id: Option<String>,
     pub device_id: Option<String>,
     #[serde(default)]
+    #[cfg_attr(
+        all(mobile, not(target_os = "android")),
+        expect(
+            dead_code,
+            reason = "only android declares accounts to the push plugin"
+        )
+    )]
     pub accounts: Vec<PushAccount>,
     /// Absent when the reader has retargeted the gateway: a token distributor
     /// needs an app id that gateway serves, and only the deployment names one.
@@ -670,6 +786,19 @@ struct Registration {
 }
 
 #[cfg(any(mobile, test))]
+const DIRECT_PUSH_APP_ID: &str = "moe.sable.up";
+
+#[cfg(any(target_os = "android", test))]
+fn rotated_registration(app_id: &str, registration: &Registration) -> Registration {
+    let keyed = app_id != DIRECT_PUSH_APP_ID;
+    Registration {
+        token: registration.token.clone(),
+        p256dh: registration.p256dh.clone().filter(|_| keyed),
+        auth: registration.auth.clone().filter(|_| keyed),
+    }
+}
+
+#[cfg(any(mobile, test))]
 fn pusher(
     registration: Registration,
     native_app_id: Option<&str>,
@@ -686,7 +815,7 @@ fn pusher(
             }),
         )),
         (None, None) if is_unified_push_endpoint(&registration.token) => {
-            Some(("moe.sable.up".to_owned(), registration.token, None))
+            Some((DIRECT_PUSH_APP_ID.to_owned(), registration.token, None))
         }
         (None, None) if !registration.token.is_empty() && !registration.token.contains("://") => {
             Some((native_app_id?.to_owned(), registration.token, None))
@@ -759,8 +888,9 @@ async fn distributor_gateway(
     core: &Arc<sable_core::Core>,
     registration: &Registration,
     config: &PushConfig,
+    server_vapid: Option<&str>,
 ) -> Option<String> {
-    if !is_direct_unified_push(registration, config) {
+    if !asks_distributor_for_gateway(config, registration, server_vapid) {
         return None;
     }
     discover_gateway(core, &registration.token).await
@@ -768,10 +898,12 @@ async fn distributor_gateway(
 
 #[cfg(mobile)]
 async fn discover_gateway(core: &Arc<sable_core::Core>, endpoint: &str) -> Option<String> {
-    let command = sable_core::protocol::Command::DiscoverPushGateway {
+    core.run(sable_core::api::push::DiscoverGatewayParams {
         endpoint: endpoint.to_owned(),
-    };
-    gateway_from_response(Box::pin(core.dispatch(command)).await)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 #[cfg(any(mobile, test))]
@@ -790,25 +922,33 @@ fn is_direct_unified_push(registration: &Registration, config: &PushConfig) -> b
 }
 
 #[cfg(any(mobile, test))]
-fn gateway_from_response(
-    response: Result<sable_core::protocol::CommandOk, CommandErr>,
-) -> Option<String> {
-    match response {
-        Ok(sable_core::protocol::CommandOk::DiscoverPushGateway { gateway }) => gateway,
-        _ => None,
+fn asks_distributor_for_gateway(
+    config: &PushConfig,
+    registration: &Registration,
+    server_vapid: Option<&str>,
+) -> bool {
+    server_vapid.is_none()
+        && (prefers_distributor_gateway(config, registration)
+            || is_direct_unified_push(registration, config))
+}
+
+#[cfg(any(mobile, test))]
+fn without_keys(registration: Registration) -> Registration {
+    Registration {
+        token: registration.token,
+        p256dh: None,
+        auth: None,
     }
 }
 
-/// A subscription bound to a VAPID key makes a distributor's Matrix gateway
-/// demand a VAPID header that a Matrix notify never carries, so a direct
-/// endpoint with such a gateway is registered again without the key.
+/// A direct endpoint with a Matrix gateway is registered again without the VAPID key, which such gateways reject.
 #[cfg(mobile)]
 async fn register_with_distributor<R: Runtime>(
     app: &AppHandle<R>,
     core: &Arc<sable_core::Core>,
     config: &PushConfig,
     server_vapid: Option<&str>,
-) -> Result<Registration, PushRegistrationError> {
+) -> Result<(Registration, Option<String>), PushRegistrationError> {
     let provider = provider_for_server_delivery(server_vapid, config.provider.as_deref());
     let register = |vapid: Option<String>| async {
         let registered = app
@@ -837,18 +977,10 @@ async fn register_with_distributor<R: Runtime>(
         server_vapid.map_or_else(|| config.vapid_key.clone(), str::to_owned),
     ))
     .await?;
-    let hosts_gateway = if server_vapid.is_some() {
-        prefers_distributor_gateway(config, &registration)
-            && discover_gateway(core, &registration.token).await.is_some()
-    } else {
-        distributor_gateway(core, &registration, config)
-            .await
-            .is_some()
+    let Some(gateway) = distributor_gateway(core, &registration, config, server_vapid).await else {
+        return Ok((registration, None));
     };
-    if hosts_gateway {
-        return register(None).await;
-    }
-    Ok(registration)
+    Ok((without_keys(register(None).await?), Some(gateway)))
 }
 
 /// # Errors
@@ -861,7 +993,7 @@ pub async fn register_push<R: Runtime>(
     core: &Arc<sable_core::Core>,
     config: PushConfig,
 ) -> Result<(), PushRegistrationError> {
-    use sable_core::protocol::{Command, PusherView};
+    use sable_core::api::push::{PusherView, SetPusherParams, WebPusherSupportParams};
     let _guard = PUSH_REGISTRATION_LOCK.lock().await;
     let root = push_store(app).map_err(|_| PushRegistrationError::Ledger)?;
     let (Some(user_id), Some(device_id)) = (config.user_id.clone(), config.device_id.clone())
@@ -869,6 +1001,7 @@ pub async fn register_push<R: Runtime>(
         return Err(PushRegistrationError::NoSession);
     };
     let identity = (user_id, device_id);
+    #[cfg(target_os = "android")]
     declare_push_accounts(app, &config, &identity).await;
 
     // MSC4174 makes the homeserver the push gateway. Query before creating the
@@ -876,10 +1009,11 @@ pub async fn register_push<R: Runtime>(
     let server_vapid = if config.gateway_override || cfg!(target_os = "ios") {
         None
     } else {
-        server_vapid_from_response(Box::pin(core.dispatch(Command::WebPusherSupport)).await)
+        core.run(WebPusherSupportParams {})
+            .await
             .map_err(|_| PushRegistrationError::Capabilities)?
     };
-    let registration =
+    let (registration, distributor_gateway) =
         register_with_distributor(app, core, &config, server_vapid.as_deref()).await?;
     if server_vapid.is_some()
         && let Some(pusher) =
@@ -895,7 +1029,7 @@ pub async fn register_push<R: Runtime>(
         .await;
     }
 
-    let gateway_url = match distributor_gateway(core, &registration, &config).await {
+    let gateway_url = match distributor_gateway {
         Some(gateway) => gateway,
         None => registration_gateway(&registration, &config)
             .ok_or_else(|| {
@@ -917,7 +1051,7 @@ pub async fn register_push<R: Runtime>(
         return Err(PushRegistrationError::NoAppId);
     };
 
-    let command = Command::SetPusher {
+    let params = SetPusherParams {
         pusher: PusherView {
             pushkey: pushkey.clone(),
             app_id: app_id.clone(),
@@ -929,7 +1063,7 @@ pub async fn register_push<R: Runtime>(
         },
     };
 
-    Box::pin(core.dispatch(command))
+    core.run(params)
         .await
         .map_err(|error| PushRegistrationError::Homeserver { error })?;
     remember_pusher(
@@ -945,21 +1079,23 @@ pub async fn register_push<R: Runtime>(
     Ok(())
 }
 
-#[cfg(mobile)]
+#[cfg(target_os = "android")]
 async fn declare_push_accounts<R: Runtime>(
     app: &AppHandle<R>,
     config: &PushConfig,
     identity: &(String, String),
 ) {
-    let accounts = config
+    use tauri_plugin_sable_push::{Account, SablePushExt};
+    let accounts: Vec<Account> = config
         .accounts
         .iter()
         .map(|account| (account.user_id.clone(), account.device_id.clone()))
         .chain(std::iter::once(identity.clone()))
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
+        .map(|(user_id, device_id)| Account { user_id, device_id })
         .collect();
-    if let Err(error) = app.notifications().set_push_accounts(accounts).await {
+    if let Err(error) = app.sable_push().set_accounts(&accounts).await {
         log::warn!("could not declare the signed-in accounts: {error}");
     }
 }
@@ -974,8 +1110,9 @@ async fn register_server_pusher(
 ) -> Result<(), PushRegistrationError> {
     let pushkey = pusher.pushkey.clone();
     let app_id = pusher.app_id.clone();
-    if let Err(error) =
-        Box::pin(core.dispatch(sable_core::protocol::Command::SetWebPusher { pusher })).await
+    if let Err(error) = core
+        .run(sable_core::api::push::SetWebPusherParams { pusher })
+        .await
     {
         log::warn!("homeserver rejected the MSC4174 pusher: {error:?}");
         return Err(PushRegistrationError::Homeserver { error });
@@ -988,16 +1125,6 @@ async fn register_server_pusher(
 }
 
 #[cfg(any(mobile, test))]
-fn server_vapid_from_response(
-    response: Result<sable_core::protocol::CommandOk, CommandErr>,
-) -> Result<Option<String>, CommandErr> {
-    match response? {
-        sable_core::protocol::CommandOk::WebPusherSupport { vapid } => Ok(vapid),
-        _ => Err(CommandErr::Unavailable),
-    }
-}
-
-#[cfg(any(mobile, test))]
 fn remember_pusher(
     root: &std::path::Path,
     identity: &(String, String),
@@ -1005,7 +1132,7 @@ fn remember_pusher(
     app_id: String,
     gateway: Option<String>,
     event_id_only: bool,
-) -> Result<(), CommandErr> {
+) -> Result<(), RpcError> {
     let mut pushers = registered_pushers(root)?;
     pushers.retain(|p| {
         !(p.user_id == identity.0
@@ -1059,13 +1186,24 @@ async fn retire_old_pushers(root: &std::path::Path, identity: &(String, String))
 /// # Errors
 ///
 /// When the homeserver refuses to delete the pusher.
-pub async fn unregister_push<R: Runtime>(app: &AppHandle<R>) -> Result<(), CommandErr> {
+pub async fn unregister_push<R: Runtime>(app: &AppHandle<R>) -> Result<(), RpcError> {
     let _guard = PUSH_REGISTRATION_LOCK.lock().await;
     #[cfg(mobile)]
     app.notifications()
         .unregister_for_push_notifications()
         .await
-        .map_err(|_| CommandErr::Unavailable)?;
+        .map_err(|_| RpcError::Unavailable)?;
+    #[cfg(target_os = "android")]
+    {
+        use tauri_plugin_sable_push::SablePushExt;
+        let push = app.sable_push();
+        if let Err(error) = push.set_accounts(&[]).await {
+            log::debug!("could not clear the signed-in accounts: {error}");
+        }
+        if let Err(error) = push.dismiss_all().await {
+            log::debug!("could not dismiss the notifications: {error}");
+        }
+    }
     let root = push_store(app)?;
     let mut pushers = registered_pushers(&root)?;
     while let Some(pusher) = pushers.first() {
@@ -1097,21 +1235,10 @@ mod tests {
     use sable_core::protocol::NotificationView;
 
     use super::{
-        Line, MAX_CONVERSATION_LINES, MESSAGE_ACTIONS, Registration, alerts_silently, body,
-        collapsed, forget, java_hash, provider_for_server_delivery, pusher, remember,
-        room_notification_id, server_web_pusher, shows_content,
+        Line, MAX_CONVERSATION_LINES, MESSAGE_ACTIONS, NOTIFY_ONCE_WINDOW, Registration,
+        alerts_silently, body, collapsed, cooling, forget, java_hash, provider_for_server_delivery,
+        pusher, remember, room_notification_id, server_web_pusher, shows_content,
     };
-
-    #[test]
-    fn failed_capability_lookup_does_not_select_a_fallback_gateway() {
-        super::server_vapid_from_response(Err(super::CommandErr::Unavailable)).unwrap_err();
-        assert!(matches!(
-            super::server_vapid_from_response(Ok(
-                sable_core::protocol::CommandOk::WebPusherSupport { vapid: None }
-            )),
-            Ok(None)
-        ));
-    }
 
     #[test]
     fn only_a_direct_unifiedpush_endpoint_asks_its_distributor_for_a_gateway() {
@@ -1139,7 +1266,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_chosen_unifiedpush_distributor_displaces_msc4174_for_its_gateway() {
+    fn only_a_chosen_unifiedpush_distributor_offers_its_gateway() {
         let mut config: super::PushConfig = serde_json::from_value(serde_json::json!({
             "gateway_url": "https://sygnal.example/_matrix/push/v1/notify",
             "vapid_key": "key", "web_app_id": "web", "event_id_only": true,
@@ -1162,21 +1289,59 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_discovery_falls_back_to_the_configured_gateway() {
-        assert_eq!(
-            super::gateway_from_response(Ok(
-                sable_core::protocol::CommandOk::DiscoverPushGateway {
-                    gateway: Some("https://ntfy.example/_matrix/push/v1/notify".to_owned())
-                }
-            ))
-            .as_deref(),
-            Some("https://ntfy.example/_matrix/push/v1/notify")
-        );
-        assert!(super::gateway_from_response(Err(super::CommandErr::Unavailable)).is_none());
-        assert!(
-            super::gateway_from_response(Ok(sable_core::protocol::CommandOk::SetWebPusher))
-                .is_none()
-        );
+    fn a_chosen_distributor_with_web_push_keys_still_offers_its_gateway() {
+        let mut config: super::PushConfig = serde_json::from_value(serde_json::json!({
+            "gateway_url": "https://sygnal.example/_matrix/push/v1/notify",
+            "vapid_key": "key", "web_app_id": "web", "event_id_only": true,
+            "provider": "unifiedpush",
+        }))
+        .expect("push config");
+        let registration = Registration {
+            token: "https://ntfy.example/upTopic?up=1".to_owned(),
+            p256dh: Some("key".to_owned()),
+            auth: Some("auth".to_owned()),
+        };
+        assert!(super::asks_distributor_for_gateway(
+            &config,
+            &registration,
+            None
+        ));
+        assert!(!super::asks_distributor_for_gateway(
+            &config,
+            &registration,
+            Some("server-key")
+        ));
+        config.provider = Some("embedded".to_owned());
+        assert!(!super::asks_distributor_for_gateway(
+            &config,
+            &registration,
+            None
+        ));
+
+        let (app_id, pushkey, web_push) = pusher(
+            super::without_keys(registration),
+            Some("native"),
+            Some("web"),
+        )
+        .expect("a direct pusher");
+        assert_eq!(app_id, super::DIRECT_PUSH_APP_ID);
+        assert_eq!(pushkey, "https://ntfy.example/upTopic?up=1");
+        assert!(web_push.is_none());
+    }
+
+    #[test]
+    fn a_rotated_direct_pusher_stays_keyed_on_its_endpoint() {
+        let registration = Registration {
+            token: "https://ntfy.example/upNew?up=1".to_owned(),
+            p256dh: Some("key".to_owned()),
+            auth: Some("auth".to_owned()),
+        };
+        let direct = super::rotated_registration(super::DIRECT_PUSH_APP_ID, &registration);
+        assert_eq!(direct.token, registration.token);
+        assert!(direct.p256dh.is_none() && direct.auth.is_none());
+        let keyed = super::rotated_registration("web", &registration);
+        assert_eq!(keyed.p256dh.as_deref(), Some("key"));
+        assert_eq!(keyed.auth.as_deref(), Some("auth"));
     }
 
     #[test]
@@ -1272,10 +1437,10 @@ mod tests {
     }
 
     #[test]
-    fn only_a_soundless_rule_or_muted_sounds_silences_an_alert() {
+    fn only_a_soundless_rule_on_desktop_or_muted_sounds_silences_an_alert() {
         assert!(!alerts_silently(Some(true), true));
         assert!(!alerts_silently(None, true));
-        assert!(alerts_silently(Some(false), true));
+        assert_eq!(alerts_silently(Some(false), true), !cfg!(mobile));
         assert!(alerts_silently(Some(true), false));
     }
 
@@ -1423,6 +1588,46 @@ mod tests {
     }
 
     #[test]
+    fn a_quiet_room_alerts_again_once_the_notify_once_window_has_passed() {
+        let quiet = NotificationView {
+            noisy: Some(false),
+            ..in_room("!cooling:example.org")
+        };
+        let start = std::time::Instant::now();
+
+        assert!(!cooling(&quiet, start));
+        assert!(cooling(&quiet, start + NOTIFY_ONCE_WINDOW / 2));
+        assert!(!cooling(&quiet, start + NOTIFY_ONCE_WINDOW));
+        assert!(cooling(
+            &quiet,
+            start + NOTIFY_ONCE_WINDOW + NOTIFY_ONCE_WINDOW / 2
+        ));
+        forget(quiet.user_id.as_str(), quiet.room_id.as_str());
+        assert!(!cooling(
+            &quiet,
+            start + NOTIFY_ONCE_WINDOW + NOTIFY_ONCE_WINDOW / 2
+        ));
+        forget(quiet.user_id.as_str(), quiet.room_id.as_str());
+    }
+
+    #[test]
+    fn a_ringing_rule_or_a_mention_is_never_quieted() {
+        let room = in_room("!loud:example.org");
+        let mention = NotificationView {
+            noisy: Some(false),
+            mention: true,
+            ..room.clone()
+        };
+        let start = std::time::Instant::now();
+
+        assert!(!cooling(&room, start));
+        assert!(!cooling(&room, start));
+        assert!(!cooling(&mention, start));
+        assert!(!cooling(&mention, start));
+        forget(room.user_id.as_str(), room.room_id.as_str());
+    }
+
+    #[test]
     fn a_conversation_keeps_the_newest_lines() {
         let view = in_room("!trimmed:example.org");
         for index in 0..=MAX_CONVERSATION_LINES {
@@ -1553,6 +1758,40 @@ mod tests {
 
         assert_eq!(reply.title(), "Reply");
         assert!(!reply.foreground());
+
+        let mark_read = category
+            .actions()
+            .iter()
+            .find(|action| action.id() == "sable-mark-read")
+            .expect("a mark-as-read action");
+
+        assert!(!mark_read.foreground());
+    }
+
+    #[test]
+    fn the_invite_category_the_ios_extension_names_is_declared() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("a Tauri config");
+        let parsed: tauri_plugin_notifications::PluginConfig = serde_json::from_value(
+            config
+                .pointer("/plugins/notifications")
+                .expect("a notifications plugin config")
+                .clone(),
+        )
+        .expect("the plugin reads its own config");
+
+        let category = parsed
+            .action_types
+            .iter()
+            .find(|action_type| action_type.id() == "sable-invite")
+            .expect("the category the iOS extension sets on invites");
+        let ids: Vec<_> = category
+            .actions()
+            .iter()
+            .map(tauri_plugin_notifications::Action::id)
+            .collect();
+
+        assert_eq!(ids, ["sable-invite-accept", "sable-invite-decline"]);
     }
 
     #[test]

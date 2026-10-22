@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
+
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
   import { preferences } from '#lib/settings/preferences.svelte.js';
@@ -21,6 +23,7 @@
   } from '#lib/ui/media-url.js';
   import { animationsPaused, stillFrame } from '#lib/ui/still-frame.js';
   import Button from '#lib/ui/primitives/Button.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
   import Spinner from '#lib/ui/primitives/Spinner.svelte';
   import ImageBrokenIcon from 'phosphor-svelte/lib/ImageBrokenIcon';
   import ImageSpoilerControl from './ImageSpoilerControl.svelte';
@@ -39,8 +42,6 @@
     title?: string;
     width: number;
     height: number;
-    thumbnailWidth?: number;
-    thumbnailHeight?: number;
     intrinsicWidth?: number | null;
     intrinsicHeight?: number | null;
     mime?: string | null;
@@ -50,13 +51,15 @@
     class?: string;
     style?: string;
     onclick?: () => void;
-    onloaded?: () => void;
-    onfailed?: () => void;
+    onloaded?: (url: string | null) => void;
+    onfailed?: (source: string) => void;
     retryable?: boolean;
     uniform?: boolean;
     tint?: boolean;
     original?: boolean;
+    pixelate?: boolean;
     autoplay?: boolean | null;
+    emoticon?: boolean;
     spoilerReason?: string | null;
     href?: string;
     spoilerHidden?: boolean;
@@ -70,8 +73,6 @@
     title,
     width,
     height,
-    thumbnailWidth = width,
-    thumbnailHeight = height,
     intrinsicWidth = null,
     intrinsicHeight = null,
     mime = null,
@@ -87,7 +88,9 @@
     uniform = false,
     tint = false,
     original = false,
+    pixelate = true,
     autoplay = null,
+    emoticon = false,
     spoilerReason = null,
     href,
     spoilerHidden = $bindable(),
@@ -109,9 +112,10 @@
   let gifFrameMs = DEFAULT_FRAME_MS;
   let paintedCanvas: HTMLCanvasElement | undefined;
   let paintedIndex = -1;
-  let blurhashCanvas = $state<HTMLCanvasElement>();
   let loadedUrl = $state<string | null>(null);
   let imageElement = $state<HTMLImageElement>();
+  let renderedWidth = $state(0);
+  let renderedHeight = $state(0);
   let sidewaysSource = $state<string | null>(null);
   let undecodableThumbnail = $state<string | null>(null);
   let eventRatio = $derived.by(() => {
@@ -152,8 +156,8 @@
       ? thumbnail
       : source
   );
-  let requestedWidth = $derived(asIs ? 0 : thumbnailWidth);
-  let requestedHeight = $derived(asIs ? 0 : thumbnailHeight);
+  let requestedWidth = $derived(asIs ? 0 : width);
+  let requestedHeight = $derived(asIs ? 0 : height);
   let requestKey = $derived(
     `${String(attempt)}:${String(requestedWidth)}x${String(requestedHeight)}:${requested}`
   );
@@ -180,11 +184,13 @@
     imageLoaded && asIs && requested === source ? (imageElement ?? null) : null
   );
   let pixelated = $derived(
-    pixelatedImage(
-      preferences.pixelatedImages,
-      intrinsicWidth ?? naturalImage?.naturalWidth,
-      intrinsicHeight ?? naturalImage?.naturalHeight
-    )
+    pixelate &&
+      pixelatedImage(
+        preferences.pixelatedImages,
+        intrinsicWidth ?? naturalImage?.naturalWidth,
+        intrinsicHeight ?? naturalImage?.naturalHeight,
+        { width: renderedWidth, height: renderedHeight }
+      )
   );
   let gifPreviewReady = $derived(url !== null && previewUrl === url);
   let gifPlaying = $derived(url !== null && playingUrl === url);
@@ -201,8 +207,10 @@
       cachedMediaType(core, requested, requestedWidth, requestedHeight) === 'image/svg+xml'
   );
   let animatedGif = $derived(animatedHint !== false && (mime === 'image/gif' || named('.gif')));
-  let manualGif = $derived(animatedGif && !(autoplay ?? preferences.autoplayGifs));
-  let paused = $derived((animated || original) && animationsPaused());
+  let manualGif = $derived(animatedGif && !emoticon && !(autoplay ?? preferences.autoplayGifs));
+  let paused = $derived(
+    (animated || original) && (animationsPaused() || (emoticon && !preferences.autoplayStickers))
+  );
   let heldFrame = $derived(paused && imageLoaded && imageElement ? stillFrame(imageElement) : null);
   let heldUrl = $derived(heldFrame ?? url);
   let steppedGif = $derived(gifFrames !== null);
@@ -224,31 +232,32 @@
   let sizeLabel = $derived(size !== null && size > 0 ? formatByteSize(size) : null);
   let mediaLabel = $derived(
     manualGif
-      ? $i18n.t(gifPlaying ? 'timeline.stopGif' : 'timeline.playGif')
+      ? i18n.t(gifPlaying ? 'timeline.stopGif' : 'timeline.playGif')
       : alt
-        ? $i18n.t('timeline.openMedia', { name: alt })
-        : $i18n.t('timeline.openMediaUnnamed')
+        ? i18n.t('timeline.openMedia', { name: alt })
+        : i18n.t('timeline.openMediaUnnamed')
   );
   let retryLabel = $derived(
     retryWait === 0
-      ? $i18n.t('timeline.retryMedia')
-      : $i18n.t('timeline.retryMediaIn', { count: Math.ceil(retryWait / 1000) })
+      ? i18n.t('common.retry')
+      : i18n.t('timeline.retryMediaIn', { count: Math.ceil(retryWait / 1000) })
   );
   let unavailableLabel = $derived(
     alt && !spoilerHidden
-      ? `${alt}: ${$i18n.t('timeline.mediaUnavailable')}`
-      : $i18n.t('timeline.mediaUnavailable')
+      ? `${alt}: ${i18n.t('timeline.mediaUnavailable')}`
+      : i18n.t('timeline.mediaUnavailable')
   );
 
   $effect(() => {
-    if (painted) onloaded?.();
+    if (painted) onloaded?.(url);
   });
 
   $effect(() => {
-    const delay = automaticMediaRetryDelay(backoff.automatic);
+    const current = backoff;
+    const delay = automaticMediaRetryDelay(current.automatic);
     if (!failed || undecodable || delay === null) return;
     const timeout = setTimeout(() => {
-      backoff = { ...backoff, attempt: backoff.attempt + 1 };
+      backoff = { ...current, attempt: current.attempt + 1 };
     }, delay);
     return () => {
       clearTimeout(timeout);
@@ -282,21 +291,26 @@
     }
 
     let active = true;
+    const shownSource = source;
+    /* The request can settle while an outro holds this component; reading a
+       derived then warns `derived_inert`, so the callbacks only touch snapshots. */
+    const previous = untrack(() => backoff);
+    const canRetry = untrack(() => retryable);
     const load = attempt > 0 && forced === attempt ? retryMediaUrl : loadMediaUrl;
     void load(core, requestSource, requestWidth, requestHeight, mime)
       .then((nextUrl) => {
         if (!active) return;
         if (sideways(mediaAspectRatio(core, requestSource, requestWidth, requestHeight))) {
-          sidewaysSource = source;
+          sidewaysSource = shownSource;
         }
         outcome = { key, url: nextUrl };
       })
       .catch(() => {
         if (!active) return;
         outcome = { key, url: null };
-        const automatic = backoff.automatic + 1;
-        backoff = { ...backoff, automatic, at: manualRetryDeadline() };
-        onfailed?.();
+        const automatic = previous.automatic + 1;
+        backoff = { ...previous, automatic, at: manualRetryDeadline(previous, canRetry) };
+        onfailed?.(shownSource);
       });
 
     return () => {
@@ -355,10 +369,9 @@
     void paintFrame(playback, gifFrameIndex);
   });
 
-  $effect(() => {
-    const canvas = blurhashCanvas;
+  function paintBlurhash(canvas: HTMLCanvasElement): void {
     const pixels = blurhashPixels;
-    if (!canvas || !pixels) return;
+    if (!pixels) return;
     const context = canvas.getContext('2d');
     if (!context) return;
     canvas.width = BLURHASH_DECODE_WIDTH;
@@ -366,7 +379,7 @@
     const image = context.createImageData(canvas.width, canvas.height);
     image.data.set(pixels);
     context.putImageData(image, 0, 0);
-  });
+  }
 
   function named(extension: string): boolean {
     return alt.toLowerCase().endsWith(extension) || source.toLowerCase().endsWith(extension);
@@ -401,16 +414,20 @@
     event.stopPropagation();
   }
 
-  function manualRetryDeadline(): number {
-    if (!retryable || backoff.manual === 0) return backoff.at;
+  function manualRetryDeadline(from = backoff, canRetry = retryable): number {
+    if (!canRetry || from.manual === 0) return from.at;
     clock = Date.now();
-    return clock + mediaRetryDelay(backoff.manual);
+    return clock + mediaRetryDelay(from.manual);
   }
 
   async function retry(event: MouseEvent): Promise<void> {
     event.stopPropagation();
     if (retryWait > 0) return;
-    if (undecodable) await core.commands.forgetMedia(requested).catch(() => undefined);
+    if (undecodable) {
+      await core.media.forgetMedia(requested).catch((error: unknown) => {
+        console.debug('[sable media] the undecodable media could not be forgotten', error);
+      });
+    }
     undecodableThumbnail = null;
     outcome = null;
     const next = backoff.attempt + 1;
@@ -446,7 +463,7 @@
     }
     outcome = { key: requestKey, url: null, undecodable: true };
     backoff = { ...backoff, at: manualRetryDeadline() };
-    onfailed?.();
+    onfailed?.(source);
   }
 
   /* A manual GIF is its own play/stop button, so the wrapper never swaps
@@ -466,12 +483,52 @@
   function toggleSpoiler(): void {
     spoilerHidden = !spoilerHidden;
   }
+
+  function withoutTabindex(props: Record<string, unknown>): Record<string, unknown> {
+    return Object.fromEntries(Object.entries(props).filter(([key]) => key !== 'tabindex'));
+  }
 </script>
+
+{#snippet gifImageElement(props: Record<string, unknown>)}
+  <img
+    {...withoutTabindex(props)}
+    bind:this={gifImage}
+    class={['media-image-content', 'gif-preview-source', { ready: showCanvas }]}
+    src={url}
+    alt={showCanvas ? '' : alt}
+    {width}
+    {height}
+    aria-hidden={showCanvas ? 'true' : undefined}
+    onload={freezeFrame}
+    onerror={brokenImage}
+  />
+{/snippet}
+
+{#snippet renderImageElement(props: Record<string, unknown>)}
+  <img
+    {...withoutTabindex(props)}
+    bind:this={imageElement}
+    bind:clientWidth={renderedWidth}
+    bind:clientHeight={renderedHeight}
+    class={['media-image-content', { tinted }]}
+    style:background-color={plate ?? undefined}
+    src={heldUrl}
+    {alt}
+    {width}
+    {height}
+    decoding="async"
+    onload={imageShown}
+    onerror={brokenImage}
+    {@attach (node) => {
+      if (node instanceof HTMLImageElement && node.complete) loadedUrl = url;
+    }}
+  />
+{/snippet}
 
 {#snippet content()}
   {#if blurhashPixels && !showUnavailable}
     <canvas
-      bind:this={blurhashCanvas}
+      {@attach paintBlurhash}
       class={['media-image-blurhash', { loaded: painted }]}
       aria-hidden="true"
     ></canvas>
@@ -486,39 +543,25 @@
       class={['media-image-content', 'gif-preview', { ready: showCanvas }]}>{alt}</canvas
     >
     {#if !steppedGif || !gifPreviewReady}
-      <img
-        bind:this={gifImage}
-        class={['media-image-content', 'gif-preview-source', { ready: showCanvas }]}
-        src={url}
-        alt={showCanvas ? '' : alt}
-        {title}
-        {width}
-        {height}
-        aria-hidden={showCanvas ? 'true' : undefined}
-        onload={freezeFrame}
-        onerror={brokenImage}
-      />
+      {#if title}
+        <Tooltip label={title} multiline>
+          {#snippet trigger({ props })}{@render gifImageElement(props)}{/snippet}
+        </Tooltip>
+      {:else}
+        {@render gifImageElement({})}
+      {/if}
     {/if}
     {#if heldGif}
       <span class="play-gif" aria-hidden="true"><PlayIcon /></span>
     {/if}
   {:else if url}
-    <img
-      bind:this={imageElement}
-      class={['media-image-content', { tinted }]}
-      style:background-color={plate ?? undefined}
-      src={heldUrl}
-      {alt}
-      {title}
-      {width}
-      {height}
-      decoding="async"
-      onload={imageShown}
-      onerror={brokenImage}
-      {@attach (node) => {
-        if (node instanceof HTMLImageElement && node.complete) loadedUrl = url;
-      }}
-    />
+    {#if title}
+      <Tooltip label={title} multiline>
+        {#snippet trigger({ props })}{@render renderImageElement(props)}{/snippet}
+      </Tooltip>
+    {:else}
+      {@render renderImageElement({})}
+    {/if}
     {#if tinted}
       <span class="media-image-tint" style:--media-tint="url({url})" aria-hidden="true"></span>
     {/if}
@@ -545,7 +588,7 @@
     <span class="media-image-progress"><Spinner small /></span>
     {#if loading.percent !== null}
       <span class="media-image-size">
-        {$i18n.t('timeline.downloadProgress', { percent: loading.percent })}
+        {i18n.t('timeline.downloadProgress', { percent: loading.percent })}
       </span>
     {:else if sizeLabel}<span class="media-image-size">{sizeLabel}</span>{/if}
   {/if}
@@ -580,7 +623,7 @@
           class="media-image-activation"
           {href}
           target="_blank"
-          rel="noopener noreferrer"
+          rel="external noopener noreferrer"
           aria-label={mediaLabel}
           onpointerdown={stopTimelinePress}
           onpointermove={stopTimelinePress}
@@ -834,12 +877,12 @@
     background: var(--surface-var-container);
     color: var(--surface-var-on-container);
     display: flex;
-    flex-direction: column;
+    flex-wrap: wrap;
     font-size: var(--font-size-small);
     gap: var(--space-100);
     height: 100%;
-    justify-content: center;
     padding: var(--space-200);
+    place-content: center center;
     text-align: center;
   }
 

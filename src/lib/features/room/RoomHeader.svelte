@@ -2,6 +2,7 @@
   import type { Snippet } from 'svelte';
   import { i18n } from '#lib/i18n.js';
   import BackIcon from 'phosphor-svelte/lib/CaretLeftIcon';
+  import BugIcon from 'phosphor-svelte/lib/BugIcon';
   import MagnifyingGlassIcon from 'phosphor-svelte/lib/MagnifyingGlassIcon';
   import ChatCircleIcon from 'phosphor-svelte/lib/ChatCircleIcon';
   import PhoneIcon from 'phosphor-svelte/lib/PhoneIcon';
@@ -12,8 +13,10 @@
   import Avatar from '#lib/ui/primitives/Avatar.svelte';
   import PanelHeader from '#lib/ui/primitives/PanelHeader.svelte';
   import PanelHeaderButton from '#lib/ui/primitives/PanelHeaderButton.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
 
   import { participantKeys } from '#lib/features/call/participant-keys.js';
+  import { preferences, setPreference } from '#lib/settings/preferences.svelte.js';
 
   import { memberIdentity } from './members/members.js';
 
@@ -71,17 +74,17 @@
   let inVoiceKeys = $derived(participantKeys(inVoice.map((entry) => entry.userId)));
   let voiceLabel = $derived(
     inVoice.length > 0
-      ? $i18n.t('timeline.inVoiceNames', {
+      ? i18n.t('timeline.inVoiceNames', {
           names: [...new Set(inVoice.map((entry) => entry.name))].join(', '),
         })
-      : $i18n.t('nav.voiceRoom')
+      : i18n.t('common.voiceRoom')
   );
   let topicShown = $derived(topic !== null && topic.trim() !== '' && onTopic !== null);
 </script>
 
-<PanelHeader class="room-header">
+<PanelHeader class="room-header" suffixToolbarLabel={i18n.t('room.actionsLabel')}>
   {#snippet prefix()}
-    <PanelHeaderButton class="back-button" label={$i18n.t('timeline.back')} onclick={onBack}>
+    <PanelHeaderButton class="back-button" label={i18n.t('timeline.back')} onclick={onBack}>
       <BackIcon />
     </PanelHeaderButton>
 
@@ -89,58 +92,71 @@
   {/snippet}
 
   {#snippet main()}
-    <div class="room-identity" class:with-topic={topicShown}>
+    <div class={['room-identity', { 'with-topic': topicShown }]}>
       <h1>{roomName}</h1>
       {#if topicShown}
         <button class="room-topic" type="button" onclick={onTopic}>{topic}</button>
       {/if}
     </div>
     {#if isVoice || inVoice.length > 0}
-      <span
-        class="voice-chip"
-        class:live={inVoice.length > 0}
-        role="img"
-        title={voiceLabel}
-        aria-label={voiceLabel}
-      >
-        <SpeakerHighIcon />
-        {#if inVoice.length > 0}
-          <span class="voice-faces">
-            {#each inVoice.slice(0, MAX_FACES) as participant, index (inVoiceKeys[index])}
-              <Avatar
-                class="voice-face"
-                src={participant.avatar}
-                name={participant.name}
-                id={participant.userId}
-              />
-            {/each}
+      <Tooltip label={voiceLabel}>
+        {#snippet trigger({ props })}
+          <span
+            {...props}
+            class={['voice-chip', { live: inVoice.length > 0 }]}
+            role="img"
+            aria-label={voiceLabel}
+          >
+            <SpeakerHighIcon />
+            {#if inVoice.length > 0}
+              <span class="voice-faces">
+                {#each inVoice.slice(0, MAX_FACES) as participant, index (inVoiceKeys[index])}
+                  <Avatar
+                    class="voice-face"
+                    src={participant.avatar}
+                    name={participant.name}
+                    id={participant.userId}
+                  />
+                {/each}
+              </span>
+              <span class="voice-count">{inVoice.length}</span>
+            {/if}
           </span>
-          <span class="voice-count">{inVoice.length}</span>
-        {/if}
-      </span>
+        {/snippet}
+      </Tooltip>
     {/if}
   {/snippet}
 
   {#snippet suffix()}
     <PanelHeaderButton
       class="search-button"
-      label={$i18n.t('search.open')}
+      label={i18n.t('common.searchMessages')}
       aria-pressed={searchOpen}
       onclick={onSearch}
     >
       <MagnifyingGlassIcon weight={searchOpen ? 'fill' : 'regular'} />
     </PanelHeaderButton>
     {@render pins?.()}
+    {#if preferences.developerTools && preferences.hiddenEventsHeaderToggle}
+      <PanelHeaderButton
+        class="hidden-events-toggle"
+        label={i18n.t('settings.showHiddenEvents')}
+        aria-pressed={preferences.showHiddenEvents}
+        onclick={() => setPreference('showHiddenEvents', !preferences.showHiddenEvents)}
+      >
+        <BugIcon weight={preferences.showHiddenEvents ? 'fill' : 'regular'} />
+      </PanelHeaderButton>
+    {/if}
     {#if onToggleChat}
       <PanelHeaderButton
         class="chat-toggle"
         label={chatBeside
           ? chatOpen
-            ? $i18n.t('call.hideChat')
-            : $i18n.t('call.showChat')
+            ? i18n.t('call.hideChat')
+            : i18n.t('call.showChat')
           : chatOpen
-            ? $i18n.t('call.showCall')
-            : $i18n.t('call.showChat')}
+            ? i18n.t('call.showCall')
+            : i18n.t('call.showChat')}
         aria-pressed={chatOpen}
         onclick={onToggleChat}
       >
@@ -154,7 +170,7 @@
     {#if onCall}
       <PanelHeaderButton
         class="call-button"
-        label={inVoice.length > 0 ? $i18n.t('call.join') : $i18n.t('call.start')}
+        label={inVoice.length > 0 ? i18n.t('call.join') : i18n.t('call.start')}
         onclick={onCall}
       >
         <PhoneIcon />
@@ -164,7 +180,7 @@
       {@render actions?.()}
       <PanelHeaderButton
         class="members-button"
-        label={$i18n.t('timeline.members')}
+        label={i18n.t('timeline.members')}
         aria-pressed={membersOpen}
         onclick={onMembers}
       >

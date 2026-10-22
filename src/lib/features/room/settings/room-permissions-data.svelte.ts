@@ -1,14 +1,13 @@
 import type { RoomPowerLevelsView } from '#src/generated/protocol';
 
 import type { CoreClient } from '#lib/core/client.svelte.js';
+import type { PowerLevelTagMap } from './power-level-tags';
 
 import { readFounders } from './room-upgrade';
-import { MEMBER_LIST_EVENT_TYPE, readAlwaysListedFrom } from './member-list.svelte.js';
-import { POWER_LEVEL_TAGS_EVENT_TYPE } from './power-level-tags';
 
 export class RoomPermissionsData {
   levels = $state.raw<RoomPowerLevelsView | null>(null);
-  rawRoleTags = $state.raw<unknown>(null);
+  roleTags = $state.raw<PowerLevelTagMap>({});
   founders = $state.raw<string[]>([]);
   alwaysListedFrom = $state<number | null>(null);
   loading = $state(false);
@@ -24,7 +23,7 @@ export class RoomPermissionsData {
     this.#roomId = roomId;
     this.#generation += 1;
     this.levels = null;
-    this.rawRoleTags = null;
+    this.roleTags = {};
     this.founders = [];
     this.alwaysListedFrom = null;
     this.loading = false;
@@ -42,10 +41,10 @@ export class RoomPermissionsData {
     try {
       void this.#loadFounders(roomId, generation);
       const [levels, tags, memberList] = await Promise.all([
-        this.core.commands.roomPowerLevels(roomId),
-        this.core.commands.roomStateEvent(roomId, POWER_LEVEL_TAGS_EVENT_TYPE),
-        this.core.commands
-          .roomStateEvent(roomId, MEMBER_LIST_EVENT_TYPE)
+        this.core.rpc.members.powerLevels({ room_id: roomId }),
+        this.core.rpc.members.powerLevelTags({ room_id: roomId }),
+        this.core.rpc.room_state
+          .memberListThreshold({ room_id: roomId })
           .catch((error: unknown) => {
             console.debug('[sable room] member list settings unavailable', error);
             return null;
@@ -53,8 +52,8 @@ export class RoomPermissionsData {
       ]);
       if (generation !== this.#generation) return;
       this.levels = levels;
-      this.rawRoleTags = tags ?? null;
-      this.alwaysListedFrom = readAlwaysListedFrom(memberList);
+      this.roleTags = tags;
+      this.alwaysListedFrom = memberList;
     } catch (error) {
       console.warn('[sable room] power levels unavailable', error);
       if (generation === this.#generation) this.failed = true;
@@ -65,7 +64,11 @@ export class RoomPermissionsData {
 
   async #loadFounders(roomId: string, generation: number): Promise<void> {
     try {
-      const events = await this.core.commands.roomStateEventsRaw(roomId, 'm.room.create', '');
+      const events = await this.core.rpc.room_state.eventsRaw({
+        room_id: roomId,
+        event_type: 'm.room.create',
+        state_key: '',
+      });
       if (generation === this.#generation) this.founders = readFounders(events[0]);
     } catch (error) {
       console.debug('[sable room] founders unavailable', error);

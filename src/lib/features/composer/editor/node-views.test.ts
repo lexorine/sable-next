@@ -1,11 +1,19 @@
 // @vitest-environment happy-dom
 
-import { expect, test, vi } from 'vitest';
+import { fireEvent } from '@testing-library/svelte';
+import { afterEach, expect, test, vi } from 'vitest';
+
+import { preferences } from '#lib/settings/preferences.svelte.js';
 
 import { composerMarkViews, composerNodeViews, type EmoteMedia } from './node-views';
 import { composerSchema } from './schema';
 
 const { mention, emoticon } = composerSchema.nodes;
+
+afterEach(() => {
+  preferences.autoplayStickers = true;
+  vi.restoreAllMocks();
+});
 
 function views(media: Partial<EmoteMedia> = {}): ReturnType<typeof composerNodeViews> {
   return composerNodeViews({
@@ -24,10 +32,14 @@ function build(
   return views(media)[name](node, null as never, () => 0, [], null as never);
 }
 
-test('a mention renders its name and keeps the caret out of the atom', () => {
+test('a mention keeps its name out of the DOM text and the caret out of the atom', () => {
   const view = build('mention', mention.create({ userId: '@one:example.org', name: 'Member One' }));
 
-  expect(view.dom.textContent).toBe('Member One×');
+  expect(view.dom.textContent).toBe('');
+  expect(view.dom.querySelector('.composer-mention-label')).toHaveAttribute(
+    'data-label',
+    'Member One'
+  );
   expect(view.dom.contentEditable).toBe('false');
   expect(view.dom.title).toBe('@one:example.org');
   expect(view.dom.querySelector('button')).toHaveAttribute('aria-label', 'Remove mention link');
@@ -178,4 +190,37 @@ test('a colour mark paints its colour in the editor', () => {
   expect(fg.dom.style.color).not.toBe('');
   expect(bg.dom).toHaveAttribute('data-mx-bg-color', '#00ff00');
   expect(bg.dom.style.backgroundColor).not.toBe('');
+});
+
+async function paintedEmoticon(): Promise<HTMLImageElement> {
+  vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({
+    drawImage: vi.fn(),
+  } as unknown as CanvasRenderingContext2D);
+  vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockReturnValue('data:image/png;still');
+  const view = build(
+    'emoticon',
+    emoticon.create({ url: 'mxc://example.org/parrot', shortcode: 'parrot' }),
+    { cached: () => 'blob:parrot' }
+  );
+  const image = view.dom.querySelector('img');
+  if (!image) throw new Error('the emote was not painted');
+  Object.defineProperty(image, 'complete', { value: true });
+  Object.defineProperty(image, 'naturalWidth', { value: 32 });
+  Object.defineProperty(image, 'naturalHeight', { value: 32 });
+  await fireEvent.load(image);
+  return image;
+}
+
+test('an emote holds a still frame when stickers and emoji do not autoplay', async () => {
+  preferences.autoplayStickers = false;
+
+  const image = await paintedEmoticon();
+
+  expect(image.getAttribute('src')).toBe('data:image/png;still');
+});
+
+test('an emote keeps animating when stickers and emoji autoplay', async () => {
+  const image = await paintedEmoticon();
+
+  expect(image.getAttribute('src')).toBe('blob:parrot');
 });

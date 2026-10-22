@@ -13,7 +13,6 @@
   import ResponsivePopover from '#lib/ui/primitives/ResponsivePopover.svelte';
 
   import MentionProfileCard from './MentionProfileCard.svelte';
-  import PersonaCard from './PersonaCard.svelte';
 
   interface Props {
     open?: boolean;
@@ -52,6 +51,10 @@
     onOpenChange,
     onOpenMainAccount,
   }: Props = $props();
+  let nestedMenuOpen = $derived.by(() => {
+    void open;
+    return false;
+  });
 
   let side = $derived.by((): 'left' | 'right' => {
     if (!anchor) return 'right';
@@ -72,9 +75,9 @@
   sticky="always"
   collisionPadding={12}
   sideOffset={10}
-  closeOnAnchorHidden
-  label={$i18n.t('timeline.userProfile')}
-  closeLabel={$i18n.t('timeline.closeProfile')}
+  closeOnAnchorHidden={!nestedMenuOpen}
+  label={i18n.t('timeline.userProfile')}
+  closeLabel={i18n.t('timeline.closeProfile')}
   handleColor="var(--bg-container)"
   handleOpacity={1}
   contentInset={false}
@@ -83,17 +86,7 @@
   onCloseAutoFocus={handleCloseAutoFocus}
 >
   {#snippet children(sheet)}
-    {#if pmp && userId}
-      <PersonaCard
-        accountId={userId}
-        accountName={member?.display_name ?? ''}
-        profile={pmp}
-        accountProfile={profile}
-        onOpenAccount={onOpenMainAccount}
-        {onAvatarClick}
-        variant={sheet ? 'sheet' : 'popover'}
-      />
-    {:else if userId}
+    {#if userId}
       <MentionProfileCard
         {userId}
         {member}
@@ -102,6 +95,9 @@
         {permissions}
         {powerTags}
         {profile}
+        {pmp}
+        onOpenAccount={onOpenMainAccount}
+        onNestedMenuOpenChange={(open) => (nestedMenuOpen = open)}
         {onAvatarClick}
         {onMatrixLink}
         {onPowerLevelChange}

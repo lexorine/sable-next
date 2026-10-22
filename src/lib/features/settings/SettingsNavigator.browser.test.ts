@@ -1,0 +1,103 @@
+import { afterEach, expect, test, vi } from 'vitest';
+import { page, userEvent } from 'vitest/browser';
+import { render } from 'vitest-browser-svelte';
+
+vi.mock('#lib/core/context.js', async () => {
+  const mock = await import('#lib/core/__mocks__/context.js');
+  return { useCoreClient: () => mock.core, provideCoreClient: vi.fn() };
+});
+vi.mock('$app/state', () => import('#lib/test-support/app-state.js'));
+vi.mock('$app/navigation', () => import('#lib/test-support/app-navigation.js'));
+
+import { core } from '#lib/core/__mocks__/context.js';
+
+import SettingsNavigator from './SettingsNavigator.svelte';
+import SettingsNavigatorHarness from './SettingsNavigatorHarness.test.svelte';
+
+afterEach(async () => {
+  await page.viewport(414, 800);
+});
+
+async function mount() {
+  await page.viewport(1280, 900);
+  Object.assign(core, { session: { user_id: '@me:example.org' }, encryption: null });
+  core.commands = core;
+  const screen = await render(SettingsNavigatorHarness, { component: SettingsNavigator });
+  const field = screen.getByRole('searchbox', { name: 'Search settings' });
+  const results = screen.getByRole('list', { name: 'Search settings' }).getByRole('listitem');
+  return { screen, field, results };
+}
+
+test('typing filters settings by their name across categories', async () => {
+  const { field, results } = await mount();
+  await userEvent.fill(field.element(), 'autoplay gifs');
+
+  await expect.poll(() => results.elements().length).toBe(1);
+  expect(results.element().textContent).toContain('Autoplay GIFs');
+  expect(results.element().textContent).toContain('In Media');
+});
+
+test('typing matches on the translated description, not just the name', async () => {
+  const { field, results } = await mount();
+  await userEvent.fill(field.element(), 'lock screen');
+
+  await expect.poll(() => results.elements().length).toBe(1);
+  expect(results.element().textContent).toContain('Show message text');
+  expect(results.element().textContent).toContain('In Notifications');
+});
+
+test('the summary reports how many results there are', async () => {
+  const { screen, field, results } = await mount();
+  await userEvent.fill(field.element(), 'notification');
+
+  await expect.poll(() => results.elements().length).toBeGreaterThan(1);
+  const count = results.elements().length;
+  await expect.element(screen.getByText(`${String(count)} results`)).toBeVisible();
+
+  await userEvent.fill(field.element(), 'autoplay gifs');
+  await expect.element(screen.getByText('1 result', { exact: true })).toBeVisible();
+});
+
+test('a query matching nothing says so', async () => {
+  const { screen, field } = await mount();
+  await userEvent.fill(field.element(), 'zzzznothingmatchesthis');
+
+  await expect.element(screen.getByText(/No settings match/)).toBeVisible();
+  expect(document.querySelectorAll('[aria-label="Search settings"] li')).toHaveLength(0);
+});
+
+test.each([
+  [1280, 900],
+  [412, 915],
+])('custom panel search links work at %s x %s', async (width, height) => {
+  const { screen, field } = await mount();
+  await page.viewport(width, height);
+  await userEvent.fill(field.element(), 'quick CSS');
+  const css = screen.getByRole('link', { name: /Quick CSS/ });
+  await expect.element(css).toBeVisible();
+  expect(css.element().getAttribute('href')).toBe('/settings/appearance?focus=quick-css');
+
+  await userEvent.fill(field.element(), 'key backup');
+  const backup = screen.getByRole('link', { name: /Cloud key backup/ });
+  await expect.element(backup).toBeVisible();
+  expect(backup.element().getAttribute('href')).toBe('/settings/devices?focus=key-backup-heading');
+
+  await userEvent.fill(field.element(), 'display name');
+  const mention = screen.getByRole('link', { name: /Display name/ });
+  await expect.element(mention).toBeVisible();
+  expect(mention.element().getAttribute('href')).toBe(
+    '/settings/notifications?focus=mention-display_name'
+  );
+});
+
+test('mobile: log out is the last row of the section list', async () => {
+  const { screen } = await mount();
+  await page.viewport(412, 915);
+  const nav = screen.getByRole('navigation', { name: 'Settings sections' });
+  const logout = nav.getByRole('button', { name: 'Log out' });
+  logout.element().scrollIntoView();
+  const about = nav.getByRole('link', { name: 'About' }).element().getBoundingClientRect();
+  const row = logout.element().getBoundingClientRect();
+
+  expect(row.y).toBeGreaterThan(about.y);
+});

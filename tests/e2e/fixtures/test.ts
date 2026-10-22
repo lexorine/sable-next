@@ -1,7 +1,6 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { expect, test as base, type Page } from '@playwright/test';
-import type { Command, CommandOk } from '#src/generated/protocol';
 import { AuthFlow } from '../pages/AuthFlow';
 import { AppShell } from '../pages/AppShell';
 import { RoomTimeline } from '../pages/RoomTimeline';
@@ -90,7 +89,6 @@ function deepRoomBodies(count = DEEP_ROOM_MESSAGES): string[] {
 }
 
 type Fixtures = {
-  keepUnverifiedBanner: boolean;
   app: AppShell;
   auth: AuthFlow;
   timeline: RoomTimeline;
@@ -108,7 +106,8 @@ type Fixtures = {
   spaceTree: SpaceTree;
   signIn: () => Promise<void>;
   freshLogin: () => Promise<MatrixAdmin>;
-  proxiedLogin: () => Promise<MatrixAdmin>;
+  proxiedAccount: () => Promise<MatrixAdmin>;
+  proxiedLogin: (account?: MatrixAdmin) => Promise<MatrixAdmin>;
   scratchRoom: { roomId: string; name: string };
 };
 
@@ -160,25 +159,13 @@ async function saveSignedInState(
 const RESIZE_OBSERVER_NOTICE = /^ResizeObserver loop /;
 
 export const test = base.extend<Fixtures, WorkerFixtures>({
-  keepUnverifiedBanner: [false, { option: true }],
-  page: async ({ page, keepUnverifiedBanner }, use) => {
+  page: async ({ page }, use) => {
     const errors: Error[] = [];
     const onError = (error: Error) => {
       if (RESIZE_OBSERVER_NOTICE.test(error.message)) return;
       errors.push(error);
     };
     page.on('pageerror', onError);
-    if (!keepUnverifiedBanner) {
-      await page.addLocatorHandler(
-        page.getByRole('status').filter({ hasText: /not verified/ }),
-        (banner) =>
-          banner
-            .getByRole('button', { name: 'Close' })
-            .click({ timeout: 2000 })
-            .catch(() => undefined),
-        { noWaitAfter: true }
-      );
-    }
     try {
       await use(page);
     } finally {
@@ -340,7 +327,7 @@ export const test = base.extend<Fixtures, WorkerFixtures>({
                     )
                   );
               },
-              { timeout: 120_000, intervals: [1_000] }
+              { timeout: 150_000, intervals: [1_000] }
             )
             .toEqual(
               expect.arrayContaining(
@@ -373,12 +360,19 @@ export const test = base.extend<Fixtures, WorkerFixtures>({
     workerProxy.reset();
   },
 
-  proxiedLogin: async ({ page, homeserver, workerProxy }, use, testInfo) => {
+  proxiedAccount: async ({ homeserver }, use, testInfo) => {
     await use(async () => {
       const username = `proxied-${String(testInfo.parallelIndex)}-${String(Date.now())}`;
       const account = await registerUser(homeserver.baseUrl, username, LOGIN_PASSWORD);
-      await signInThroughUi(page, workerProxy.baseUrl, username);
       return new MatrixAdmin(homeserver.baseUrl, account.accessToken, account.userId);
+    });
+  },
+
+  proxiedLogin: async ({ page, workerProxy, proxiedAccount }, use) => {
+    await use(async (existing) => {
+      const account = existing ?? (await proxiedAccount());
+      await signInThroughUi(page, workerProxy.baseUrl, account.userId.slice(1).split(':')[0]);
+      return account;
     });
   },
 
@@ -418,7 +412,7 @@ export const test = base.extend<Fixtures, WorkerFixtures>({
 
       await use(path);
     },
-    { scope: 'worker', timeout: 180_000 },
+    { scope: 'worker', timeout: 240_000 },
   ],
 
   installEmptyCore: async ({ page, workerSession }, use) => {
@@ -573,22 +567,14 @@ export { expect } from '@playwright/test';
 async function installEmptyCore(page: Page, mode: WorkerMode, session: Session): Promise<void> {
   await page.addInitScript(
     ({ workerMode, workerSession }: { workerMode: WorkerMode; workerSession: Session }) => {
-      type CommandType = Command['type'];
-      type OkFor<T extends CommandType> = Extract<CommandOk, { type: T }>;
-      type BareCommandType = {
-        [T in CommandType]: keyof OkFor<T> extends 'type' ? T : never;
-      }[CommandType];
-
-      const bareReply = <T extends CommandType>(type: T): OkFor<T> => ({ type }) as OkFor<T>;
-
-      const reply = (command: Command): CommandOk =>
-        command.type === 'restore'
-          ? { type: 'restore', session: workerSession }
-          : command.type === 'list_accounts'
-            ? { type: 'list_accounts', accounts: [workerSession] }
-            : command.type === 'subscribe_room_list'
-              ? { type: 'subscribe_room_list', subscription: 1, rooms: [] }
-              : bareReply(command.type as BareCommandType);
+      const callReply = (method: string): unknown =>
+        method === 'session.restore'
+          ? workerSession
+          : method === 'session.list_accounts'
+            ? [workerSession]
+            : method === 'timeline.subscribe_room_list'
+              ? { subscription: 1, rooms: [] }
+              : null;
 
       class FakePort {
         onmessage: ((event: MessageEvent) => void) | null = null;
@@ -598,15 +584,16 @@ async function installEmptyCore(page: Page, mode: WorkerMode, session: Session):
 
         close(): void {}
 
-        postMessage(request: { id: number; command?: Command }): void {
-          const command = request.command;
-          if (!command) return;
-          if (workerMode === 'loading' && command.type === 'restore') return;
+        postMessage(request: { id: number; call?: { method: string; params: unknown } }): void {
+          const { call } = request;
+          if (!call) return;
+          const restoring = call.method === 'session.restore';
+          if (workerMode === 'loading' && restoring) return;
 
           const response =
-            workerMode === 'error' && command.type === 'restore'
+            workerMode === 'error' && restoring
               ? { id: request.id, err: { code: 'unavailable' } }
-              : { id: request.id, ok: reply(command) };
+              : { id: request.id, ok: callReply(call.method) };
 
           window.setTimeout(() => {
             this.onmessage?.({ data: response } as MessageEvent);

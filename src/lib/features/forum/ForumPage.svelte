@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { MediaQuery } from 'svelte/reactivity';
   import type { RoomPermissionsView } from '#src/generated/protocol';
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
@@ -34,7 +35,6 @@
   import { preferences, readReceiptIsPrivate } from '#lib/settings/preferences.svelte.js';
   import { holdOverlayBack } from '#lib/platform/overlay-back.svelte.js';
   import { BREAKPOINTS } from '#lib/ui/breakpoints.js';
-  import { createMediaQuery } from '#lib/ui/media-query.svelte.js';
   import TextInput from '#lib/ui/primitives/TextInput.svelte';
   import { toasts } from '#lib/ui/toasts.svelte.js';
 
@@ -58,17 +58,20 @@
   const messageMenu = provideMessageMenu(new OpenMessageMenu());
   const forumThreads = new ForumThreads(core);
   const memberLoader = new RoomMemberLoader();
-  const pinnedEvents = new PinnedEvents(core.commands);
+  const pinnedEvents = new PinnedEvents(core.rpc.timeline);
   providePinnedEvents(pinnedEvents);
 
   let resolvedRoom = $derived(findRoomByPathId(roomList.rooms, roomId));
   let resolvedRoomId = $derived(resolvedRoom?.room_id ?? roomId);
   let roomName = $derived(resolvedRoom?.name ?? roomId);
   let roomAvatar = $derived(resolvedRoom?.avatar_url ?? null);
-  let threadRootId = $state<string | null>(null);
-  const sidePanels = createMediaQuery(BREAKPOINTS.sidePanels);
-  let threadInPanel = $derived(sidePanels.matches && preferences.threadPresentation === 'panel');
-  let permissions = $state<RoomPermissionsView | null>(null);
+  let threadRootId = $derived.by<string | null>(() => {
+    void resolvedRoomId;
+    return null;
+  });
+  const sidePanels = new MediaQuery(BREAKPOINTS.sidePanels);
+  let threadInPanel = $derived(sidePanels.current && preferences.threadPresentation === 'panel');
+  let permissions = $state.raw<RoomPermissionsView | null>(null);
   let latestEventId = $derived.by(() => {
     const items = forumThreads.roomTimeline.items;
     for (let index = items.length - 1; index >= 0; index -= 1) {
@@ -101,12 +104,13 @@
     if (forumThreads.loading || forumThreads.backwardPagination !== 'idle') return;
     if (autoFills >= AUTO_FILL_ROUNDS) return;
     autoFills += 1;
-    forumThreads.paginateBackward(50).catch(() => {});
+    forumThreads.paginateBackward(50).catch((error: unknown) => {
+      console.warn('[sable forum] loading threads failed', error);
+    });
   });
 
   $effect(() => {
     void resolvedRoomId;
-    threadRootId = null;
     memberLoader.reset();
   });
 
@@ -124,18 +128,21 @@
   $effect(() => {
     if (threadRootId === null) return;
     const activeRoomId = resolvedRoomId;
-    void memberLoader.load(activeRoomId, (id) => core.commands.roomMembers(id));
+    void memberLoader.load(activeRoomId, (id) =>
+      core.rpc.members.list({ room_id: id, memberships: [] })
+    );
   });
 
   $effect(() => {
     const activeRoomId = resolvedRoomId;
     let current = true;
-    core.commands
-      .roomPermissions(activeRoomId)
+    core.rpc.members
+      .permissions({ room_id: activeRoomId })
       .then((next) => {
         if (current) permissions = next;
       })
-      .catch(() => {
+      .catch((error: unknown) => {
+        console.warn('[sable forum] loading permissions failed', error);
         if (current) permissions = null;
       });
     return () => {
@@ -144,13 +151,14 @@
   });
 
   async function markRead(eventId: string): Promise<void> {
-    await core.commands.markRead(
-      resolvedRoomId,
-      eventId,
-      readReceiptIsPrivate(),
-      null,
-      forumThreads.roomTimeline.subscriptionId
-    );
+    await core.rpc.timeline.markRead({
+      room_id: resolvedRoomId,
+      event_id: eventId,
+      private_receipt: readReceiptIsPrivate(),
+      thread_root: null,
+      subscription: forumThreads.roomTimeline.subscriptionId,
+      fully_read: false,
+    });
   }
 
   function openThread(eventId: string): void {
@@ -162,10 +170,12 @@
   }
 
   function deleteThread(eventId: string, reason: string | null): void {
-    void core.commands.deleteThread(resolvedRoomId, eventId, reason).catch((error: unknown) => {
-      console.warn('[sable forum] deleting a thread failed', error);
-      toasts.error($i18n.t('errors.actionFailed'));
-    });
+    void core.rpc.messages
+      .deleteThread({ room_id: resolvedRoomId, root_event_id: eventId, reason })
+      .catch((error: unknown) => {
+        console.warn('[sable forum] deleting a thread failed', error);
+        toasts.error(i18n.t('errors.actionFailed'));
+      });
   }
 
   function togglePin(eventId: string): void {
@@ -181,7 +191,7 @@
       { room_id: resolvedRoomId, canonical_alias: resolvedRoom?.canonical_alias ?? null },
       eventId
     ).then((copied) => {
-      if (!copied) toasts.error($i18n.t('errors.copyFailed'));
+      if (!copied) toasts.error(i18n.t('errors.copyFailed'));
     });
   }
 
@@ -199,7 +209,9 @@
   }
 
   function loadMoreThreads(): void {
-    forumThreads.paginateBackward(30).catch(() => {});
+    forumThreads.paginateBackward(30).catch((error: unknown) => {
+      console.warn('[sable forum] loading threads failed', error);
+    });
   }
 
   async function findJustSent(body: string, sentAfter: number): Promise<string | null> {
@@ -248,10 +260,9 @@
 />
 <MessageContextMenu menu={messageMenu} />
 
-<main class="forum-page" aria-label={$i18n.t('forum.label')} data-inset-owner="top">
+<main class="forum-page" aria-label={i18n.t('forum.label')} data-inset-owner="top">
   <div
-    class="forum-main"
-    class:thread-covered={threadRootId !== null && !threadInPanel}
+    class={['forum-main', { 'thread-covered': threadRootId !== null && !threadInPanel }]}
     inert={threadRootId !== null && !threadInPanel}
   >
     <ForumHeader
@@ -262,6 +273,7 @@
       onSearch={() => searchInRoom(resolvedRoom, resolvedRoomId)}
       onEventTimeline={preferences.developerTools
         ? () => {
+            // eslint-disable-next-line svelte/no-navigation-without-resolve -- eventTimelinePath() resolves the route itself
             void goto(eventTimelinePath(resolvedRoomId));
           }
         : undefined}
@@ -269,12 +281,12 @@
     <RoomBannerStrip roomId={resolvedRoomId} />
     <div class="forum-content">
       <div class="forum-compose-area">
-        <p class="forum-composer-hint">{$i18n.t('forum.newThreadHint')}</p>
+        <p class="forum-composer-hint">{i18n.t('forum.newThreadHint')}</p>
         <TextInput
           bind:value={conversation.forumTitle}
           maxlength={FORUM_TITLE_MAX}
-          placeholder={$i18n.t('forum.titlePlaceholder')}
-          aria-label={$i18n.t('forum.titleLabel')}
+          placeholder={i18n.t('forum.titlePlaceholder')}
+          aria-label={i18n.t('forum.titleLabel')}
           disabled={permissions ? !permissions.can_post : false}
         />
         <ConversationComposer
@@ -295,7 +307,6 @@
         onDelete={deleteThread}
         roomId={resolvedRoomId}
         onReact={permissions?.can_react === false ? undefined : conversation.toggleReaction}
-        loadImagePacks={core.commands.imagePacks}
         onCopyLink={copyEventLink}
         onLoadMore={loadMoreThreads}
         isPinned={(eventId) => pinnedEvents.has(eventId)}
@@ -310,7 +321,7 @@
         roomId={resolvedRoomId}
         rootEventId={threadRootId}
         sidePanel={threadInPanel}
-        backLabel={$i18n.t('forum.backToForum')}
+        backLabel={i18n.t('forum.backToForum')}
         rootMessage={forumThreads.roomTimeline.items.find((item) => item.event_id === threadRootId)}
         {roomName}
         members={memberLoader.members}

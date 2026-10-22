@@ -2,15 +2,14 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 
 vi.mock('../worker/core.worker.ts?sharedworker&url', () => ({ default: 'core.worker.js' }));
 vi.mock('#src/generated/wasm/sable_wasm_version.js', () => ({ default: 'test-wasm-version' }));
+vi.mock('#lib/migrations/v1/migration.js', () => ({ migrateV1: () => undefined }));
 
-const { captureException, captureMessage } = vi.hoisted(() => ({
+const { captureException } = vi.hoisted(() => ({
   captureException: vi.fn<(error: unknown, context?: unknown) => void>(),
-  captureMessage: vi.fn(),
 }));
 vi.mock('@sentry/sveltekit', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@sentry/sveltekit')>()),
   captureException,
-  captureMessage,
 }));
 
 class FakePort {
@@ -63,10 +62,12 @@ class FakeSharedWorker extends EventTarget {
   static created = 0;
   port = new FakePort();
   url: URL;
+  name: string | undefined;
 
-  constructor(url: string | URL) {
+  constructor(url: string | URL, options?: WorkerOptions) {
     super();
     this.url = new URL(url);
+    this.name = options?.name;
     FakeSharedWorker.last = this;
     FakeSharedWorker.created += 1;
   }
@@ -78,6 +79,11 @@ beforeEach(() => {
   FakeSharedWorker.created = 0;
   vi.stubGlobal('SharedWorker', FakeSharedWorker);
   vi.stubGlobal('self', { location: new URL('https://sable.test/room') });
+  const stored = new Map<string, string>();
+  vi.stubGlobal('localStorage', {
+    getItem: (key: string) => stored.get(key) ?? null,
+    setItem: (key: string, value: string) => stored.set(key, value),
+  });
 });
 
 afterEach(() => {
@@ -108,7 +114,7 @@ async function load() {
 
 test('uses a WASM-specific worker URL', async () => {
   const transport = await load();
-  void transport.send({ type: 'room_members', room_id: '!r:example.org' } as never);
+  void transport.call('members.list', { room_id: '!r:example.org' });
 
   expect(FakeSharedWorker.last?.url.searchParams.get('wasm')).toBeTruthy();
 }, 20_000);
@@ -120,7 +126,7 @@ test('adopts a prewarmed worker instead of opening a second one', async () => {
   expect(FakeSharedWorker.created).toBe(1);
 
   const transport = createWebTransport();
-  void transport.send({ type: 'room_members', room_id: '!r:example.org' } as never);
+  void transport.call('members.list', { room_id: '!r:example.org' });
 
   expect(FakeSharedWorker.created).toBe(1);
   expect(FakeSharedWorker.last?.port.posted).toHaveLength(1);
@@ -134,9 +140,7 @@ test('a prewarmed worker that failed to load rejects the first request', async (
 
   const transport = createWebTransport();
 
-  await expect(
-    transport.send({ type: 'room_members', room_id: '!r:example.org' } as never)
-  ).rejects.toThrow();
+  await expect(transport.call('members.list', { room_id: '!r:example.org' })).rejects.toThrow();
 });
 
 test('uses an in-memory event cache in an iOS PWA', async () => {
@@ -145,9 +149,32 @@ test('uses an in-memory event cache in an iOS PWA', async () => {
     standalone: true,
   });
   const transport = await load();
-  void transport.send({ type: 'room_members', room_id: '!r:example.org' } as never);
+  void transport.call('members.list', { room_id: '!r:example.org' });
 
   expect(FakeSharedWorker.last?.url.searchParams.get('event-cache')).toBe('memory');
+});
+
+test('sends the log filter to the shared worker instead of forking it by URL', async () => {
+  vi.stubGlobal('self', { location: new URL('https://sable.test/room?log=debug') });
+  const transport = await load();
+  void transport.call('members.list', { room_id: '!r:example.org' });
+
+  expect(FakeSharedWorker.last?.url.searchParams.has('log')).toBe(false);
+  expect(FakeSharedWorker.last?.port.posted).toContainEqual({ logFilter: 'debug' });
+});
+
+test('a superseded worker rejects pending work and is never reopened', async () => {
+  const transport = await load();
+  const superseded = vi.fn();
+  transport.subscribeSuperseded?.(superseded);
+  const pending = transport.call('members.list', { room_id: '!r:example.org' });
+
+  FakeSharedWorker.last?.port.receive({ superseded: true });
+
+  expect(superseded).toHaveBeenCalledOnce();
+  await expect(pending).rejects.toThrow();
+  await expect(transport.call('members.list', { room_id: '!r:example.org' })).rejects.toThrow();
+  expect(FakeSharedWorker.created).toBe(1);
 });
 
 test('preserves rich attachment captions and mentions across the worker transport', async () => {
@@ -243,7 +270,7 @@ test('sends a gallery as one worker request', async () => {
 test('a slow command reports an unresponsive worker', async () => {
   expect(
     await stalledFor((transport) => {
-      void transport.send({ type: 'room_members', room_id: '!r:example.org' } as never);
+      void transport.call('members.list', { room_id: '!r:example.org' });
     })
   ).toBe(true);
 });
@@ -251,7 +278,7 @@ test('a slow command reports an unresponsive worker', async () => {
 test('a slow command does not report a responsive worker as unresponsive', async () => {
   expect(
     await stalledFor((transport) => {
-      void transport.send({ type: 'room_members', room_id: '!r:example.org' } as never);
+      void transport.call('members.list', { room_id: '!r:example.org' });
     }, true)
   ).toBe(false);
 });
@@ -260,8 +287,8 @@ test('a command response clears an unresponsive report while other commands rema
   const transport = await load();
   const stalls: boolean[] = [];
   transport.subscribeStall((stalled) => stalls.push(stalled));
-  void transport.send({ type: 'room_members', room_id: '!r:example.org' } as never).catch(() => {});
-  void transport.send({ type: 'user_profile', user_id: '@u:example.org' }).catch(() => {});
+  void transport.call('members.list', { room_id: '!r:example.org' }).catch(() => {});
+  void transport.call('account.user_profile', { user_id: '@u:example.org' }).catch(() => {});
 
   await vi.advanceTimersByTimeAsync(23_000);
   expect(stalls).toEqual([true]);
@@ -282,7 +309,7 @@ test('an interrupted IndexedDB transaction requests explicit recovery', async ()
   const transport = await load();
   const interrupted = vi.fn();
   transport.subscribeStorageFailure?.(interrupted);
-  void transport.send({ type: 'room_members', room_id: '!r:example.org' } as never).catch(() => {});
+  void transport.call('members.list', { room_id: '!r:example.org' }).catch(() => {});
 
   FakeSharedWorker.last?.port.receive({
     logs: [
@@ -305,14 +332,14 @@ test('resetCaches terminates the worker and drops the cached stores', async () =
       deleted.push(name);
       const request = {} as IDBOpenDBRequest;
       queueMicrotask(() => {
-        request.onsuccess?.call(request, new Event('success'));
+        request.onsuccess?.(new Event('success'));
       });
       return request;
     },
   });
 
   const transport = await load();
-  void transport.send({ type: 'room_members', room_id: '!r:example.org' } as never).catch(() => {});
+  void transport.call('members.list', { room_id: '!r:example.org' }).catch(() => {});
 
   await transport.resetCaches([]);
 
@@ -322,7 +349,7 @@ test('resetCaches terminates the worker and drops the cached stores', async () =
 
 test('a worker crash reports the stack the worker sent, grouped on its message', async () => {
   const transport = await load();
-  void transport.send({ type: 'room_members', room_id: '!r:example.org' } as never).catch(() => {});
+  void transport.call('members.list', { room_id: '!r:example.org' }).catch(() => {});
 
   FakeSharedWorker.last?.port.receive({
     panic: {
@@ -339,17 +366,63 @@ test('a worker crash reports the stack the worker sent, grouped on its message',
   });
 });
 
+test('a panicked worker is replaced under a new name', async () => {
+  const transport = await load();
+  void transport.call('members.list', { room_id: '!r:example.org' }).catch(() => {});
+  const panicked = FakeSharedWorker.last;
+  expect(panicked?.name).toBe('sable-core');
+
+  panicked?.port.receive({ panic: { message: 'failed to remove an event' } });
+  void transport.call('members.list', { room_id: '!r:example.org' }).catch(() => {});
+
+  expect(FakeSharedWorker.last).not.toBe(panicked);
+  expect(FakeSharedWorker.last?.name).toBe('sable-core-1');
+});
+
+test('a page opened after a panic uses the new name, and each panic moves it on', async () => {
+  const first = await load();
+  void first.call('members.list', { room_id: '!r:example.org' }).catch(() => {});
+  FakeSharedWorker.last?.port.receive({ panic: { message: 'first panic' } });
+
+  vi.resetModules();
+  const reloaded = await load();
+  void reloaded.call('members.list', { room_id: '!r:example.org' }).catch(() => {});
+  expect(FakeSharedWorker.last?.name).toBe('sable-core-1');
+
+  FakeSharedWorker.last?.port.receive({ panic: { message: 'second panic' } });
+  void reloaded.call('members.list', { room_id: '!r:example.org' }).catch(() => {});
+  expect(FakeSharedWorker.last?.name).toBe('sable-core-2');
+});
+
+test('tabs that crash on the same worker agree on the next one', async () => {
+  const first = await load();
+  void first.call('members.list', { room_id: '!r:example.org' }).catch(() => {});
+  const firstWorker = FakeSharedWorker.last;
+  const second = await load();
+  void second.call('members.list', { room_id: '!r:example.org' }).catch(() => {});
+  const secondWorker = FakeSharedWorker.last;
+
+  firstWorker?.port.receive({ panic: { message: 'shared panic' } });
+  secondWorker?.port.receive({ panic: { message: 'shared panic' } });
+  void first.call('members.list', { room_id: '!r:example.org' }).catch(() => {});
+  const firstNext = FakeSharedWorker.last;
+  void second.call('members.list', { room_id: '!r:example.org' }).catch(() => {});
+
+  expect(firstNext?.name).toBe('sable-core-1');
+  expect(FakeSharedWorker.last?.name).toBe('sable-core-1');
+});
+
 test('a worker startup failure rejects restore and allows a new worker', async () => {
   const transport = await load();
   const crashed = vi.fn();
   transport.subscribeCrash(crashed);
-  const restored = transport.send({ type: 'restore' }).catch((error: unknown) => error);
+  const restored = transport.call('session.restore', {}).catch((error: unknown) => error);
   const failed = FakeSharedWorker.last;
   failed?.dispatchEvent(new Event('error'));
   await Promise.resolve();
   expect(crashed).toHaveBeenCalledTimes(1);
   expect(await restored).toBeInstanceOf(Error);
-  const retry = transport.send({ type: 'restore' }).catch(() => undefined);
+  const retry = transport.call('session.restore', {}).catch(() => undefined);
   expect(FakeSharedWorker.last).not.toBe(failed);
   failed?.dispatchEvent(new Event('error'));
   expect(crashed).toHaveBeenCalledTimes(1);
@@ -359,16 +432,31 @@ test('a worker startup failure rejects restore and allows a new worker', async (
 
 test('reports new core errors after twenty distinct failures', async () => {
   const transport = await load();
-  const restored = transport.send({ type: 'restore' }).catch(() => undefined);
-  captureMessage.mockClear();
+  const restored = transport.call('session.restore', {}).catch(() => undefined);
+  captureException.mockClear();
   const logs = Array.from(
     { length: 26 },
     (_, index) => `ERROR failure_${String.fromCharCode(97 + index)}`
   );
   FakeSharedWorker.last?.port.receive({ logs });
-  expect(captureMessage).toHaveBeenCalledTimes(26);
+  expect(captureException).toHaveBeenCalledTimes(26);
   FakeSharedWorker.last?.port.receive({ logs });
-  expect(captureMessage).toHaveBeenCalledTimes(26);
+  expect(captureException).toHaveBeenCalledTimes(26);
   transport.close();
   await restored;
+});
+
+test('tells the worker whether the page is visible, on connect and on every change', async () => {
+  const page = Object.assign(new EventTarget(), { visibilityState: 'hidden' });
+  vi.stubGlobal('document', page);
+  const transport = await load();
+  void transport.call('members.list', { room_id: '!r:example.org' });
+  const port = FakeSharedWorker.last?.port;
+
+  expect(port?.posted).toContainEqual({ visible: false });
+
+  page.visibilityState = 'visible';
+  page.dispatchEvent(new Event('visibilitychange'));
+
+  expect(port?.posted).toContainEqual({ visible: true });
 });

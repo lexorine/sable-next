@@ -8,6 +8,8 @@ export function parsePronouns(input: string): PronounView[] {
     .map((entry) => entry.trim())
     .filter((entry) => entry !== '')
     .map((entry) => {
+      const prefixed = /^([a-z]{2,8}(?:-[a-z0-9]{1,8})*)\s*:\s*(.+)$/i.exec(entry);
+      if (prefixed) return { summary: prefixed[2].trim(), language: prefixed[1].toLowerCase() };
       const match = /^(.*?)(?:\s*\(([^)]+)\))?$/.exec(entry);
       return {
         summary: match?.[1]?.trim() || entry,
@@ -27,6 +29,25 @@ export function splitDisplayNamePronouns(name: string): {
   const stripped = name.replace(match[0], '').trim();
   if (stripped === '') return { name, pronouns: [] };
   return { name: stripped, pronouns: [{ summary: match[1] || match[2], language: null }] };
+}
+
+const PLURALKIT_GROUP = /\s*[([]([^()[\]]+)[)\]]/gu;
+const PLURALKIT_SET = /^[\p{L}\p{N}'_-]+(?:\/[\p{L}\p{N}'_-]+){1,3}$/u;
+
+export function splitPluralkitNamePronouns(name: string): {
+  name: string;
+  pronouns: PronounView[];
+} {
+  const pronouns: PronounView[] = [];
+  const stripped = name
+    .replace(PLURALKIT_GROUP, (group: string, inner: string) => {
+      const sets = inner.split(/[,;|]/u).map((entry) => entry.trim());
+      if (!sets.every((entry) => PLURALKIT_SET.test(entry))) return group;
+      pronouns.push(...sets.map((summary) => ({ summary, language: null })));
+      return '';
+    })
+    .trim();
+  return stripped === '' ? { name, pronouns: [] } : { name: stripped, pronouns };
 }
 
 export function withDisplayNamePronouns(
@@ -88,4 +109,22 @@ export function visiblePronouns(
     summary: clampPronoun(pronoun.summary, maxLength),
   }));
   return { visible: clamped.slice(0, limit), overflow: clamped.slice(limit) };
+}
+
+export function fittingPillCount(
+  widths: readonly number[],
+  overflowWidth: number,
+  gap: number,
+  available: number,
+  forceOverflow = false
+): number {
+  let used = 0;
+  let count = 0;
+  for (const [index, width] of widths.entries()) {
+    used += width + (index > 0 ? gap : 0);
+    const needsOverflow = forceOverflow || index < widths.length - 1;
+    const total = used + (needsOverflow ? gap + overflowWidth : 0);
+    if (total <= available) count = index + 1;
+  }
+  return count;
 }

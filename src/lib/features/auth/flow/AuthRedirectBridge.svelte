@@ -1,7 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { on } from 'svelte/events';
-  import { removeLocalValue } from '#lib/platform/local-json.js';
+  import { readText, removeLocalValue, writeText } from '#lib/platform/local-json.js';
 
   import {
     callbackChannelName,
@@ -21,6 +20,7 @@
   }
 
   let { onCallback, onRegistrationComplete, onCallbackWindow }: Props = $props();
+  const HANDLED_CALLBACK_KEY = 'sable-handled-auth-callback';
   let removeDeepLinkListener: (() => void) | undefined;
   let disposed = false;
 
@@ -35,10 +35,22 @@
     }, 0);
   }
 
+  function handleStorage(event: StorageEvent): void {
+    if (event.key !== 'sable-registration-complete' || !event.newValue) return;
+    removeLocalValue(event.key);
+    onRegistrationComplete();
+  }
+
+  function handleCallback(url: string): void {
+    if (url === readText(HANDLED_CALLBACK_KEY)) return;
+    writeText(HANDLED_CALLBACK_KEY, url);
+    onCallback(url);
+  }
+
   async function watchDeepLinks(): Promise<void> {
     const unlisten = await subscribeDeepLinks((urls) => {
       const url = urls.find((candidate) => redirectLoginType(candidate));
-      if (url) onCallback(url);
+      if (url) handleCallback(url);
     });
 
     if (disposed) {
@@ -48,16 +60,10 @@
     removeDeepLinkListener = unlisten;
 
     const url = (await currentDeepLinks()).find((candidate) => redirectLoginType(candidate));
-    if (url) onCallback(url);
+    if (url) handleCallback(url);
   }
 
   onMount(() => {
-    const offStorage = on(window, 'storage', (event: StorageEvent) => {
-      if (event.key !== 'sable-registration-complete' || !event.newValue) return;
-      removeLocalValue(event.key);
-      onRegistrationComplete();
-    });
-
     const callbackUrl = window.location.href;
     if (deliversDeepLinks()) void watchDeepLinks();
     else if (redirectLoginType(callbackUrl)) handOffCallbackWindow(callbackUrl);
@@ -65,7 +71,8 @@
     return () => {
       disposed = true;
       removeDeepLinkListener?.();
-      offStorage();
     };
   });
 </script>
+
+<svelte:window onstorage={handleStorage} />

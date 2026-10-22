@@ -1,24 +1,14 @@
+import { fileURLToPath } from 'node:url';
+
 import js from '@eslint/js';
-import { defineConfig, globalIgnores } from 'eslint/config';
+import { defineConfig, includeIgnoreFile } from 'eslint/config';
 import globals from 'globals';
 import oxlint from 'eslint-plugin-oxlint';
 import svelte from 'eslint-plugin-svelte';
 import tseslint from 'typescript-eslint';
 
 export default defineConfig([
-  globalIgnores([
-    'build/**',
-    'coverage/**',
-    'dist/**',
-    'node_modules/**',
-    'playwright-report/**',
-    'src/generated/**',
-    'target/**',
-    'target-local/**',
-    'test-results/**',
-    'wasm/**',
-    '.svelte-kit/**',
-  ]),
+  includeIgnoreFile(fileURLToPath(new URL('.gitignore', import.meta.url))),
   js.configs.recommended,
   ...tseslint.configs.strict,
   svelte.configs.recommended,
@@ -52,19 +42,33 @@ export default defineConfig([
     },
   },
   {
+    files: ['src/lib/**/*.{ts,svelte}'],
+    ignores: ['src/lib/features/**', 'src/lib/**/*.test.ts', 'src/lib/**/*.test.svelte'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: ['#lib/features/*', '**/features/*'],
+              message: 'Shared lib must not import from a feature; move the module down instead.',
+            },
+          ],
+        },
+      ],
+    },
+  },
+  {
     files: ['**/*.svelte'],
     languageOptions: {
       parserOptions: {
         extraFileExtensions: ['.svelte'],
         parser: tseslint.parser,
+        svelteConfig: { compilerOptions: { experimental: { async: true } } },
       },
     },
     rules: {
       'no-undef': 'off',
-      'svelte/no-unused-props': 'error',
-      'svelte/no-unused-svelte-ignore': 'error',
-      'svelte/no-useless-children-snippet': 'error',
-      'svelte/no-useless-mustaches': 'error',
       'svelte/prefer-const': 'error',
       'svelte/valid-compile': ['error', { ignoreWarnings: false }],
 
@@ -77,6 +81,12 @@ export default defineConfig([
       // but the modules are still evaluated in node when prerendering the shell.
       'svelte/no-top-level-browser-globals': 'error',
       'svelte/prefer-derived-over-derived-by': 'error',
+      'svelte/block-lang': ['error', { script: 'ts' }],
+      'svelte/no-bind-value-on-checkable-inputs': 'error',
+      'svelte/no-conflicting-module-names': 'error',
+      'svelte/no-nested-style-tag': 'error',
+      'svelte/require-event-prefix': 'error',
+      'svelte/valid-style-parse': 'error',
     },
   },
   {
@@ -95,18 +105,27 @@ export default defineConfig([
     },
   },
   {
-    // SvelteKit keeps the service worker out of the app's tsconfig, since it
-    // compiles against webworker libs rather than the DOM's.
-    files: ['src/service-worker.ts'],
-    extends: [tseslint.configs.disableTypeChecked],
+    files: ['src/lib/platform/*-worklet.js'],
+    languageOptions: { globals: { ...globals.audioWorklet } },
+  },
+  {
+    files: ['src/service-worker/**/*.ts'],
     languageOptions: {
-      parserOptions: { projectService: false, project: false },
       globals: { ...globals.serviceworker },
     },
   },
   {
-    files: ['**/*.{js,mjs,cjs}'],
-    extends: [tseslint.configs.disableTypeChecked],
+    files: ['tests/e2e/**/*.ts'],
+    ignores: ['tests/e2e/fixtures/settle.ts'],
+    rules: {
+      'no-restricted-properties': [
+        'error',
+        {
+          property: 'waitForTimeout',
+          message: 'Wait on a condition, or name the window in fixtures/settle.ts.',
+        },
+      ],
+    },
   },
-  oxlint.configs['flat/recommended'],
+  ...oxlint.buildFromOxlintConfigFile('./.oxlintrc.json'),
 ]);

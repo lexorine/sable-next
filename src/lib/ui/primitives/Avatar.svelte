@@ -9,11 +9,12 @@
   import type { ClassValue } from 'svelte/elements';
 
   import MediaImage from '#lib/ui/MediaImage.svelte';
+  import { isAnimatedImage } from '#lib/ui/media-url.js';
 
   import { identityColor } from './identity-color.js';
   import { toInitials } from './initials.js';
 
-  type AvatarSize = 'small' | 'medium' | 'large';
+  type AvatarSize = 'tiny' | 'small' | 'medium' | 'large';
   type Props = {
     src?: string | null;
     alt?: string;
@@ -58,6 +59,18 @@
   let plate = $derived(color ?? (id === null ? undefined : identityColor(id)));
   let tint = $derived(paintedSrc === src ? undefined : plate);
   let hovered = $state(false);
+  let animatedSrc = $state<string | null>(null);
+
+  async function checkAnimated(source: string, url: string | null): Promise<void> {
+    if (!url) return;
+    try {
+      const blob = await (await fetch(url)).blob();
+      const head = await blob.slice(0, 65536).arrayBuffer();
+      if (isAnimatedImage(new Uint8Array(head))) animatedSrc = source;
+    } catch (error) {
+      console.debug('[sable media] the avatar could not be checked for animation', error);
+    }
+  }
 
   function playOnHover(node: HTMLElement): () => void {
     const scope = node.closest<HTMLElement>(HOVER_SCOPE) ?? node;
@@ -93,14 +106,25 @@
       {uniform}
       tint={recolor}
       {original}
+      pixelate={false}
       onloaded={() => {
         paintedSrc = src;
         failedSrc = null;
       }}
-      onfailed={() => (failedSrc = src)}
+      onfailed={(source) => (failedSrc = source)}
     />
     {#if hovered && !original}
-      <MediaImage class="avatar-image" source={src} alt="" width={96} height={96} original />
+      <MediaImage
+        class="avatar-image"
+        style={animatedSrc === src ? undefined : 'opacity: 0'}
+        source={src}
+        alt=""
+        width={96}
+        height={96}
+        original
+        pixelate={false}
+        onloaded={(url) => void checkAnimated(src, url)}
+      />
     {/if}
   {:else if src}
     <Avatar.Image {src} alt="" class="avatar-image" />
@@ -132,6 +156,12 @@
     user-select: none;
     vertical-align: middle;
     width: var(--avatar-size);
+  }
+
+  :global(.avatar-tiny) {
+    --avatar-size: var(--avatar-size-100);
+
+    font-size: var(--font-size-small);
   }
 
   :global(.avatar-small) {

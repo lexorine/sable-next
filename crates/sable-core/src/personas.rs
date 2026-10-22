@@ -1,31 +1,34 @@
+use crate::api::personas::DisableRoomParams;
+use crate::api::personas::ReorderParams;
+use crate::api::personas::SaveParams;
+use crate::api::personas::SetSelectionParams;
 use std::collections::{BTreeMap, BTreeSet};
 
 use matrix_sdk::Room;
+use matrix_sdk::ruma::TransactionId;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContentWithoutRelation;
 use matrix_sdk::ruma::events::{
     AnyMessageLikeEventContent, GlobalAccountDataEventType, MessageLikeEventContent,
 };
 use matrix_sdk::ruma::serde::Raw;
-use matrix_sdk::ruma::{OwnedRoomId, TransactionId};
 use matrix_sdk::send_queue::LocalEchoContent;
+use sable_model::non_blank::{NonBlank, NonBlankVerbatim};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value, json};
+use serde_with::{DefaultOnError, MapSkipError, VecSkipError, serde_as};
 
 use crate::Core;
 use crate::ResultExt;
 use crate::profiles::pronoun_sets;
+use crate::protocol::PersonaAlternateAvatarView;
 use crate::protocol::{
-    CommandErr, PerMessageProfileView, PersonaCatalogView, PersonaSelectionView,
-    PersonaTriggerView, PersonaView, PluralkitImportView, PronounView,
+    PerMessageProfileView, PersonaCatalogView, PersonaSelectionView, PersonaTriggerView,
+    PersonaView, PluralkitImportView, PronounView, RpcError,
 };
 
 const CATALOG_V3: &str = "fi.mau.msc4461.per_message_profiles.v3";
 const CATALOG_V2: &str = "fi.mau.msc4461.per_message_profiles.v2";
 const SELECTION_PREFIX: &str = "fyi.cisnt.permessageprofile";
-const PRONOUNS: &str = "io.fsky.nyx.pronouns";
-const COLORS: &str = "eu.she-a.color";
-const PKIMPORT: &str = "net.f0rest.pkimport";
-const TRIGGER_SUFFIX: &str = "net.f0rest.suffix";
-const TRIGGER_CIRCUMFIX: &str = "net.f0rest.circumfix";
 
 pub(crate) const PER_MESSAGE_PROFILE: &str = "com.beeper.per_message_profile";
 
@@ -33,243 +36,449 @@ fn selection_event(scope: &str) -> GlobalAccountDataEventType {
     GlobalAccountDataEventType::from(format!("{SELECTION_PREFIX}.{scope}"))
 }
 
-fn text(value: Option<&Value>) -> Option<String> {
-    value
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+#[serde_as]
+#[derive(Deserialize)]
+struct TriggerIn {
+    #[serde_as(as = "NonBlankVerbatim")]
+    #[serde(default)]
+    prefix: Option<String>,
+    #[serde_as(as = "NonBlankVerbatim")]
+    #[serde(default)]
+    suffix: Option<String>,
+    #[serde_as(deserialize_as = "DefaultOnError")]
+    #[serde(default)]
+    keep_trigger: Option<bool>,
 }
 
-fn color(profile: &Value, key: &str) -> Option<String> {
-    text(profile.get(COLORS).and_then(|colors| colors.get(key)))
-}
+impl TriggerIn {
+    fn into_view(self) -> Option<PersonaTriggerView> {
+        if self.prefix.is_none() && self.suffix.is_none() {
+            return None;
+        }
 
-fn trigger_from_json(value: &Value) -> Option<PersonaTriggerView> {
-    let prefix = text(value.get("prefix"));
-    let suffix = text(value.get("suffix"));
-    if prefix.is_none() && suffix.is_none() {
-        return None;
+        Some(PersonaTriggerView {
+            prefix: self.prefix,
+            suffix: self.suffix,
+            keep_trigger: self.keep_trigger.unwrap_or(false),
+        })
     }
-
-    Some(PersonaTriggerView {
-        prefix,
-        suffix,
-        keep_trigger: value
-            .get("keep_trigger")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-    })
 }
 
-fn triggers_from_v2(trigger: &Value) -> Vec<PersonaTriggerView> {
-    let strings = |key: &str| -> Vec<String> {
-        trigger
-            .get(key)
-            .and_then(Value::as_array)
-            .map_or_else(Vec::new, |entries| {
-                entries
-                    .iter()
-                    .filter_map(|entry| text(Some(entry)))
-                    .collect()
-            })
-    };
+#[serde_as]
+#[derive(Deserialize)]
+struct TriggerV2In {
+    #[serde_as(deserialize_as = "DefaultOnError<Vec<NonBlankVerbatim>>")]
+    #[serde(default)]
+    prefix: Vec<Option<String>>,
+    #[serde_as(deserialize_as = "DefaultOnError<Vec<NonBlankVerbatim>>")]
+    #[serde(default, rename = "net.f0rest.suffix")]
+    suffix: Vec<Option<String>>,
+    #[serde_as(deserialize_as = "DefaultOnError<VecSkipError<_>>")]
+    #[serde(default, rename = "net.f0rest.circumfix")]
+    circumfix: Vec<TriggerIn>,
+}
 
-    let circumfixes: Vec<PersonaTriggerView> = trigger
-        .get(TRIGGER_CIRCUMFIX)
-        .and_then(Value::as_array)
-        .map_or_else(Vec::new, |entries| {
+impl TriggerV2In {
+    fn into_views(self) -> Vec<PersonaTriggerView> {
+        let circumfixes = self
+            .circumfix
+            .into_iter()
+            .filter(|trigger| trigger.prefix.is_some() && trigger.suffix.is_some())
+            .map(|trigger| PersonaTriggerView {
+                prefix: trigger.prefix,
+                suffix: trigger.suffix,
+                keep_trigger: false,
+            });
+        let prefixes = self
+            .prefix
+            .into_iter()
+            .flatten()
+            .map(|prefix| PersonaTriggerView {
+                prefix: Some(prefix),
+                suffix: None,
+                keep_trigger: false,
+            });
+        let suffixes = self
+            .suffix
+            .into_iter()
+            .flatten()
+            .map(|suffix| PersonaTriggerView {
+                prefix: None,
+                suffix: Some(suffix),
+                keep_trigger: false,
+            });
+
+        circumfixes.chain(prefixes).chain(suffixes).collect()
+    }
+}
+
+#[serde_as]
+#[derive(Default, Deserialize)]
+struct ColorsIn {
+    #[serde_as(as = "NonBlank")]
+    #[serde(default)]
+    on_light: Option<String>,
+    #[serde_as(as = "NonBlank")]
+    #[serde(default)]
+    on_dark: Option<String>,
+}
+
+#[serde_as]
+#[derive(Deserialize)]
+struct PluralkitIn {
+    #[serde_as(as = "NonBlank")]
+    #[serde(default)]
+    id: Option<String>,
+    #[serde_as(as = "NonBlank")]
+    #[serde(default)]
+    uuid: Option<String>,
+    #[serde_as(as = "NonBlank")]
+    #[serde(default)]
+    avatar_url: Option<String>,
+    #[serde_as(as = "NonBlank")]
+    #[serde(default)]
+    description: Option<String>,
+}
+
+impl PluralkitIn {
+    fn into_view(self) -> Option<PluralkitImportView> {
+        Some(PluralkitImportView {
+            id: self.id?,
+            uuid: self.uuid,
+            avatar_url: self.avatar_url,
+            description: self.description,
+        })
+    }
+}
+
+#[serde_as]
+#[derive(Deserialize)]
+struct AlternateAvatarIn {
+    #[serde_as(as = "NonBlank")]
+    #[serde(default)]
+    id: Option<String>,
+    #[serde_as(as = "NonBlank")]
+    #[serde(default)]
+    avatar_url: Option<String>,
+}
+
+impl AlternateAvatarIn {
+    fn into_view(self) -> Option<PersonaAlternateAvatarView> {
+        Some(PersonaAlternateAvatarView {
+            id: self.id?,
+            avatar_url: self.avatar_url?,
+        })
+    }
+}
+
+#[serde_as]
+#[derive(Deserialize)]
+struct PersonaIn {
+    #[serde_as(as = "NonBlank")]
+    #[serde(default)]
+    id: Option<String>,
+    #[serde_as(deserialize_as = "DefaultOnError")]
+    #[serde(default)]
+    displayname: Option<String>,
+    #[serde_as(as = "NonBlank")]
+    #[serde(default)]
+    avatar_url: Option<String>,
+    #[serde(default, rename = "io.fsky.nyx.pronouns")]
+    pronouns: Option<Value>,
+    #[serde_as(deserialize_as = "DefaultOnError")]
+    #[serde(default, rename = "eu.she-a.color")]
+    colors: Option<ColorsIn>,
+    #[serde_as(deserialize_as = "DefaultOnError<Option<VecSkipError<_>>>")]
+    #[serde(default)]
+    triggers: Option<Vec<TriggerIn>>,
+    #[serde_as(deserialize_as = "DefaultOnError")]
+    #[serde(default)]
+    trigger: Option<TriggerV2In>,
+    #[serde_as(deserialize_as = "DefaultOnError")]
+    #[serde(default, rename = "net.f0rest.pkimport")]
+    pluralkit: Option<PluralkitIn>,
+    #[serde_as(deserialize_as = "DefaultOnError")]
+    #[serde(default, rename = "net.f0rest.last_used")]
+    last_used: Option<u64>,
+    #[serde(default, rename = "net.f0rest.alternate_avatars")]
+    alternate_avatars: Option<Vec<AlternateAvatarIn>>,
+}
+
+impl PersonaIn {
+    fn into_view(self) -> Option<PersonaView> {
+        let colors = self.colors.unwrap_or_default();
+        let triggers = match self.triggers {
+            Some(entries) => entries
+                .into_iter()
+                .filter_map(TriggerIn::into_view)
+                .collect(),
+            None => self.trigger.map_or_else(Vec::new, TriggerV2In::into_views),
+        };
+
+        let alternate_avatars = self.alternate_avatars.map(|entries| {
             entries
-                .iter()
-                .filter_map(|entry| {
-                    Some(PersonaTriggerView {
-                        prefix: text(entry.get("prefix")),
-                        suffix: text(entry.get("suffix")),
-                        keep_trigger: false,
-                    })
-                    .filter(|trigger| trigger.prefix.is_some() && trigger.suffix.is_some())
-                })
+                .into_iter()
+                .filter_map(AlternateAvatarIn::into_view)
                 .collect()
         });
 
-    let prefixes = strings("prefix")
-        .into_iter()
-        .map(|prefix| PersonaTriggerView {
-            prefix: Some(prefix),
-            suffix: None,
-            keep_trigger: false,
-        });
-    let suffixes = strings(TRIGGER_SUFFIX)
-        .into_iter()
-        .map(|suffix| PersonaTriggerView {
-            prefix: None,
-            suffix: Some(suffix),
-            keep_trigger: false,
-        });
-
-    circumfixes
-        .into_iter()
-        .chain(prefixes)
-        .chain(suffixes)
-        .collect()
+        Some(PersonaView {
+            id: self.id?,
+            display_name: self.displayname?,
+            avatar_url: self.avatar_url,
+            pronouns: pronoun_sets(self.pronouns.as_ref()),
+            color_on_light: colors.on_light,
+            color_on_dark: colors.on_dark,
+            triggers,
+            pluralkit: self.pluralkit.and_then(PluralkitIn::into_view),
+            last_used: self.last_used,
+            alternate_avatars,
+        })
+    }
 }
 
-fn pluralkit_from_json(value: Option<&Value>) -> Option<PluralkitImportView> {
-    let record = value?;
-    Some(PluralkitImportView {
-        id: text(record.get("id"))?,
-        uuid: text(record.get("uuid")),
-        avatar_url: text(record.get("avatar_url")),
-        description: text(record.get("description")),
-    })
-}
-
-fn persona_from_json(value: &Value) -> Option<PersonaView> {
-    let id = text(value.get("id"))?;
-    let display_name = value.get("displayname").and_then(Value::as_str)?.to_owned();
-
-    let triggers = value.get("triggers").and_then(Value::as_array).map_or_else(
-        || value.get("trigger").map_or_else(Vec::new, triggers_from_v2),
-        |entries| entries.iter().filter_map(trigger_from_json).collect(),
-    );
-
-    Some(PersonaView {
-        id,
-        display_name,
-        avatar_url: text(value.get("avatar_url")),
-        pronouns: pronoun_sets(value.get(PRONOUNS)),
-        color_on_light: color(value, "on_light"),
-        color_on_dark: color(value, "on_dark"),
-        triggers,
-        pluralkit: pluralkit_from_json(value.get(PKIMPORT)),
-    })
+#[serde_as]
+#[derive(Deserialize)]
+struct ProfilesIn {
+    #[serde_as(deserialize_as = "DefaultOnError<Option<VecSkipError<_>>>")]
+    #[serde(default)]
+    profiles: Option<Vec<PersonaIn>>,
 }
 
 fn personas_from_catalog(content: &Value) -> Vec<PersonaView> {
-    let profiles = content.get("profiles").or_else(|| {
-        content
-            .get("content")
-            .and_then(|inner| inner.get("profiles"))
-    });
+    #[serde_as]
+    #[derive(Deserialize)]
+    struct Wrapped {
+        #[serde_as(deserialize_as = "DefaultOnError")]
+        #[serde(default)]
+        content: Option<ProfilesIn>,
+    }
+
+    let profiles = ProfilesIn::deserialize(content)
+        .ok()
+        .and_then(|catalog| catalog.profiles)
+        .or_else(|| Wrapped::deserialize(content).ok()?.content?.profiles);
 
     let mut seen = BTreeSet::new();
     profiles
-        .and_then(Value::as_array)
-        .map_or_else(Vec::new, |entries| {
-            entries
-                .iter()
-                .filter_map(persona_from_json)
-                .filter(|persona| seen.insert(persona.id.clone()))
-                .collect()
+        .into_iter()
+        .flatten()
+        .filter_map(PersonaIn::into_view)
+        .filter(|persona| seen.insert(persona.id.clone()))
+        .collect()
+}
+
+#[derive(Serialize)]
+struct PronounOut {
+    summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
+}
+
+impl From<&PronounView> for PronounOut {
+    fn from(pronoun: &PronounView) -> Self {
+        Self {
+            summary: pronoun.summary.clone(),
+            language: pronoun.language.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ColorsOut {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    on_light: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    on_dark: Option<String>,
+}
+
+impl ColorsOut {
+    fn new(on_light: Option<String>, on_dark: Option<String>) -> Option<Self> {
+        (on_light.is_some() || on_dark.is_some()).then_some(Self { on_light, on_dark })
+    }
+}
+
+#[derive(Serialize)]
+struct LookOut {
+    #[serde(rename = "io.fsky.nyx.pronouns", skip_serializing_if = "Vec::is_empty")]
+    pronouns: Vec<PronounOut>,
+    #[serde(rename = "eu.she-a.color", skip_serializing_if = "Option::is_none")]
+    colors: Option<ColorsOut>,
+}
+
+impl LookOut {
+    fn new(pronouns: &[PronounView], on_light: Option<&str>, on_dark: Option<&str>) -> Self {
+        Self {
+            pronouns: pronouns.iter().map(Into::into).collect(),
+            colors: ColorsOut::new(on_light.map(str::to_owned), on_dark.map(str::to_owned)),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PluralkitOut {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uuid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    avatar_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+impl From<&PluralkitImportView> for PluralkitOut {
+    fn from(pluralkit: &PluralkitImportView) -> Self {
+        Self {
+            id: pluralkit.id.clone(),
+            uuid: pluralkit.uuid.clone(),
+            avatar_url: pluralkit.avatar_url.clone(),
+            description: pluralkit.description.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct TriggerOut {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    keep_trigger: bool,
+}
+
+impl From<&PersonaTriggerView> for TriggerOut {
+    fn from(trigger: &PersonaTriggerView) -> Self {
+        Self {
+            prefix: trigger.prefix.clone(),
+            suffix: trigger.suffix.clone(),
+            keep_trigger: trigger.keep_trigger,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct AlternateAvatarOut {
+    id: String,
+    avatar_url: String,
+}
+
+impl From<&PersonaAlternateAvatarView> for AlternateAvatarOut {
+    fn from(avatar: &PersonaAlternateAvatarView) -> Self {
+        Self {
+            id: avatar.id.clone(),
+            avatar_url: avatar.avatar_url.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PersonaOut {
+    id: String,
+    displayname: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    avatar_url: Option<String>,
+    #[serde(flatten)]
+    look: LookOut,
+    #[serde(
+        rename = "net.f0rest.pkimport",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pluralkit: Option<PluralkitOut>,
+    triggers: Vec<TriggerOut>,
+    #[serde(
+        rename = "net.f0rest.last_used",
+        skip_serializing_if = "Option::is_none"
+    )]
+    last_used: Option<u64>,
+    #[serde(
+        rename = "net.f0rest.alternate_avatars",
+        skip_serializing_if = "Option::is_none"
+    )]
+    alternate_avatars: Option<Vec<AlternateAvatarOut>>,
+}
+
+impl From<&PersonaView> for PersonaOut {
+    fn from(persona: &PersonaView) -> Self {
+        Self {
+            id: persona.id.clone(),
+            displayname: persona.display_name.clone(),
+            avatar_url: persona.avatar_url.clone(),
+            look: LookOut::new(
+                &persona.pronouns,
+                persona.color_on_light.as_deref(),
+                persona.color_on_dark.as_deref(),
+            ),
+            pluralkit: persona.pluralkit.as_ref().map(Into::into),
+            triggers: persona.triggers.iter().map(Into::into).collect(),
+            last_used: persona.last_used,
+            alternate_avatars: persona
+                .alternate_avatars
+                .as_ref()
+                .map(|vec| vec.iter().map(Into::into).collect()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CatalogOut {
+    profiles: Vec<PersonaOut>,
+}
+
+#[serde_as]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectionIn {
+    #[serde_as(as = "NonBlank")]
+    #[serde(default)]
+    profile_id: Option<String>,
+    #[serde_as(deserialize_as = "DefaultOnError")]
+    #[serde(default)]
+    valid_until: Option<u64>,
+    #[serde_as(as = "NonBlank")]
+    #[serde(default)]
+    alternate_avatar_id: Option<String>,
+}
+
+impl SelectionIn {
+    fn into_view(self) -> Option<PersonaSelectionView> {
+        Some(PersonaSelectionView {
+            persona_id: self.profile_id?,
+            valid_until: self.valid_until,
+            alternate_avatar_id: self.alternate_avatar_id,
         })
+    }
 }
 
-fn pronouns_to_json(pronouns: &[PronounView]) -> Value {
-    Value::Array(
-        pronouns
-            .iter()
-            .map(|pronoun| {
-                let mut set = Map::new();
-                set.insert("summary".to_owned(), pronoun.summary.clone().into());
-                if let Some(language) = &pronoun.language {
-                    set.insert("language".to_owned(), language.clone().into());
-                }
-                Value::Object(set)
-            })
-            .collect(),
-    )
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectionOut {
+    profile_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    valid_until: Option<u64>,
 }
 
-fn colors_to_json(on_light: Option<&String>, on_dark: Option<&String>) -> Option<Value> {
-    if on_light.is_none() && on_dark.is_none() {
-        return None;
-    }
-
-    let mut colors = Map::new();
-    if let Some(value) = on_light {
-        colors.insert("on_light".to_owned(), value.clone().into());
-    }
-    if let Some(value) = on_dark {
-        colors.insert("on_dark".to_owned(), value.clone().into());
-    }
-    Some(Value::Object(colors))
-}
-
-fn persona_to_json(persona: &PersonaView) -> Value {
-    let mut object = Map::new();
-    object.insert("id".to_owned(), persona.id.clone().into());
-    object.insert(
-        "displayname".to_owned(),
-        persona.display_name.clone().into(),
-    );
-
-    if let Some(avatar_url) = &persona.avatar_url {
-        object.insert("avatar_url".to_owned(), avatar_url.clone().into());
-    }
-    if !persona.pronouns.is_empty() {
-        object.insert(PRONOUNS.to_owned(), pronouns_to_json(&persona.pronouns));
-    }
-    if let Some(colors) = colors_to_json(
-        persona.color_on_light.as_ref(),
-        persona.color_on_dark.as_ref(),
-    ) {
-        object.insert(COLORS.to_owned(), colors);
-    }
-    if let Some(pluralkit) = &persona.pluralkit {
-        let mut record = Map::new();
-        record.insert("id".to_owned(), pluralkit.id.clone().into());
-        if let Some(uuid) = &pluralkit.uuid {
-            record.insert("uuid".to_owned(), uuid.clone().into());
+impl From<&PersonaSelectionView> for SelectionOut {
+    fn from(selection: &PersonaSelectionView) -> Self {
+        Self {
+            profile_id: selection.persona_id.clone(),
+            valid_until: selection.valid_until,
         }
-        if let Some(avatar_url) = &pluralkit.avatar_url {
-            record.insert("avatar_url".to_owned(), avatar_url.clone().into());
-        }
-        if let Some(description) = &pluralkit.description {
-            record.insert("description".to_owned(), description.clone().into());
-        }
-        object.insert(PKIMPORT.to_owned(), Value::Object(record));
     }
-
-    object.insert(
-        "triggers".to_owned(),
-        Value::Array(
-            persona
-                .triggers
-                .iter()
-                .map(|trigger| {
-                    let mut entry = Map::new();
-                    if let Some(prefix) = &trigger.prefix {
-                        entry.insert("prefix".to_owned(), prefix.clone().into());
-                    }
-                    if let Some(suffix) = &trigger.suffix {
-                        entry.insert("suffix".to_owned(), suffix.clone().into());
-                    }
-                    if trigger.keep_trigger {
-                        entry.insert("keep_trigger".to_owned(), true.into());
-                    }
-                    Value::Object(entry)
-                })
-                .collect(),
-        ),
-    );
-
-    Value::Object(object)
 }
 
-fn selection_from_json(value: &Value) -> Option<PersonaSelectionView> {
-    Some(PersonaSelectionView {
-        persona_id: text(value.get("profileId"))?,
-        valid_until: value.get("validUntil").and_then(Value::as_u64),
-    })
+#[serde_as]
+#[derive(Deserialize)]
+struct AccountSelectionIn {
+    #[serde_as(deserialize_as = "DefaultOnError")]
+    #[serde(default)]
+    association: Option<SelectionIn>,
 }
 
-fn selection_to_json(selection: &PersonaSelectionView) -> Value {
-    let mut object = Map::new();
-    object.insert("profileId".to_owned(), selection.persona_id.clone().into());
-    if let Some(valid_until) = selection.valid_until {
-        object.insert("validUntil".to_owned(), valid_until.into());
-    }
-    Value::Object(object)
+#[derive(Serialize)]
+struct AccountSelectionOut {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    association: Option<SelectionOut>,
 }
 
 #[derive(Debug, Clone)]
@@ -278,38 +487,52 @@ enum RoomAssociation {
     Disabled,
 }
 
-fn room_associations_from_json(content: &Value) -> BTreeMap<String, RoomAssociation> {
-    content
-        .get("associations")
-        .and_then(Value::as_object)
-        .map(|associations| {
-            associations
-                .iter()
-                .filter_map(|(room_id, association)| {
-                    let association = match association {
-                        Value::Bool(false) => RoomAssociation::Disabled,
-                        association => RoomAssociation::Persona(selection_from_json(association)?),
-                    };
-                    Some((room_id.clone(), association))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+impl Serialize for RoomAssociation {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Persona(selection) => SelectionOut::from(selection).serialize(serializer),
+            Self::Disabled => serializer.serialize_bool(false),
+        }
+    }
 }
 
-fn room_associations_to_json(rooms: &BTreeMap<String, RoomAssociation>) -> Value {
-    let associations: Map<String, Value> = rooms
-        .iter()
-        .map(|(room_id, association)| {
-            let value = match association {
-                RoomAssociation::Persona(selection) => selection_to_json(selection),
-                RoomAssociation::Disabled => Value::Bool(false),
-            };
-            (room_id.clone(), value)
-        })
-        .collect();
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AssociationIn {
+    Off(bool),
+    Persona(SelectionIn),
+}
 
-    json!({ "associations": Value::Object(associations) })
+impl AssociationIn {
+    fn into_association(self) -> Option<RoomAssociation> {
+        match self {
+            Self::Off(false) => Some(RoomAssociation::Disabled),
+            Self::Off(true) => None,
+            Self::Persona(selection) => selection.into_view().map(RoomAssociation::Persona),
+        }
+    }
+}
+
+fn room_associations(content: &Value) -> BTreeMap<String, RoomAssociation> {
+    #[serde_as]
+    #[derive(Deserialize)]
+    struct RoomAssociationsIn {
+        #[serde_as(deserialize_as = "DefaultOnError<MapSkipError<_, _>>")]
+        #[serde(default)]
+        associations: BTreeMap<String, AssociationIn>,
+    }
+
+    RoomAssociationsIn::deserialize(content)
+        .map(|content| content.associations)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(room_id, association)| Some((room_id, association.into_association()?)))
+        .collect()
+}
+
+#[derive(Serialize)]
+struct RoomAssociationsOut {
+    associations: BTreeMap<String, RoomAssociation>,
 }
 
 const MAX_FIELD_BYTES: usize = 255;
@@ -329,45 +552,47 @@ fn clamp_field(value: &str) -> String {
         .collect()
 }
 
-pub(crate) fn profile_to_json(profile: &PerMessageProfileView) -> Value {
-    let mut object = Map::new();
-    if let Some(id) = profile
-        .id
-        .as_deref()
-        .map(clamp_field)
-        .filter(|id| !id.is_empty())
-    {
-        object.insert("id".to_owned(), id.into());
-    }
-    if let Some(display_name) = profile
-        .display_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(clamp_field)
-    {
-        object.insert("displayname".to_owned(), display_name.into());
-    }
-    if let Some(avatar_url) = &profile.avatar_url {
-        object.insert("avatar_url".to_owned(), avatar_url.clone().into());
-    }
-    if !profile.pronouns.is_empty() {
-        object.insert(PRONOUNS.to_owned(), pronouns_to_json(&profile.pronouns));
-    }
-    if let Some(colors) = colors_to_json(
-        profile.color_on_light.as_ref(),
-        profile.color_on_dark.as_ref(),
-    ) {
-        object.insert(COLORS.to_owned(), colors);
-    }
-    if profile.has_fallback {
-        object.insert("has_fallback".to_owned(), true.into());
-    }
-    Value::Object(object)
+#[derive(Serialize)]
+struct ProfileOut {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    displayname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    avatar_url: Option<String>,
+    #[serde(flatten)]
+    look: LookOut,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    has_fallback: bool,
+}
+
+pub(crate) fn profile_value(profile: &PerMessageProfileView) -> Value {
+    let out = ProfileOut {
+        id: profile
+            .id
+            .as_deref()
+            .map(clamp_field)
+            .filter(|id| !id.is_empty()),
+        displayname: profile
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(clamp_field),
+        avatar_url: profile.avatar_url.clone(),
+        look: LookOut::new(
+            &profile.pronouns,
+            profile.color_on_light.as_deref(),
+            profile.color_on_dark.as_deref(),
+        ),
+        has_fallback: profile.has_fallback,
+    };
+    // Strings, bools and lists of them always serialize.
+    serde_json::to_value(out).unwrap_or_default()
 }
 
 pub(crate) fn profile_extra_content(profile: &PerMessageProfileView) -> Map<String, Value> {
-    [(PER_MESSAGE_PROFILE.to_owned(), profile_to_json(profile))]
+    [(PER_MESSAGE_PROFILE.to_owned(), profile_value(profile))]
         .into_iter()
         .collect()
 }
@@ -383,6 +608,7 @@ pub(crate) fn fallback_body(
     body: &str,
     formatted: Option<&str>,
     profile: &PerMessageProfileView,
+    edit: bool,
 ) -> Option<(String, String)> {
     if !profile.has_fallback {
         return None;
@@ -401,8 +627,8 @@ pub(crate) fn fallback_body(
         html_escape::encode_text(&name)
     );
 
-    let (marker, body) = split_edit_marker(body);
-    let formatted = formatted.map(|html| split_edit_marker(html).1.to_owned());
+    let (marker, body) = split_edit_marker(body, edit);
+    let formatted = formatted.map(|html| split_edit_marker(html, edit).1.to_owned());
     let stripped = body.strip_prefix(&plain_prefix).unwrap_or(body);
 
     let formatted = match formatted {
@@ -425,7 +651,7 @@ pub(crate) fn outgoing_with_fallback(
     formatted: Option<String>,
     profile: &PerMessageProfileView,
 ) -> (String, Option<String>, PerMessageProfileView) {
-    match fallback_body(&body, formatted.as_deref(), profile) {
+    match fallback_body(&body, formatted.as_deref(), profile, false) {
         Some((body, formatted)) => (body, Some(formatted), profile.clone()),
         None => (body, formatted, without_fallback(profile)),
     }
@@ -446,16 +672,17 @@ pub(crate) fn stamp_profile(content: &mut Value, profile: &PerMessageProfileView
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
 
-    let Some((body, formatted)) = fallback_body(&raw_body, raw_formatted.as_deref(), profile)
+    let edit = object.contains_key("m.new_content");
+    let Some((body, formatted)) = fallback_body(&raw_body, raw_formatted.as_deref(), profile, edit)
     else {
         object.insert(
             PER_MESSAGE_PROFILE.to_owned(),
-            profile_to_json(&without_fallback(profile)),
+            profile_value(&without_fallback(profile)),
         );
         return;
     };
 
-    object.insert(PER_MESSAGE_PROFILE.to_owned(), profile_to_json(profile));
+    object.insert(PER_MESSAGE_PROFILE.to_owned(), profile_value(profile));
     object.insert("format".to_owned(), "org.matrix.custom.html".into());
     object.insert("formatted_body".to_owned(), formatted.into());
     object.insert("body".to_owned(), body.into());
@@ -463,10 +690,20 @@ pub(crate) fn stamp_profile(content: &mut Value, profile: &PerMessageProfileView
 
 const EDIT_MARKER: &str = "* ";
 
-fn split_edit_marker(value: &str) -> (&str, &str) {
+fn split_edit_marker(value: &str, edit: bool) -> (&str, &str) {
     value
         .strip_prefix(EDIT_MARKER)
+        .filter(|_| edit)
         .map_or(("", value), |rest| (EDIT_MARKER, rest))
+}
+
+fn catalog_from_backup(backup: &str) -> Option<Value> {
+    let parsed: Value = serde_json::from_str(backup).ok()?;
+    let catalog = parsed.get(CATALOG_V3)?;
+    catalog
+        .get("profiles")
+        .is_some_and(Value::is_array)
+        .then(|| catalog.clone())
 }
 
 impl Core {
@@ -476,7 +713,7 @@ impl Core {
         transaction_id: &TransactionId,
         message: RoomMessageEventContentWithoutRelation,
         profile: &PerMessageProfileView,
-    ) -> Result<bool, CommandErr> {
+    ) -> Result<bool, RpcError> {
         let (echoes, _updates) = room
             .send_queue()
             .subscribe()
@@ -529,9 +766,10 @@ impl Core {
         content: &AnyMessageLikeEventContent,
         profile: Option<&PerMessageProfileView>,
         forum_title: Option<String>,
-    ) -> Result<(), CommandErr> {
+        retained: serde_json::Map<String, Value>,
+    ) -> Result<(), RpcError> {
         let event_type = content.event_type().to_string();
-        let title = crate::dispatch::forum_title_value(forum_title);
+        let title = crate::outgoing::forum_title_value(forum_title);
         let mut value = serde_json::to_value(content).or_failed(self, "edit_with_persona")?;
 
         let update = |content: &mut Value| {
@@ -549,6 +787,9 @@ impl Core {
         update(&mut value);
         if let Some(content) = value.get_mut("m.new_content") {
             update(content);
+            if let Some(object) = content.as_object_mut() {
+                object.extend(retained);
+            }
         }
 
         let raw = Raw::<AnyMessageLikeEventContent>::from_json_string(value.to_string())
@@ -565,7 +806,7 @@ impl Core {
     async fn persona_account_data(
         &self,
         event_type: GlobalAccountDataEventType,
-    ) -> Result<Option<Value>, CommandErr> {
+    ) -> Result<Option<Value>, RpcError> {
         let Some(raw) = self
             .global_account_data(event_type, "personas: fetch_account_data")
             .await?
@@ -578,7 +819,7 @@ impl Core {
             .or_failed(self, "personas_deserialize")
     }
 
-    async fn load_personas(&self) -> Result<Vec<PersonaView>, CommandErr> {
+    async fn load_personas(&self) -> Result<Vec<PersonaView>, RpcError> {
         if let Some(content) = self
             .persona_account_data(GlobalAccountDataEventType::from(CATALOG_V3))
             .await?
@@ -603,34 +844,65 @@ impl Core {
         Ok(personas)
     }
 
-    async fn save_personas(&self, personas: &[PersonaView]) -> Result<(), CommandErr> {
+    /// A backup file is the v3 catalog event wrapped under its own type.
+    pub(crate) async fn persona_backup(&self) -> Result<String, RpcError> {
+        let content = self
+            .persona_account_data(GlobalAccountDataEventType::from(CATALOG_V3))
+            .await?;
+        serde_json::to_string_pretty(&json!({ CATALOG_V3: content }))
+            .or_failed(self, "persona_backup")
+    }
+
+    pub(crate) fn check_persona_backup(backup: &str) -> Result<(), RpcError> {
+        catalog_from_backup(backup)
+            .map(drop)
+            .ok_or(RpcError::InvalidBackup)
+    }
+
+    pub(crate) async fn restore_persona_backup(&self, backup: &str) -> Result<(), RpcError> {
+        let catalog = catalog_from_backup(backup).ok_or(RpcError::InvalidBackup)?;
         self.put_global_account_data(
             GlobalAccountDataEventType::from(CATALOG_V3),
-            &json!({ "profiles": personas.iter().map(persona_to_json).collect::<Vec<_>>() }),
+            &catalog,
+            "restore_persona_backup",
+        )
+        .await
+    }
+
+    async fn save_personas(&self, personas: &[PersonaView]) -> Result<(), RpcError> {
+        self.put_global_account_data(
+            GlobalAccountDataEventType::from(CATALOG_V3),
+            &CatalogOut {
+                profiles: personas.iter().map(Into::into).collect(),
+            },
             "personas",
         )
         .await
     }
 
-    async fn account_selection(&self) -> Result<Option<PersonaSelectionView>, CommandErr> {
+    async fn account_selection(&self) -> Result<Option<PersonaSelectionView>, RpcError> {
         Ok(self
             .persona_account_data(selection_event("globalassociation"))
             .await?
             .as_ref()
-            .and_then(|content| content.get("association"))
-            .and_then(selection_from_json))
+            .and_then(|content| {
+                AccountSelectionIn::deserialize(content)
+                    .ok()?
+                    .association?
+                    .into_view()
+            }))
     }
 
-    async fn room_selections(&self) -> Result<BTreeMap<String, RoomAssociation>, CommandErr> {
+    async fn room_selections(&self) -> Result<BTreeMap<String, RoomAssociation>, RpcError> {
         Ok(self
             .persona_account_data(selection_event("roomassociation"))
             .await?
             .as_ref()
-            .map(room_associations_from_json)
+            .map(room_associations)
             .unwrap_or_default())
     }
 
-    pub(crate) async fn personas(&self) -> Result<PersonaCatalogView, CommandErr> {
+    pub(crate) async fn personas(&self) -> Result<PersonaCatalogView, RpcError> {
         let mut rooms = BTreeMap::new();
         let mut disabled_rooms = Vec::new();
         for (room_id, association) in self.room_selections().await? {
@@ -652,9 +924,11 @@ impl Core {
 
     pub(crate) async fn save_persona(
         &self,
-        persona: PersonaView,
-        previous_id: Option<String>,
-    ) -> Result<Vec<PersonaView>, CommandErr> {
+        SaveParams {
+            persona,
+            previous_id,
+        }: SaveParams,
+    ) -> Result<Vec<PersonaView>, RpcError> {
         let _guard = self.account_data_lock.lock().await;
         let replaced = previous_id.unwrap_or_else(|| persona.id.clone());
         let mut personas = self.load_personas().await?;
@@ -674,7 +948,7 @@ impl Core {
         Ok(personas)
     }
 
-    pub(crate) async fn remove_persona(&self, id: &str) -> Result<Vec<PersonaView>, CommandErr> {
+    pub(crate) async fn remove_persona(&self, id: &str) -> Result<Vec<PersonaView>, RpcError> {
         let _guard = self.account_data_lock.lock().await;
         let mut personas = self.load_personas().await?;
         personas.retain(|persona| persona.id != id);
@@ -687,8 +961,8 @@ impl Core {
 
     pub(crate) async fn reorder_personas(
         &self,
-        ids: Vec<String>,
-    ) -> Result<Vec<PersonaView>, CommandErr> {
+        ReorderParams { ids }: ReorderParams,
+    ) -> Result<Vec<PersonaView>, RpcError> {
         let _guard = self.account_data_lock.lock().await;
         let personas = self.load_personas().await?;
         let mut reordered = Vec::with_capacity(personas.len());
@@ -710,22 +984,20 @@ impl Core {
         Ok(reordered)
     }
 
-    async fn repoint_selections(&self, from: &str, to: Option<&str>) -> Result<(), CommandErr> {
+    async fn repoint_selections(&self, from: &str, to: Option<&str>) -> Result<(), RpcError> {
         if let Some(account) = self.account_selection().await?
             && account.persona_id == from
         {
-            let content = to.map_or_else(
-                || json!({}),
-                |id| {
-                    json!({ "association": selection_to_json(&PersonaSelectionView {
-                        persona_id: id.to_owned(),
-                        valid_until: account.valid_until,
-                    }) })
-                },
-            );
+            let selection = to.map(|id| PersonaSelectionView {
+                persona_id: id.to_owned(),
+                alternate_avatar_id: account.alternate_avatar_id,
+                valid_until: account.valid_until,
+            });
             self.put_global_account_data(
                 selection_event("globalassociation"),
-                &content,
+                &AccountSelectionOut {
+                    association: selection.as_ref().map(Into::into),
+                },
                 "personas",
             )
             .await?;
@@ -756,16 +1028,18 @@ impl Core {
             }
         }
 
-        self.write_room_selections(&rooms).await
+        self.write_room_selections(rooms).await
     }
 
     async fn write_room_selections(
         &self,
-        rooms: &BTreeMap<String, RoomAssociation>,
-    ) -> Result<(), CommandErr> {
+        rooms: BTreeMap<String, RoomAssociation>,
+    ) -> Result<(), RpcError> {
         self.put_global_account_data(
             selection_event("roomassociation"),
-            &room_associations_to_json(rooms),
+            &RoomAssociationsOut {
+                associations: rooms,
+            },
             "personas",
         )
         .await
@@ -773,23 +1047,29 @@ impl Core {
 
     pub(crate) async fn set_persona_selection(
         &self,
-        room_id: Option<OwnedRoomId>,
-        persona_id: Option<String>,
-        valid_until: Option<u64>,
-    ) -> Result<(), CommandErr> {
+        SetSelectionParams {
+            room_id,
+            persona_id,
+            valid_until,
+            alternate_avatar_id,
+        }: SetSelectionParams,
+    ) -> Result<(), RpcError> {
         let _guard = self.account_data_lock.lock().await;
         let selection = persona_id.map(|persona_id| PersonaSelectionView {
             persona_id,
+            alternate_avatar_id,
             valid_until,
         });
 
         let Some(room_id) = room_id else {
-            let content = selection.as_ref().map_or_else(
-                || json!({}),
-                |selection| json!({ "association": selection_to_json(selection) }),
-            );
             return self
-                .put_global_account_data(selection_event("globalassociation"), &content, "personas")
+                .put_global_account_data(
+                    selection_event("globalassociation"),
+                    &AccountSelectionOut {
+                        association: selection.as_ref().map(Into::into),
+                    },
+                    "personas",
+                )
                 .await;
         };
 
@@ -803,17 +1083,17 @@ impl Core {
             }
         }
 
-        self.write_room_selections(&rooms).await
+        self.write_room_selections(rooms).await
     }
 
     pub(crate) async fn disable_room_personas(
         &self,
-        room_id: OwnedRoomId,
-    ) -> Result<(), CommandErr> {
+        DisableRoomParams { room_id }: DisableRoomParams,
+    ) -> Result<(), RpcError> {
         let _guard = self.account_data_lock.lock().await;
         let mut rooms = self.room_selections().await?;
         rooms.insert(room_id.to_string(), RoomAssociation::Disabled);
-        self.write_room_selections(&rooms).await
+        self.write_room_selections(rooms).await
     }
 }
 
@@ -827,13 +1107,36 @@ fn ensure_empty_mentions(content: &mut Value) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_backup_must_carry_a_catalog_with_profiles() {
+        let catalog = serde_json::json!({ "profiles": [{ "id": "alt" }] });
+        let backup = serde_json::json!({ super::CATALOG_V3: catalog }).to_string();
+        assert_eq!(super::catalog_from_backup(&backup), Some(catalog));
+
+        for invalid in [
+            "not json".to_owned(),
+            serde_json::json!({ super::CATALOG_V3: {} }).to_string(),
+            serde_json::json!({ super::CATALOG_V3: null }).to_string(),
+            serde_json::json!({ super::CATALOG_V3: [] }).to_string(),
+            serde_json::json!({ "other": { "profiles": [] } }).to_string(),
+        ] {
+            assert_eq!(super::catalog_from_backup(&invalid), None, "{invalid}");
+        }
+    }
+
     use super::{
-        RoomAssociation, ensure_empty_mentions, fallback_body, outgoing_with_fallback,
-        persona_from_json, personas_from_catalog, profile_to_json, room_associations_from_json,
-        room_associations_to_json, stamp_profile,
+        RoomAssociation, RoomAssociationsOut, ensure_empty_mentions, fallback_body,
+        outgoing_with_fallback, personas_from_catalog, profile_value, room_associations,
+        stamp_profile,
     };
     use crate::protocol::{PerMessageProfileView, PronounView};
     use serde_json::json;
+
+    fn persona(value: &serde_json::Value) -> crate::protocol::PersonaView {
+        personas_from_catalog(&json!({ "profiles": [value] }))
+            .pop()
+            .expect("a persona")
+    }
 
     fn profile(display_name: &str, has_fallback: bool) -> PerMessageProfileView {
         PerMessageProfileView {
@@ -867,7 +1170,7 @@ mod tests {
             }
         });
 
-        let rooms = room_associations_from_json(&content);
+        let rooms = room_associations(&content);
 
         assert!(matches!(
             rooms.get("!off:example.org"),
@@ -879,7 +1182,10 @@ mod tests {
                 if selection.persona_id == "kris" && selection.valid_until == Some(20)
         ));
         assert_eq!(
-            room_associations_to_json(&rooms),
+            serde_json::to_value(RoomAssociationsOut {
+                associations: rooms
+            })
+            .expect("serializable"),
             json!({
                 "associations": {
                     "!off:example.org": false,
@@ -891,7 +1197,7 @@ mod tests {
 
     #[test]
     fn reads_a_v3_persona_with_its_triggers() {
-        let persona = persona_from_json(&json!({
+        let persona = persona(&json!({
             "id": "kris",
             "displayname": "Kris",
             "avatar_url": "mxc://example.org/kris",
@@ -902,8 +1208,7 @@ mod tests {
                 { "suffix": "-k", "keep_trigger": true },
                 { "prefix": "", "suffix": "" }
             ],
-        }))
-        .expect("a persona");
+        }));
 
         assert_eq!(persona.display_name, "Kris");
         assert_eq!(
@@ -919,8 +1224,84 @@ mod tests {
     }
 
     #[test]
+    fn a_persona_writes_only_what_it_has_and_reads_back_unchanged() {
+        let written = json!({
+            "id": "kris",
+            "displayname": "Kris",
+            "io.fsky.nyx.pronouns": [{ "summary": "they/them", "language": "en" }],
+            "eu.she-a.color": { "on_dark": "#eee" },
+            "net.f0rest.pkimport": { "id": "abcde" },
+            "triggers": [{ "prefix": "k:" }, { "suffix": "-k", "keep_trigger": true }],
+            "net.f0rest.last_used": 7,
+        });
+        let persona = persona(&written);
+
+        let out = serde_json::to_value(super::PersonaOut::from(&persona)).expect("serializable");
+
+        assert_eq!(out, written);
+    }
+
+    #[test]
+    fn triggers_keep_the_spaces_they_were_saved_with() {
+        let tags =
+            |persona: &crate::protocol::PersonaView| -> Vec<(Option<String>, Option<String>)> {
+                persona
+                    .triggers
+                    .iter()
+                    .map(|trigger| (trigger.prefix.clone(), trigger.suffix.clone()))
+                    .collect()
+            };
+        let owned = |text: &str| Some(text.to_owned());
+
+        let v3 = persona(&json!({
+            "id": "emi", "displayname": "Emi",
+            "triggers": [
+                { "prefix": "emi: " },
+                { "suffix": " -emi" },
+                { "prefix": "  ", "suffix": " " }
+            ],
+        }));
+        assert_eq!(
+            tags(&v3),
+            vec![(owned("emi: "), None), (None, owned(" -emi"))]
+        );
+
+        let v2 = persona(&json!({
+            "id": "emi", "displayname": "Emi",
+            "trigger": { "prefix": ["e: "], "net.f0rest.suffix": [" -e"] },
+        }));
+        assert_eq!(tags(&v2), vec![(owned("e: "), None), (None, owned(" -e"))]);
+    }
+
+    #[test]
+    fn lists_skip_bad_entries_and_a_non_list_reads_as_missing() {
+        let skipped = persona(&json!({
+            "id": "a", "displayname": "A",
+            "triggers": [5, { "prefix": "a:" }, "x"],
+            "trigger": { "prefix": ["v2:"] },
+        }));
+        assert_eq!(skipped.triggers.len(), 1);
+        assert_eq!(skipped.triggers[0].prefix.as_deref(), Some("a:"));
+
+        let legacy = persona(&json!({
+            "id": "a", "displayname": "A",
+            "triggers": "nope",
+            "trigger": { "prefix": ["v2:", 5, "  "], "net.f0rest.suffix": "nope" },
+        }));
+        assert_eq!(legacy.triggers.len(), 1);
+        assert_eq!(legacy.triggers[0].prefix.as_deref(), Some("v2:"));
+    }
+
+    #[test]
+    fn room_associations_skip_bad_entries_and_a_non_object_is_empty() {
+        let rooms = room_associations(&json!({ "associations": { "!a:x": 7, "!b:x": false } }));
+        assert_eq!(rooms.len(), 1);
+        assert!(room_associations(&json!({ "associations": [1] })).is_empty());
+    }
+
+    #[test]
     fn converts_a_v2_trigger_object_circumfixes_first() {
-        let persona = persona_from_json(&json!({
+        let persona = persona(&json!({
             "id": "kris",
             "displayname": "Kris",
             "trigger": {
@@ -928,8 +1309,7 @@ mod tests {
                 "net.f0rest.suffix": ["-k"],
                 "net.f0rest.circumfix": [{ "prefix": "[", "suffix": "]" }],
             },
-        }))
-        .expect("a persona");
+        }));
 
         let shapes: Vec<_> = persona
             .triggers
@@ -969,6 +1349,53 @@ mod tests {
             .map(|persona| persona.display_name)
             .collect();
         assert_eq!(names, vec!["Kris", "Sam"]);
+    }
+
+    #[test]
+    fn a_message_opening_with_a_bullet_is_not_an_edit() {
+        let (body, formatted, _) = outgoing_with_fallback(
+            "* one\n* two".to_owned(),
+            Some("<ul><li>one</li><li>two</li></ul>".to_owned()),
+            &profile("Kris", true),
+        );
+
+        assert_eq!(body, "Kris: * one\n* two");
+        assert_eq!(
+            formatted.as_deref(),
+            Some(
+                "<strong data-mx-profile-fallback>Kris: </strong><ul><li>one</li><li>two</li></ul>"
+            )
+        );
+    }
+
+    #[test]
+    fn an_edit_keeps_its_marker_ahead_of_the_prefix() {
+        let mut content = json!({
+            "msgtype": "m.text",
+            "body": "* * one",
+            "format": "org.matrix.custom.html",
+            "formatted_body": "* <ul><li>one</li></ul>",
+            "m.new_content": {
+                "msgtype": "m.text",
+                "body": "* one",
+                "format": "org.matrix.custom.html",
+                "formatted_body": "<ul><li>one</li></ul>",
+            },
+        });
+        let persona = profile("Kris", true);
+        stamp_profile(&mut content, &persona);
+        stamp_profile(&mut content["m.new_content"], &persona);
+
+        assert_eq!(content["body"], "* Kris: * one");
+        assert_eq!(
+            content["formatted_body"],
+            "* <strong data-mx-profile-fallback>Kris: </strong><ul><li>one</li></ul>"
+        );
+        assert_eq!(content["m.new_content"]["body"], "Kris: * one");
+        assert_eq!(
+            content["m.new_content"]["formatted_body"],
+            "<strong data-mx-profile-fallback>Kris: </strong><ul><li>one</li></ul>"
+        );
     }
 
     #[test]
@@ -1034,7 +1461,7 @@ mod tests {
                 .get("has_fallback")
                 .is_none()
         );
-        assert!(fallback_body("hello", None, &nameless).is_none());
+        assert!(fallback_body("hello", None, &nameless, false).is_none());
     }
 
     #[test]
@@ -1061,7 +1488,7 @@ mod tests {
         let mut long = profile(&"é".repeat(200), true);
         long.id = Some("k".repeat(300));
 
-        let stamped = profile_to_json(&long);
+        let stamped = profile_value(&long);
         let name = stamped["displayname"].as_str().expect("a display name");
 
         assert!(name.len() <= 255);
@@ -1072,7 +1499,7 @@ mod tests {
     #[test]
     fn a_null_byte_never_reaches_the_wire() {
         let profile = profile("Kr\0is", true);
-        let stamped = profile_to_json(&profile);
+        let stamped = profile_value(&profile);
 
         assert_eq!(stamped["displayname"], "Kris");
     }

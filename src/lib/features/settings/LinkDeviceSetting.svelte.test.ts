@@ -13,8 +13,8 @@ afterEach(() => {
 });
 
 test('shows QR device linking in Account when the homeserver supports OAuth', async () => {
-  Object.assign(core, {
-    devices: vi.fn(() => Promise.resolve({ devices: [], accountManagement: false, oauth: true })),
+  Object.assign(core.rpc.encryption, {
+    devices: vi.fn(() => Promise.resolve({ devices: [], account_management: false, oauth: true })),
   });
   render(LinkDeviceSetting);
 
@@ -22,8 +22,8 @@ test('shows QR device linking in Account when the homeserver supports OAuth', as
 });
 
 test('hides QR device linking when the homeserver does not support OAuth', async () => {
-  Object.assign(core, {
-    devices: vi.fn(() => Promise.resolve({ devices: [], accountManagement: false, oauth: false })),
+  Object.assign(core.rpc.encryption, {
+    devices: vi.fn(() => Promise.resolve({ devices: [], account_management: false, oauth: false })),
   });
   render(LinkDeviceSetting);
 

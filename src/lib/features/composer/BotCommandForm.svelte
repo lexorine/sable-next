@@ -2,7 +2,7 @@
   import XIcon from 'phosphor-svelte/lib/XIcon';
   import { untrack } from 'svelte';
 
-  import type { MemberView, RoomSummary } from '#src/generated/protocol';
+  import type { MemberView, RoomListItemView } from '#src/generated/protocol';
 
   import { i18n } from '#lib/i18n.js';
   import Avatar from '#lib/ui/primitives/Avatar.svelte';
@@ -31,7 +31,7 @@
     command: BotCommand;
     drafts: ArgumentDrafts;
     members: readonly MemberView[];
-    rooms: readonly RoomSummary[];
+    rooms: readonly RoomListItemView[];
     prefix: string;
     sending?: boolean;
     onSubmit: (body: string, invocation: BotCommandInvocation) => void;
@@ -103,7 +103,7 @@
         options.push({ value: room.canonical_alias, label: name });
       }
     }
-    return options;
+    return [...new Map(options.map((option) => [option.value, option])).values()];
   }
 
   function selectChoices(parameter: BotCommandParameter): Option[] | null {
@@ -137,8 +137,8 @@
     const error = errors[key];
     if (!error) return null;
     return error === 'required'
-      ? $i18n.t('composer.botCommandRequired')
-      : $i18n.t('composer.botCommandInvalid');
+      ? i18n.t('composer.botCommandRequired')
+      : i18n.t('composer.botCommandInvalid');
   }
 
   function describedBy(parameter: BotCommandParameter): string | undefined {
@@ -155,7 +155,7 @@
       if (parameter.schema.schema_type === 'array') addEntry(parameter.key);
     }
     const result = buildInvocation(command, values, prefix);
-    if (!result.ok) {
+    if (result.kind === 'invalid') {
       errors = result.errors;
       const [first] = Object.keys(result.errors);
       event.currentTarget.querySelector<HTMLElement>(`#${CSS.escape(fieldId(first))}`)?.focus();
@@ -173,7 +173,7 @@
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <form
   class="bot-command"
-  aria-label={$i18n.t('composer.botCommandForm', { command: `${prefix}${command.command}` })}
+  aria-label={i18n.t('composer.botCommandForm', { command: `${prefix}${command.command}` })}
   onsubmit={submit}
   onkeydown={(event: KeyboardEvent) => {
     if (event.key !== 'Escape' || event.defaultPrevented) return;
@@ -185,12 +185,12 @@
   <div class="bot-command-header">
     <Avatar
       size="small"
-      src={command.senderAvatar}
+      src={command.sender_avatar}
       id={command.sender}
-      name={command.senderName ?? command.sender}
+      name={command.sender_name ?? command.sender}
     />
     <span class="bot-command-name">{prefix}{command.command}</span>
-    <span class="bot-command-bot">{command.senderName ?? command.sender}</span>
+    <span class="bot-command-bot">{command.sender_name ?? command.sender}</span>
     {#if command.description}
       <span class="bot-command-description">{command.description}</span>
     {/if}
@@ -198,7 +198,7 @@
       size="small"
       variant="ghost"
       class="bot-command-close"
-      label={$i18n.t('composer.botCommandCancel')}
+      label={i18n.t('composer.botCommandCancel')}
       onclick={onCancel}
     >
       <XIcon />
@@ -215,7 +215,7 @@
           <label class="bot-command-label" for={id}>
             {labelOf(parameter.key)}
             {#if parameter.optional}
-              <span class="bot-command-optional">{$i18n.t('composer.botCommandOptional')}</span>
+              <span class="bot-command-optional">{i18n.t('composer.botCommandOptional')}</span>
             {/if}
           </label>
           {#if isBooleanParameter(parameter.schema)}
@@ -248,7 +248,7 @@
                   <IconButton
                     size="small"
                     variant="ghost"
-                    label={$i18n.t('composer.botCommandRemove', { value: entry })}
+                    label={i18n.t('composer.botCommandRemove', { value: entry })}
                     onclick={() => {
                       removeEntry(parameter.key, index);
                     }}
@@ -260,7 +260,7 @@
               <TextInput
                 {id}
                 list="{id}-options"
-                placeholder={placeholderFor(parameter) ?? $i18n.t('composer.botCommandAdd')}
+                placeholder={placeholderFor(parameter) ?? i18n.t('composer.botCommandAdd')}
                 autocomplete="off"
                 aria-invalid={error !== null}
                 aria-describedby={describedBy(parameter)}
@@ -318,7 +318,7 @@
 
   <div class="bot-command-actions">
     <Button type="submit" variant="primary" size="small" loading={sending}>
-      {$i18n.t('composer.botCommandSend')}
+      {i18n.t('composer.botCommandSend')}
     </Button>
   </div>
 </form>

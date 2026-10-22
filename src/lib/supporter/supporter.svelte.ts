@@ -2,6 +2,7 @@ import { untrack } from 'svelte';
 
 import type { SupporterConfig } from '#lib/config/runtime-config.js';
 import type { CoreClient } from '#lib/core/client.svelte.js';
+import { requestOpenIdToken } from '#lib/core/api/session.js';
 import { openExternalAuthUrl } from '#lib/platform/external-auth.js';
 import { SUPPORTER_FIELD, SUPPORTER_BADGE_FIELD } from '#lib/profile/fields.js';
 
@@ -19,7 +20,14 @@ const POLL_TIMEOUT_MS = 10 * 60 * 1000;
 const STEP_TIMEOUT_MS = 15_000;
 const REFRESH_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
-export type SupporterStatus = 'idle' | 'waiting' | 'refreshing' | 'checking' | 'none' | 'failed';
+export type SupporterStatus =
+  | 'idle'
+  | 'waiting'
+  | 'refreshing'
+  | 'checking'
+  | 'none'
+  | 'failed'
+  | 'error';
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -69,6 +77,7 @@ class Supporter {
   private generation = 0;
   private abort: AbortController | null = null;
   private appearanceSave: Promise<void> | null = null;
+  private pendingAppearance: SupporterAppearance | null = null;
 
   get enabled(): boolean {
     return this.config !== null;
@@ -92,6 +101,7 @@ class Supporter {
     this.savingAppearance = false;
     this.removing = false;
     this.appearanceSave = null;
+    this.pendingAppearance = null;
   }
 
   cancel(): void {
@@ -111,7 +121,7 @@ class Supporter {
     try {
       const url = await startVerification(
         config.serviceUrl,
-        await withTimeout(core.commands.requestOpenIdToken())
+        await withTimeout(requestOpenIdToken(core.rpc))
       );
       await withTimeout(openExternalAuthUrl(url));
 
@@ -128,7 +138,7 @@ class Supporter {
       this.status = aborted() ? 'idle' : 'failed';
     } catch (error) {
       console.warn('[sable supporter] verification failed', error);
-      if (generation === this.generation) this.status = 'failed';
+      if (generation === this.generation) this.status = 'error';
     }
   }
 
@@ -144,7 +154,7 @@ class Supporter {
       this.status = (await this.adopt(core, config, userId, awards)) ? 'idle' : 'none';
     } catch (error) {
       console.warn('[sable supporter] award lookup failed', error);
-      this.status = 'failed';
+      this.status = 'error';
     }
   }
 
@@ -155,21 +165,19 @@ class Supporter {
 
     this.status = 'refreshing';
     try {
-      const awards = await refreshAwards(
-        config.serviceUrl,
-        await core.commands.requestOpenIdToken()
-      );
+      const awards = await refreshAwards(config.serviceUrl, await requestOpenIdToken(core.rpc));
       if (awards) await this.adopt(core, config, userId, awards, true);
       this.status = 'idle';
     } catch (error) {
       console.warn('[sable supporter] refresh failed', error);
-      this.status = 'failed';
+      this.status = 'error';
     }
   }
 
   async remove(): Promise<void> {
     const core = this.core;
     if (!core || this.removing) return;
+    this.pendingAppearance = null;
     const generation = this.generation;
     this.removing = true;
     try {
@@ -185,18 +193,37 @@ class Supporter {
 
   async selectAppearance(patch: Partial<SupporterAppearance>): Promise<void> {
     const core = this.core;
-    if (!core || !this.badge || this.savingAppearance || this.removing) return;
-    const generation = this.generation;
-    const appearance = supporterAppearance({ ...this.appearance, ...patch });
+    if (!core || !this.badge || this.removing) return;
+    const saved = this.appearance;
+    this.pendingAppearance = supporterAppearance({ ...this.appearance, ...patch });
+    this.appearance = this.pendingAppearance;
+    if (this.appearanceSave) return this.appearanceSave;
+
     this.savingAppearance = true;
+    this.appearanceSave = this.saveAppearance(core, this.generation, saved);
+    return this.appearanceSave;
+  }
+
+  private async saveAppearance(
+    core: CoreClient,
+    generation: number,
+    saved: SupporterAppearance
+  ): Promise<void> {
     try {
-      this.appearanceSave = core.setProfileField(SUPPORTER_BADGE_FIELD, appearance);
-      await this.appearanceSave;
-      if (generation === this.generation) this.appearance = appearance;
+      while (generation === this.generation && this.pendingAppearance) {
+        const appearance = this.pendingAppearance;
+        this.pendingAppearance = null;
+        await core.setProfileField(SUPPORTER_BADGE_FIELD, appearance);
+        saved = appearance;
+      }
+    } catch (error) {
+      if (generation === this.generation) this.appearance = saved;
+      throw error;
     } finally {
       if (generation === this.generation) {
         this.savingAppearance = false;
         this.appearanceSave = null;
+        this.pendingAppearance = null;
       }
     }
   }

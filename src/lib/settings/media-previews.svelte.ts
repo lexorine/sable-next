@@ -1,53 +1,43 @@
-import type { RoomJoinRuleView } from '#src/generated/protocol';
+import type {
+  MediaPreviewConfigView,
+  MediaPreviewsView,
+  RoomJoinRuleView,
+} from '#src/generated/protocol';
 
 import type { CoreClient } from '#lib/core/client.svelte.js';
-import { isRecord } from '#lib/guards.js';
-import { preferences, setPreference, type MediaAutoLoad } from './preferences.svelte.js';
+import { AccountDataSync } from '#lib/core/account-data-sync.js';
+import { preferences, setPreference } from './preferences.svelte.js';
 
 export const MEDIA_PREVIEW_EVENT = 'm.media_preview_config';
 export const UNSTABLE_MEDIA_PREVIEW_EVENT = 'io.element.msc4278.media_preview_config';
 
-export type MediaPreviews = MediaAutoLoad;
+export type MediaPreviews = MediaPreviewsView;
 export type InviteAvatars = 'on' | 'off';
 
-export interface MediaPreviewConfig {
-  media_previews?: MediaPreviews;
-  invite_avatars?: InviteAvatars;
-}
+export type MediaPreviewConfig = Partial<MediaPreviewConfigView>;
 
-const PRIVATE_JOIN_RULES: readonly RoomJoinRuleView[] = [
+const PRIVATE_JOIN_RULES: ReadonlySet<RoomJoinRuleView> = new Set([
   'invite',
   'knock',
   'restricted',
   'knock_restricted',
-];
-
-export function parseMediaPreviewConfig(content: unknown): MediaPreviewConfig {
-  if (!isRecord(content)) return {};
-  const config: MediaPreviewConfig = {};
-  if ('media_previews' in content) {
-    const value = content.media_previews;
-    config.media_previews = value === 'on' || value === 'private' ? value : 'off';
-  }
-  if ('invite_avatars' in content) {
-    config.invite_avatars = content.invite_avatars === 'on' ? 'on' : 'off';
-  }
-  return config;
-}
+]);
 
 export function previewsShown(level: MediaPreviews, joinRule: RoomJoinRuleView | null): boolean {
   if (level === 'on') return true;
   if (level === 'off') return false;
-  return joinRule !== null && PRIVATE_JOIN_RULES.includes(joinRule);
+  return joinRule !== null && PRIVATE_JOIN_RULES.has(joinRule);
 }
 
 class MediaPreviewSettings {
   global = $state.raw<MediaPreviewConfig>({});
 
-  private core: CoreClient | null = null;
-  private generation = 0;
   private reads = 0;
-  private stopEvents: (() => void) | null = null;
+
+  private readonly sync = new AccountDataSync(
+    [MEDIA_PREVIEW_EVENT, UNSTABLE_MEDIA_PREVIEW_EVENT],
+    (generation) => this.pull(generation)
+  );
 
   get mediaPreviews(): MediaPreviews {
     return this.global.media_previews ?? preferences.mediaAutoLoad;
@@ -58,49 +48,38 @@ class MediaPreviewSettings {
   }
 
   start(core: CoreClient): void {
-    const generation = ++this.generation;
-    this.core = core;
-    this.stopEvents?.();
-    this.stopEvents = core.subscribeEvents((event) => {
-      if (
-        event.type === 'account_data_changed' &&
-        (event.event_type === MEDIA_PREVIEW_EVENT ||
-          event.event_type === UNSTABLE_MEDIA_PREVIEW_EVENT)
-      ) {
-        void this.pull(generation);
-      }
-    });
-    void this.pull(generation);
+    this.sync.start(core);
   }
 
   stop(): void {
-    this.generation += 1;
-    this.core = null;
+    this.sync.stop();
     this.global = {};
-    this.stopEvents?.();
-    this.stopEvents = null;
   }
 
   async roomConfig(roomId: string): Promise<MediaPreviewConfig> {
-    const core = this.core;
+    const core = this.sync.core;
     if (core === null) return {};
-    const stable = await core.commands.roomAccountData(roomId, MEDIA_PREVIEW_EVENT);
-    const content =
-      stable ?? (await core.commands.roomAccountData(roomId, UNSTABLE_MEDIA_PREVIEW_EVENT));
-    return parseMediaPreviewConfig(content);
+    return core.rpc.account.mediaPreviewConfig({ room_id: roomId });
   }
 
   async set(next: MediaPreviewConfig): Promise<void> {
-    const core = this.core;
+    const core = this.sync.core;
     if (core === null) return;
     this.reads += 1;
     const previous = this.global;
-    const merged = { ...previous, ...next };
+    const merged: MediaPreviewConfig = {
+      media_previews: next.media_previews ?? previous.media_previews,
+      invite_avatars: next.invite_avatars ?? previous.invite_avatars,
+    };
     this.global = merged;
     try {
-      await core.commands.setAccountData(MEDIA_PREVIEW_EVENT, merged);
-      await core.commands.setAccountData(UNSTABLE_MEDIA_PREVIEW_EVENT, merged);
-      if (this.global === merged && next.media_previews !== undefined) {
+      await core.rpc.account.setMediaPreviewConfig({
+        config: {
+          media_previews: next.media_previews ?? null,
+          invite_avatars: next.invite_avatars ?? null,
+        },
+      });
+      if (this.global === merged && next.media_previews) {
         setPreference('mediaAutoLoad', next.media_previews);
       }
     } catch (error) {
@@ -112,15 +91,12 @@ class MediaPreviewSettings {
   private async pull(generation: number): Promise<void> {
     const read = ++this.reads;
     try {
-      const core = this.core;
+      const core = this.sync.core;
       if (core === null) return;
-      const stable = await core.commands.accountData(MEDIA_PREVIEW_EVENT);
-      const content = stable ?? (await core.commands.accountData(UNSTABLE_MEDIA_PREVIEW_EVENT));
-      if (generation === this.generation && read === this.reads) {
-        this.global = parseMediaPreviewConfig(content);
-        if (this.global.media_previews !== undefined) {
-          setPreference('mediaAutoLoad', this.global.media_previews);
-        }
+      const config = await core.rpc.account.mediaPreviewConfig({ room_id: null });
+      if (generation === this.sync.generation && read === this.reads) {
+        this.global = config;
+        if (config.media_previews) setPreference('mediaAutoLoad', config.media_previews);
       }
     } catch (error) {
       console.debug('[sable settings] media preview settings unavailable', error);

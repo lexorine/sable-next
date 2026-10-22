@@ -17,22 +17,20 @@
 
   let { url, encrypted, bundled = null }: Props = $props();
   let post = $derived(parseInstagramLink(url));
-  let playing = $state(false);
-  const title = 'Instagram';
-
-  $effect(() => {
+  let playing = $derived.by(() => {
     void url;
-    playing = false;
+    return false;
   });
+  const title = 'Instagram';
 </script>
 
 {#if post}
   <div class="instagram-embed">
-    <a class="instagram-header" href={url} target="_blank" rel="noopener noreferrer">
+    <a class="instagram-header" href={url} target="_blank" rel="external noopener noreferrer">
       <span class="instagram-site">Instagram</span>
       <span class="instagram-title">{post.kind === 'reel' ? 'Reel' : 'Post'}</span>
     </a>
-    <div class="instagram-player" class:reel={post.kind === 'reel'}>
+    <div class={['instagram-player', { reel: post.kind === 'reel' }]}>
       {#if playing}
         <iframe
           src={instagramEmbedUrl(post)}
@@ -44,7 +42,7 @@
         <button
           type="button"
           class="instagram-poster"
-          aria-label={$i18n.t('timeline.showEmbed', { name: title })}
+          aria-label={i18n.t('timeline.showEmbed', { name: title })}
           onclick={() => (playing = true)}
         >
           <span class="instagram-play" aria-hidden="true"><InstagramLogoIcon /></span>

@@ -6,8 +6,7 @@
   import Spinner from '#lib/ui/primitives/Spinner.svelte';
 
   import ImagePackEditor from './ImagePackEditor.svelte';
-  import { USER_EMOTES_EVENT_TYPE } from './pack-address.js';
-  import { packEventContent, type PackDraft } from './pack-content.js';
+  import type { PackDraft } from './pack-content.js';
 
   const core = useCoreClient();
 
@@ -27,7 +26,7 @@
 
   async function load(): Promise<void> {
     try {
-      const packs = await core.commands.allImagePacks();
+      const packs = await core.rpc.packs.listAll();
       if (!alive) return;
       pack = packs.find((candidate) => candidate.origin === 'account') ?? null;
     } catch (error) {
@@ -36,8 +35,11 @@
   }
 
   async function apply(draft: PackDraft): Promise<void> {
-    await core.commands.setAccountData(USER_EMOTES_EVENT_TYPE, packEventContent(draft));
-    invalidatePacks(core.commands);
+    await core.rpc.packs.save({
+      target: { kind: 'account' },
+      draft: $state.snapshot(draft),
+    });
+    invalidatePacks(core.rpc);
     await load();
   }
 </script>

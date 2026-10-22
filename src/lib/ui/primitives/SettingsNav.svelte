@@ -2,6 +2,8 @@
   import type { Component, Snippet } from 'svelte';
   import CaretRightIcon from 'phosphor-svelte/lib/CaretRightIcon';
 
+  import { rovingFocus } from '#lib/ui/roving-focus.js';
+
   export interface SettingsNavEntry {
     id: string;
     label: string;
@@ -43,7 +45,11 @@
   let sections = $derived(groups ?? [{ id: 'entries', entries }]);
 </script>
 
-<nav class="settings-nav-list" aria-label={ariaLabel}>
+<nav
+  class="settings-nav-list"
+  aria-label={ariaLabel}
+  {@attach rovingFocus({ orientation: 'vertical', selector: '.settings-nav-item' })}
+>
   {#each sections as group (group.id)}
     {@const labelId = `${uid}-${group.id}`}
     <div
@@ -72,6 +78,7 @@
     { 'settings-nav-item-large': large },
   ]}
   {#if href}
+    <!-- eslint-disable svelte/no-navigation-without-resolve -- href() is resolved by the caller -->
     <a
       class={classes}
       href={href(entry)}
@@ -84,6 +91,7 @@
       <span class="label">{entry.label}</span>
       {#if showChevron}<span class="chevron" aria-hidden="true"><CaretRightIcon /></span>{/if}
     </a>
+    <!-- eslint-enable svelte/no-navigation-without-resolve -->
   {:else}
     <button
       class={classes}

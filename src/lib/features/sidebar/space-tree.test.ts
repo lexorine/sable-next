@@ -1,11 +1,12 @@
 import { expect, test } from 'vitest';
 
-import type { RoomSummary } from '#src/generated/protocol';
+import type { RoomListItemView } from '#src/generated/protocol';
 
 import { flattenSpaceTree, spaceTree, type SpaceTreeNode } from './space-tree';
+import { withCounts } from '#lib/rooms/summary-fixtures.js';
 
-function room(roomId: string, overrides: Partial<RoomSummary> = {}): RoomSummary {
-  return {
+function room(roomId: string, overrides: Partial<RoomListItemView> = {}): RoomListItemView {
+  return withCounts({
     room_id: roomId,
     canonical_alias: null,
     name: roomId,
@@ -17,11 +18,10 @@ function room(roomId: string, overrides: Partial<RoomSummary> = {}): RoomSummary
     tags: [],
     state: 'joined',
     encrypted: null,
-    is_space: false,
     is_tombstoned: false,
-    is_voice: false,
     call_participants: [],
-    room_type: null,
+    screen_sharers: [],
+    room_kind: 'text',
     supports_knock: true,
     supports_restricted: true,
     supports_knock_restricted: true,
@@ -32,12 +32,12 @@ function room(roomId: string, overrides: Partial<RoomSummary> = {}): RoomSummary
     marked_unread: false,
     latest_event: null,
     ...overrides,
-  };
+  });
 }
 
-function space(roomId: string, children: string[]): RoomSummary {
+function space(roomId: string, children: string[]): RoomListItemView {
   return room(roomId, {
-    is_space: true,
+    room_kind: 'space',
     space_children: children.map((child, index) => ({
       room_id: child,
       via: [],
@@ -48,7 +48,7 @@ function space(roomId: string, children: string[]): RoomSummary {
   });
 }
 
-function byId(rooms: RoomSummary[]): Map<string, RoomSummary> {
+function byId(rooms: RoomListItemView[]): Map<string, RoomListItemView> {
   return new Map(rooms.map((entry) => [entry.room_id, entry]));
 }
 

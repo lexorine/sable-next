@@ -1,29 +1,22 @@
-import {
-  adoptDraftDocuments,
-  draftDocuments,
-} from '#lib/features/composer/composer-drafts.svelte.js';
+import { adoptDraftDocuments, draftDocuments } from '#lib/composer/composer-drafts.svelte.js';
 import {
   adoptFavorites,
   adoptRecentGifs,
   favoriteGifs,
   parseFavorites,
   recentGifs,
-} from '#lib/features/gif/favorites.svelte.js';
+} from '#lib/gif/favorites.svelte.js';
 import {
   adoptRoomIconOverrides,
   parseRoomIconOverrides,
   roomIconOverrides,
-} from '#lib/features/room/settings/room-appearance.svelte.js';
+} from '#lib/rooms/room-appearance.svelte.js';
 import {
   adoptUngroupedFavourites,
   parseUngroupedFavourites,
   ungroupedFavourites,
-} from '#lib/features/sidebar/favourite-grouping.svelte.js';
-import {
-  adoptQueue,
-  parseQueue,
-  scheduledQueue,
-} from '#lib/features/composer/scheduled-queue.svelte.js';
+} from '#lib/rooms/favourite-grouping.svelte.js';
+import { adoptQueue, parseQueue, scheduledQueue } from '#lib/composer/scheduled-queue.svelte.js';
 import { adoptQuietRooms, parseQuietRooms, quietRooms } from '#lib/rooms/quiet-rooms.svelte.js';
 import { parseShortcodes, readRecent, writeRecent } from '#lib/emoji/recent-packs.svelte.js';
 import {
@@ -34,9 +27,14 @@ import {
 import type { SpaceSidebar } from '#lib/spaces/sidebar-layout.svelte.js';
 
 import type { SyncedDocument } from './account-sync.svelte.js';
-import { customThemes, replaceCustomThemes } from './custom-themes.svelte.js';
+import { customThemes, hydrateCatalogThemes, replaceCustomThemes } from './custom-themes.svelte.js';
 import { applyPreferences, isExplicitPreference, preferences } from './preferences.svelte.js';
-import { applySettings, prepareSettings, SETTINGS_ACCOUNT_DATA_TYPE } from './sync.js';
+import {
+  applySettings,
+  mergeSettings,
+  prepareSettings,
+  SETTINGS_ACCOUNT_DATA_TYPE,
+} from './sync.js';
 import { v1SettingsFallback, v1WorkspaceFallback } from '#lib/migrations/v1/documents.js';
 
 export const WORKSPACE_ACCOUNT_DATA_TYPE = 'moe.sable.next.workspace';
@@ -56,8 +54,14 @@ export const settingsDocument: SyncedDocument = {
   snapshot() {
     const prepared = prepareSettings(preferences, customThemes, isExplicitPreference);
     excludedThemeIds = prepared.excludedThemeIds;
-    return { content: prepared.content, partial: prepared.excludedThemeIds.length > 0 };
+    const excluded = new Set(prepared.excludedThemeIds);
+    const skipped = [...customThemes.themes, ...customThemes.tweaks]
+      .filter((entry) => excluded.has(entry.id))
+      .map((entry) => entry.name);
+    return { content: prepared.content, partial: skipped.length > 0, skipped };
   },
+
+  merge: mergeSettings,
 
   adopt(content) {
     const applied = applySettings(content, preferences, customThemes, excludedThemeIds);
@@ -65,6 +69,7 @@ export const settingsDocument: SyncedDocument = {
 
     applyPreferences(applied.preferences, applied.keys);
     replaceCustomThemes(applied.themes);
+    void hydrateCatalogThemes();
     return true;
   },
 };

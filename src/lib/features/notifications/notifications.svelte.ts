@@ -1,4 +1,4 @@
-import type { NotificationView, RoomSummary } from '#src/generated/protocol';
+import type { NotificationView, RoomListItemView } from '#src/generated/protocol';
 
 import { createContext } from 'svelte';
 
@@ -10,7 +10,7 @@ import { preferences } from '#lib/settings/preferences.svelte.js';
 import { loadMediaUrl } from '#lib/ui/media-url.js';
 
 import { appendLine, type ConversationLine, summarise } from './conversation';
-import { parsePushPayload, webPushValidation } from './push-payload';
+import { parsePushPayload, webPushValidation } from '#lib/notifications/push-payload.js';
 import { enabled, line, tag, title } from './present';
 import { retireReadAlerts, retireRoomAlerts } from './retire';
 import { playNotificationSound } from './sound';
@@ -33,7 +33,7 @@ export class NotificationCenter {
   private reading: string | null = null;
   private retirePosted: ReturnType<typeof setTimeout> | undefined;
   private readRooms: readonly string[] = [];
-  private rooms: readonly RoomSummary[] = [];
+  private rooms: readonly RoomListItemView[] = [];
   private unreadFor: RoomUnread = roomNotifications;
   /* eslint-disable svelte/prefer-svelte-reactivity -- a write from a notification would subscribe whichever effect is running */
   private readonly pushed = new Map<string, string>();
@@ -61,9 +61,9 @@ export class NotificationCenter {
       const validation = webPushValidation(message.message);
       if (validation !== null) {
         if (message.nativeActivation) return;
-        void core.commands
-          .ackWebPusher(validation.appId, validation.ackToken)
-          .catch(() => undefined);
+        void core.rpc.push
+          .ackWebPusher({ app_id: validation.app_id, ack_token: validation.ack_token })
+          .catch(failed('acknowledging web pusher'));
         return;
       }
       this.retirePush(message.message);
@@ -72,7 +72,7 @@ export class NotificationCenter {
         if (generation === this.nativePushGeneration) this.stopNativePush = stop;
         else stop();
       })
-      .catch(() => undefined);
+      .catch(failed('watching native push'));
   }
 
   stop(): void {
@@ -100,19 +100,23 @@ export class NotificationCenter {
     if (this.reading === roomId) return;
     this.reading = roomId;
 
-    void this.client?.commands.setReadRoom(roomId).catch(() => undefined);
+    void this.client?.rpc.session
+      .setReadRoom({ room_id: roomId })
+      .catch(failed('setting read room'));
     if (roomId !== null) this.settle(roomId);
   }
 
-  retireRead(rooms: readonly RoomSummary[], unreadFor: RoomUnread = roomNotifications): void {
+  retireRead(rooms: readonly RoomListItemView[], unreadFor: RoomUnread = roomNotifications): void {
     this.rooms = rooms;
     this.unreadFor = unreadFor;
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity -- collected for one batched retire, never rendered
+    const settled = new Set<string>();
     for (const [roomId, appeared] of this.invites) {
       const room = rooms.find((item) => item.room_id === roomId);
       if (room?.state === 'invited') {
         this.invites.set(roomId, true);
       } else if (room !== undefined || appeared) {
-        this.settle(roomId);
+        settled.add(roomId);
       }
     }
 
@@ -130,13 +134,14 @@ export class NotificationCenter {
       this.unread.delete(room.room_id);
       if (this.readThrough(room, this.pushed.get(room.room_id))) {
         this.pushed.delete(room.room_id);
-        this.settle(room.room_id);
+        settled.add(room.room_id);
         continue;
       }
       if (this.retired.has(room.room_id)) continue;
-      this.settle(room.room_id);
+      settled.add(room.room_id);
     }
 
+    this.settleAll([...settled]);
     if (preferences.clearNotificationsOnRead) this.retirePostedAlerts(read);
   }
 
@@ -146,13 +151,17 @@ export class NotificationCenter {
       this.retirePosted = undefined;
       const userId = this.client?.session?.user_id;
       if (userId === undefined) return;
-      void retireReadAlerts(userId, this.readRooms).catch(() => undefined);
+      void retireReadAlerts(userId, this.readRooms).catch(failed('retiring read alerts'));
     }, POSTED_RETIRE_DELAY_MS);
   }
 
   private settle(roomId: string): void {
-    if (preferences.clearNotificationsOnRead) this.retire(roomId);
-    else this.forget(roomId);
+    this.settleAll([roomId]);
+  }
+
+  private settleAll(roomIds: readonly string[]): void {
+    if (preferences.clearNotificationsOnRead) this.retireAll(roomIds);
+    else for (const roomId of roomIds) this.forget(roomId);
   }
 
   private forget(roomId: string): void {
@@ -163,13 +172,20 @@ export class NotificationCenter {
   }
 
   private retire(roomId: string): void {
-    this.forget(roomId);
-    this.presented.get(roomId)?.close();
-    this.presented.delete(roomId);
+    this.retireAll([roomId]);
+  }
+
+  private retireAll(roomIds: readonly string[]): void {
+    if (roomIds.length === 0) return;
+    for (const roomId of roomIds) {
+      this.forget(roomId);
+      this.presented.get(roomId)?.close();
+      this.presented.delete(roomId);
+    }
 
     const userId = this.client?.session?.user_id;
     if (userId === undefined) return;
-    void retireRoomAlerts(userId, roomId).catch(() => undefined);
+    void retireRoomAlerts(userId, roomIds).catch(failed('retiring room alerts'));
   }
 
   present(view: NotificationView): void {
@@ -184,20 +200,18 @@ export class NotificationCenter {
     const lines = appendLine(standing, line(view));
     this.conversations.set(view.room_id, lines);
 
-    const quiet = preferences.notifyOnce && standing.length > 0 && !view.mention;
     const allowed = soundsAllowed();
-    const chime = view.noisy !== false && preferences.notificationSounds && !quiet && allowed;
+    const chime = view.noisy !== false && preferences.notificationSounds && allowed;
     recordDebugLog('debug', 'notification', 'sound', chime ? 'chime' : 'silent', {
       noisy: view.noisy,
       sounds: preferences.notificationSounds,
-      quiet,
       allowed,
       mention: view.mention,
       direct: view.is_direct,
       encrypted: view.encrypted,
     });
     if (chime) {
-      void playNotificationSound().catch((error: unknown) => {
+      void playNotificationSound('notification').catch((error: unknown) => {
         console.warn('[sable notification sound] failed', error);
       });
     }
@@ -208,28 +222,28 @@ export class NotificationCenter {
   }
 
   private retirePush(raw: string): void {
-    const notification = parsePushPayload(raw)?.notification;
-    if (notification?.room_id === undefined) return;
+    const notification = parsePushPayload(raw);
+    if (!notification || notification.room_id === null) return;
     const roomId = notification.room_id;
     const userId = notification.user_id;
-    if (userId !== undefined && userId !== this.client?.session?.user_id) {
-      if (notification.counts?.unread === 0) {
-        void retireRoomAlerts(userId, roomId).catch(() => undefined);
+    if (userId !== null && userId !== this.client?.session?.user_id) {
+      if (notification.unread === 0) {
+        void retireRoomAlerts(userId, [roomId]).catch(failed('retiring room alerts'));
       }
       return;
     }
-    if (notification.counts?.unread === 0 || this.reading === roomId) {
+    if (notification.unread === 0 || this.reading === roomId) {
       this.retire(roomId);
       return;
     }
-    if (notification.event_id === undefined) return;
+    if (notification.event_id === null) return;
 
     const room = this.rooms.find((item) => item.room_id === roomId);
     if (room !== undefined && this.readThrough(room, notification.event_id)) this.settle(roomId);
     else this.pushed.set(roomId, notification.event_id);
   }
 
-  private readThrough(room: RoomSummary, eventId: string | undefined): boolean {
+  private readThrough(room: RoomListItemView, eventId: string | undefined): boolean {
     return (
       eventId !== undefined &&
       room.latest_event?.event_id === eventId &&
@@ -276,7 +290,10 @@ async function avatar(core: CoreClient, view: NotificationView): Promise<string>
   const source = view.room_avatar_url ?? view.sender_avatar_url;
   if (source === null) return FALLBACK_ICON;
 
-  return loadMediaUrl(core, source, AVATAR_SIZE, AVATAR_SIZE).catch(() => FALLBACK_ICON);
+  return loadMediaUrl(core, source, AVATAR_SIZE, AVATAR_SIZE).catch((error: unknown) => {
+    failed('loading notification avatar')(error);
+    return FALLBACK_ICON;
+  });
 }
 
 async function showFromWorker(title: string, options: NotificationOptions): Promise<void> {
@@ -286,6 +303,12 @@ async function showFromWorker(title: string, options: NotificationOptions): Prom
 }
 
 const FALLBACK_ICON = '/favicon.png';
+
+function failed(what: string): (error: unknown) => void {
+  return (error) => {
+    console.debug(`[sable notifications] ${what} failed`, error);
+  };
+}
 
 function soundsAllowed(): boolean {
   if (preferences.backgroundNotificationSounds) return true;

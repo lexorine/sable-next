@@ -32,6 +32,8 @@ export function renameLegacyThemeIdentifiers(css: string): string {
     .replace(/--sable-([a-z0-9-]+)/g, (_, name: string) =>
       name === 'shadow' ? '--shadow-color' : `--${name}`
     )
+    .replace(/--font-secondary(?![a-z0-9-])/g, '--font-family')
+    .replace(/--font-monospace(?![a-z0-9-])/g, '--font-family-mono')
     .replace(/\.sable-([a-z0-9-]+)/g, (_, name: string) => {
       if (LEGACY_CLASS_ALIASES[name]) return `.${LEGACY_CLASS_ALIASES[name]}`;
       return name.startsWith('button-') ? `.btn-${name.slice('button-'.length)}` : `.${name}`;
@@ -71,6 +73,26 @@ export function applyCustomTweaks(css: readonly string[]): void {
   style.textContent = css.map(renameLegacyThemeIdentifiers).join('\n');
 }
 
+export function applyFontFamily(family: string): void {
+  applyFontPreference('--font-family', '--font-family-base', family);
+  // Override themes that set font-family directly on body.
+  if (family.trim()) document.body.style.setProperty('font-family', 'var(--font-family)');
+  else document.body.style.removeProperty('font-family');
+}
+
+export function applyFontFamilyMono(family: string): void {
+  applyFontPreference('--font-family-mono', '--font-family-mono-base', family);
+}
+
+function applyFontPreference(property: string, fallback: string, family: string): void {
+  const name = family.trim();
+  // Body variables would otherwise override the inherited root preference.
+  for (const style of [document.documentElement.style, document.body.style]) {
+    if (name) style.setProperty(property, `${name}, var(${fallback})`);
+    else style.removeProperty(property);
+  }
+}
+
 export function applyQuickCss(css: string): void {
   const existing = document.getElementById(QUICK_CSS_STYLE_ID);
   if (!css) {
@@ -80,6 +102,18 @@ export function applyQuickCss(css: string): void {
 
   const style = existing ?? createStyle(QUICK_CSS_STYLE_ID, null);
   style.textContent = css;
+  keepQuickCssLast();
+}
+
+let headObserver: MutationObserver | undefined;
+
+function keepQuickCssLast(): void {
+  if (headObserver) return;
+  headObserver = new MutationObserver(() => {
+    const style = document.getElementById(QUICK_CSS_STYLE_ID);
+    if (style && document.head.lastElementChild !== style) document.head.append(style);
+  });
+  headObserver.observe(document.head, { childList: true });
 }
 
 function createStyle(id: string, anchor: Element | null): HTMLStyleElement {

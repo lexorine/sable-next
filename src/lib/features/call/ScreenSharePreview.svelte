@@ -8,8 +8,11 @@
 
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
+  import { UserProfile } from '#lib/profile/user-profile.svelte.js';
+  import { preferences } from '#lib/settings/preferences.svelte.js';
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
 
+  import CallStatsOverlay from './CallStatsOverlay.svelte';
   import { callTiles, featuredTiles, type CallTile } from './call-layout';
   import type { CallSession } from './call-session.svelte.js';
   import {
@@ -46,32 +49,22 @@
     return featured ?? tiles[0];
   });
   let room = $derived(shown ? session.roomFor(shown.participant.backendId) : undefined);
+  let shownTrack = $derived.by(() => {
+    const share = shown?.participant.screenShare;
+    return share?.subscribed ? `${shown?.key ?? ''}/${share.id}` : undefined;
+  });
   let sharerId = $derived.by(() => {
     if (!shown) return null;
     const identity = shown.participant.identity;
     return session.members.find((member) => member.identity === identity)?.user_id ?? identity;
   });
-  let sharerName = $state<string | null>(null);
-  let label = $derived($i18n.t('call.screenOf', { name: sharerName ?? sharerId ?? '' }));
-
-  $effect(() => {
-    const userId = sharerId;
-    sharerName = null;
-    if (userId === null) return;
-    let current = true;
-    core.userProfile(userId).then(
-      (profile) => {
-        if (current) sharerName = profile.display_name ?? null;
-      },
-      () => undefined
-    );
-    return () => {
-      current = false;
-    };
-  });
+  const sharerProfile = new UserProfile(core, () => sharerId);
+  let sharerName = $derived(sharerProfile.current?.display_name ?? null);
+  let label = $derived(i18n.t('call.screenOf', { name: sharerName ?? sharerId ?? '' }));
 
   let video = $state<HTMLVideoElement | null>(null);
   let popped = $state<'document' | 'video' | null>(null);
+  let pipWindow: Window | null = null;
   let drag = $state<{ x: number; y: number } | null>(null);
   function canPopOut(): boolean {
     return 'documentPictureInPicture' in window || document.pictureInPictureEnabled;
@@ -84,7 +77,10 @@
       ?.getTrackPublication(Track.Source.ScreenShare)?.track;
   }
 
+  $effect(() => () => pipWindow?.close());
+
   function attach(node: HTMLVideoElement) {
+    void shownTrack;
     const media = untrack(track);
     media?.attach(node);
     return () => {
@@ -99,6 +95,7 @@
       .documentPictureInPicture;
     if (pip) {
       const opened = await pip.requestWindow({ width: 480, height: 270 });
+      pipWindow = opened;
       const doc = opened.document;
       doc.title = label;
       const theme = getComputedStyle(document.documentElement);
@@ -118,7 +115,7 @@
       player.style.cssText = 'width:100%;height:100%;object-fit:contain;min-height:0';
       const back = doc.createElement('button');
       back.type = 'button';
-      back.textContent = $i18n.t('call.returnToCall');
+      back.textContent = i18n.t('call.returnToCall');
       Object.assign(back.style, {
         cursor: 'pointer',
         font: 'inherit',
@@ -134,6 +131,7 @@
       popped = 'document';
       on(opened, 'pagehide', () => {
         media.detach(player);
+        if (pipWindow === opened) pipWindow = null;
         popped = null;
       });
       return;
@@ -179,18 +177,28 @@
   }
 </script>
 
-{#if shown && room && popped !== 'document' && dismissedPreview.key !== shown.key}
+{#if popped === 'video' || (shown && room && popped !== 'document' && dismissedPreview.key !== shown.key)}
   <section
-    class="screen-preview {previewCorner.value}"
-    class:dragging={drag !== null}
-    class:hidden={popped === 'video'}
+    class={[
+      'screen-preview',
+      previewCorner.value,
+      { dragging: drag !== null, hidden: popped === 'video' },
+    ]}
     aria-label={label}
     style:translate={drag ? `${String(drag.x)}px ${String(drag.y)}px` : undefined}
     onpointerdown={startDrag}
   >
-    {#key shown.key}
+    <div class="stage">
       <video bind:this={video} autoplay muted playsinline {@attach attach}></video>
-    {/key}
+      {#if shown && room && shownTrack !== undefined && preferences.developerTools && preferences.callStatsOverlay}
+        <CallStatsOverlay
+          {room}
+          identity={shown.participant.identity}
+          local={false}
+          trackId={shownTrack}
+        />
+      {/if}
+    </div>
     <div class="bar">
       <MonitorIcon aria-hidden="true" weight="fill" />
       <button type="button" class="name" onclick={onReturn}>{label}</button>
@@ -198,8 +206,11 @@
         <IconButton
           variant="ghost"
           size="small"
-          label={$i18n.t('call.popOutScreen')}
-          onclick={() => void popOut().catch(() => undefined)}
+          label={i18n.t('call.popOutScreen')}
+          onclick={() =>
+            void popOut().catch((error: unknown) => {
+              console.warn('[sable call] could not pop out screen share', error);
+            })}
         >
           <ArrowSquareOutIcon />
         </IconButton>
@@ -207,7 +218,7 @@
       <IconButton
         variant="ghost"
         size="small"
-        label={$i18n.t('call.hideScreenPreview')}
+        label={i18n.t('call.hideScreenPreview')}
         onclick={() => {
           if (shown) dismissedPreview.key = shown.key;
         }}
@@ -262,6 +273,10 @@
   .top-right,
   .bottom-right {
     right: max(var(--space-400), var(--safe-right));
+  }
+
+  .stage {
+    position: relative;
   }
 
   video {

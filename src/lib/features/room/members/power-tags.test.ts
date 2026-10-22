@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { parsePowerLevelTags, withPowerLevelTag } from '../settings/power-level-tags';
+import {
+  contrastRatio,
+  nameColorOnDark,
+  nameColorOnLight,
+} from '#lib/ui/primitives/readable-color.js';
+
 import { FOUNDER_POWER_LEVEL, powerTag } from './power-tags';
 
 const t = (key: string, options?: Record<string, unknown>): string =>
@@ -14,16 +19,35 @@ describe('powerTag', () => {
     expect(powerTag(-1, t).name).toBe('timeline.powerLevelMuted');
   });
 
+  it('colours the default staff roles but leaves members uncoloured', () => {
+    expect(powerTag(FOUNDER_POWER_LEVEL, t).color).toBe('#0000ff');
+    expect(powerTag(100, t).color).toBe('#0088ff');
+    expect(powerTag(50, t).color).toBe('#1fd81f');
+    expect(powerTag(75, t).color).toBe('#1fd81f');
+    expect(powerTag(0, t).color).toBeNull();
+    expect(powerTag(10, t).color).toBeNull();
+  });
+
+  it('keeps every default role colour legible on light and dark grounds', () => {
+    for (const level of [FOUNDER_POWER_LEVEL, 150, 101, 100, 50, -1]) {
+      const color = powerTag(level, t).color;
+      expect(contrastRatio(nameColorOnLight(color) ?? '', '#e4e4e7')).toBeGreaterThanOrEqual(4.5);
+      expect(contrastRatio(nameColorOnDark(color) ?? '', '#2d2c36')).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
+  it('keeps a room tag without a colour uncoloured', () => {
+    expect(powerTag(100, t, { 100: { name: 'Admin', color: null, icon: null } }).color).toBeNull();
+  });
+
   it('names a room-version-12 creator, whose power level is infinite', () => {
     expect(powerTag(Number.MAX_SAFE_INTEGER + 1, t).name).toBe('timeline.powerTagFounder');
   });
 
-  it('applies saved founder flair after reading the room state', () => {
+  it('applies saved founder flair', () => {
     const flair = { name: 'Founder', color: '#ff0000', icon: '👑' };
-    const content = withPowerLevelTag({}, FOUNDER_POWER_LEVEL, flair);
-    const tags = parsePowerLevelTags(content);
 
-    expect(powerTag(FOUNDER_POWER_LEVEL, t, tags)).toEqual(flair);
+    expect(powerTag(FOUNDER_POWER_LEVEL, t, { [FOUNDER_POWER_LEVEL]: flair })).toEqual(flair);
   });
 
   it('does not name the highest 32-bit power level as founder', () => {

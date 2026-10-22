@@ -2,20 +2,22 @@
   import type { Component, Snippet } from 'svelte';
   import ArrowBendUpLeftIcon from 'phosphor-svelte/lib/ArrowBendUpLeftIcon';
 
-  import type { MemberView, ProfileView, TimelineItemView } from '#src/generated/protocol';
+  import type { MemberView, TimelineItemView } from '#src/generated/protocol';
 
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
+  import { UserProfile } from '#lib/profile/user-profile.svelte.js';
   import { useRoomCosmetics } from '#lib/rooms/room-cosmetics.svelte.js';
   import { preferences } from '#lib/settings/preferences.svelte.js';
 
   import { readEventSource } from './event-source-cache';
   import { memberName, senderDisplayColors } from '../members/members.js';
-  import { replyFallbackFromSource } from './reply-fallback';
+  import { eventPreview, reactionKey } from '#lib/model/model.js';
+  import { fallbackText } from './reply-fallback';
   import { replyPreviewBody } from './reply-preview';
   import { hasSenderRoles, useSenderRoles } from '../members/sender-roles';
   import SenderName from '../members/SenderName.svelte';
-  import { reactionKey, stateEventText, type Translate } from '../timeline/state-event-text';
+  import { stateEventText, type Translate } from '../timeline/state-event-text';
   import type { TimelineEventIndex } from '../timeline/timeline-event-index';
 
   interface Props {
@@ -52,22 +54,20 @@
 
   let fetched = $state<Preview | null>(null);
   let loaded = $derived(events?.get(eventId) ?? null);
-  let preview = $derived(loaded ? previewOf(loaded, $i18n.t) : fetched);
+  let preview = $derived(loaded ? previewOf(loaded, i18n.t) : fetched);
   let name = $derived.by(() => {
-    if (!preview?.sender) return $i18n.t('timeline.unknownSender');
-    const own = (loaded?.sender_name ?? null) || memberName(members, preview.sender);
-    const shown = roomCosmetics?.identity(preview.sender, { name: own, avatar: null });
-    return shown?.name ?? own;
+    if (!preview?.sender) return i18n.t('timeline.unknownSender');
+    return (loaded?.sender_name ?? null) || memberName(members, preview.sender);
   });
 
   let persona = $derived(loaded?.per_message_profile ?? null);
   let cosmetics = $derived(persona ? null : (roomCosmetics?.for(preview?.sender) ?? null));
-  let profile = $state<ProfileView | null>(null);
   let sender = $derived(preview?.sender ?? null);
+  const profile = new UserProfile(core, () => sender);
   let colors = $derived(
     senderDisplayColors(
       sender ?? '',
-      profile,
+      profile.current,
       persona,
       currentUserId !== null && sender === currentUserId,
       cosmetics,
@@ -75,22 +75,6 @@
     )
   );
   let replyStyle = $derived(reply ? preferences.replyPreviewStyle : null);
-
-  $effect(() => {
-    const userId = sender;
-    profile = null;
-    if (!userId) return;
-    let current = true;
-    void core.userProfile(userId).then(
-      (next) => {
-        if (current) profile = next;
-      },
-      () => undefined
-    );
-    return () => {
-      current = false;
-    };
-  });
 
   function previewOf(item: TimelineItemView, t: Translate): Preview {
     const content = item.content;
@@ -110,10 +94,17 @@
     const target = eventId;
     let current = true;
     fetched = null;
-    const read = (room: string, id: string) => core.commands.eventSource(room, id);
+    const read = (room: string, id: string) =>
+      core.rpc.timeline
+        .eventSource({ room_id: room, event_id: id, include_original: false })
+        .then(({ source }) => source);
     void readEventSource(read, roomId, target).then((event) => {
       if (!current || event === null) return;
-      fetched = replyFallbackFromSource(JSON.stringify(event), $i18n.t);
+      const preview = eventPreview(event);
+      fetched = preview && {
+        sender: preview.sender,
+        body: fallbackText(preview.body, preview.fallback, i18n.t),
+      };
     });
     return () => {
       current = false;

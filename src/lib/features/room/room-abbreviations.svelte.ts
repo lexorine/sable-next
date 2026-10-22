@@ -1,13 +1,9 @@
 import { createContext } from 'svelte';
 
-import type { CoreCommands } from '#lib/core/commands.svelte.js';
+import type { Rpc } from '#src/generated/protocol';
 
 import { abbreviationPattern, buildAbbreviationMap, type AbbreviationMap } from './abbreviations';
-import {
-  ABBREVIATIONS_EVENT_TYPE,
-  readAbbreviations,
-  type AbbreviationEntry,
-} from './settings/abbreviations';
+import type { AbbreviationEntry } from './settings/abbreviations';
 
 export const abbreviationChanges = $state({ version: 0 });
 
@@ -21,7 +17,7 @@ export class RoomAbbreviations {
   #roomId: string | null = null;
   #generation = 0;
 
-  constructor(private readonly commands: Pick<CoreCommands, 'roomStateEvent'>) {}
+  constructor(private readonly rpc: { room_state: Pick<Rpc['room_state'], 'abbreviations'> }) {}
 
   get map(): AbbreviationMap {
     return this.#map;
@@ -45,9 +41,7 @@ export class RoomAbbreviations {
 
   async #entries(roomId: string): Promise<AbbreviationEntry[]> {
     try {
-      return readAbbreviations(
-        await this.commands.roomStateEvent(roomId, ABBREVIATIONS_EVENT_TYPE)
-      );
+      return await this.rpc.room_state.abbreviations({ room_id: roomId });
     } catch (error) {
       console.debug('[sable room] abbreviations unavailable', error);
       return [];

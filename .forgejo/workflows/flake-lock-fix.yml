@@ -1,0 +1,57 @@
+name: Fix flake hashes
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'pnpm-lock.yaml'
+      - '**/Cargo.lock'
+      - 'scripts/build/fetch-deepfilternet.mjs'
+  workflow_dispatch:
+
+jobs:
+  fix:
+    name: Fix flake hashes
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout main
+        uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: true
+          token: ${{ github.token }}
+
+      - name: Install Lix
+        uses: https://github.com/samueldr/lix-gha-installer-action@a0fee77b2a98bb7c5c0ed7ae6d6ad4903dbdad0d # v2026-06-15
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+
+      # Only the fixed-output derivations carry hashes, so there's no need to build the app.
+      - name: Fix hash mismatches
+        run: |
+          set +o pipefail
+          nix build -L --keep-going --no-link \
+            .#sable-unwrapped.pnpmDeps \
+            .#sable-unwrapped.cargoDeps \
+            .#sable-deepfilternet-assets 2>&1 |
+            tee /dev/stderr |
+            grep -E '(specified|got):' | grep -oE 'sha256-\S+' | paste - - |
+            while read -r old new; do
+              sed -i "s|$old|$new|" packaging/nix/*.nix
+            done
+
+      - name: Commit and push if changed
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "No changes after fix hashes; nothing to commit."
+            exit 0
+          fi
+          git config user.name "forgejo-actions[bot]"
+          git config user.email "forgejo-actions[bot]@users.noreply.git.sable.moe"
+          git add --update --ignore-removal .
+          git commit -m "chore(nix): auto-fix nix hashes"
+          git push origin HEAD:main

@@ -10,9 +10,17 @@ import {
   type NodeType,
 } from 'prosemirror-model';
 import { liftListItem, sinkListItem, splitListItem, wrapInList } from 'prosemirror-schema-list';
-import { TextSelection, type Command, type EditorState, type Transaction } from 'prosemirror-state';
+import {
+  Selection,
+  TextSelection,
+  type Command,
+  type EditorState,
+  type Transaction,
+} from 'prosemirror-state';
 import { canJoin, findWrapping } from 'prosemirror-transform';
 import { wrapIn } from 'prosemirror-commands';
+
+import type { ShortcutId } from '#lib/ui/shortcuts/shortcuts.js';
 
 import { composerSchema } from './schema';
 import { atomText, markdownSlice } from './serialize';
@@ -148,12 +156,6 @@ function inlineMarkdownRule(): InputRule {
   });
 }
 
-const URL_PATTERN =
-  /(?:^|[\p{White_Space}(])((?:https?:\/\/|www\.)[^\p{White_Space}\uFFFC<>()]*[^\p{White_Space}\uFFFC<>().,;:!?'"])[.,;:!?'"]*([\p{White_Space})\uFFFC])$/u;
-
-const URL_AT_CURSOR =
-  /(?:^|[\p{White_Space}(])((?:https?:\/\/|www\.)[^\p{White_Space}<>()]*[^\p{White_Space}<>().,;:!?'"])[.,;:!?'"]*$/u;
-
 const LINE_BREAK = '\uFFFC';
 
 type LineHandler = (
@@ -250,44 +252,7 @@ export const formattingInputRules: readonly InputRule[] = [
     (match) => ({ order: Number(match[1]) }),
     (match, node) => node.childCount + (node.attrs.order as number) === Number(match[1])
   ),
-  autolinkRule(),
 ];
-
-function autolinkRule(): InputRule {
-  return new InputRule(
-    URL_PATTERN,
-    (state, match, start, end) => {
-      const text = match[1];
-      const from = start + match[0].indexOf(text);
-      const to = from + text.length;
-      if (from < 0 || state.doc.rangeHasMark(from, to, marks.link)) return null;
-
-      const href = text.startsWith('www.') ? `https://${text}` : text;
-      const tr = state.tr
-        .addMark(from, to, marks.link.create({ href }))
-        .removeStoredMark(marks.link);
-
-      return end - start === match[0].length ? tr : tr.insertText(match[2], end);
-    },
-    { inCodeMark: false }
-  );
-}
-
-export function autolinkAtCursor(state: EditorState): Transaction | null {
-  if (!state.selection.empty) return null;
-  const { $from } = state.selection;
-  const text = $from.parent.textBetween(0, $from.parentOffset, '', '');
-  const match = URL_AT_CURSOR.exec(text);
-  const url = match?.[1];
-  if (!match || !url) return null;
-
-  const from = $from.start() + match.index + match[0].indexOf(url);
-  const to = from + url.length;
-  if (state.doc.rangeHasMark(from, to, marks.link)) return null;
-
-  const href = url.startsWith('www.') ? `https://${url}` : url;
-  return state.tr.addMark(from, to, marks.link.create({ href })).removeStoredMark(marks.link);
-}
 
 function isInside(state: EditorState, type: NodeType): boolean {
   const { $from } = state.selection;
@@ -397,8 +362,13 @@ export const joinListItemBackward: Command = (state, dispatch) => {
   if (!canJoin(state.doc, boundary)) return false;
   if (dispatch) {
     const tr = state.tr.join(boundary);
-    const inner = tr.mapping.map($from.before());
-    if (canJoin(tr.doc, inner)) tr.join(inner);
+    const inner = tr.doc.resolve(tr.mapping.map($from.before()));
+    if (inner.nodeBefore?.type === inner.nodeAfter?.type && canJoin(tr.doc, inner.pos)) {
+      tr.join(inner.pos);
+    } else if (inner.nodeAfter?.content.size === 0) {
+      tr.delete(inner.pos, inner.pos + inner.nodeAfter.nodeSize);
+      tr.setSelection(Selection.near(tr.doc.resolve(inner.pos), -1));
+    }
     dispatch(tr.scrollIntoView());
   }
   return true;
@@ -451,22 +421,25 @@ const orderedListCommand = toggleList(nodes.ordered_list);
 const blockquoteCommand = toggleWrap(nodes.blockquote);
 
 export const formattingKeymap: Record<string, Command> = {
-  'Mod-b': toggleMark(marks.strong),
-  'Mod-i': toggleMark(marks.em),
-  'Mod-u': toggleMark(marks.underline),
-  'Mod-Shift-x': toggleMark(marks.strike),
-  'Mod-e': toggleMark(marks.code),
-  'Mod-,': toggleMark(marks.sub),
-  'Mod-.': toggleMark(marks.sup),
-  'Mod-h': toggleMark(marks.spoiler),
-  'Mod-Shift-8': bulletListCommand,
-  'Mod-Shift-9': orderedListCommand,
-  'Mod-Shift-.': blockquoteCommand,
-  'Mod-1': headingCommand(1),
-  'Mod-2': headingCommand(2),
-  'Mod-3': headingCommand(3),
-  'Mod-;': codeBlockCommand,
   'Shift-Tab': liftListEntry,
+};
+
+export const formattingShortcuts: Partial<Record<ShortcutId, Command>> = {
+  'composer.strong': toggleMark(marks.strong),
+  'composer.em': toggleMark(marks.em),
+  'composer.underline': toggleMark(marks.underline),
+  'composer.strike': toggleMark(marks.strike),
+  'composer.code': toggleMark(marks.code),
+  'composer.sub': toggleMark(marks.sub),
+  'composer.sup': toggleMark(marks.sup),
+  'composer.spoiler': toggleMark(marks.spoiler),
+  'composer.bullet_list': bulletListCommand,
+  'composer.ordered_list': orderedListCommand,
+  'composer.blockquote': blockquoteCommand,
+  'composer.heading1': headingCommand(1),
+  'composer.heading2': headingCommand(2),
+  'composer.heading3': headingCommand(3),
+  'composer.code_block': codeBlockCommand,
 };
 
 export const splitListEntry = splitListItem(nodes.list_item);

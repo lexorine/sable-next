@@ -1,11 +1,11 @@
-import { describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 
 import {
   callbackChannelName,
   createRedirectUri,
   redirectLoginType,
   scrubbedCallbackPath,
-  tauriRedirectUri,
+  nativeRedirectUri,
 } from './redirect';
 
 describe('redirect authentication', () => {
@@ -44,14 +44,35 @@ describe('redirect authentication', () => {
     expect(createRedirectUri('oidc', 'https://next.sable.moe/login', 'nonce')).toBe(
       'https://next.sable.moe/login'
     );
-    expect(createRedirectUri('oidc', 'moe.sable.next:/login', 'nonce')).toBe(
-      'moe.sable.next:/login'
-    );
+    expect(createRedirectUri('oidc', 'moe.sable.app:/login', 'nonce')).toBe('moe.sable.app:/login');
   });
 
-  test('uses valid native callback URI forms', () => {
-    expect(tauriRedirectUri('oidc')).toBe('moe.sable.next:/login');
-    expect(tauriRedirectUri('sso')).toBe('sable://login');
+  describe('native callback URI forms', () => {
+    afterEach(() => vi.unstubAllGlobals());
+
+    test('stable keeps the v1 schemes', () => {
+      vi.stubGlobal('__SABLE_STABLE__', true);
+      expect(nativeRedirectUri('oidc')).toBe('moe.sable.app:/login');
+      expect(nativeRedirectUri('sso')).toBe('sable://login');
+    });
+
+    test('nightly and development use their own scheme', () => {
+      vi.stubGlobal('__SABLE_STABLE__', false);
+      expect(nativeRedirectUri('oidc')).toBe('moe.sable.next:/login');
+      expect(nativeRedirectUri('sso')).toBe('moe.sable.next://login');
+    });
+
+    test.each([true, false])(
+      'Electron uses the schemes its package registers (stable=%s)',
+      (stable) => {
+        vi.stubGlobal('__SABLE_STABLE__', stable);
+        vi.stubGlobal('sableElectron', {});
+        expect(nativeRedirectUri('oidc')).toBe(
+          stable ? 'moe.sable.app:/login' : 'moe.sable.next:/login'
+        );
+        expect(nativeRedirectUri('sso')).toBe(stable ? 'sable://login' : 'moe.sable.next://login');
+      }
+    );
   });
 
   test('uses protocol state to isolate callback channels', () => {

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { MediaQuery } from 'svelte/reactivity';
   import MicrophoneIcon from 'phosphor-svelte/lib/MicrophoneIcon';
   import PaperPlaneIcon from 'phosphor-svelte/lib/PaperPlaneTiltIcon';
   import TextAaIcon from 'phosphor-svelte/lib/TextAaIcon';
@@ -20,7 +21,6 @@
   import { i18n } from '#lib/i18n.js';
   import { preferences } from '#lib/settings/preferences.svelte.js';
   import { BREAKPOINTS } from '#lib/ui/breakpoints.js';
-  import { createMediaQuery } from '#lib/ui/media-query.svelte.js';
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
   import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
 
@@ -28,14 +28,14 @@
   const uid = $props.id();
   const listboxId = `${uid}-listbox`;
   const voiceSupported = isVoiceRecordingSupported();
-  const appLayout = createMediaQuery(BREAKPOINTS.appLayout);
-  const roomyPointer = createMediaQuery('(width >= 32rem) and (any-pointer: fine)');
+  const appLayout = new MediaQuery(BREAKPOINTS.appLayout);
+  const roomyPointer = new MediaQuery('(width >= 32rem) and (any-pointer: fine)');
   const short = $derived(
     preferences.composerForm === 'short' ||
-      (preferences.composerForm === 'adaptive' && roomyPointer.matches)
+      (preferences.composerForm === 'adaptive' && roomyPointer.current)
   );
 
-  let desktop = $derived(appLayout.matches);
+  let desktop = $derived(appLayout.current);
   let showPlaceholder = $state(true);
   let activeFormats = $state.raw<FormatAction[]>([]);
   let activeColors = $state.raw<ActiveColors>({ fg: null, bg: null });
@@ -44,8 +44,8 @@
   let richText = $derived(preferences.richTextComposer);
   let configuredRich = preferences.richTextComposer;
   let showVoice = $derived(preferences.composerVoiceButton && voiceSupported);
-  let sendLabel = $derived($i18n.t('timeline.sendMessage'));
-  let placeholder = $derived($i18n.t('timeline.messagePlaceholder'));
+  let sendLabel = $derived(i18n.t('timeline.sendMessage'));
+  let placeholder = $derived(i18n.t('timeline.messagePlaceholder'));
 
   const editor = new ComposerEditor({
     media: {
@@ -54,7 +54,7 @@
       hold: () => () => {},
     },
     emotes: () => [],
-    label: () => $i18n.t('timeline.messagePlaceholder'),
+    label: () => i18n.t('timeline.messagePlaceholder'),
     listboxId,
     activeOptionId: () => null,
     editable: () => true,
@@ -84,11 +84,10 @@
 
   let previewReady = $state(false);
 
-  onMount(() => {
-    void tick().then(() => {
-      previewReady = true;
-      seedSample();
-    });
+  onMount(async () => {
+    await tick();
+    previewReady = true;
+    seedSample();
   });
 
   $effect(() => {
@@ -101,21 +100,44 @@
   });
 </script>
 
-<aside class="composer-preview" aria-label={$i18n.t('settings.composerPreview')}>
-  <p class="preview-label">{$i18n.t('settings.composerButtonOrderHint')}</p>
+<aside class="composer-preview" aria-label={i18n.t('settings.composerPreview')}>
+  <p class="preview-label">{i18n.t('settings.composerButtonOrderHint')}</p>
   <div class="composer-stack">
     <div class="composer-shell">
-      <div class="composer" role="group" aria-label={$i18n.t('settings.composerPreview')}>
+      <div class="composer" role="group" aria-label={i18n.t('settings.composerPreview')}>
         <form
-          class="composer-row"
-          class:short
-          class:formatting-open={formattingOpen}
+          class={['composer-row', { short, 'formatting-open': formattingOpen }]}
           onsubmit={(event) => {
             event.preventDefault();
           }}
         >
+          {#snippet personaButton(onReorder: () => void)}
+            <Tooltip label={i18n.t('settings.composerButtonOrderDragHintNone')}>
+              {#snippet trigger({ props })}
+                <IconButton
+                  {...props}
+                  variant="ghost"
+                  size="small"
+                  class="composer-format selection-open"
+                  aria-keyshortcuts="ArrowLeft ArrowRight"
+                  onclick={onReorder}
+                  label={i18n.t('personas.picker')}
+                >
+                  <UserSwitchIcon />
+                </IconButton>
+              {/snippet}
+            </Tooltip>
+          {/snippet}
           <div class="composer-before">
-            <ComposerDoor {desktop} disabled onPick={() => {}} />
+            <ComposerDoor
+              {desktop}
+              disabled
+              onPick={() => {}}
+              extras={{
+                ...(preferences.personaPicker &&
+                  preferences.personaPickerLeftSide && { persona: personaButton }),
+              }}
+            />
           </div>
           <div class="composer-field">
             <ComposerEditorView {editor} {showPlaceholder} {placeholder} />
@@ -139,25 +161,8 @@
               />
             </div>
           {/if}
-          {#snippet personaButton(onReorder: () => void)}
-            <Tooltip label={$i18n.t('settings.composerButtonOrderDragHintNone')}>
-              {#snippet trigger({ props })}
-                <IconButton
-                  {...props}
-                  variant="ghost"
-                  size="small"
-                  class="composer-format selection-open"
-                  aria-keyshortcuts="ArrowLeft ArrowRight"
-                  onclick={onReorder}
-                  label={$i18n.t('personas.picker')}
-                >
-                  <UserSwitchIcon />
-                </IconButton>
-              {/snippet}
-            </Tooltip>
-          {/snippet}
           {#snippet formatButton(onReorder: () => void)}
-            <Tooltip label={$i18n.t('settings.composerButtonOrderDragHintNone')}>
+            <Tooltip label={i18n.t('settings.composerButtonOrderDragHintNone')}>
               {#snippet trigger({ props })}
                 <IconButton
                   {...props}
@@ -168,7 +173,7 @@
                   aria-pressed={formattingOpen}
                   onclick={onReorder}
                   data-state={formattingOpen ? 'open' : 'closed'}
-                  label={$i18n.t('composer.formatting')}
+                  label={i18n.t('composer.formatting')}
                 >
                   <TextAaIcon />
                 </IconButton>
@@ -185,7 +190,8 @@
               onPick={() => {}}
               onPickUnicode={() => {}}
               extras={{
-                ...(preferences.personaPicker && { persona: personaButton }),
+                ...(preferences.personaPicker &&
+                  !preferences.personaPickerLeftSide && { persona: personaButton }),
                 ...(preferences.composerFormatButton && { format: formatButton }),
               }}
             />
@@ -195,7 +201,7 @@
                 size="small"
                 class="composer-voice"
                 disabled
-                label={$i18n.t('composer.voiceRecord')}><MicrophoneIcon /></IconButton
+                label={i18n.t('composer.voiceRecord')}><MicrophoneIcon /></IconButton
               >
             {/if}
             <IconButton

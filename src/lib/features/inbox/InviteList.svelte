@@ -4,12 +4,11 @@
   import LockSimpleIcon from 'phosphor-svelte/lib/LockSimpleIcon';
   import { SvelteSet } from 'svelte/reactivity';
 
-  import type { ProfileView } from '#src/generated/protocol';
-
   import { useCoreClient } from '#lib/core/context.js';
   import MentionProfile from '#lib/features/room/members/MentionProfile.svelte';
   import { formatDate } from '#lib/ui/date-time.js';
   import { i18n } from '#lib/i18n.js';
+  import { UserProfile } from '#lib/profile/user-profile.svelte.js';
   import { dismissedInvites } from '#lib/rooms/dismissed-invites.svelte.js';
   import { InviteActions, isDeclining } from '#lib/rooms/invites.svelte.js';
   import { roomLabel, useRoomList } from '#lib/rooms/room-list.svelte.js';
@@ -21,6 +20,7 @@
   import ConfirmDialog from '#lib/ui/primitives/ConfirmDialog.svelte';
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
   import StatusBadge from '#lib/ui/primitives/StatusBadge.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
   import { toasts } from '#lib/ui/toasts.svelte.js';
   import { DisplayNames } from './display-names.svelte';
   import InboxSectionHeader from './InboxSectionHeader.svelte';
@@ -76,18 +76,11 @@
 
   let profileOpen = $state(false);
   let profileTarget = $state.raw<{ userId: string; anchor: HTMLElement } | null>(null);
-  let profile = $state.raw<ProfileView | null>(null);
+  const profile = new UserProfile(core, () => profileTarget?.userId);
 
   function openProfile(userId: string, anchor: HTMLElement): void {
     profileTarget = { userId, anchor };
-    profile = null;
     profileOpen = true;
-    void core.userProfile(userId).then(
-      (loaded) => {
-        if (profileTarget?.userId === userId) profile = loaded;
-      },
-      () => undefined
-    );
   }
 
   $effect(() => {
@@ -98,7 +91,7 @@
     const write = next ? dismissedInvites.dismiss(roomId) : dismissedInvites.restore(roomId);
     write.catch((error: unknown) => {
       console.warn('[sable room] dismissed invites not saved', error);
-      toasts.error($i18n.t('errors.actionFailed'));
+      toasts.error(i18n.t('errors.actionFailed'));
     });
   }
 
@@ -123,7 +116,7 @@
 
 {#if triage.ready && (invites.length > 0 || dismissed.length > 0)}
   <section class="invites" aria-labelledby={headingId}>
-    <InboxSectionHeader id={headingId} title={$i18n.t('inbox.invites')} count={invites.length}>
+    <InboxSectionHeader id={headingId} title={i18n.t('inbox.invites')} count={invites.length}>
       {#if dismissed.length > 0}
         <Button
           variant="ghost"
@@ -132,8 +125,8 @@
           onclick={() => (dismissedOpen = !showDismissed)}
         >
           {showDismissed
-            ? $i18n.t('inbox.invitesShowPending')
-            : $i18n.t('inbox.invitesShowHidden', { count: dismissed.length })}
+            ? i18n.t('inbox.invitesShowPending')
+            : i18n.t('inbox.invitesShowHidden', { count: dismissed.length })}
         </Button>
       {/if}
     </InboxSectionHeader>
@@ -146,13 +139,13 @@
       <section
         class="group"
         aria-labelledby={titled ? groupId : undefined}
-        aria-label={titled ? undefined : $i18n.t(GROUP_TITLES[group])}
+        aria-label={titled ? undefined : i18n.t(GROUP_TITLES[group])}
       >
         {#if titled}
           <InboxSectionHeader
             id={groupId}
             level={3}
-            title={$i18n.t(GROUP_TITLES[group])}
+            title={i18n.t(GROUP_TITLES[group])}
             count={members.length}
           >
             <div class="group-actions">
@@ -165,7 +158,7 @@
                     void answers.acceptAll(members.map((invite) => invite.room));
                   }}
                 >
-                  {$i18n.t('inbox.acceptAll')}
+                  {i18n.t('inbox.acceptAll')}
                 </Button>
               {/if}
               {#if group === 'spam'}
@@ -176,9 +169,7 @@
                   aria-controls={`${groupId}-list`}
                   onclick={() => (spamOpen = !spamOpen)}
                 >
-                  {spamOpen
-                    ? $i18n.t('inbox.invitesSpamCollapse')
-                    : $i18n.t('inbox.invitesSpamShow')}
+                  {spamOpen ? i18n.t('inbox.invitesSpamCollapse') : i18n.t('inbox.invitesSpamShow')}
                 </Button>
               {/if}
               {#if group !== 'known' && (group === 'spam' || members.length > 1)}
@@ -190,7 +181,7 @@
                     answers.declineAll(members.map((invite) => invite.room));
                   }}
                 >
-                  {$i18n.t('inbox.declineAll')}
+                  {i18n.t('inbox.declineAll')}
                 </Button>
               {/if}
               {#if group === 'spam' && members.some((invite) => invite.inviter)}
@@ -202,7 +193,7 @@
                     askToBlock(members);
                   }}
                 >
-                  {$i18n.t('inbox.blockSenders')}
+                  {i18n.t('inbox.blockSenders')}
                 </Button>
               {/if}
             </div>
@@ -211,7 +202,7 @@
 
         {#if group === 'spam'}
           <Alert variant="warning">
-            <p>{$i18n.t('inbox.invitesSpamWarning')}</p>
+            <p>{i18n.t('inbox.invitesSpamWarning')}</p>
           </Alert>
         {/if}
 
@@ -228,9 +219,9 @@
 
   <ConfirmDialog
     bind:open={blockOpen}
-    title={$i18n.t('inbox.blockSendersTitle', { count: blockSenders.length })}
-    description={$i18n.t('inbox.blockSendersBody', { count: blockTargets.length })}
-    confirmLabel={$i18n.t('inbox.blockSendersConfirm')}
+    title={i18n.t('inbox.blockSendersTitle', { count: blockSenders.length })}
+    description={i18n.t('inbox.blockSendersBody', { count: blockTargets.length })}
+    confirmLabel={i18n.t('inbox.blockSendersConfirm')}
     busy={blocking}
     onConfirm={() => {
       void block();
@@ -253,7 +244,7 @@
     userId={profileTarget.userId}
     member={null}
     roomId=""
-    {profile}
+    profile={profile.current}
     anchor={profileTarget.anchor}
   />
 {/if}
@@ -276,24 +267,24 @@
         <p class="name">
           <span class="name-text">{name}</span>
           {#if room.encrypted}
-            <span
-              class="lock"
-              role="img"
-              aria-label={$i18n.t('inbox.inviteEncrypted')}
-              title={$i18n.t('inbox.inviteEncrypted')}
-            >
-              <LockSimpleIcon aria-hidden="true" />
-            </span>
+            {@const encryptedLabel = i18n.t('inbox.inviteEncrypted')}
+            <Tooltip label={encryptedLabel}>
+              {#snippet trigger({ props })}
+                <span {...props} class="lock" role="img" aria-label={encryptedLabel}>
+                  <LockSimpleIcon aria-hidden="true" />
+                </span>
+              {/snippet}
+            </Tooltip>
           {/if}
         </p>
         <p class="meta">
-          {#if room.is_space}
-            <StatusBadge label={$i18n.t('inbox.inviteSpace')} variant="secondary" />
+          {#if room.room_kind === 'space'}
+            <StatusBadge label={i18n.t('inbox.inviteSpace')} variant="secondary" />
           {:else if room.is_direct}
-            <StatusBadge label={$i18n.t('inbox.inviteDirect')} variant="secondary" />
+            <StatusBadge label={i18n.t('common.directMessage')} variant="secondary" />
           {/if}
           {#if invite.group === 'strangers'}
-            <StatusBadge label={$i18n.t('inbox.inviteNoSharedRooms')} variant="warning" />
+            <StatusBadge label={i18n.t('inbox.inviteNoSharedRooms')} variant="warning" />
           {/if}
           {#if from && fromName}
             <button
@@ -303,7 +294,7 @@
                 openProfile(from, event.currentTarget);
               }}
             >
-              {$i18n.t('inbox.invitedBy', { name: fromName })}
+              {i18n.t('inbox.invitedBy', { name: fromName })}
               <span>({from})</span>
             </button>
           {/if}
@@ -322,7 +313,7 @@
     {/if}
 
     {#if invite.reason}
-      {@const label = $i18n.t('inbox.inviteMessageFrom', { name: fromName ?? '' })}
+      {@const label = i18n.t('inbox.inviteMessageFrom', { name: fromName ?? '' })}
       {#if invite.group === 'spam' && !revealed.has(room.room_id)}
         <Button
           class="reveal"
@@ -332,7 +323,7 @@
             revealed.add(room.room_id);
           }}
         >
-          {$i18n.t('inbox.inviteMessageShow', { name: fromName ?? '' })}
+          {i18n.t('inbox.inviteMessageShow', { name: fromName ?? '' })}
         </Button>
       {:else}
         <figure class="reason">
@@ -348,22 +339,22 @@
         disabled={busy}
         onclick={() => {
           void answers.accept(room);
-        }}>{$i18n.t('room.inviteAccept')}</Button
+        }}>{i18n.t('common.accept')}</Button
       >
       <Button
         variant="ghost"
         disabled={busy}
         onclick={() => {
           answers.decline(room);
-        }}>{$i18n.t('room.inviteDecline')}</Button
+        }}>{i18n.t('common.decline')}</Button
       >
-      <ActionMenu label={$i18n.t('inbox.inviteOptions', { room: name })}>
+      <ActionMenu label={i18n.t('inbox.inviteOptions', { room: name })}>
         {#snippet trigger({ props })}
           <IconButton
             {...props}
             variant="ghost"
             disabled={busy}
-            label={$i18n.t('inbox.inviteOptions', { room: name })}
+            label={i18n.t('inbox.inviteOptions', { room: name })}
           >
             <DotsThreeIcon weight="bold" />
           </IconButton>
@@ -373,7 +364,7 @@
             setDismissed(room.room_id, !showDismissed);
           }}
         >
-          {showDismissed ? $i18n.t('inbox.inviteRestore') : $i18n.t('inbox.inviteHide')}
+          {showDismissed ? i18n.t('common.restore') : i18n.t('inbox.inviteHide')}
         </ActionMenuItem>
       </ActionMenu>
     </div>

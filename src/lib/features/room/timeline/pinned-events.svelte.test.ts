@@ -29,7 +29,11 @@ test('toggling updates the shared set without another fetch', async () => {
   await pins.load('!room:example.org');
   await pins.toggle('!room:example.org', '$b');
 
-  expect(setPinned).toHaveBeenCalledWith('!room:example.org', '$b', true);
+  expect(setPinned).toHaveBeenCalledWith({
+    room_id: '!room:example.org',
+    event_id: '$b',
+    pinned: true,
+  });
   expect(pins.has('$b')).toBe(true);
   expect(pinnedEvents).toHaveBeenCalledTimes(1);
 });
@@ -46,7 +50,11 @@ test('unpinning passes the current state through', async () => {
   await pins.load('!room:example.org');
   await pins.toggle('!room:example.org', '$a');
 
-  expect(setPinned).toHaveBeenCalledWith('!room:example.org', '$a', false);
+  expect(setPinned).toHaveBeenCalledWith({
+    room_id: '!room:example.org',
+    event_id: '$a',
+    pinned: false,
+  });
   expect(pins.has('$a')).toBe(false);
 });
 
@@ -101,7 +109,7 @@ test('a failed load leaves the set intact rather than clearing it', async () => 
 
 test('a refused pin says so instead of asking to retry', () => {
   expect(pinErrorMessage(new CoreError({ code: 'denied' }))).toBe(
-    "You don't have permission to pin messages in this room."
+    'You don’t have permission to pin messages in this room.'
   );
   expect(pinErrorMessage(new CoreError({ code: 'failed', log_id: 'e1' }))).toBe(
     'Could not complete that action. Try again.'

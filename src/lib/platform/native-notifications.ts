@@ -1,6 +1,7 @@
 import { addPluginListener, invoke, isTauri } from '@tauri-apps/api/core';
 
 import { deliversNativePush } from './notifications.js';
+import { isAndroid } from './os.js';
 
 export interface NativeNotificationTarget {
   userId: string;
@@ -34,9 +35,32 @@ export async function requestNativeNotificationPermission(): Promise<Notificatio
   return invoke<NotificationGrant>('request_notification_permission');
 }
 
-export async function dismissNativeRoomNotification(userId: string, roomId: string): Promise<void> {
+export async function dismissNativeRoomNotifications(
+  userId: string,
+  roomIds: readonly string[]
+): Promise<void> {
   if (!isTauri()) return;
-  await invoke('dismiss_room_notification', { userId, roomId });
+  await invoke('dismiss_room_notifications', { userId, roomIds });
+}
+
+let openConversation: Promise<void> = Promise.resolve();
+
+/** In call order, so leaving one room never lands after opening the next. */
+export function setNativeOpenConversation(
+  userId: string | null,
+  roomId: string | null
+): Promise<void> {
+  if (!isAndroid()) return Promise.resolve();
+  const next = openConversation.then(() =>
+    invoke('set_open_conversation', { userId, roomId }).then(() => undefined)
+  );
+  openConversation = next.catch(() => undefined);
+  return next;
+}
+
+export async function forgetLeftNativeConversations(): Promise<void> {
+  if (!isAndroid()) return;
+  await invoke('forget_left_conversations');
 }
 
 export async function dismissNativeReadRoomNotifications(
@@ -52,7 +76,9 @@ export async function setNativeEncryptedContentAllowed(
   content = false,
   enabled = true,
   sounds = true,
-  notifyOnce = true
+  notifyOnce = true,
+  clearOnRead = true,
+  privateReceipts = false
 ): Promise<void> {
   if (!isTauri()) return;
   await invoke('set_notification_encrypted_content', {
@@ -61,6 +87,8 @@ export async function setNativeEncryptedContentAllowed(
     enabled,
     sounds,
     notifyOnce,
+    clearOnRead,
+    privateReceipts,
   });
 }
 
@@ -83,7 +111,7 @@ export async function takeNativePushDiagnostics(): Promise<NativePushDiagnostics
       counts?: Record<string, number>;
       lastOutcome?: string;
       lastAt?: number;
-    }>('plugin:notifications|take_push_diagnostics');
+    }>('plugin:sable-push|take_push_diagnostics');
     return {
       counts: taken.counts ?? {},
       lastOutcome: taken.lastOutcome ?? null,
@@ -97,7 +125,7 @@ export async function takeNativePushDiagnostics(): Promise<NativePushDiagnostics
 export async function nativePushHistory(): Promise<unknown[] | null> {
   if (!isTauri()) return null;
   try {
-    const taken = await invoke<{ entries?: unknown[] }>('plugin:notifications|push_history');
+    const taken = await invoke<{ entries?: unknown[] }>('plugin:sable-push|push_history');
     return taken.entries ?? [];
   } catch {
     return null;
@@ -106,7 +134,11 @@ export async function nativePushHistory(): Promise<unknown[] | null> {
 
 export async function clearNativePushHistory(): Promise<void> {
   if (!isTauri()) return;
-  await invoke('plugin:notifications|clear_push_history');
+  await invoke('plugin:sable-push|clear_push_history');
+}
+
+export async function playNativeChime(volume: number): Promise<void> {
+  await invoke('plugin:sable-push|play_chime', { volume });
 }
 
 export interface NativePushTransport {
@@ -160,9 +192,9 @@ export async function watchNativeNotificationActions(
 
   return () => {
     void invoke('plugin:notifications|set_action_listener_active', { active: false }).catch(
-      () => undefined
+      listenerNotReleased
     );
-    void listener.unregister().catch(() => undefined);
+    void listener.unregister().catch(listenerNotReleased);
   };
 }
 
@@ -183,9 +215,9 @@ export async function watchNativeNotificationClicks(
 
   return () => {
     void invoke('plugin:notifications|set_click_listener_active', { active: false }).catch(
-      () => undefined
+      listenerNotReleased
     );
-    void listener.unregister().catch(() => undefined);
+    void listener.unregister().catch(listenerNotReleased);
   };
 }
 
@@ -211,9 +243,9 @@ export async function watchNativePushMessages(
 
   return () => {
     void invoke('plugin:notifications|set_push_message_listener_active', { active: false }).catch(
-      () => undefined
+      listenerNotReleased
     );
-    void listener.unregister().catch(() => undefined);
+    void listener.unregister().catch(listenerNotReleased);
   };
 }
 
@@ -224,8 +256,12 @@ export async function watchNativePushTokens(handler: () => void): Promise<() => 
       handler();
   });
   return () => {
-    void listener.unregister().catch(() => undefined);
+    void listener.unregister().catch(listenerNotReleased);
   };
+}
+
+function listenerNotReleased(error: unknown): void {
+  console.debug('[sable notifications] native listener not released', error);
 }
 
 function text(value: unknown): string | null {

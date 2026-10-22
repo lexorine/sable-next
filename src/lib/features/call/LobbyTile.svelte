@@ -3,6 +3,7 @@
   import MicrophoneSlashIcon from 'phosphor-svelte/lib/MicrophoneSlashIcon';
 
   import Avatar from '#lib/ui/primitives/Avatar.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
 
   interface Props {
     name: string;
@@ -12,9 +13,19 @@
     speaking?: boolean;
     stream?: MediaStream;
     note?: string;
+    live?: boolean;
   }
 
-  let { name, userId, avatar, muted = false, speaking = false, stream, note }: Props = $props();
+  let {
+    name,
+    userId,
+    avatar,
+    muted = false,
+    speaking = false,
+    stream,
+    note,
+    live = false,
+  }: Props = $props();
 
   function attachStream(node: HTMLVideoElement) {
     node.srcObject = stream ?? null;
@@ -24,14 +35,14 @@
   }
 </script>
 
-<li class="tile" class:video-on={stream !== undefined} class:speaking>
+<li class={['tile', { 'video-on': stream !== undefined, speaking }]}>
   {#if stream}
     <video
       class="video"
       autoplay
       muted
       playsinline
-      aria-label={$i18n.t('call.prescreenPreview')}
+      aria-label={i18n.t('call.prescreenPreview')}
       {@attach attachStream}
     ></video>
   {:else}
@@ -42,11 +53,17 @@
   {/if}
   <span class="tag">
     {#if muted}
-      <span class="muted" title={$i18n.t('call.muted')}>
-        <MicrophoneSlashIcon aria-hidden="true" weight="fill" />
-        <span class="screen-reader-only">{$i18n.t('call.muted')}</span>
-      </span>
+      {@const mutedLabel = i18n.t('call.muted')}
+      <Tooltip label={mutedLabel}>
+        {#snippet trigger({ props })}
+          <span {...props} class="muted">
+            <MicrophoneSlashIcon aria-hidden="true" weight="fill" />
+            <span class="screen-reader-only">{mutedLabel}</span>
+          </span>
+        {/snippet}
+      </Tooltip>
     {/if}
+    {#if live}<span class="live">{i18n.t('call.live')}</span>{/if}
     <span class="name">{name}</span>
   </span>
 </li>
@@ -134,6 +151,17 @@
     max-inline-size: calc(100% - var(--space-400));
     padding: var(--space-050) var(--space-200);
     position: absolute;
+  }
+
+  .live {
+    background: var(--crit-main);
+    border-radius: var(--radii-300);
+    color: var(--crit-on-main);
+    font-size: var(--font-size-small);
+    font-weight: var(--font-weight-bold);
+    letter-spacing: 0.04em;
+    padding: 0 var(--space-100);
+    text-transform: uppercase;
   }
 
   .tag :global(svg) {

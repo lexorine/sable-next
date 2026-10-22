@@ -1,9 +1,8 @@
-import type { DirectoryRoomType, PublicRoomView } from '#src/generated/protocol';
+import type { DirectoryRoomType, PublicRoomView, Rpc } from '#src/generated/protocol';
 
-import type { CoreCommands } from '#lib/core/commands.svelte.js';
 import { CoreError } from '#src/transport';
 
-export type RoomDirectoryApi = Pick<CoreCommands, 'publicRooms'>;
+export type RoomDirectoryApi = Pick<Rpc['rooms'], 'publicRooms'>;
 
 export type DirectoryQuery = {
   server: string | null;
@@ -60,12 +59,12 @@ export class RoomDirectory {
         server: this.#query.server,
         search: this.#query.search,
         since,
-        ...(roomType ? { roomType } : {}),
+        room_type: roomType,
       });
       if (generation !== this.#generation) return;
 
       const rooms = roomType
-        ? page.rooms.filter((room) => room.is_space === (roomType === 'spaces'))
+        ? page.rooms.filter((room) => roomType !== 'spaces' || room.room_kind === 'space')
         : page.rooms;
       this.rooms = since === null ? rooms : mergeRooms(this.rooms, rooms);
       this.total = page.total;

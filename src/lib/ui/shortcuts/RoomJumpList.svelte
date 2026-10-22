@@ -1,10 +1,9 @@
 <script lang="ts">
-  import type { RoomSummary } from '#src/generated/protocol';
+  import type { RoomListItemView } from '#src/generated/protocol';
   import { i18n } from '#lib/i18n.js';
   import { useRoomList } from '#lib/rooms/room-list.svelte.js';
   import Avatar from '#lib/ui/primitives/Avatar.svelte';
   import RoomIcon from '#lib/ui/primitives/RoomIcon.svelte';
-  import { CALENDAR_ROOM_TYPE } from '#lib/features/calendar/calendar-events.js';
   import TextInput from '#lib/ui/primitives/TextInput.svelte';
   import UnreadBadge from '#lib/ui/primitives/UnreadBadge.svelte';
   import '#lib/ui/primitives/menu.css';
@@ -16,9 +15,10 @@
     parseJumpQuery,
     roomDisplayName,
   } from './room-jump.js';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
 
   interface Props {
-    onSelect: (room: RoomSummary) => void;
+    onSelect: (room: RoomListItemView) => void;
     onClose?: () => void;
   }
 
@@ -35,7 +35,7 @@
   let results = $derived(filterRoomsByQuery(roomList.rooms, query));
   let parents = $derived(parentSpaceNames(roomList.rooms));
   let active = $derived(Math.min(activeIndex, Math.max(0, results.length - 1)));
-  let heading = $derived(parsed.text === '' ? $i18n.t('shortcuts.paletteRecents') : null);
+  let heading = $derived(parsed.text === '' ? i18n.t('shortcuts.paletteRecents') : null);
 
   function optionId(index: number): string {
     return `${uid}-option-${index}`;
@@ -72,20 +72,21 @@
     aria-controls={listboxId}
     aria-activedescendant={results.length > 0 ? optionId(active) : undefined}
     aria-autocomplete="list"
-    aria-label={$i18n.t('shortcuts.paletteLabel')}
-    placeholder={$i18n.t('shortcuts.palettePlaceholder')}
+    aria-label={i18n.t('shortcuts.paletteTitle')}
+    placeholder={i18n.t('common.searchRooms')}
     autocomplete="off"
   />
-  <p class="hint">{$i18n.t('shortcuts.paletteHint')}</p>
+  <p class="hint">{i18n.t('shortcuts.paletteHint')}</p>
   {#if results.length === 0}
-    <p class="empty">{$i18n.t('shortcuts.paletteEmpty')}</p>
+    <p class="empty">{i18n.t('shortcuts.paletteEmpty')}</p>
   {:else}
     {#if heading}<p class="heading">{heading}</p>{/if}
     <ul
       id={listboxId}
       role="listbox"
-      aria-label={$i18n.t('shortcuts.paletteLabel')}
+      aria-label={i18n.t('shortcuts.paletteTitle')}
       {@attach keepActiveInView}
+      {@attach scrollHint}
     >
       {#each results as room, index (room.room_id)}
         {@const name = roomDisplayName(room)}
@@ -110,9 +111,8 @@
               uniform
             >
               <RoomIcon
-                isCalendar={room.room_type === CALENDAR_ROOM_TYPE}
-                isSpace={room.is_space}
-                isVoice={room.is_voice}
+                roomKind={room.room_kind}
+                hasParent={parents.has(room.room_id)}
                 joinRule={room.join_rule}
               />
             </Avatar>

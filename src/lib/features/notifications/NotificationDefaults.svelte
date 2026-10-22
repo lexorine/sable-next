@@ -39,7 +39,7 @@
     key: 'badgeDefaultDirect' | 'badgeDefaultGroup';
     label: string;
   }[] = [
-    { key: 'badgeDefaultDirect', label: 'settings.notificationDefaultDirect' },
+    { key: 'badgeDefaultDirect', label: 'common.directMessages' },
     { key: 'badgeDefaultGroup', label: 'settings.notificationDefaultGroup' },
   ];
 
@@ -48,7 +48,7 @@
     label: string;
     direct: boolean;
   }[] = [
-    { key: 'direct', label: 'settings.notificationDefaultDirect', direct: true },
+    { key: 'direct', label: 'common.directMessages', direct: true },
     { key: 'group', label: 'settings.notificationDefaultGroup', direct: false },
   ];
 
@@ -74,27 +74,28 @@
     void settingsChanges.version;
 
     let alive = true;
-    void core.commands
-      .defaultNotificationModes()
+    void core.rpc.notifications
+      .defaultModes()
       .then((modes) => {
         if (!alive) return;
         current = modes;
         failed = false;
       })
-      .catch(() => {
+      .catch((error: unknown) => {
+        console.warn('[sable notifications] loading default modes failed', error);
         if (alive) failed = true;
       });
-    void core.commands.eventNotifications().then(
+    void core.rpc.notifications.eventNotifications().then(
       (view) => {
         if (alive) events = view;
       },
-      () => undefined
+      (error: unknown) => console.warn('[sable notifications] loading event settings failed', error)
     );
-    void core.commands.masterMute().then(
+    void core.rpc.notifications.masterMute().then(
       (value) => {
         if (alive) muted = value;
       },
-      () => undefined
+      (error: unknown) => console.warn('[sable notifications] loading master mute failed', error)
     );
 
     return () => {
@@ -109,11 +110,12 @@
   ): void {
     if (current) current = { ...current, [key]: mode };
 
-    void core.commands.setDefaultNotificationMode(isDirect, mode).then(
+    void core.rpc.notifications.setDefaultMode({ direct: isDirect, mode }).then(
       () => {
         settingsChanges.version += 1;
       },
-      () => {
+      (error: unknown) => {
+        console.warn('[sable notifications] saving default mode failed', error);
         failed = true;
         settingsChanges.version += 1;
       }
@@ -123,7 +125,8 @@
   function saveMute(value: boolean): void {
     muted = value;
 
-    void core.commands.setMasterMute(value).catch(() => {
+    void core.rpc.notifications.setMasterMute({ muted: value }).catch((error: unknown) => {
+      console.warn('[sable notifications] saving master mute failed', error);
       failed = true;
       settingsChanges.version += 1;
     });
@@ -132,7 +135,8 @@
   function saveEvent(event: EventNotificationView, enabled: boolean): void {
     if (events) events = { ...events, [event]: enabled };
 
-    void core.commands.setEventNotification(event, enabled).catch(() => {
+    void core.rpc.notifications.setEventNotification({ event, enabled }).catch((error: unknown) => {
+      console.warn('[sable notifications] saving event setting failed', error);
       failed = true;
       settingsChanges.version += 1;
     });
@@ -142,19 +146,19 @@
 <section class="defaults settings-form" aria-labelledby="notification-badges">
   <div class="settings-heading-row">
     <h3 id="notification-badges" data-settings-outline>
-      {$i18n.t('settings.notificationBadges')}
+      {i18n.t('settings.notificationBadges')}
     </h3>
     <SettingsAnchorLink anchor="notification-badges" />
   </div>
-  <p class="hint settings-description">{$i18n.t('settings.notificationBadgesHint')}</p>
+  <p class="hint settings-description">{i18n.t('settings.notificationBadgesHint')}</p>
 
   <ul class="settings-rows">
     {#each badgeRows as { key, label } (key)}
-      <SettingsRow title={$i18n.t(label)}>
+      <SettingsRow id={`notification-badge-${key}`} title={i18n.t(label)} {key}>
         <Select
-          aria-label={`${$i18n.t('settings.notificationBadges')}: ${$i18n.t(label)}`}
+          aria-label={`${i18n.t('settings.notificationBadges')}: ${i18n.t(label)}`}
           value={preferences[key]}
-          items={badgeModes.map((mode) => ({ value: mode, label: $i18n.t(badgeModeLabels[mode]) }))}
+          items={badgeModes.map((mode) => ({ value: mode, label: i18n.t(badgeModeLabels[mode]) }))}
           onValueChange={(value) => {
             setPreference(key, value as BadgeNotificationMode);
           }}
@@ -167,38 +171,39 @@
 <section class="defaults settings-form" aria-labelledby="notification-push">
   <div class="settings-heading-row">
     <h3 id="notification-push" data-settings-outline>
-      {$i18n.t('settings.notificationPush')}
+      {i18n.t('settings.notificationPush')}
     </h3>
     <SettingsAnchorLink anchor="notification-push" />
   </div>
-  <p class="hint settings-description">{$i18n.t('settings.notificationPushHint')}</p>
+  <p class="hint settings-description">{i18n.t('settings.notificationPushHint')}</p>
 
   {#if failed}
     <Alert variant="warning" role="status">
-      <p>{$i18n.t('settings.notificationDefaultsFailed')}</p>
+      <p>{i18n.t('settings.notificationDefaultsFailed')}</p>
     </Alert>
   {/if}
 
   <ul class="settings-rows">
     {#if muted !== null}
       <SettingsRow
-        title={$i18n.t('settings.notificationMasterMute')}
-        description={$i18n.t('settings.notificationMasterMuteHint')}
+        id="notification-master-mute"
+        title={i18n.t('settings.notificationMasterMute')}
+        description={i18n.t('settings.notificationMasterMuteHint')}
       >
         <Switch
-          label={$i18n.t('settings.notificationMasterMute')}
+          label={i18n.t('settings.notificationMasterMute')}
           checked={muted}
           onCheckedChange={saveMute}
         />
       </SettingsRow>
     {/if}
     {#each pushRows as { key, label, direct } (key)}
-      <SettingsRow title={$i18n.t(label)}>
+      <SettingsRow id={`notification-push-${key}`} title={i18n.t(label)}>
         {#if current}
           <Select
-            aria-label={`${$i18n.t('settings.notificationPush')}: ${$i18n.t(label)}`}
+            aria-label={`${i18n.t('settings.notificationPush')}: ${i18n.t(label)}`}
             value={current[key]}
-            items={modes.map((mode) => ({ value: mode, label: $i18n.t(modeLabels[mode]) }))}
+            items={modes.map((mode) => ({ value: mode, label: i18n.t(modeLabels[mode]) }))}
             onValueChange={(value) => {
               savePush(key, direct, value as NotificationModeView);
             }}
@@ -209,11 +214,11 @@
     {#if events}
       {#each eventRows as { key, label } (key)}
         {#if events[key] !== null}
-          <SettingsRow title={$i18n.t(label)}>
+          <SettingsRow id={`notification-event-${key}`} title={i18n.t(label)}>
             <Select
-              aria-label={$i18n.t(label)}
+              aria-label={i18n.t(label)}
               value={events[key] ? 'on' : 'off'}
-              items={eventItems.map((item) => ({ value: item.value, label: $i18n.t(item.label) }))}
+              items={eventItems.map((item) => ({ value: item.value, label: i18n.t(item.label) }))}
               onValueChange={(value) => {
                 saveEvent(key, value === 'on');
               }}

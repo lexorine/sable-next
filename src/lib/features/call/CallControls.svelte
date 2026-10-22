@@ -8,7 +8,6 @@
   import MonitorArrowUpIcon from 'phosphor-svelte/lib/MonitorArrowUpIcon';
   import HeadphonesIcon from 'phosphor-svelte/lib/HeadphonesIcon';
   import SpeakerHighIcon from 'phosphor-svelte/lib/SpeakerHighIcon';
-  import SpeakerSlashIcon from 'phosphor-svelte/lib/SpeakerSlashIcon';
   import PhoneDisconnectIcon from 'phosphor-svelte/lib/PhoneDisconnectIcon';
   import GearSixIcon from 'phosphor-svelte/lib/GearSixIcon';
   import type { Snippet } from 'svelte';
@@ -23,6 +22,8 @@
   import { longPress } from '#lib/ui/long-press.svelte.js';
 
   import CallDeviceMenu from './CallDeviceMenu.svelte';
+  import CallRouteMenu from './CallRouteMenu.svelte';
+  import type { CallTransportCapabilities } from './call-transport';
   import { supportsDeviceSelection } from './devices';
 
   interface Props {
@@ -40,6 +41,8 @@
     onHangUp?: () => void;
     onSwitchDevice?: (kind: MediaDeviceKind, deviceId: string) => void;
     onSwitchCamera?: () => void;
+    audioRoutes?: CallTransportCapabilities['audioRoutes'];
+    audioInputs?: CallTransportCapabilities['audioInputs'];
     onOpenSettings?: (event: MouseEvent) => void;
     extra?: Snippet;
     action?: Snippet;
@@ -60,6 +63,8 @@
     onHangUp,
     onSwitchDevice,
     onSwitchCamera,
+    audioRoutes,
+    audioInputs,
     onOpenSettings,
     extra,
     action,
@@ -70,9 +75,13 @@
   let devices = $derived(compact ? undefined : onSwitchDevice);
   const selectable = supportsDeviceSelection();
   let grouped = $derived(devices !== undefined && selectable);
-  let pending = $derived(ready ? '' : ` · ${$i18n.t('call.waitingForMedia')}`);
+  let pending = $derived(ready ? '' : ` · ${i18n.t('call.waitingForMedia')}`);
   let micMenu = $state(false);
   let outputMenu = $state(false);
+  let routes = $derived(compact ? undefined : audioRoutes);
+  let outputGrouped = $derived(grouped || routes !== undefined);
+  let inputs = $derived(compact ? undefined : audioInputs);
+  let inputGrouped = $derived(grouped || inputs !== undefined);
   let cameraMenu = $state(false);
 
   function shortcut(id: ShortcutId): string {
@@ -80,12 +89,12 @@
     return binding ? ` (${formatBinding(binding, isMacPlatform())})` : '';
   }
 
-  let micLabel = $derived($i18n.t(microphoneEnabled ? 'call.microphoneOn' : 'call.microphoneOff'));
-  let cameraLabel = $derived($i18n.t(cameraEnabled ? 'call.cameraOn' : 'call.cameraOff'));
+  let micLabel = $derived(i18n.t(microphoneEnabled ? 'call.microphoneOn' : 'call.microphoneOff'));
+  let cameraLabel = $derived(i18n.t(cameraEnabled ? 'call.cameraOn' : 'call.cameraOff'));
   let screenLabel = $derived(
-    $i18n.t(screenShareEnabled ? 'call.screenShareOn' : 'call.screenShareOff')
+    i18n.t(screenShareEnabled ? 'call.screenShareOn' : 'call.screenShareOff')
   );
-  let deafenLabel = $derived($i18n.t(deafened ? 'call.undeafen' : 'call.deafen'));
+  let deafenLabel = $derived(i18n.t(deafened ? 'call.undeafen' : 'call.deafen'));
 </script>
 
 {#snippet control(
@@ -93,26 +102,27 @@
   button: Snippet<[Record<string, unknown>]>,
   menu?: Snippet,
   onHold?: () => void,
-  tone?: 'neutral' | 'danger' | 'primary'
+  tone?: 'neutral' | 'danger' | 'primary',
+  split: boolean = grouped
 )}
   <div
-    class={['control', grouped && menu && 'group']}
-    data-tone={grouped && menu ? tone : undefined}
+    class={['control', split && menu && 'group']}
+    data-tone={split && menu ? tone : undefined}
     {@attach longPress({ enabled: () => onHold !== undefined, onPress: () => onHold?.() })}
   >
     <Tooltip label={tip} side={compact ? 'right' : 'top'}>
       {#snippet trigger({ props })}{@render button(props)}{/snippet}
     </Tooltip>
-    {#if grouped && menu}<span class="divider" aria-hidden="true"></span>{/if}
+    {#if split && menu}<span class="divider" aria-hidden="true"></span>{/if}
     {@render menu?.()}
   </div>
 {/snippet}
 
-<div class="controls" class:compact>
+<div class={['controls', { compact }]}>
   {#snippet micButton(props: Record<string, unknown>)}
     <IconButton
       {...props}
-      variant={grouped ? 'ghost' : microphoneEnabled ? neutral : 'danger'}
+      variant={inputGrouped ? 'ghost' : microphoneEnabled ? neutral : 'danger'}
       {size}
       label={micLabel}
       aria-disabled={ready ? undefined : 'true'}
@@ -126,11 +136,18 @@
     </IconButton>
   {/snippet}
   {#snippet micMenuSnippet()}
-    {#if devices}
+    {#if inputs}
+      <CallRouteMenu
+        bind:open={micMenu}
+        label={i18n.t('call.microphoneDevices')}
+        list={inputs.list}
+        onSelect={(inputId) => void inputs?.select(inputId)}
+      />
+    {:else if devices}
       <CallDeviceMenu
         bind:open={micMenu}
         kinds={['audioinput']}
-        label={$i18n.t('call.microphoneDevices')}
+        label={i18n.t('call.microphoneDevices')}
         onSelect={devices}
       />
     {/if}
@@ -139,31 +156,28 @@
     `${micLabel}${shortcut('call.toggleMute')}${pending}`,
     micButton,
     micMenuSnippet,
-    devices ? () => (micMenu = true) : undefined,
-    microphoneEnabled ? 'neutral' : 'danger'
+    devices || inputs ? () => (micMenu = true) : undefined,
+    microphoneEnabled ? 'neutral' : 'danger',
+    inputGrouped
   )}
 
   {#snippet deafenButton(props: Record<string, unknown>)}
     {#if onToggleDeafen}
       <IconButton
         {...props}
-        variant={grouped ? 'ghost' : deafened ? 'danger' : neutral}
+        variant={outputGrouped ? 'ghost' : deafened ? 'danger' : neutral}
         {size}
         label={deafenLabel}
         onclick={onToggleDeafen}
       >
-        {#if deafened}
-          <SpeakerSlashIcon weight="fill" />
-        {:else}
-          <HeadphonesIcon />
-        {/if}
+        <HeadphonesIcon weight={deafened ? 'fill' : 'regular'} />
       </IconButton>
     {:else}
       <IconButton
         {...props}
-        variant={grouped ? 'ghost' : neutral}
+        variant={outputGrouped ? 'ghost' : neutral}
         {size}
-        label={$i18n.t('call.outputDevices')}
+        label={i18n.t('call.outputDevices')}
         onclick={() => (outputMenu = true)}
       >
         <SpeakerHighIcon />
@@ -171,11 +185,19 @@
     {/if}
   {/snippet}
   {#snippet deafenMenu()}
-    {#if devices}
+    {#if routes}
+      <CallRouteMenu
+        bind:open={outputMenu}
+        icon="speaker"
+        label={i18n.t('call.outputDevices')}
+        list={routes.list}
+        onSelect={(routeId) => void routes?.select(routeId)}
+      />
+    {:else if devices}
       <CallDeviceMenu
         bind:open={outputMenu}
         kinds={['audiooutput']}
-        label={$i18n.t('call.outputDevices')}
+        label={i18n.t('call.outputDevices')}
         onSelect={devices}
       />
     {/if}
@@ -183,11 +205,12 @@
   {@render control(
     onToggleDeafen
       ? `${deafenLabel}${shortcut('call.toggleDeafen')}`
-      : $i18n.t('call.outputDevices'),
+      : i18n.t('call.outputDevices'),
     deafenButton,
     deafenMenu,
-    devices ? () => (outputMenu = true) : undefined,
-    deafened ? 'danger' : 'neutral'
+    devices || routes ? () => (outputMenu = true) : undefined,
+    deafened ? 'danger' : 'neutral',
+    outputGrouped
   )}
 
   {#snippet cameraButton(props: Record<string, unknown>)}
@@ -211,7 +234,7 @@
       <CallDeviceMenu
         bind:open={cameraMenu}
         kinds={['videoinput']}
-        label={$i18n.t('call.cameraDevices')}
+        label={i18n.t('call.cameraDevices')}
         onSelect={devices}
       />
     {/if}
@@ -230,7 +253,7 @@
         {...props}
         variant={neutral}
         {size}
-        label={$i18n.t('call.switchCamera')}
+        label={i18n.t('call.switchCamera')}
         disabled={!cameraEnabled}
         aria-disabled={ready ? undefined : 'true'}
         onclick={ready ? onSwitchCamera : undefined}
@@ -238,7 +261,7 @@
         <CameraRotateIcon />
       </IconButton>
     {/snippet}
-    {@render control($i18n.t('call.switchCamera'), switchCameraButton)}
+    {@render control(i18n.t('call.switchCamera'), switchCameraButton)}
   {/if}
 
   {#if canScreenShare}
@@ -267,13 +290,13 @@
         {...props}
         variant={neutral}
         {size}
-        label={$i18n.t('call.settings')}
+        label={i18n.t('call.settings')}
         onclick={onOpenSettings}
       >
         <GearSixIcon />
       </IconButton>
     {/snippet}
-    {@render control($i18n.t('call.settings'), settingsButton)}
+    {@render control(i18n.t('call.settings'), settingsButton)}
   {/if}
 
   {#snippet hangUpButton(props: Record<string, unknown>)}
@@ -282,7 +305,7 @@
       class="hang-up"
       variant="danger"
       {size}
-      label={$i18n.t('call.hangUp')}
+      label={i18n.t('call.hangUp')}
       onclick={onHangUp}
     >
       <PhoneDisconnectIcon weight="fill" />
@@ -291,7 +314,7 @@
   {#if action}
     <div class="control action">{@render action()}</div>
   {:else if onHangUp}
-    {@render control(`${$i18n.t('call.hangUp')}${shortcut('call.hangUp')}`, hangUpButton)}
+    {@render control(`${i18n.t('call.hangUp')}${shortcut('call.hangUp')}`, hangUpButton)}
   {/if}
 </div>
 
@@ -410,7 +433,10 @@
 
   @container call-dock (width < 34rem) {
     .controls:not(.compact) {
+      box-sizing: border-box;
+      flex-wrap: wrap;
       gap: var(--space-100);
+      max-inline-size: 100%;
     }
 
     .controls:not(.compact) :global(.device-caret),
@@ -421,12 +447,6 @@
     .controls:not(.compact) :global(.hang-up) {
       margin-inline-start: var(--space-100);
       width: calc(var(--button-height) * 1.3);
-    }
-
-    .controls:not(.compact):has(.action) {
-      box-sizing: border-box;
-      flex-wrap: wrap;
-      max-inline-size: 100%;
     }
 
     .controls:not(.compact) .action {

@@ -1,5 +1,8 @@
 <script lang="ts">
+  import { MediaQuery } from 'svelte/reactivity';
   import { i18n } from '#lib/i18n.js';
+  import { useCoreClient } from '#lib/core/context.js';
+  import { isRecord } from '#lib/guards.js';
   import PhoneIcon from 'phosphor-svelte/lib/PhoneIcon';
   import PhoneDisconnectIcon from 'phosphor-svelte/lib/PhoneDisconnectIcon';
   import VideoCameraIcon from 'phosphor-svelte/lib/VideoCameraIcon';
@@ -8,40 +11,69 @@
   import Button from '#lib/ui/primitives/Button.svelte';
   import DialogFrame from '#lib/ui/primitives/DialogFrame.svelte';
   import { BREAKPOINTS } from '#lib/ui/breakpoints.js';
-  import { createMediaQuery } from '#lib/ui/media-query.svelte.js';
 
   import type { IncomingCall } from './incoming-calls.svelte.js';
 
   interface Props {
     call: IncomingCall | null;
-    senderName: string;
-    senderAvatar: string | null;
     roomName: string;
     onAccept: (call: IncomingCall) => void;
     onDecline: (call: IncomingCall) => void;
   }
 
-  let { call, senderName, senderAvatar, roomName, onAccept, onDecline }: Props = $props();
+  let { call, roomName, onAccept, onDecline }: Props = $props();
 
-  const appLayout = createMediaQuery(BREAKPOINTS.appLayout);
+  const core = useCoreClient();
+  let profile = $state.raw<{ name: string; avatar: string | null } | null>(null);
+  let senderName = $derived(profile?.name ?? call?.senderName ?? call?.sender ?? '');
+  let senderAvatar = $derived(profile?.avatar ?? null);
+
+  $effect(() => {
+    const incoming = call;
+    profile = null;
+    if (!incoming) return;
+
+    let current = true;
+    void core.rpc.room_state
+      .event({
+        room_id: incoming.roomId,
+        event_type: 'm.room.member',
+        state_key: incoming.sender,
+      })
+      .then(
+        (content) => {
+          if (!current || !isRecord(content)) return;
+          profile = {
+            name: typeof content.displayname === 'string' ? content.displayname : incoming.sender,
+            avatar: typeof content.avatar_url === 'string' ? content.avatar_url : null,
+          };
+        },
+        (error: unknown) => console.debug('[sable call] caller profile unavailable', error)
+      );
+    return () => {
+      current = false;
+    };
+  });
+
+  const appLayout = new MediaQuery(BREAKPOINTS.appLayout);
   let open = $derived(call !== null);
-  let variant = $derived(appLayout.matches ? ('sheet' as const) : ('fullscreen' as const));
+  let variant = $derived(appLayout.current ? ('sheet' as const) : ('fullscreen' as const));
 </script>
 
 <DialogFrame
   {open}
   {variant}
-  label={$i18n.t('call.incomingTitle')}
+  label={i18n.t('call.incomingTitle')}
   onOpenChange={(next: boolean) => {
     if (!next && call) onDecline(call);
   }}
 >
   {#if call}
-    <div class="incoming" class:incoming-fullscreen={variant === 'fullscreen'}>
+    <div class={['incoming', { 'incoming-fullscreen': variant === 'fullscreen' }]}>
       <div class="who">
         <Avatar src={senderAvatar} name={senderName} id={call.sender} size="large" />
-        <p class="name">{$i18n.t('call.incomingFrom', { name: senderName })}</p>
-        <p class="where">{$i18n.t('call.incomingInRoom', { room: roomName })}</p>
+        <p class="name">{i18n.t('call.incomingFrom', { name: senderName })}</p>
+        <p class="where">{i18n.t('call.incomingInRoom', { room: roomName })}</p>
       </div>
 
       <div class="actions">
@@ -52,7 +84,7 @@
           }}
         >
           <PhoneDisconnectIcon aria-hidden="true" />
-          {$i18n.t('call.decline')}
+          {i18n.t('common.decline')}
         </Button>
         <Button
           variant="primary"
@@ -65,7 +97,7 @@
           {:else}
             <PhoneIcon aria-hidden="true" />
           {/if}
-          {$i18n.t('call.accept')}
+          {i18n.t('common.accept')}
         </Button>
       </div>
     </div>

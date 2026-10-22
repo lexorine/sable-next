@@ -1,13 +1,13 @@
 // @vitest-environment happy-dom
 
 import { render } from '@testing-library/svelte';
-import { tick } from 'svelte';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
+import { flushed } from '#lib/ui/flushed.js';
 
-import type { RoomSummary } from '#src/generated/protocol';
+import type { RoomListItemView } from '#src/generated/protocol';
 
 const rendered = vi.hoisted(() => [] as { kind: string; roomId: string; extra: unknown }[]);
-const roomList = vi.hoisted(() => ({ start: () => Promise.resolve() }));
+const roomList = vi.hoisted(() => ({ settled: true }));
 
 vi.mock('$app/state', () => import('#lib/test-support/app-state.js'));
 vi.mock('$app/navigation', () => import('#lib/test-support/app-navigation.js'));
@@ -16,7 +16,12 @@ import { visit } from '#lib/test-support/app-state.js';
 vi.mock('#lib/core/context.js');
 vi.mock('#lib/rooms/room-list.svelte.js', async (importOriginal) => ({
   ...(await importOriginal<object>()),
-  useRoomList: () => ({ rooms: [], start: () => roomList.start() }),
+  useRoomList: () => ({
+    rooms: [],
+    get settled() {
+      return roomList.settled;
+    },
+  }),
 }));
 vi.mock('./RoomView.svelte', () => ({
   default: (_anchor: unknown, props: { roomId: string; room?: unknown }) => {
@@ -40,30 +45,32 @@ beforeEach(() => {
 
 afterEach(() => {
   rendered.length = 0;
-  roomList.start = () => Promise.resolve();
+  roomList.settled = true;
   resetNavigation();
 });
 
 async function settle(): Promise<void> {
   for (let index = 0; index < 5; index += 1) {
     await Promise.resolve();
-    await tick();
+    await flushed();
   }
 }
 
 test('a joined room the list filters out still opens', async () => {
-  const room = { room_id: '!old:example.org', state: 'joined' } as RoomSummary;
-  const roomSummary = vi.fn(() => Promise.resolve(room));
-  Object.assign(core, { roomSummary });
+  const room = { room_id: '!old:example.org', state: 'joined' } as RoomListItemView;
+  const roomListItem = vi.fn(() => Promise.resolve(room));
+  Object.assign(core.rpc.rooms, { listItem: roomListItem });
   render(RoomPage);
   await settle();
 
-  expect(roomSummary).toHaveBeenCalledWith('!old:example.org');
+  expect(roomListItem).toHaveBeenCalledWith({ room_id: '!old:example.org' });
   expect(rendered.at(-1)).toEqual({ kind: 'view', roomId: '!old:example.org', extra: room });
 });
 
 test('a room we are not in goes through the join, with its via', async () => {
-  Object.assign(core, { roomSummary: vi.fn(() => Promise.reject(new Error('unknown_room'))) });
+  Object.assign(core.rpc.rooms, {
+    listItem: vi.fn(() => Promise.reject(new Error('unknown_room'))),
+  });
   render(RoomPage);
   await settle();
 
@@ -75,8 +82,8 @@ test('a room we are not in goes through the join, with its via', async () => {
 });
 
 test('a room we left goes through the join', async () => {
-  const room = { room_id: '!old:example.org', state: 'left' } as RoomSummary;
-  Object.assign(core, { roomSummary: vi.fn(() => Promise.resolve(room)) });
+  const room = { room_id: '!old:example.org', state: 'left' } as RoomListItemView;
+  Object.assign(core.rpc.rooms, { listItem: vi.fn(() => Promise.resolve(room)) });
   render(RoomPage);
   await settle();
 
@@ -85,7 +92,7 @@ test('a room we left goes through the join', async () => {
 
 test('an alias waits for the room list rather than opening with the alias', async () => {
   visit('/rooms/%23next:example.org', { roomId: '#next:example.org' });
-  roomList.start = () => new Promise(() => {});
+  roomList.settled = false;
   render(RoomPage);
   await settle();
 
@@ -93,8 +100,12 @@ test('an alias waits for the room list rather than opening with the alias', asyn
 });
 
 test('a space opened as a room is sent to its lobby', async () => {
-  const space = { room_id: '!old:example.org', state: 'joined', is_space: true } as RoomSummary;
-  Object.assign(core, { roomSummary: vi.fn(() => Promise.resolve(space)) });
+  const space = {
+    room_id: '!old:example.org',
+    state: 'joined',
+    room_kind: 'space',
+  } as RoomListItemView;
+  Object.assign(core.rpc.rooms, { listItem: vi.fn(() => Promise.resolve(space)) });
   render(RoomPage);
   await settle();
 
@@ -106,8 +117,12 @@ test('a space opened as a room is sent to its lobby', async () => {
 
 test('the event timeline opens a space as a normal room', async () => {
   visit('/rooms/!old:example.org?timeline=events', { roomId: '!old:example.org' });
-  const space = { room_id: '!old:example.org', state: 'joined', is_space: true } as RoomSummary;
-  Object.assign(core, { roomSummary: vi.fn(() => Promise.resolve(space)) });
+  const space = {
+    room_id: '!old:example.org',
+    state: 'joined',
+    room_kind: 'space',
+  } as RoomListItemView;
+  Object.assign(core.rpc.rooms, { listItem: vi.fn(() => Promise.resolve(space)) });
   render(RoomPage);
   await settle();
 
@@ -120,8 +135,8 @@ test('on the mobile layout the room mounts a frame after the route, behind the d
     happyDOM: { setViewport: (viewport: { width: number }) => void };
   };
   happyDOM.setViewport({ width: 400 });
-  const room = { room_id: '!old:example.org', state: 'joined' } as RoomSummary;
-  Object.assign(core, { roomSummary: vi.fn(() => Promise.resolve(room)) });
+  const room = { room_id: '!old:example.org', state: 'joined' } as RoomListItemView;
+  Object.assign(core.rpc.rooms, { listItem: vi.fn(() => Promise.resolve(room)) });
   render(RoomPage);
   await settle();
 

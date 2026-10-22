@@ -44,7 +44,7 @@
         : preferences.badgeDefaultGroup) === 'quiet'
   );
   let defaultLabel = $derived(
-    $i18n.t(defaultQuiet ? 'room.notifyMentionsQuiet' : modeLabels[fallback])
+    i18n.t(defaultQuiet ? 'room.notifyMentionsQuiet' : modeLabels[fallback])
   );
 
   $effect(() => {
@@ -54,7 +54,7 @@
 
   async function read(): Promise<void> {
     try {
-      const settings = await core.commands.notificationSettings(roomId);
+      const settings = await core.rpc.notifications.settings({ room_id: roomId });
       mode = settings.room;
       fallback = settings.default ?? 'mentions';
     } catch (error) {
@@ -66,23 +66,20 @@
     if (quiet) setQuiet(roomId, true);
     else if (mode === 'mentions' && isQuiet(roomId)) setQuiet(roomId, false);
     mode = next;
-    void core.commands.setRoomNotificationMode(roomId, next).then(
-      () => {
-        roomList.setNotificationOverride(roomId, next);
-      },
-      (error: unknown) => {
+    core.rpc.notifications
+      .setRoomNotificationMode({ room_id: roomId, mode: next })
+      .catch((error: unknown) => {
         console.warn('[sable room] notification mode failed', error);
-        toasts.error($i18n.t('errors.actionFailed'));
+        toasts.error(i18n.t('errors.actionFailed'));
         void read();
-      }
-    );
+      });
   }
 </script>
 
-<ActionMenuSub label={$i18n.t('room.menuNotifications')} class="room-options-menu">
+<ActionMenuSub label={i18n.t('room.menuNotifications')} class="room-options-menu">
   {#snippet trigger()}
     <BellIcon />
-    {$i18n.t('room.menuNotifications')}
+    {i18n.t('room.menuNotifications')}
   {/snippet}
   <IconContext values={{ 'aria-hidden': 'true' }}>
     {#each modes as option (option.label)}
@@ -95,7 +92,7 @@
         }}
       >
         <span class="menu-check" aria-hidden="true">{selected ? '✓' : ''}</span>
-        {$i18n.t(option.label, {
+        {i18n.t(option.label, {
           mode: defaultLabel,
         })}
       </ActionMenuItem>

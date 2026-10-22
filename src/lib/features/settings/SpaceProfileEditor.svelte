@@ -2,27 +2,35 @@
   import { onDestroy } from 'svelte';
 
   import type {
+    FieldEdit,
     PronounView,
     ProfileView,
     RoomPermissionsView,
     RoomPowerLevelsView,
   } from '#src/generated/protocol';
   import { useCoreClient } from '#lib/core/context.js';
-  import {
-    COSMETIC_EVENT_TYPES,
-    pronounContent,
-    writeMemberColors,
-  } from '#lib/features/composer/slash-commands.js';
+  import { setMemberLook } from '#lib/core/api/members.js';
+  import { COSMETIC_EVENT_TYPES, pronounSets } from '#lib/features/composer/slash-commands.js';
+  import { MAX_DISPLAY_NAME_LENGTH } from '#lib/profile/fields.js';
+  import { MAX_PRONOUN_INPUT } from '#lib/profile/pronouns.js';
+  import { preferences } from '#lib/settings/preferences.svelte.js';
+  import { nativeFilePicker } from '#lib/platform/native-file-picker.js';
   import MentionProfileCard from '#lib/features/room/members/MentionProfileCard.svelte';
   import { canSendState } from '#lib/features/room/settings/permission-groups.js';
   import { senderColor } from '../room/timeline/timeline-format';
   import { i18n, t } from '#lib/i18n.js';
   import { useRoomList } from '#lib/rooms/room-list.svelte.js';
+  import { joinedSpaceRooms } from '#lib/rooms/spaces.js';
   import Button from '#lib/ui/primitives/Button.svelte';
   import ProfileCard from '#lib/ui/primitives/ProfileCard.svelte';
   import TextInput from '#lib/ui/primitives/TextInput.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
+  import TimelineItem from '#lib/features/room/timeline/TimelineItem.svelte';
+  import { previewMessage } from '#lib/features/room/timeline/preview-message.js';
   import { uprightJpeg } from '#lib/ui/upright-jpeg.js';
-  import ColorSetting from './ColorSetting.svelte';
+  import ColorSetting from '#lib/ui/ColorSetting.svelte';
+  import { hexColorOrEmpty } from '#lib/ui/hex-color.js';
+  import { type SenderCosmetics } from '#lib/rooms/room-cosmetics.svelte.js';
   import './profile-editor.css';
 
   interface Props {
@@ -86,22 +94,23 @@
     name_color_light: draft.light || profile.name_color_light,
     name_color_dark: draft.dark || profile.name_color_dark,
   });
-  let applyTargets = $derived.by(() => {
-    const found: string[] = [];
-    const seen: string[] = [spaceId];
-    const walk = (parent: typeof space) => {
-      for (const edge of parent?.space_children ?? []) {
-        if (seen.includes(edge.room_id)) continue;
-        seen.push(edge.room_id);
-        const child = roomList.byId(edge.room_id);
-        if (child?.state !== 'joined') continue;
-        if (child.is_space) walk(child);
-        else found.push(child.room_id);
-      }
-    };
-    walk(space);
-    return found;
+  let applyTargets = $derived(joinedSpaceRooms(space, (id) => roomList.byId(id)));
+
+  const previewCosmetics = $derived<SenderCosmetics>({
+    colorOnLight: previewProfile.name_color_light,
+    colorOnDark: previewProfile.name_color_dark,
+    pronouns: previewProfile.pronouns,
   });
+
+  const previewItem = $derived(
+    previewMessage('profile-message-preview', 'See you at six?', {
+      sender: profile.user_id,
+      sender_name: previewProfile.display_name,
+      sender_avatar: previewProfile.avatar_url,
+      timestamp: Date.now(),
+      is_own: true,
+    })
+  );
 
   $effect(() => {
     const target = spaceId;
@@ -111,14 +120,6 @@
   onDestroy(() => {
     if (avatarPreview) URL.revokeObjectURL(avatarPreview);
   });
-
-  function record(value: unknown): Record<string, unknown> {
-    return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : {};
-  }
-
-  function text(value: unknown): string {
-    return typeof value === 'string' ? value : '';
-  }
 
   function setAvatar(file: File | null): void {
     if (avatarPreview) URL.revokeObjectURL(avatarPreview);
@@ -133,62 +134,37 @@
     applied = null;
     setAvatar(null);
     try {
-      const [member, pronounEvent, nextPermissions, nextLevels] = await Promise.all([
-        core.commands.roomStateEvent(target, 'm.room.member', userId),
-        core.commands.roomStateEvent(target, COSMETIC_EVENT_TYPES.pronoun, userId),
-        core.commands.roomPermissions(target),
-        core.commands.roomPowerLevels(target),
+      const [look, nextPermissions, nextLevels] = await Promise.all([
+        core.rpc.members.look({ room_id: target }),
+        core.rpc.members.permissions({ room_id: target }),
+        core.rpc.members.powerLevels({ room_id: target }),
       ]);
       if (current !== run) return;
-      const memberRecord = record(member);
-      const colors = record(memberRecord['eu.she-a.color']);
-      const memberName = text(memberRecord.displayname);
-      const memberAvatar = text(memberRecord.avatar_url);
-      const sets = record(pronounEvent).pronouns;
       permissions = nextPermissions;
       levels = nextLevels;
       const next: Draft = {
-        name: memberName === profile.display_name ? '' : memberName,
-        pronouns: Array.isArray(sets)
-          ? sets
-              .map((set) => {
-                const entry = record(set);
-                const language = text(entry.language);
-                return `${language ? `${language}:` : ''}${text(entry.summary)}`;
-              })
-              .filter((entry) => entry !== '')
-              .join(', ')
-          : '',
-        light: text(colors.on_light),
-        dark: text(colors.on_dark),
-        avatar: memberAvatar === '' || memberAvatar === profile.avatar_url ? null : memberAvatar,
+        name: look.display_name === profile.display_name ? '' : (look.display_name ?? ''),
+        pronouns: look.pronouns
+          .map((set) => `${set.language ? `${set.language}:` : ''}${set.summary}`)
+          .join(', '),
+        light: look.color_on_light ?? '',
+        dark: look.color_on_dark ?? '',
+        avatar: look.avatar_url === profile.avatar_url ? null : look.avatar_url,
       };
       draft = { ...next };
       base = { ...next };
     } catch (failure) {
       if (current === run) {
         console.warn('[sable space] profile unavailable', failure);
-        error = t('room.cosmeticsFailed');
+        error = t('room.settingsFailed');
       }
     } finally {
       if (current === run) loading = false;
     }
   }
 
-  async function writeMember(
-    target: string,
-    fields: Partial<Record<'displayname' | 'avatar_url', string | null>>
-  ): Promise<void> {
-    const rest = Object.fromEntries(
-      Object.entries(
-        record(await core.commands.roomStateEvent(target, 'm.room.member', userId))
-      ).filter(([key]) => !(key in fields))
-    );
-    await core.commands.sendStateEvent(target, 'm.room.member', userId, {
-      ...rest,
-      membership: 'join',
-      ...Object.fromEntries(Object.entries(fields).filter(([, value]) => value)),
-    });
+  function field(value: string | null | undefined): FieldEdit {
+    return value ? { kind: 'set', value } : { kind: 'clear' };
   }
 
   async function save(): Promise<void> {
@@ -199,37 +175,38 @@
       let avatar = draft.avatar;
       if (avatarFile) {
         const upright = await uprightJpeg(avatarFile);
-        avatar = await core.commands.uploadMedia(
+        avatar = await core.media.uploadMedia(
           upright.type || 'image/*',
           new Uint8Array(await upright.arrayBuffer())
         );
       }
-      if (draft.name !== base.name || avatar !== base.avatar) {
-        await writeMember(spaceId, {
-          displayname: draft.name.trim() || profileName,
-          avatar_url: avatar ?? profile.avatar_url,
-        });
-      }
-      if (draft.light !== base.light || draft.dark !== base.dark) {
-        await writeMemberColors(core.commands, spaceId, userId, {
-          kind: 'set',
-          colors: { on_light: draft.light || undefined, on_dark: draft.dark || undefined },
+      const identityChanged = draft.name !== base.name || avatar !== base.avatar;
+      const colorsChanged = draft.light !== base.light || draft.dark !== base.dark;
+      if (identityChanged || colorsChanged) {
+        await setMemberLook(core.rpc, spaceId, {
+          ...(identityChanged && {
+            display_name: field(draft.name.trim() || profileName),
+            avatar_url: field(avatar ?? profile.avatar_url),
+          }),
+          ...(colorsChanged && {
+            color_on_light: field(hexColorOrEmpty(draft.light)),
+            color_on_dark: field(hexColorOrEmpty(draft.dark)),
+          }),
         });
       }
       if (draft.pronouns !== base.pronouns) {
-        await core.commands.sendStateEvent(
-          spaceId,
-          COSMETIC_EVENT_TYPES.pronoun,
-          userId,
-          pronounContent(draft.pronouns.trim() === '' ? 'reset' : draft.pronouns) ?? {}
-        );
+        await core.rpc.members.setPronouns({
+          room_id: spaceId,
+          pronouns: pronounSets(draft.pronouns),
+          in_parent_space: false,
+        });
       }
       draft = { ...draft, avatar };
       base = $state.snapshot(draft);
       setAvatar(null);
     } catch (failure) {
       console.warn('[sable space] profile not saved', failure);
-      error = t('room.cosmeticsFailed');
+      error = t('room.settingsFailed');
     } finally {
       saving = false;
     }
@@ -249,9 +226,9 @@
     applied = progress;
     for (const child of applyTargets) {
       try {
-        await writeMember(child, {
-          displayname: draft.name.trim() || profileName,
-          avatar_url: draft.avatar ?? profile.avatar_url,
+        await setMemberLook(core.rpc, child, {
+          display_name: field(draft.name.trim() || profileName),
+          avatar_url: field(draft.avatar ?? profile.avatar_url),
         });
         progress = { ...progress, done: progress.done + 1 };
       } catch (failure) {
@@ -267,6 +244,7 @@
     if (applied && saving)
       return t('room.cosmeticsApplying', {
         done: applied.done + applied.failed,
+        count: applied.total,
         total: applied.total,
       });
     if (applied?.failed)
@@ -281,6 +259,13 @@
 {#if tab === 'preview'}
   <div class="preview-panel" role="tabpanel" id="profile-panel-preview">
     <MentionProfileCard {userId} member={null} roomId="" profile={previewProfile} />
+    <TimelineItem
+      item={previewItem}
+      collapsed={false}
+      layout={preferences.layout}
+      overrideCosmetics={previewCosmetics}
+      preview
+    />
   </div>
 {:else}
   <div role="tabpanel" id="profile-panel-edit" aria-busy={loading}>
@@ -291,7 +276,7 @@
         void save();
       }}
     >
-      <div class="profile-hero" aria-label={$i18n.t('settings.profilePreview')}>
+      <div class="profile-hero" aria-label={i18n.t('settings.profilePreview')}>
         <ProfileCard
           {userId}
           displayName={draft.name.trim() || profile.display_name || userId}
@@ -306,7 +291,7 @@
           {#snippet nameField()}
             <div class="caption-field">
               <label class="caption" for="space-display-name"
-                >{$i18n.t('room.cosmeticsNameSpace')}</label
+                >{i18n.t('room.cosmeticsNameSpace')}</label
               >
               <TextInput
                 id="space-display-name"
@@ -314,26 +299,44 @@
                 bind:value={draft.name}
                 placeholder={profile.display_name ?? userId}
                 disabled={loading}
-                maxlength={255}
+                maxlength={MAX_DISPLAY_NAME_LENGTH}
               />
             </div>
           {/snippet}
           {#snippet pronouns()}
             <div class="caption-field">
-              <label class="caption" for="space-pronouns">{$i18n.t('settings.pronouns')}</label>
-              <TextInput
-                id="space-pronouns"
-                class="inline-edit hero-pronouns"
-                bind:value={draft.pronouns}
-                disabled={loading || !canSetPronouns}
-                placeholder={$i18n.t('room.cosmeticsPronounsPlaceholder')}
-                title={canSetPronouns ? undefined : $i18n.t('room.cosmeticsNotAllowed')}
-              />
+              <label class="caption" for="space-pronouns">{i18n.t('settings.pronouns')}</label>
+              {#if canSetPronouns}
+                <TextInput
+                  id="space-pronouns"
+                  class="inline-edit hero-pronouns"
+                  bind:value={draft.pronouns}
+                  disabled={loading}
+                  placeholder={i18n.t('room.cosmeticsPronounsPlaceholder')}
+                  maxlength={MAX_PRONOUN_INPUT}
+                />
+              {:else}
+                <Tooltip label={i18n.t('room.cosmeticsNotAllowed')}>
+                  {#snippet trigger({ props })}
+                    <span {...props} class="pronouns-tooltip-trigger">
+                      <TextInput
+                        id="space-pronouns"
+                        class="inline-edit hero-pronouns"
+                        bind:value={draft.pronouns}
+                        disabled
+                        placeholder={i18n.t('room.cosmeticsPronounsPlaceholder')}
+                        maxlength={MAX_PRONOUN_INPUT}
+                      />
+                    </span>
+                  {/snippet}
+                </Tooltip>
+              {/if}
             </div>
           {/snippet}
           {#snippet actions()}
             <label class="file-button btn btn-secondary btn-small">
               <input
+                use:nativeFilePicker
                 type="file"
                 accept="image/*"
                 disabled={loading}
@@ -343,7 +346,7 @@
                   if (file) setAvatar(file);
                 }}
               />
-              {$i18n.t('room.cosmeticsAvatarChange')}
+              {i18n.t('common.changePicture')}
             </label>
             {#if draft.avatar || avatarFile}
               <Button
@@ -352,7 +355,7 @@
                 onclick={() => {
                   setAvatar(null);
                   draft.avatar = null;
-                }}>{$i18n.t('room.cosmeticsAvatarReset')}</Button
+                }}>{i18n.t('room.cosmeticsAvatarReset')}</Button
               >
             {/if}
           {/snippet}
@@ -361,9 +364,9 @@
       <div class="settings-form">
         {#if canSetColor}
           <fieldset class="group">
-            <legend>{$i18n.t('settings.profileColors')}</legend>
+            <legend>{i18n.t('settings.profileColors')}</legend>
             <ColorSetting
-              label={$i18n.t('room.cosmeticsColorDark')}
+              label={i18n.t('room.cosmeticsColorDark')}
               bind:value={draft.dark}
               onCommit={() => {}}
               onReset={() => {
@@ -371,7 +374,7 @@
               }}
             />
             <ColorSetting
-              label={$i18n.t('room.cosmeticsColorLight')}
+              label={i18n.t('room.cosmeticsColorLight')}
               bind:value={draft.light}
               onCommit={() => {}}
               onReset={() => {
@@ -381,14 +384,13 @@
           </fieldset>
         {/if}
         <fieldset class="group">
-          <legend>{$i18n.t('room.cosmeticsApplyRooms')}</legend>
+          <legend>{i18n.t('room.cosmeticsApplyRooms')}</legend>
           <p class="settings-note">{applyNote}</p>
           <div>
             <Button
               size="small"
               disabled={saving || dirty || applyTargets.length === 0}
-              onclick={() => void applyToRooms()}
-              >{$i18n.t('room.cosmeticsApplyRoomsAction')}</Button
+              onclick={() => void applyToRooms()}>{i18n.t('common.apply')}</Button
             >
           </div>
         </fieldset>
@@ -396,19 +398,31 @@
       <div class="actions">
         {#if error}<p class="actions-note critical" role="alert">{error}</p>
         {:else if dirty}<p class="actions-note" role="status">
-            {$i18n.t('settings.unsavedChanges')}
+            {i18n.t('settings.unsavedChanges')}
           </p>{/if}
         <Button type="submit" variant="primary" disabled={!dirty || loading} loading={saving}
-          >{$i18n.t('settings.saveButton')}</Button
+          >{i18n.t('common.save')}</Button
         >
-        <Button disabled={!dirty || saving} onclick={cancel}>{$i18n.t('settings.cancel')}</Button>
+        <Button disabled={!dirty || saving} onclick={cancel}>{i18n.t('common.cancel')}</Button>
       </div>
     </form>
   </div>
 {/if}
 
 <style>
+  .pronouns-tooltip-trigger {
+    display: block;
+    width: 100%;
+  }
+
   .preview-panel {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-400);
     padding: var(--space-400);
+  }
+
+  .preview-panel > :global(.message) {
+    border-radius: var(--radius);
   }
 </style>

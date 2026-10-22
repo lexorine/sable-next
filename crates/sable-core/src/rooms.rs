@@ -1,21 +1,32 @@
+use std::collections::BTreeSet;
+
+use crate::api::rooms::DirectoryRoomType;
+use crate::api::rooms::PublicRoomsParams;
 use matrix_sdk::config::RequestConfig;
 use matrix_sdk::deserialized_responses::SyncOrStrippedState;
 use matrix_sdk::room::Room;
 use matrix_sdk::ruma::SpaceChildOrder;
+use matrix_sdk::ruma::api::FeatureFlag;
 use matrix_sdk::ruma::api::client::directory::get_public_rooms_filtered;
 use matrix_sdk::ruma::api::client::membership::joined_rooms;
 use matrix_sdk::ruma::api::client::space::get_hierarchy;
 use matrix_sdk::ruma::directory::{Filter, RoomTypeFilter};
+use matrix_sdk::ruma::events::AnySyncTimelineEvent;
+use matrix_sdk::ruma::events::StateEventType;
 use matrix_sdk::ruma::events::room::join_rules::{AllowRule, JoinRule, RoomJoinRulesEventContent};
 use matrix_sdk::ruma::events::room::tombstone::RoomTombstoneEventContent;
 use matrix_sdk::ruma::events::space::child::SpaceChildEventContent;
+use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, RoomId, RoomOrAliasId, ServerName, UInt};
 use matrix_sdk::send_queue::SendHandle;
 use matrix_sdk::{Client, EncryptionState, RoomMemberships, RoomState};
-use matrix_sdk_base::{RoomInfo, RoomInfoNotableUpdateReasons};
+use matrix_sdk_base::{RawStateEventWithKeys, RoomInfo, RoomInfoNotableUpdateReasons};
+use serde::{Deserialize, Serialize};
 
 use crate::ResultExt;
-use crate::protocol::{CommandErr, CommandOk, DirectoryRoomType, JoinRuleView};
+use crate::api::rooms::PublicRoomsOk;
+use crate::api::spaces::HierarchyOk;
+use crate::protocol::{JoinRuleView, RoomPreviewView, RpcError};
 
 use crate::Core;
 use crate::view;
@@ -24,22 +35,80 @@ const HIERARCHY_PAGE_SIZE: u32 = 100;
 const HIERARCHY_MAX_DEPTH: u32 = 1;
 const DIRECTORY_PAGE_SIZE: u32 = 30;
 const OWN_MEMBER_FILL_MAX_MEMBERS: u64 = 50;
+const MEMBERSHIP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A tombstone whose replacement room is empty; everything else in it is kept as received.
+#[derive(Deserialize, Serialize)]
+struct UnreadableTombstone {
+    #[serde(rename = "type")]
+    kind: String,
+    state_key: String,
+    content: TombstoneContent,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct TombstoneContent {
+    #[serde(default)]
+    replacement_room: String,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+pub(crate) fn repair_unreadable_tombstones(
+    client: &Client,
+) -> matrix_sdk::event_handler::EventHandlerHandle {
+    client.add_event_handler(|raw: Raw<AnySyncTimelineEvent>, room: Room| async move {
+        if raw.get_field::<String>("type").ok().flatten().as_deref() != Some("m.room.tombstone") {
+            return;
+        }
+        let Ok(mut event) = raw.deserialize_as_unchecked::<UnreadableTombstone>() else {
+            return;
+        };
+        let empty_replacement = event.kind == "m.room.tombstone"
+            && event.state_key.is_empty()
+            && event.content.replacement_room.is_empty();
+        if !empty_replacement || room.is_tombstoned() {
+            return;
+        }
+        event.content.replacement_room = room.room_id().to_string();
+        let Ok(sanitized) = Raw::new(&event) else {
+            return;
+        };
+        let Some(mut keys) =
+            RawStateEventWithKeys::try_from_raw_state_event(sanitized.cast_unchecked())
+        else {
+            return;
+        };
+        let saved = room
+            .update_and_save_room_info(|mut info| {
+                info.handle_state_event(&mut keys);
+                (info, RoomInfoNotableUpdateReasons::NONE)
+            })
+            .await;
+        if let Err(error) = saved {
+            tracing::warn!("could not record an unreadable tombstone: {error}");
+        }
+    })
+}
 
 pub(crate) async fn reconcile_memberships(client: &Client) -> Result<(), matrix_sdk::Error> {
-    let joined = client
+    let joined: std::collections::HashSet<_> = client
         .send(joined_rooms::v3::Request::new())
         .await?
-        .joined_rooms;
+        .joined_rooms
+        .into_iter()
+        .collect();
 
     for room in client.rooms() {
-        let mark: fn(&mut RoomInfo) =
-            match (room.state(), joined.iter().any(|id| id == room.room_id())) {
-                (RoomState::Joined, false) => RoomInfo::mark_as_left,
-                (RoomState::Left | RoomState::Invited | RoomState::Knocked, true) => {
-                    RoomInfo::mark_as_joined
-                }
-                _ => continue,
-            };
+        let mark: fn(&mut RoomInfo) = match (room.state(), joined.contains(room.room_id())) {
+            (RoomState::Joined, false) => RoomInfo::mark_as_left,
+            (RoomState::Left | RoomState::Invited | RoomState::Knocked, true) => {
+                RoomInfo::mark_as_joined
+            }
+            _ => continue,
+        };
         room.update_and_save_room_info(|mut info| {
             mark(&mut info);
             (info, RoomInfoNotableUpdateReasons::MEMBERSHIP)
@@ -47,6 +116,16 @@ pub(crate) async fn reconcile_memberships(client: &Client) -> Result<(), matrix_
         .await?;
     }
     Ok(())
+}
+
+pub(crate) async fn poll_memberships(core: std::sync::Arc<crate::Core>, client: Client) {
+    loop {
+        matrix_sdk::sleep::sleep(MEMBERSHIP_POLL_INTERVAL).await;
+        core.wait_until_active().await;
+        if let Err(error) = reconcile_memberships(&client).await {
+            tracing::debug!("could not poll room memberships: {error}");
+        }
+    }
 }
 
 pub(crate) async fn reconcile_joined_invites(client: Client) {
@@ -76,29 +155,48 @@ pub(crate) async fn reconcile_joined_invites(client: Client) {
 }
 
 pub(crate) async fn fill_own_members(client: &Client) -> Result<(), matrix_sdk::Error> {
-    let Some(own) = client.user_id() else {
-        return Ok(());
-    };
     for room in client.joined_rooms() {
-        if room.joined_members_count() > OWN_MEMBER_FILL_MAX_MEMBERS
-            || room.get_member_no_sync(own).await?.is_some()
-        {
-            continue;
-        }
-        if let Err(error) = room.sync_members().await {
-            tracing::warn!(room_id = %room.room_id(), "could not fetch our own membership: {error}");
-        }
+        fill_own_member(&room).await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn fill_own_member(room: &matrix_sdk::Room) -> Result<(), matrix_sdk::Error> {
+    if room.joined_members_count() > OWN_MEMBER_FILL_MAX_MEMBERS
+        || room.get_member_no_sync(room.own_user_id()).await?.is_some()
+    {
+        return Ok(());
+    }
+    if let Err(error) = room.sync_members().await {
+        tracing::warn!(room_id = %room.room_id(), "could not fetch our own membership: {error}");
     }
     Ok(())
 }
 
 impl Core {
+    /// The active account, with the rooms it left or was banned from: their conversations are gone.
+    ///
+    /// # Errors
+    ///
+    /// When no account is signed in.
+    pub async fn left_rooms(&self) -> Result<(String, Vec<String>), RpcError> {
+        let client = self.client().await?;
+        let user_id = client.user_id().ok_or(RpcError::NotLoggedIn)?.to_string();
+        let rooms = client
+            .rooms()
+            .into_iter()
+            .filter(|room| matches!(room.state(), RoomState::Left | RoomState::Banned))
+            .map(|room| room.room_id().to_string())
+            .collect();
+        Ok((user_id, rooms))
+    }
+
     pub(crate) async fn set_direct(
         &self,
         room_id: &OwnedRoomId,
         direct: bool,
         user_id: Option<matrix_sdk::ruma::OwnedUserId>,
-    ) -> Result<(), CommandErr> {
+    ) -> Result<(), RpcError> {
         let client = self.client().await?;
         let room = self.room(room_id).await?;
 
@@ -114,7 +212,7 @@ impl Core {
                 {
                     vec![user_id]
                 }
-                Some(_) => return Err(CommandErr::Denied),
+                Some(_) => return Err(RpcError::Denied),
                 None => members
                     .iter()
                     .map(|member| member.user_id().to_owned())
@@ -139,7 +237,7 @@ impl Core {
         &self,
         room_id: &OwnedRoomId,
         rule: JoinRuleView,
-    ) -> Result<(), CommandErr> {
+    ) -> Result<(), RpcError> {
         let room = self.room(room_id).await?;
         let (supports_knock, supports_restricted, supports_knock_restricted) =
             join_rule_support(&room);
@@ -149,12 +247,12 @@ impl Core {
             JoinRuleView::Knock if supports_knock => {
                 RoomJoinRulesEventContent::new(JoinRule::Knock)
             }
-            JoinRuleView::Knock => return Err(CommandErr::Unsupported),
+            JoinRuleView::Knock => return Err(RpcError::Unsupported),
             JoinRuleView::Restricted if !supports_restricted => {
-                return Err(CommandErr::Unsupported);
+                return Err(RpcError::Unsupported);
             }
             JoinRuleView::KnockRestricted if !supports_knock_restricted => {
-                return Err(CommandErr::Unsupported);
+                return Err(RpcError::Unsupported);
             }
             JoinRuleView::Restricted | JoinRuleView::KnockRestricted => {
                 let client = self.client().await?;
@@ -164,7 +262,7 @@ impl Core {
                     .map(AllowRule::room_membership)
                     .collect();
                 if allow.is_empty() {
-                    return Err(CommandErr::Denied);
+                    return Err(RpcError::Denied);
                 }
                 if matches!(rule, JoinRuleView::Restricted) {
                     RoomJoinRulesEventContent::restricted(allow)
@@ -190,15 +288,27 @@ impl Core {
     }
 
     pub(crate) async fn align_notification_rules(&self) {
-        let Ok(rules) = self.push_rules().await else {
+        let (Ok(client), Ok(rules)) = (self.client().await, self.push_rules().await) else {
             return;
         };
         let writes = crate::push_rules::plan_alignment(&rules.snapshot().await);
-        if writes.is_empty() {
-            return;
-        }
         if let Err(error) = rules.apply(writes).await {
             tracing::warn!("could not align notification rules: {error}");
+            return;
+        }
+        let shaped: Vec<_> = client
+            .joined_rooms()
+            .iter()
+            .filter_map(|room| {
+                let direct = crate::notifications::uses_direct_push_rules(room);
+                let joined = room.joined_members_count();
+                ((direct && joined > 2) || (!direct && joined == 2))
+                    .then(|| (room.room_id().to_owned(), direct))
+            })
+            .collect();
+        let writes = crate::push_rules::plan_room_shapes(&rules.snapshot().await, &shaped);
+        if let Err(error) = rules.apply(writes).await {
+            tracing::warn!("could not align notification rules to the direct chats: {error}");
         }
     }
 
@@ -211,7 +321,7 @@ impl Core {
         }
     }
 
-    pub(crate) async fn room_is_encrypted(&self, room: &Room) -> Result<bool, CommandErr> {
+    pub(crate) async fn room_is_encrypted(&self, room: &Room) -> Result<bool, RpcError> {
         match room
             .latest_encryption_state()
             .await
@@ -219,7 +329,7 @@ impl Core {
         {
             matrix_sdk::EncryptionState::Encrypted => Ok(true),
             matrix_sdk::EncryptionState::NotEncrypted => Ok(false),
-            matrix_sdk::EncryptionState::Unknown => Err(CommandErr::Unavailable),
+            matrix_sdk::EncryptionState::Unknown => Err(RpcError::Unavailable),
         }
     }
 
@@ -230,7 +340,7 @@ impl Core {
         space_id: &OwnedRoomId,
         room_id: &RoomId,
         suggested: Option<bool>,
-    ) -> Result<(), CommandErr> {
+    ) -> Result<(), RpcError> {
         let space = self.room(space_id).await?;
         if let Some(mut content) = self
             .space_child_content(&space, room_id, "add_to_space")
@@ -265,11 +375,11 @@ impl Core {
         Ok(())
     }
 
-    async fn child_via(&self, room_id: &RoomId) -> Result<Vec<String>, CommandErr> {
+    async fn child_via(&self, room_id: &RoomId) -> Result<Vec<String>, RpcError> {
         let client = self.client().await?;
         let own = client
             .user_id()
-            .ok_or(CommandErr::NotLoggedIn)?
+            .ok_or(RpcError::NotLoggedIn)?
             .server_name()
             .to_string();
 
@@ -284,7 +394,7 @@ impl Core {
         Ok(if via.is_empty() { vec![own] } else { via })
     }
 
-    pub(crate) async fn room_via_servers(&self, room: &Room) -> Result<Vec<String>, CommandErr> {
+    pub(crate) async fn room_via_servers(&self, room: &Room) -> Result<Vec<String>, RpcError> {
         let members = room
             .members(RoomMemberships::JOIN)
             .await
@@ -326,7 +436,7 @@ impl Core {
         space: &Room,
         room_id: &RoomId,
         context: &str,
-    ) -> Result<Option<SpaceChildEventContent>, CommandErr> {
+    ) -> Result<Option<SpaceChildEventContent>, RpcError> {
         let Some(raw) = space
             .get_state_event_static_for_key::<SpaceChildEventContent, _>(room_id)
             .await
@@ -350,13 +460,13 @@ impl Core {
         space_id: &OwnedRoomId,
         room_id: &RoomId,
         order: Option<String>,
-    ) -> Result<CommandOk, CommandErr> {
+    ) -> Result<(), RpcError> {
         let space = self.room(space_id).await?;
 
         let mut content = self
             .space_child_content(&space, room_id, "set_space_child_order: read")
             .await?
-            .ok_or(CommandErr::UnknownRoom)?;
+            .ok_or(RpcError::UnknownRoom)?;
 
         content.order = match order {
             Some(order) => Some(
@@ -371,7 +481,7 @@ impl Core {
             .await
             .map_err(|error| self.room_error("set_space_child_order", error))?;
 
-        Ok(CommandOk::SetSpaceChildOrder)
+        Ok(())
     }
 
     pub(crate) async fn set_space_child_suggested(
@@ -379,13 +489,13 @@ impl Core {
         space_id: &OwnedRoomId,
         room_id: &RoomId,
         suggested: bool,
-    ) -> Result<CommandOk, CommandErr> {
+    ) -> Result<(), RpcError> {
         let space = self.room(space_id).await?;
 
         let mut content = self
             .space_child_content(&space, room_id, "set_space_child_suggested: read")
             .await?
-            .ok_or(CommandErr::UnknownRoom)?;
+            .ok_or(RpcError::UnknownRoom)?;
         content.suggested = suggested;
 
         space
@@ -393,7 +503,7 @@ impl Core {
             .await
             .map_err(|error| self.room_error("set_space_child_suggested", error))?;
 
-        Ok(CommandOk::SetSpaceChildSuggested)
+        Ok(())
     }
 
     pub(crate) async fn knock_room(
@@ -401,8 +511,8 @@ impl Core {
         address: &str,
         via: &[String],
         reason: Option<String>,
-    ) -> Result<CommandOk, CommandErr> {
-        let address = RoomOrAliasId::parse(address).map_err(|_| CommandErr::UnknownRoom)?;
+    ) -> Result<OwnedRoomId, RpcError> {
+        let address = RoomOrAliasId::parse(address).map_err(|_| RpcError::UnknownRoom)?;
         let via = via
             .iter()
             .filter_map(|server| ServerName::parse(server).ok())
@@ -415,43 +525,90 @@ impl Core {
             .await
             .or_failed(self, "knock_room")?;
 
-        Ok(CommandOk::KnockRoom {
-            room_id: room.room_id().to_owned(),
-        })
+        Ok(room.room_id().to_owned())
     }
 
     pub(crate) async fn room_preview(
         &self,
         address: &str,
         via: &[String],
-    ) -> Result<CommandOk, CommandErr> {
-        let address = RoomOrAliasId::parse(address).map_err(|_| CommandErr::UnknownRoom)?;
+    ) -> Result<RoomPreviewView, RpcError> {
+        let client = self.client().await?;
+        let address = RoomOrAliasId::parse(address).map_err(|_| RpcError::UnknownRoom)?;
         let via = via
             .iter()
             .filter_map(|server| ServerName::parse(server).ok())
             .collect::<Vec<_>>();
 
-        let preview = self
-            .client()
-            .await?
+        if client
+            .unstable_features()
+            .await
+            .unwrap_or_default()
+            .contains(&FeatureFlag::Msc4560)
+        {
+            let state = client
+                .get_room_stripped_state(
+                    &address,
+                    via.clone(),
+                    BTreeSet::from_iter([
+                        StateEventType::RoomCreate,
+                        StateEventType::RoomCanonicalAlias,
+                        StateEventType::RoomName,
+                        StateEventType::RoomTopic,
+                        StateEventType::RoomAvatar,
+                        StateEventType::RoomJoinRules,
+                    ]),
+                    true,
+                )
+                .await;
+
+            match state {
+                Ok(state) => {
+                    let membership = client.get_room(&state.room_id).map(|room| room.state());
+
+                    return Ok(view::room_preview_from_stripped_state(
+                        state.room_id,
+                        state.via,
+                        state
+                            .num_joined_members
+                            .map(|count| u32::try_from(count).unwrap_or(u32::MAX)),
+                        state.state,
+                        membership,
+                    ));
+                }
+                Err(error) => {
+                    tracing::debug!(?error, "MSC4560 room preview failed, using the SDK preview");
+                }
+            }
+        }
+
+        let mut preview = client
             .get_room_preview(&address, via)
             .await
             .or_failed(self, "room_preview")?;
 
-        Ok(CommandOk::RoomPreview {
-            preview: view::room_preview_view(&preview),
-        })
+        // If the server didn't provide the state, but we have it locally,
+        // fill it in before returning
+        if let state @ None = &mut preview.state
+            && let Some(room) = client.get_room(&preview.room_id)
+        {
+            *state = Some(room.state());
+        }
+
+        Ok(view::room_preview_view(&preview))
     }
 
     pub(crate) async fn public_rooms(
         &self,
-        server: Option<String>,
-        search: Option<String>,
-        since: Option<String>,
-        room_type: Option<DirectoryRoomType>,
-    ) -> Result<CommandOk, CommandErr> {
+        PublicRoomsParams {
+            server,
+            search,
+            since,
+            room_type,
+        }: PublicRoomsParams,
+    ) -> Result<PublicRoomsOk, RpcError> {
         let server = match server.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(name) => Some(ServerName::parse(name).map_err(|_| CommandErr::UnknownHomeserver)?),
+            Some(name) => Some(ServerName::parse(name).map_err(|_| RpcError::UnknownHomeserver)?),
             None => None,
         };
 
@@ -478,7 +635,7 @@ impl Core {
             .await
             .map_err(|error| self.room_error("public_rooms", error.into()))?;
 
-        Ok(CommandOk::PublicRooms {
+        Ok(PublicRoomsOk {
             rooms: response.chunk.iter().map(view::public_room).collect(),
             next_batch: response.next_batch,
             total: response.total_room_count_estimate.map(u64::from),
@@ -489,7 +646,7 @@ impl Core {
         &self,
         space_id: &OwnedRoomId,
         from: Option<String>,
-    ) -> Result<CommandOk, CommandErr> {
+    ) -> Result<HierarchyOk, RpcError> {
         let client = self.client().await?;
 
         let mut request = get_hierarchy::v1::Request::new(space_id.clone());
@@ -514,7 +671,7 @@ impl Core {
             })
             .collect();
 
-        Ok(CommandOk::SpaceHierarchy {
+        Ok(HierarchyOk {
             rooms,
             next_batch: response.next_batch,
         })
@@ -526,7 +683,7 @@ impl Core {
         room_id: &OwnedRoomId,
         transaction_id: &str,
         thread_root: Option<&OwnedEventId>,
-    ) -> Result<SendHandle, CommandErr> {
+    ) -> Result<SendHandle, RpcError> {
         self.timeline_for(room_id, thread_root)
             .await?
             .items()
@@ -539,7 +696,7 @@ impl Core {
                     .is_some_and(|id| id == transaction_id)
             })
             .and_then(matrix_sdk_ui::timeline::EventTimelineItem::local_echo_send_handle)
-            .ok_or(CommandErr::UnknownLocalEcho)
+            .ok_or(RpcError::UnknownLocalEcho)
     }
 }
 
@@ -575,6 +732,66 @@ mod tests {
     #[test]
     fn an_unknown_encryption_state_is_treated_as_encrypted() {
         assert!(maybe_encrypted(&EncryptionState::Unknown));
+    }
+
+    #[tokio::test]
+    async fn a_tombstone_with_an_empty_replacement_still_closes_the_room() {
+        use matrix_sdk::ruma::{room_id, serde::Raw};
+        use matrix_sdk::test_utils::mocks::MatrixMockServer;
+        use matrix_sdk_test::JoinedRoomBuilder;
+        use serde_json::json;
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let _handle = super::repair_unreadable_tombstones(&client);
+        let room_id = room_id!("!archived:example.org");
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_timeline_event(
+                    Raw::new(&json!({
+                        "type": "m.room.tombstone", "state_key": "", "event_id": "$archive",
+                        "sender": "@admin:example.org", "origin_server_ts": 1,
+                        "content": {"body": "This room has been archived.", "replacement_room": ""}
+                    }))
+                    .unwrap()
+                    .cast_unchecked(),
+                ),
+            )
+            .await;
+
+        let room = client.get_room(room_id).unwrap();
+        assert!(room.is_tombstoned());
+    }
+
+    #[tokio::test]
+    async fn a_tombstone_without_a_replacement_still_closes_the_room() {
+        use matrix_sdk::ruma::{room_id, serde::Raw};
+        use matrix_sdk::test_utils::mocks::MatrixMockServer;
+        use matrix_sdk_test::JoinedRoomBuilder;
+        use serde_json::json;
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let _handle = super::repair_unreadable_tombstones(&client);
+        let room_id = room_id!("!archived:example.org");
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_timeline_event(
+                    Raw::new(&json!({
+                        "type": "m.room.tombstone", "state_key": "", "event_id": "$archive",
+                        "sender": "@admin:example.org", "origin_server_ts": 1,
+                        "content": {"body": "This room has been archived."}
+                    }))
+                    .unwrap()
+                    .cast_unchecked(),
+                ),
+            )
+            .await;
+
+        let room = client.get_room(room_id).unwrap();
+        assert!(room.is_tombstoned());
     }
 
     #[tokio::test]

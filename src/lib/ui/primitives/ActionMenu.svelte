@@ -1,16 +1,17 @@
 <script lang="ts">
+  import { MediaQuery } from 'svelte/reactivity';
   import { DropdownMenu } from 'bits-ui';
   import type { Snippet } from 'svelte';
 
   import { i18n } from '#lib/i18n.js';
   import { BREAKPOINTS } from '#lib/ui/breakpoints.js';
-  import { createMediaQuery } from '#lib/ui/media-query.svelte.js';
   import type { CursorAnchor } from '#lib/ui/cursor-anchor.js';
   import { overlayLayer } from '#lib/ui/overlay-layer.js';
 
   import BottomSheet from './BottomSheet.svelte';
   import { setActionMenuSurface } from './action-menu.js';
   import './menu.css';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
 
   interface Props {
     open?: boolean;
@@ -40,8 +41,8 @@
     children,
   }: Props = $props();
 
-  const appLayout = createMediaQuery(BREAKPOINTS.appLayout);
-  let sheet = $derived(!appLayout.matches);
+  const appLayout = new MediaQuery(BREAKPOINTS.appLayout);
+  let sheet = $derived(!appLayout.current);
 
   setActionMenuSurface({
     get sheet() {
@@ -68,7 +69,7 @@
 {#if sheet}
   {#if trigger}{@render trigger({ props: sheetTrigger })}{/if}
   {#if open}
-    <BottomSheet bind:open {label} closeLabel={$i18n.t('timeline.closeMenu')} {onOpenChange}>
+    <BottomSheet bind:open {label} closeLabel={i18n.t('timeline.closeMenu')} {onOpenChange}>
       <div class="action-menu-rows" role="menu">{@render children()}</div>
     </BottomSheet>
   {/if}
@@ -90,7 +91,9 @@
         {sideOffset}
         {preventScroll}
       >
-        {@render children()}
+        <div class="menu-scroll-content" {@attach scrollHint}>
+          {@render children()}
+        </div>
       </DropdownMenu.Content>
     </DropdownMenu.Portal>
   </DropdownMenu.Root>

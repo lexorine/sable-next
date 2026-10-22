@@ -4,8 +4,6 @@ import { render, screen, within } from '@testing-library/svelte';
 import { userEvent } from '@testing-library/user-event';
 import { expect, test, vi } from 'vitest';
 
-import type { TimelineItemView } from '#src/generated/protocol';
-
 vi.mock('#lib/core/context.js');
 
 vi.mock('#lib/rooms/room-list.svelte.js', () => ({
@@ -46,8 +44,9 @@ vi.mock('#lib/features/room/messages/message-scope.svelte.js', async () => {
 
 import ForumThreadItemHarness from './ForumThreadItemHarness.test.svelte';
 import type { ForumThread } from './forum-threads';
+import { withRowFields } from '#lib/features/room/timeline/row-fixtures.js';
 
-const root: TimelineItemView = {
+const root = withRowFields({
   id: 'thread-row',
   event_id: '$thread:example.org',
   transaction_id: null,
@@ -63,6 +62,7 @@ const root: TimelineItemView = {
     emote: false,
     notice: false,
     edited: false,
+    jumbo: null,
   },
   in_reply_to: null,
   thread_root: null,
@@ -77,7 +77,7 @@ const root: TimelineItemView = {
   mention: 'none',
   forwarded: null,
   forum_title: null,
-};
+});
 
 const thread: ForumThread = {
   id: 'thread-row',
@@ -115,7 +115,6 @@ test('uses the timeline context menu for a forum thread', async () => {
     onDelete,
     roomId: '!forum:example.org',
     onReact: vi.fn(),
-    loadImagePacks: vi.fn(() => Promise.resolve([])),
     onCopyLink: vi.fn(),
   });
 
@@ -149,7 +148,6 @@ test('renders the thread root through the timeline renderer', async () => {
     canDelete: false,
     onDelete: vi.fn(),
     roomId: '!forum:example.org',
-    loadImagePacks: vi.fn(() => Promise.resolve([])),
     onCopyLink: vi.fn(),
   });
 

@@ -9,6 +9,7 @@
   import '#lib/ui/primitives/settings-row.css';
   import { findCategory, SETTINGS_ACCOUNT_SECTION } from '#lib/settings/registry.js';
   import ExtendedProfileSettings from './ExtendedProfileSettings.svelte';
+  import DeleteAccountSetting from './DeleteAccountSetting.svelte';
   import LinkDeviceSetting from './LinkDeviceSetting.svelte';
   import ProfileEditor from './ProfileEditor.svelte';
   import SettingsCategorySections from './SettingsCategorySections.svelte';
@@ -16,7 +17,7 @@
   const category = findCategory(SETTINGS_ACCOUNT_SECTION);
 
   const core = useCoreClient();
-  let profile = $state<ProfileView | null>(null);
+  let profile = $state.raw<ProfileView | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
 
@@ -36,7 +37,7 @@
           profile = next;
         },
         () => {
-          if (!cancelled) error = $i18n.t('settings.profileSaveFailed');
+          if (!cancelled) error = i18n.t('settings.profileSaveFailed');
         }
       )
       .finally(() => {
@@ -49,13 +50,18 @@
 
   function refreshProfile(): void {
     if (!userId) return;
-    void core.userProfile(userId).then((next) => {
-      profile = next;
-    });
+    void core.refreshUserProfile(userId).then(
+      (next) => {
+        profile = next;
+      },
+      (cause: unknown) => {
+        console.warn('[sable settings] profile refresh failed', cause);
+      }
+    );
   }
 </script>
 
-<AppPageShell title={$i18n.t('settings.account')} density="compact" class="account-settings">
+<AppPageShell title={i18n.t('settings.account')} density="compact" class="account-settings">
   <div class="settings-stack">
     {#if error}<Alert variant="critical" aria-live="polite">{error}</Alert>{/if}
     {#if loading}
@@ -65,6 +71,7 @@
       {#if profile}<ExtendedProfileSettings {profile} />{/if}
       <LinkDeviceSetting />
       {#if category}<SettingsCategorySections {category} />{/if}
+      <DeleteAccountSetting />
     {/if}
   </div>
 </AppPageShell>

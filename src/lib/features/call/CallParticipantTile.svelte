@@ -1,6 +1,8 @@
 <script lang="ts">
   import { i18n } from '#lib/i18n.js';
   import MicrophoneSlashIcon from 'phosphor-svelte/lib/MicrophoneSlashIcon';
+  import CornersInIcon from 'phosphor-svelte/lib/CornersInIcon';
+  import CornersOutIcon from 'phosphor-svelte/lib/CornersOutIcon';
   import MonitorIcon from 'phosphor-svelte/lib/MonitorIcon';
   import PushPinIcon from 'phosphor-svelte/lib/PushPinIcon';
   import PushPinSlashIcon from 'phosphor-svelte/lib/PushPinSlashIcon';
@@ -17,9 +19,17 @@
   import Button from '#lib/ui/primitives/Button.svelte';
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
   import Slider from '#lib/ui/primitives/Slider.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
+  import { preferences } from '#lib/settings/preferences.svelte.js';
 
   import { cameraVisible, type CallTileSource } from './call-layout';
-  import type { CallParticipant, CallVideoOverlay } from './call-transport';
+  import CallStatsOverlay from './CallStatsOverlay.svelte';
+  import type {
+    CallParticipant,
+    CallRemoteVideoOverlay,
+    CallVideoOverlay,
+    CallVideoRect,
+  } from './call-transport';
   import { nativeVideoSlot } from './native-video-overlay';
   import {
     MAX_PARTICIPANT_VOLUME,
@@ -33,6 +43,7 @@
     source: CallTileSource;
     room: LivekitRoom | undefined;
     localVideo?: CallVideoOverlay;
+    remoteVideo?: CallRemoteVideoOverlay;
     name: string;
     userId: string;
     avatar: string | null;
@@ -49,6 +60,7 @@
     source,
     room,
     localVideo,
+    remoteVideo,
     name,
     userId,
     avatar,
@@ -72,7 +84,7 @@
       (!screen || (watchingScreen && participant.screenShareAudio !== undefined))
   );
   let volumeLabel = $derived(
-    screen ? $i18n.t('call.screenVolume', { name }) : $i18n.t('call.participantVolume', { name })
+    screen ? i18n.t('call.screenVolume', { name }) : i18n.t('call.participantVolume', { name })
   );
   let videoOn = $derived(
     screen ? participant.local === true || watchingScreen : cameraVisible(participant)
@@ -84,10 +96,21 @@
   let muted = $derived(participant.microphone === undefined || participant.microphone.muted);
   let speaking = $derived(!screen && !muted && participant.speaking === true);
   let quality = $derived(participant.connectionQuality ?? 'unknown');
-  let label = $derived(screen ? $i18n.t('call.screenOf', { name }) : name);
+  let label = $derived(screen ? i18n.t('call.screenOf', { name }) : name);
   let volume = $derived(participantVolume(volumeKey));
   let volumeOpen = $state(false);
   let revealed = $state(false);
+  let element = $state<HTMLLIElement>();
+  let fullscreen = $state(false);
+  const fullscreenAvailable =
+    typeof document !== 'undefined' &&
+    document.fullscreenEnabled &&
+    typeof HTMLElement.prototype.requestFullscreen === 'function';
+
+  function toggleFullscreen(): void {
+    if (fullscreen) void document.exitFullscreen();
+    else void element?.requestFullscreen();
+  }
 
   function reveal(event: PointerEvent): void {
     if (event.pointerType !== 'touch') return;
@@ -134,6 +157,20 @@
     };
   }
 
+  let remoteIdentity = $derived(participant.identity);
+  let remoteTrackId = $derived(
+    participant.local ? undefined : (screen ? participant.screenShare : participant.camera)?.id
+  );
+  let remoteSlot = $derived.by(() => {
+    const identity = remoteIdentity;
+    const trackId = remoteTrackId;
+    if (!remoteVideo || trackId === undefined) return undefined;
+    return {
+      place: (rect: CallVideoRect) => remoteVideo.place({ ...rect, identity, trackId }),
+      clear: () => remoteVideo.clear(trackId),
+    };
+  });
+
   function attachVideo(node: HTMLVideoElement) {
     if (videoTrackId === undefined) return;
     const identity = untrack(() => participant.identity);
@@ -151,22 +188,30 @@
 </script>
 
 <li
-  class="tile"
-  class:speaking
-  class:screen
-  class:featured
-  class:revealed
-  class:audible={screen && adjustable}
-  class:video-on={videoOn}
+  class={[
+    'tile',
+    {
+      speaking,
+      screen,
+      featured,
+      revealed,
+      audible: screen && adjustable,
+      'video-on': videoOn,
+      overlaid: videoOn && remoteSlot !== undefined,
+    },
+  ]}
+  bind:this={element}
+  onfullscreenchange={() => (fullscreen = document.fullscreenElement === element)}
   onpointerup={reveal}
   oncontextmenu={openVolume}
 >
   {#if videoOn && localVideo && !screen}
     <div class="video" {@attach nativeVideoSlot(localVideo)}></div>
+  {:else if videoOn && remoteSlot}
+    <div class="video" {@attach nativeVideoSlot(remoteSlot)}></div>
   {:else if videoOn}
     <video
-      class="video"
-      class:mirrored={participant.local && !screen}
+      class={['video', { mirrored: participant.local && !screen }]}
       autoplay
       muted
       playsinline
@@ -175,15 +220,19 @@
   {:else if screen}
     <div class="share-placeholder">
       <MonitorIcon aria-hidden="true" />
-      <p class="name" title={label}>{label}</p>
+      <Tooltip {label}>
+        {#snippet trigger({ props })}
+          <p {...props} class="name">{label}</p>
+        {/snippet}
+      </Tooltip>
       {#if onWatchScreen}
         <Button
           variant="primary"
           size="small"
-          aria-label={$i18n.t('call.watchScreen', { name })}
+          aria-label={i18n.t('call.watchScreen', { name })}
           onclick={onWatchScreen}
         >
-          {$i18n.t('call.watch')}
+          {i18n.t('call.watch')}
         </Button>
       {/if}
     </div>
@@ -199,10 +248,10 @@
         variant="ghost"
         size="small"
         class="tile-action"
-        aria-label={$i18n.t('call.stopWatchingScreen', { name })}
+        aria-label={i18n.t('call.stopWatchingScreen', { name })}
         onclick={onWatchScreen}
       >
-        {$i18n.t('call.stopWatching')}
+        {i18n.t('call.stopWatching')}
       </Button>
     </div>
   {/if}
@@ -213,7 +262,7 @@
         variant="ghost"
         size="small"
         class="tile-action"
-        label={$i18n.t(pinned ? 'call.unpin' : 'call.pin', { name: label })}
+        label={i18n.t(pinned ? 'call.unpin' : 'call.pin', { name: label })}
         aria-pressed={pinned}
         onclick={onPin}
       >
@@ -221,6 +270,21 @@
           <PushPinSlashIcon />
         {:else}
           <PushPinIcon />
+        {/if}
+      </IconButton>
+    {/if}
+    {#if screen && videoOn && fullscreenAvailable}
+      <IconButton
+        variant="ghost"
+        size="small"
+        class="tile-action"
+        label={i18n.t(fullscreen ? 'call.exitFullscreen' : 'call.fullscreen')}
+        onclick={toggleFullscreen}
+      >
+        {#if fullscreen}
+          <CornersInIcon />
+        {:else}
+          <CornersOutIcon />
         {/if}
       </IconButton>
     {/if}
@@ -248,24 +312,48 @@
       {#if screen}
         <MonitorIcon aria-hidden="true" weight="fill" />
       {:else if muted}
-        <span class="muted" title={$i18n.t('call.muted')}>
-          <MicrophoneSlashIcon aria-hidden="true" weight="fill" />
-          <span class="screen-reader-only">{$i18n.t('call.muted')}</span>
-        </span>
+        {@const mutedLabel = i18n.t('call.muted')}
+        <Tooltip label={mutedLabel}>
+          {#snippet trigger({ props })}
+            <span {...props} class="muted">
+              <MicrophoneSlashIcon aria-hidden="true" weight="fill" />
+              <span class="screen-reader-only">{mutedLabel}</span>
+            </span>
+          {/snippet}
+        </Tooltip>
       {/if}
       <span class="name">{label}</span>
       {#if quality === 'poor'}
-        <span class="quality" title={$i18n.t('call.connectionPoor')}>
-          <CellSignalLowIcon aria-hidden="true" weight="fill" />
-          <span class="screen-reader-only">{$i18n.t('call.connectionPoor')}</span>
-        </span>
+        {@const qualityLabel = i18n.t('call.connectionPoor')}
+        <Tooltip label={qualityLabel}>
+          {#snippet trigger({ props })}
+            <span {...props} class="quality">
+              <CellSignalLowIcon aria-hidden="true" weight="fill" />
+              <span class="screen-reader-only">{qualityLabel}</span>
+            </span>
+          {/snippet}
+        </Tooltip>
       {:else if quality === 'lost'}
-        <span class="quality lost" title={$i18n.t('call.connectionLost')}>
-          <CellSignalSlashIcon aria-hidden="true" weight="fill" />
-          <span class="screen-reader-only">{$i18n.t('call.connectionLost')}</span>
-        </span>
+        {@const qualityLabel = i18n.t('call.connectionLost')}
+        <Tooltip label={qualityLabel}>
+          {#snippet trigger({ props })}
+            <span {...props} class="quality lost">
+              <CellSignalSlashIcon aria-hidden="true" weight="fill" />
+              <span class="screen-reader-only">{qualityLabel}</span>
+            </span>
+          {/snippet}
+        </Tooltip>
       {/if}
     </div>
+  {/if}
+
+  {#if screen && videoOn && room && videoTrackId !== undefined && preferences.developerTools && preferences.callStatsOverlay}
+    <CallStatsOverlay
+      {room}
+      identity={participant.identity}
+      local={participant.local === true}
+      trackId={videoTrackId}
+    />
   {/if}
 
   {#if volumeOpen && adjustable}
@@ -282,7 +370,7 @@
       <IconButton
         variant="ghost"
         size="small"
-        label={$i18n.t(volume === 0 ? 'call.unmuteParticipant' : 'call.muteParticipant', { name })}
+        label={i18n.t(volume === 0 ? 'call.unmuteParticipant' : 'call.muteParticipant', { name })}
         aria-pressed={volume === 0}
         onclick={toggleMute}
       >
@@ -327,6 +415,10 @@
 
   .tile.video-on {
     background: var(--picker-black);
+  }
+
+  .tile:fullscreen {
+    border-radius: 0;
   }
 
   .video {
@@ -411,6 +503,7 @@
     max-inline-size: calc(100% - var(--space-400));
     padding: var(--space-050) var(--space-200);
     position: absolute;
+    transition: opacity var(--motion-slow) var(--motion-easing-emphasized);
   }
 
   .tag :global(svg) {
@@ -430,6 +523,28 @@
     font-size: var(--font-size-small);
     margin: 0;
     max-inline-size: 100%;
+  }
+
+  .overlaid {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .overlaid .video {
+    block-size: auto;
+    flex: 1;
+    min-block-size: 0;
+    order: 1;
+  }
+
+  .overlaid .stop-watching {
+    min-block-size: calc(var(--control-height-300) + var(--space-200));
+    padding: var(--space-100) var(--space-200);
+    position: static;
+  }
+
+  .overlaid .tag {
+    display: none;
   }
 
   .muted {

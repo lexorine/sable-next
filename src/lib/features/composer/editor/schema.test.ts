@@ -95,14 +95,14 @@ test('an emote serialises to the MSC2545 image the sanitiser allows', () => {
   ]);
 
   expect(html(doc)).toBe(
-    '<p><img data-mx-emoticon="" src="mxc://example.org/wave" alt=":wave:" title=":wave:" height="32"></p>'
+    '<p><img data-mx-emoticon="" src="mxc://example.org/wave" alt="wave" title="wave" height="32"></p>'
   );
 });
 
 test('both atoms survive a clipboard round trip', () => {
   const source =
     '<p>hey <a href="https://matrix.to/#/@one:example.org">Member One</a> ' +
-    '<img data-mx-emoticon src="mxc://example.org/wave" alt=":wave:"></p>';
+    '<img data-mx-emoticon src="mxc://example.org/wave" alt="wave"></p>';
   const doc = parse(source);
   const kinds = [...Array(doc.firstChild?.childCount ?? 0).keys()].map(
     (index) => doc.firstChild?.child(index).type.name
@@ -198,7 +198,7 @@ test('an emote description survives HTML and draft round trips', () => {
     ]),
   ]);
   const output = html(doc);
-  expect(output).toContain('alt="A cat waving" title=":wave:"');
+  expect(output).toContain('alt="A cat waving" title="wave"');
   expect(parse(output).firstChild?.firstChild?.attrs).toMatchObject({
     shortcode: 'wave',
     body: 'A cat waving',
@@ -217,7 +217,7 @@ test('an emote whose description is its own address is sent with its shortcode',
     ]),
   ]);
 
-  expect(html(doc)).toContain('alt=":wave:" title=":wave:"');
+  expect(html(doc)).toContain('alt="wave" title="wave"');
 });
 
 test('an explicit matrix.to link stays a link and is re-marked on serialise', () => {
@@ -230,4 +230,10 @@ test('an explicit matrix.to link stays a link and is re-marked on serialise', ()
   });
   expect(mentions).toBe(0);
   expect(html(doc)).toContain('data-org.matrix.msc4550.link');
+});
+
+test('a bare matrix.to link is not marked explicit on serialise', () => {
+  const href = 'https://matrix.to/#/!room:example.org/$event';
+  const doc = parse(`<a href="${href}">${href}</a>`);
+  expect(html(doc)).not.toContain('msc4550');
 });

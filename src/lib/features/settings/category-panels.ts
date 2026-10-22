@@ -2,14 +2,17 @@ import type { Component } from 'svelte';
 
 import { hasNativeCalls } from '#lib/platform/calls.js';
 import { usesPushGateway } from '#lib/platform/notifications.js';
+import { supportsTouch } from '#lib/platform/os.js';
 import { preferences } from '#lib/settings/preferences.svelte.js';
 import { SETTINGS_ACCOUNT_SECTION } from '#lib/settings/registry.js';
 
 import AppIconSettings from '#lib/features/settings/AppIconSettings.svelte';
+import CallCompatibilityDebug from '#lib/features/settings/CallCompatibilityDebug.svelte';
 import CallDeviceSettings from '#lib/features/call/CallDeviceSettings.svelte';
 import ComposerButtons from '#lib/features/settings/ComposerButtons.svelte';
 import ComposerEnterSetting from '#lib/features/settings/ComposerEnterSetting.svelte';
 import CustomThemes from '#lib/features/settings/CustomThemes.svelte';
+import FontSettings from '#lib/features/settings/FontSettings.svelte';
 import QuickCss from '#lib/features/settings/QuickCss.svelte';
 import DoubleTapReaction from '#lib/features/settings/DoubleTapReaction.svelte';
 import MediaPreviewPrivacy from '#lib/features/settings/MediaPreviewPrivacy.svelte';
@@ -32,7 +35,9 @@ import DeveloperNotifications from '#lib/features/settings/DeveloperNotification
 import DeveloperPushHistory from '#lib/features/settings/DeveloperPushHistory.svelte';
 import DeveloperSearchMetrics from '#lib/features/settings/DeveloperSearchMetrics.svelte';
 import DeveloperSentry from '#lib/features/settings/DeveloperSentry.svelte';
+import DeveloperServerFeatures from '#lib/features/settings/DeveloperServerFeatures.svelte';
 import DeveloperSyncDiagnostics from '#lib/features/settings/DeveloperSyncDiagnostics.svelte';
+import SoundVolumeSettings from '../call/SoundVolumeSettings.svelte';
 
 export interface CategoryPanel {
   component: Component;
@@ -41,18 +46,20 @@ export interface CategoryPanel {
   when?: () => boolean;
 }
 
+// Add panel anchors to settings/registry/panels.ts for search and link labels.
 export const categoryPanels: Record<string, CategoryPanel[]> = {
   appearance: [
     { component: CustomThemes, section: 'themes' },
     { component: QuickCss, section: 'themes' },
     { component: AppIconSettings, section: 'themes' },
+    { component: FontSettings, section: 'font' },
   ],
   composer: [
     { component: ComposerEnterSetting, section: 'writing', start: true },
     { component: ComposerButtons, section: 'composer-buttons' },
   ],
   timeline: [
-    { component: DoubleTapReaction, section: 'messages' },
+    { component: DoubleTapReaction, section: 'messages', when: supportsTouch },
     {
       component: DeveloperSearchMetrics,
       section: 'developer-search-metrics',
@@ -73,6 +80,13 @@ export const categoryPanels: Record<string, CategoryPanel[]> = {
       component: CallDeviceSettings,
       section: 'call-devices',
       when: () => !hasNativeCalls(),
+    },
+    { component: CallCompatibilityDebug, section: 'call-compat' },
+  ],
+  sounds: [
+    {
+      component: SoundVolumeSettings,
+      section: 'volumes',
     },
   ],
   privacy: [{ component: MediaPreviewPrivacy, section: 'blurring', start: true }],
@@ -95,6 +109,11 @@ export const categoryPanels: Record<string, CategoryPanel[]> = {
     {
       component: DeveloperSyncDiagnostics,
       section: 'developer-sync-diagnostics',
+      when: () => preferences.developerTools,
+    },
+    {
+      component: DeveloperServerFeatures,
+      section: 'developer-server-features',
       when: () => preferences.developerTools,
     },
     {

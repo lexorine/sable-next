@@ -1,10 +1,9 @@
-//! MSC4174 web push: the homeserver encrypts and delivers, so no gateway.
-//!
-//! Ruma's client API types cannot express the custom pusher kind, so the three
-//! requests are hand-rolled into the [`OutgoingRequest`] shape.
+//! MSC4174 web push: the homeserver encrypts and delivers. Requests are hand-rolled because Ruma
+//! cannot express the pusher kind.
 
+use crate::api::push::WebPusherView;
 use crate::errors::CoreError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use http::{self, header::CONTENT_TYPE};
@@ -17,8 +16,9 @@ use ruma::api::{
     path_builder::{PathBuilder, StablePathSelector, VersionHistory},
 };
 use ruma::http_headers::APPLICATION_JSON;
+use ruma::push::PushFormat;
 
-use crate::protocol::{RegisteredPusherView, WebPusherView};
+use crate::protocol::RegisteredPusherView;
 
 /// The capability name once upstreamed, and the unstable one meanwhile.
 const CAPABILITIES: [&str; 2] = ["m.webpush", "org.matrix.msc4174.webpush"];
@@ -65,7 +65,8 @@ pub async fn support(client: &Client) -> Result<Option<String>, CoreError> {
 pub async fn set_pusher(client: &Client, mut pusher: WebPusherView) -> Result<(), CoreError> {
     pusher.device_display_name =
         crate::notifications::pusher_display_name(client, pusher.device_display_name).await;
-    let body = pusher_body(&pusher, client.user_id().map(ToString::to_string));
+    let body = pusher_body(pusher, client.user_id().map(ToString::to_string))
+        .map_err(CoreError::backend)?;
 
     client
         .send(SetWebPusher { body })
@@ -76,32 +77,64 @@ pub async fn set_pusher(client: &Client, mut pusher: WebPusherView) -> Result<()
 
 /// MSC4174's pusher body: `url` is the subscription, not a gateway, and the
 /// server merges `default_payload` into every notification it encrypts.
-fn pusher_body(pusher: &WebPusherView, user_id: Option<String>) -> JsonValue {
-    let mut data = serde_json::Map::new();
-    data.insert("url".to_owned(), pusher.endpoint.clone().into());
-    data.insert("auth".to_owned(), pusher.auth.clone().into());
-    if pusher.event_id_only {
-        data.insert(
-            "format".to_owned(),
-            JsonValue::String("event_id_only".to_owned()),
-        );
-    }
-    if let Some(user_id) = user_id {
-        data.insert(
-            "default_payload".to_owned(),
-            serde_json::json!({ "user_id": user_id }),
-        );
+fn pusher_body(
+    pusher: WebPusherView,
+    user_id: Option<String>,
+) -> Result<JsonValue, serde_json::Error> {
+    #[derive(Serialize)]
+    struct DefaultPayloadOut {
+        user_id: String,
     }
 
-    serde_json::json!({
-        "pushkey": pusher.pushkey,
-        "app_id": pusher.app_id,
-        "kind": PUSHER_KIND,
-        "app_display_name": "Sable",
-        "device_display_name": pusher.device_display_name,
-        "lang": "en",
-        "data": data,
-        "append": false,
+    #[derive(Serialize)]
+    enum AppDisplayNameOut {
+        Sable,
+    }
+
+    #[derive(Serialize)]
+    enum LangOut {
+        #[serde(rename = "en")]
+        English,
+    }
+
+    #[derive(Serialize)]
+    struct DataOut {
+        url: String,
+        auth: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        format: Option<PushFormat>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        default_payload: Option<DefaultPayloadOut>,
+    }
+
+    #[derive(Serialize)]
+    #[serde(tag = "kind")]
+    enum BodyOut {
+        #[serde(rename = "org.matrix.msc4174.webpush")]
+        WebPush {
+            pushkey: String,
+            app_id: String,
+            app_display_name: AppDisplayNameOut,
+            device_display_name: String,
+            lang: LangOut,
+            data: DataOut,
+            append: bool,
+        },
+    }
+
+    serde_json::to_value(BodyOut::WebPush {
+        pushkey: pusher.pushkey,
+        app_id: pusher.app_id,
+        app_display_name: AppDisplayNameOut::Sable,
+        device_display_name: pusher.device_display_name,
+        lang: LangOut::English,
+        data: DataOut {
+            url: pusher.endpoint,
+            auth: pusher.auth,
+            format: pusher.event_id_only.then_some(PushFormat::EventIdOnly),
+            default_payload: user_id.map(|user_id| DefaultPayloadOut { user_id }),
+        },
+        append: false,
     })
 }
 
@@ -312,6 +345,12 @@ pub async fn ack(client: &Client, app_id: String, ack_token: String) -> Result<(
         .map_err(CoreError::backend)
 }
 
+#[derive(Serialize)]
+struct AckBodyOut {
+    app_id: String,
+    ack_token: String,
+}
+
 /// Returns the token the validation push carried.
 #[derive(Clone, Debug)]
 struct AckWebPusher {
@@ -338,10 +377,10 @@ impl OutgoingRequest for AckWebPusher {
         base_url: &str,
         path_builder_input: <UnstablePath as PathBuilder>::Input<'_>,
     ) -> Result<http::Request<Self::Body>, IntoHttpError> {
-        let body = serde_json::json!({
-            "app_id": self.app_id,
-            "ack_token": self.ack_token,
-        });
+        let body = AckBodyOut {
+            app_id: self.app_id,
+            ack_token: self.ack_token,
+        };
 
         http::Request::builder()
             .method(Self::METHOD)
@@ -419,7 +458,7 @@ mod tests {
     #[test]
     fn the_webpush_pusher_body_matches_msc4174() {
         assert_eq!(
-            pusher_body(&pusher(), Some("@alice:example.org".to_owned())),
+            pusher_body(pusher(), Some("@alice:example.org".to_owned())).unwrap(),
             serde_json::json!({
                 "pushkey": "B5Dw",
                 "app_id": "moe.sable.webpush",
@@ -444,7 +483,7 @@ mod tests {
             event_id_only: false,
             ..pusher()
         };
-        let body = pusher_body(&rich, Some("@alice:example.org".to_owned()));
+        let body = pusher_body(rich, Some("@alice:example.org".to_owned())).unwrap();
 
         assert!(body["data"].get("format").is_none());
         assert_eq!(
@@ -486,7 +525,7 @@ mod tests {
     #[test]
     fn the_pusher_is_registered_on_the_versioned_path() {
         let http_request: http::Request<Vec<u8>> = SetWebPusher {
-            body: pusher_body(&pusher(), Some("@alice:example.org".to_owned())),
+            body: pusher_body(pusher(), Some("@alice:example.org".to_owned())).unwrap(),
         }
         .try_into_http_request(
             "https://homeserver.example",
@@ -507,14 +546,14 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_slice::<JsonValue>(http_request.body().as_slice()).unwrap(),
-            pusher_body(&pusher(), Some("@alice:example.org".to_owned()))
+            pusher_body(pusher(), Some("@alice:example.org".to_owned())).unwrap()
         );
     }
 
     #[test]
     fn old_homeservers_still_get_the_r0_path() {
         let http_request: http::Request<Vec<u8>> = SetWebPusher {
-            body: pusher_body(&pusher(), Some("@alice:example.org".to_owned())),
+            body: pusher_body(pusher(), Some("@alice:example.org".to_owned())).unwrap(),
         }
         .try_into_http_request(
             "https://homeserver.example",

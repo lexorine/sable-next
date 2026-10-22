@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { MediaQuery } from 'svelte/reactivity';
   import type { SearchContextView, SearchHitView, SearchOrder } from '#src/generated/protocol';
   import { onDestroy, onMount, untrack } from 'svelte';
   import { goto } from '$app/navigation';
@@ -17,23 +18,26 @@
   import AppPageShell from '#lib/ui/primitives/AppPageShell.svelte';
   import Button from '#lib/ui/primitives/Button.svelte';
   import Select from '#lib/ui/primitives/Select.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
   import { BREAKPOINTS } from '#lib/ui/breakpoints.js';
-  import { createMediaQuery } from '#lib/ui/media-query.svelte.js';
   import { whenVisible } from '#lib/ui/when-visible.js';
   import '#lib/ui/primitives/form-control.css';
 
   import { formatFullTimestamp, formatMessageTimestamp } from '#lib/ui/date-time.js';
   import Avatar from '#lib/ui/primitives/Avatar.svelte';
   import { MESSAGE_SEARCH_FIELD_ID, MessageSearch } from './message-search.svelte.js';
-  import { clearRecentSearches, recentSearches, rememberSearch } from './recent-searches.svelte.js';
   import {
-    resolveDirectRooms,
+    clearRecentSearches,
+    recentSearches,
+    rememberSearch,
+  } from '#lib/search/recent-searches.svelte.js';
+  import {
     resolveRoomTarget,
-    resolveSpaceRooms,
     resolveSpaceTarget,
-    resolveUserTarget,
+    searchRooms,
+    suggestPersonTarget,
     suggestRoomTarget,
-    suggestUserTarget,
+    type SearchPerson,
     type TargetSuggestion,
   } from './resolve-targets';
   import { coverageMessage } from './coverage';
@@ -60,20 +64,15 @@
   const roomList = useRoomList();
   const senders = new SenderDirectory(core);
 
-  const search = new MessageSearch(core, () => ({
-    roomId: (value) => resolveRoomTarget(roomList.rooms, value),
-    userId: (value) => resolveUserTarget(knownSenders(), value),
-    usersMatching: (pattern) =>
-      knownSenders()
-        .filter((sender) => pattern.test(sender.userId) || pattern.test(sender.displayName))
-        .map((sender) => sender.userId),
-    spaceRooms: (value) => resolveSpaceRooms(roomList.rooms, value),
-    directRooms: (value) =>
-      resolveDirectRooms(roomList.rooms, resolveUserTarget(knownSenders(), value) ?? value),
-  }));
+  let rooms = $derived(searchRooms(roomList.rooms));
+  let people: SearchPerson[] = $derived(
+    knownSenders().map((sender) => ({ user_id: sender.userId, display_name: sender.displayName }))
+  );
+  let directory = $derived({ rooms, people });
+  const search = new MessageSearch(core, () => directory);
 
   const LOOKUP_DELAY_MS = 300;
-  const PEOPLE_OPERATORS: readonly string[] = ['from', 'mentions', 'with'];
+  const PEOPLE_OPERATORS: ReadonlySet<string> = new Set(['from', 'mentions', 'with']);
   const STARTER_OPERATORS: readonly string[] = ['from', 'in', 'has', 'before', 'is'];
   let lookupTimer: ReturnType<typeof setTimeout> | undefined;
   let destroyed = false;
@@ -94,13 +93,15 @@
   let suggestionsOpen = $state(false);
   let activeSuggestion = $state(0);
   let navigated = $state(false);
-  const compact = createMediaQuery(`(width < ${BREAKPOINTS.compactContent})`);
+  const compact = new MediaQuery(`(width < ${BREAKPOINTS.compactContent})`);
   const listboxId = $props.id();
   const optionId = (index: number): string => `${listboxId}-${String(index)}`;
 
   let showOperatorList = $state(false);
 
-  let spaces = $derived(roomList.rooms.filter((room) => room.is_space && room.state === 'joined'));
+  let spaces = $derived(
+    roomList.rooms.filter((room) => room.room_kind === 'space' && room.state === 'joined')
+  );
 
   const CLEAR_RECENT = 'recent:clear';
   let userId = $derived(core.session?.user_id ?? null);
@@ -118,7 +119,7 @@
             label: query,
             insert: `${query} `,
           })),
-          { id: CLEAR_RECENT, label: $i18n.t('search.clearRecent'), insert: '' },
+          { id: CLEAR_RECENT, label: i18n.t('search.clearRecent'), insert: '' },
         ]
       : suggestionsOpen
         ? suggestionsFor(
@@ -152,29 +153,29 @@
 
   let coverage = $derived(
     coverageMessage(core.searchCoverage, core.searchCoverageUnavailable, (key, options) =>
-      $i18n.t(key, options)
+      i18n.t(key, options)
     )
   );
 
   let countLabel = $derived(
-    $i18n.t(search.exhausted ? 'search.count' : 'search.countMore', { count: search.hits.length })
+    i18n.t(search.exhausted ? 'search.count' : 'search.countMore', { count: search.hits.length })
   );
 
   let showCoverage = $derived(coverage !== '' && core.searchCoverage?.state !== 'complete');
 
   let emptyLabel = $derived(
     search.older
-      ? $i18n.t('search.emptyRecent')
+      ? i18n.t('search.emptyRecent')
       : showCoverage
-        ? $i18n.t('search.emptyIndexing')
-        : $i18n.t('search.empty')
+        ? i18n.t('search.emptyIndexing')
+        : i18n.t('search.empty')
   );
 
   let status = $derived.by(() => {
     if (!search.runnable) return '';
     if (search.failed) return '';
     if (search.searching && (search.hits.length === 0 || search.refining))
-      return $i18n.t('search.searching');
+      return i18n.t('search.searching');
     if (search.hits.length === 0) return showCoverage ? `${emptyLabel} ${coverage}` : emptyLabel;
     return countLabel;
   });
@@ -193,13 +194,13 @@
 
     if (tokens.length > 0)
       hints.push(
-        $i18n.t('search.recoveryFilter', {
+        i18n.t('search.recoveryFilter', {
           filters: tokens.map((token) => `${token.operator}:${token.value}`).join(', '),
         })
       );
-    if (phrases.length > 0) hints.push($i18n.t('search.recoveryPhrase'));
-    if (exclude.length > 0) hints.push($i18n.t('search.recoveryExclude'));
-    if (wordCount > 1) hints.push($i18n.t('search.recoveryTerms'));
+    if (phrases.length > 0) hints.push(i18n.t('search.recoveryPhrase'));
+    if (exclude.length > 0) hints.push(i18n.t('search.recoveryExclude'));
+    if (wordCount > 1) hints.push(i18n.t('search.recoveryTerms'));
     return hints;
   });
 
@@ -221,13 +222,13 @@
   function suggestionFor(token: SearchToken): TargetSuggestion | undefined {
     switch (token.operator) {
       case 'in':
-        return suggestRoomTarget(roomList.rooms, token.value);
+        return suggestRoomTarget(rooms, token.value);
       case 'space':
-        return suggestRoomTarget(roomList.rooms, token.value, true);
+        return suggestRoomTarget(rooms, token.value, true);
       case 'from':
       case 'mentions':
       case 'with':
-        return suggestUserTarget(knownSenders(), token.value);
+        return suggestPersonTarget(people, token.value);
       default:
         return undefined;
     }
@@ -273,11 +274,11 @@
 
   function chipLabel(chip: SearchToken): string {
     if (chip.operator === 'in') {
-      const roomId = resolveRoomTarget(roomList.rooms, chip.value);
+      const roomId = resolveRoomTarget(rooms, chip.value);
       return roomId === undefined ? chip.value : roomList.labelFor(roomId);
     }
     if (chip.operator === 'space') {
-      const spaceId = resolveSpaceTarget(roomList.rooms, chip.value);
+      const spaceId = resolveSpaceTarget(rooms, chip.value);
       return spaceId === undefined ? chip.value : roomList.labelFor(spaceId);
     }
     return chip.value;
@@ -421,7 +422,7 @@
 
   function lookUpUnresolvedPeople(): void {
     const terms = search.unresolved
-      .filter((token) => PEOPLE_OPERATORS.includes(token.operator))
+      .filter((token) => PEOPLE_OPERATORS.has(token.operator))
       .map((token) => token.value);
 
     for (const term of terms) {
@@ -447,6 +448,7 @@
     if (space !== null) parts.push(`space=${encodeURIComponent(space)}`);
 
     const encoded = parts.join('&');
+    // eslint-disable-next-line svelte/no-navigation-without-resolve -- rewrites the query of the current, already resolved URL
     void goto(encoded === '' ? page.url.pathname : `${page.url.pathname}?${encoded}`, {
       replace: true,
       shallow: true,
@@ -464,26 +466,28 @@
 
   async function openHit(hit: SearchHitView): Promise<void> {
     remember();
+    // eslint-disable-next-line svelte/no-navigation-without-resolve -- roomSectionPath() resolves the route itself
     await goto(roomSectionPath(roomList.rooms, hit.room_id, hit.event_id));
   }
 
   let orders = $derived<{ value: SearchOrder; label: string }[]>([
-    { value: 'rank', label: $i18n.t('search.orderRank') },
-    { value: 'recent', label: $i18n.t('search.orderRecent') },
-    { value: 'oldest', label: $i18n.t('search.orderOldest') },
+    { value: 'rank', label: i18n.t('search.orderRank') },
+    { value: 'recent', label: i18n.t('search.orderRecent') },
+    { value: 'oldest', label: i18n.t('search.orderOldest') },
   ]);
 </script>
 
 {#snippet loadMore()}
   {#if !search.exhausted}
     <div class="load-more">
-      {#key search.pages}
-        <div
-          class="load-sentinel"
-          aria-hidden="true"
-          {@attach whenVisible(() => void search.loadMore())}
-        ></div>
-      {/key}
+      <div
+        class="load-sentinel"
+        aria-hidden="true"
+        {@attach (node) => {
+          void search.pages;
+          return whenVisible(() => void search.loadMore())(node);
+        }}
+      ></div>
       <Button
         variant="ghost"
         size="small"
@@ -491,10 +495,10 @@
         onclick={() => void search.loadMore()}
       >
         {search.searching
-          ? $i18n.t('search.searching')
+          ? i18n.t('search.searching')
           : search.older
-            ? $i18n.t('search.loadOlder')
-            : $i18n.t('search.loadMore')}
+            ? i18n.t('search.loadOlder')
+            : i18n.t('search.loadMore')}
       </Button>
     </div>
   {/if}
@@ -510,13 +514,13 @@
 {#if panel}
   {@render content()}
 {:else}
-  <AppPageShell title={$i18n.t('search.title')} density="compact">
+  <AppPageShell title={i18n.t('common.searchMessages')} density="compact">
     {@render content()}
   </AppPageShell>
 {/if}
 
 {#snippet content()}
-  <div class="search-view" class:panel>
+  <div class={['search-view', { panel }]}>
     <div class="search-bar">
       <div class="field">
         <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -529,19 +533,19 @@
           }}
         >
           {#if field.chips.length > 0}
-            <ul class="chips" aria-label={$i18n.t('search.activeFilters')}>
+            <ul class="chips" aria-label={i18n.t('search.activeFilters')}>
               {#each field.chips as chip (chip.start)}
-                <li class="chip" class:negated={chip.negated} class:unresolved={isUnresolved(chip)}>
+                <li class={['chip', { negated: chip.negated, unresolved: isUnresolved(chip) }]}>
                   {#if isUnresolved(chip)}<WarningIcon />{/if}
                   <span class="chip-operator">{chip.negated ? '-' : ''}{chip.operator}:</span>
                   <span class="chip-value">{chipLabel(chip)}</span>
                   {#if isUnresolved(chip)}
-                    <span class="visually-hidden">{$i18n.t('search.chipUnresolved')}</span>
+                    <span class="visually-hidden">{i18n.t('search.chipUnresolved')}</span>
                   {/if}
                   <button
                     class="chip-remove"
                     type="button"
-                    aria-label={$i18n.t('search.removeFilter', {
+                    aria-label={i18n.t('search.removeFilter', {
                       filter: `${chip.negated ? '-' : ''}${chip.operator}:${chipLabel(chip)}`,
                     })}
                     onclick={() => {
@@ -557,6 +561,11 @@
 
           <input
             bind:this={input}
+            {@attach (node) => {
+              if (untrack(() => compact.current)) return;
+              node.focus();
+              suggestionsOpen = false;
+            }}
             id={MESSAGE_SEARCH_FIELD_ID}
             class="token-input"
             value={field.draft}
@@ -573,11 +582,14 @@
               : undefined}
             placeholder={field.chips.length > 0
               ? ''
-              : $i18n.t(compact.matches ? 'search.placeholderShort' : 'search.placeholder')}
-            aria-label={$i18n.t('search.title')}
+              : i18n.t(compact.current ? 'common.searchMessages' : 'search.placeholder')}
+            aria-label={i18n.t('common.searchMessages')}
             oninput={onInput}
             onkeydown={onKeydown}
             onfocus={() => {
+              suggestionsOpen = true;
+            }}
+            onclick={() => {
               suggestionsOpen = true;
             }}
             onblur={() => {
@@ -590,7 +602,7 @@
           <button
             class="query-clear"
             type="button"
-            aria-label={$i18n.t('search.clear')}
+            aria-label={i18n.t('search.clear')}
             onclick={clearQuery}
           >
             <XIcon />
@@ -603,8 +615,8 @@
               id={listboxId}
               {optionId}
               heading={showingRecent
-                ? $i18n.t('search.recentSearches')
-                : $i18n.t('search.suggestions')}
+                ? i18n.t('search.recentSearches')
+                : i18n.t('search.suggestions')}
               {suggestions}
               active={suggestionHighlighted ? activeSuggestion : -1}
               onSelect={accept}
@@ -616,7 +628,7 @@
         class="order-select"
         items={orders}
         value={search.order}
-        aria-label={$i18n.t('search.order')}
+        aria-label={i18n.t('search.order')}
         onValueChange={(next: string) => {
           chooseOrder(orderFrom(next));
         }}
@@ -625,22 +637,21 @@
 
     {#if search.parsed.unsupported.length > 0}
       <p class="notice">
-        {$i18n.t('search.unsupported', { operators: search.parsed.unsupported.join(', ') })}
+        {i18n.t('search.unsupported', { operators: search.parsed.unsupported.join(', ') })}
       </p>
     {/if}
 
     <p class="announcement" role="status" aria-live="polite">{status}</p>
 
     <div
-      class="results"
-      class:refining={search.refining && search.hits.length > 0}
+      class={['results', { refining: search.refining && search.hits.length > 0 }]}
       aria-busy={search.refining}
       bind:this={results}
     >
       {#if !search.runnable}
         <div class="starter">
-          <p class="hint">{$i18n.t('search.hint')}</p>
-          <ul class="starter-filters" aria-label={$i18n.t('search.startFilter')}>
+          <p class="hint">{i18n.t('search.hint')}</p>
+          <ul class="starter-filters" aria-label={i18n.t('search.startFilter')}>
             {#each STARTER_OPERATORS as operator (operator)}
               <li>
                 <button
@@ -656,28 +667,29 @@
             {/each}
             <li>
               <button class="starter-filter more" type="button" onclick={showAllFilters}>
-                {$i18n.t('search.allFilters')}
+                {i18n.t('search.allFilters')}
               </button>
             </li>
           </ul>
-          <p class="hint">{$i18n.t('search.hintExample')}</p>
-          <p class="hint">{$i18n.t('search.hintSyntax')}</p>
+          <p class="hint">{i18n.t('search.hintExample')}</p>
+          <p class="hint">{i18n.t('search.hintSyntax')}</p>
         </div>
       {:else if search.failed}
         <Alert variant="critical" role="alert">
-          <p>{$i18n.t('search.failed')}</p>
+          <p>{i18n.t('search.failed')}</p>
           <div class="alert-actions">
-            <Button size="small" onclick={() => search.schedule()}>{$i18n.t('search.retry')}</Button
+            <Button size="small" onclick={() => search.schedule()}
+              >{i18n.t('common.tryAgain')}</Button
             >
           </div>
         </Alert>
       {:else if search.searching && search.hits.length === 0}
-        <p class="hint">{$i18n.t('search.searching')}</p>
+        <p class="hint">{i18n.t('search.searching')}</p>
       {:else if search.hits.length === 0}
         <div class="empty">
           {#if search.unresolved.length > 0}
             <p>
-              {$i18n.t('search.unresolved', {
+              {i18n.t('search.unresolved', {
                 targets: search.unresolved
                   .map((token) => `${token.operator}:${token.value}`)
                   .join(', '),
@@ -691,7 +703,7 @@
                   applyFix(token, suggestion);
                 }}
               >
-                {$i18n.t('search.didYouMean', { label: suggestion.label })}
+                {i18n.t('search.didYouMean', { label: suggestion.label })}
               </Button>
             {/each}
           {:else}
@@ -717,7 +729,7 @@
           {@const room = roomList.byId(group.roomId)}
           {@const label = roomList.labelFor(group.roomId)}
           <section class="group">
-            <h2 class:visually-hidden={panel && search.groups.length === 1}>
+            <h2 class={{ 'visually-hidden': panel && search.groups.length === 1 }}>
               <Avatar id={group.roomId} src={room?.avatar_url ?? null} name={label} size="small" />
               <span class="group-name">{label}</span>
               <span class="group-count">{group.hits.length}</span>
@@ -725,11 +737,12 @@
             <ul class="hit-list">
               {#each group.hits as hit (hit.event_id)}
                 {@const snippet = snippetAround(hit.body, terms)}
-                {@const openLabel = $i18n.t('search.openResultFrom', {
+                {@const openLabel = i18n.t('search.openResultFrom', {
                   sender: senders.identity(hit.sender).displayName,
                   room: roomList.labelFor(hit.room_id),
                   time: formatFullTimestamp(hit.origin_server_ts),
                 })}
+                {@const fullTimestamp = formatFullTimestamp(hit.origin_server_ts)}
                 <li class="hit">
                   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
                   <div
@@ -789,19 +802,21 @@
                                       )
                                     : []}
                                 />
-                                <button
-                                  class="hit-time-action"
-                                  type="button"
-                                  aria-label={openLabel}
-                                  onclick={() => void openHit(hit)}
-                                >
-                                  <time
-                                    datetime={new Date(hit.origin_server_ts).toISOString()}
-                                    title={formatFullTimestamp(hit.origin_server_ts)}
-                                  >
-                                    {formatMessageTimestamp(hit.origin_server_ts)}
-                                  </time>
-                                </button>
+                                <Tooltip label={fullTimestamp}>
+                                  {#snippet trigger({ props })}
+                                    <button
+                                      {...props}
+                                      class="hit-time-action"
+                                      type="button"
+                                      aria-label={openLabel}
+                                      onclick={() => void openHit(hit)}
+                                    >
+                                      <time datetime={new Date(hit.origin_server_ts).toISOString()}>
+                                        {formatMessageTimestamp(hit.origin_server_ts)}
+                                      </time>
+                                    </button>
+                                  {/snippet}
+                                </Tooltip>
                               </span>
                               <span class="hit-body">
                                 {#if snippet.clippedStart}…{/if}

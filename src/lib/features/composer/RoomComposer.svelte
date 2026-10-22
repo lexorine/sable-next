@@ -1,4 +1,9 @@
+<script module lang="ts">
+  let lastFocusedRow: HTMLElement | undefined;
+</script>
+
 <script lang="ts">
+  import { MediaQuery } from 'svelte/reactivity';
   import type {
     ImageUsageView,
     MemberView,
@@ -7,55 +12,52 @@
     PackImageView,
     PersonaView,
   } from '#src/generated/protocol';
-  import { mergeProps, Portal } from 'bits-ui';
-  import FileIcon from 'phosphor-svelte/lib/FileIcon';
-  import CheckIcon from 'phosphor-svelte/lib/CheckIcon';
-  import ArrowsInSimpleIcon from 'phosphor-svelte/lib/ArrowsInSimpleIcon';
-  import ArrowsOutSimpleIcon from 'phosphor-svelte/lib/ArrowsOutSimpleIcon';
+  import { mergeProps } from 'bits-ui';
   import MicrophoneIcon from 'phosphor-svelte/lib/MicrophoneIcon';
-  import PaperPlaneIcon from 'phosphor-svelte/lib/PaperPlaneTiltIcon';
   import TextAaIcon from 'phosphor-svelte/lib/TextAaIcon';
-  import TrashIcon from 'phosphor-svelte/lib/TrashIcon';
   import type { Node as ProseMirrorNode } from 'prosemirror-model';
   import { onDestroy, tick, untrack } from 'svelte';
 
   import type { OutgoingMentions } from '#lib/core/client.svelte.js';
-  import type { SendAttachmentOptions } from '#lib/core/commands.svelte.js';
-  import type { SendGalleryOptions } from '#lib/core/commands.svelte.js';
+  import type { SendAttachmentOptions } from '#lib/core/media.svelte.js';
+  import type { SendGalleryOptions } from '#lib/core/media.svelte.js';
   import { useCoreClient } from '#lib/core/context.js';
   import type { ConversationSendResult } from '#lib/features/room/conversation/conversation.svelte.js';
   import type { ReplyDirection } from '#lib/features/room/timeline/timeline-format.js';
   import DeleteMessageDialog from '#lib/features/room/messages/DeleteMessageDialog.svelte';
-  import { LongPress, SCHEDULE_PRESS_MS, touchContextMenu } from '#lib/ui/long-press.svelte.js';
+  import { previewSources } from '#lib/features/room/media/link-preview-cache.js';
+  import { previewableLinks } from '#lib/features/room/media/link-preview.js';
   import { i18n } from '#lib/i18n.js';
-  import { isPackChange, loadPacks } from '#lib/emoji/load-packs.js';
-  import { listenNativeFileDrop } from '#lib/platform/file-drop.js';
+  import { isPackChange } from '#lib/emoji/load-packs.js';
   import { capturesFromCamera, pickFiles } from '#lib/platform/files.js';
   import { usePersonaStore } from '#lib/personas/personas.svelte.js';
+  import { profileOverrides } from '#lib/profile/profile-overrides.svelte.js';
   import { useRoomList } from '#lib/rooms/room-list.svelte.js';
   import { enterInsertsNewline } from '#lib/settings/enter-key.svelte.js';
-  import { preferences, setPreference } from '#lib/settings/preferences.svelte.js';
+  import {
+    preferences,
+    setPreference,
+    type ImageMetadata,
+  } from '#lib/settings/preferences.svelte.js';
   import { BREAKPOINTS } from '#lib/ui/breakpoints.js';
   import { formatByteSize } from '#lib/ui/byte-size.js';
-  import { REORDER_DRAG_TYPE } from '#lib/ui/drag-list.js';
-  import { matchesBinding } from '#lib/ui/shortcuts/binding.js';
-  import { effectiveShortcuts } from '#lib/ui/shortcuts/bindings.svelte.js';
-  import { isMacPlatform } from '#lib/ui/shortcuts/global-shortcuts.js';
   import { cachedMediaUrl, holdMediaUrl, loadMediaUrl } from '#lib/ui/media-url.js';
-  import { createMediaQuery } from '#lib/ui/media-query.svelte.js';
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
-  import Spinner from '#lib/ui/primitives/Spinner.svelte';
   import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
   import { toasts } from '#lib/ui/toasts.svelte.js';
 
   import BotCommandForm from './BotCommandForm.svelte';
   import ComposerAttachments from './ComposerAttachments.svelte';
   import ComposerAutocomplete from './ComposerAutocomplete.svelte';
-  import type { GifResult } from '#lib/features/gif/providers.js';
+  import type { GifResult } from '#lib/gif/providers.js';
   import ComposerBoard from './ComposerBoard.svelte';
   import ComposerContextBanner from './ComposerContextBanner.svelte';
+  import ComposerLinkPreviews from './ComposerLinkPreviews.svelte';
   import ComposerError from './ComposerError.svelte';
   import ComposerDoor from './ComposerDoor.svelte';
+  import ComposerDropZone from './ComposerDropZone.svelte';
+  import ComposerField from './ComposerField.svelte';
+  import ComposerSendButton from './ComposerSendButton.svelte';
   import PersonaPicker from './PersonaPicker.svelte';
   import PollComposer from './PollComposer.svelte';
   import ComposerFormatting from './ComposerFormatting.svelte';
@@ -64,24 +66,30 @@
   import LocationComposer from './LocationComposer.svelte';
   import ScheduleComposer from './ScheduleComposer.svelte';
   import type { AutocompleteQuery, Suggestion } from './autocomplete';
-  import { formattedForEditing, type ComposerContext } from './composer-context';
-  import { clearDraft, readDraft, remoteRevision, writeDraft } from './composer-drafts.svelte';
+  import { formattedForEditing, type ComposerContext } from '#lib/composer/composer-context.js';
   import {
-    filesFrom,
+    previewKind,
     restoreFile,
     stageFiles,
+    setMetadata,
     toggleSpoiler,
     unstageFile,
     type StagedFile,
-  } from './composer-files';
-  import { shouldFocusComposer } from './type-to-focus';
-  import ComposerEditorView from './editor/ComposerEditor.svelte';
+  } from '#lib/composer/composer-files.js';
+  import { isMultiline } from './composer-multiline';
+  import { ComposerSources } from './composer-sources.svelte';
+  import { DraftSync } from './draft-sync.svelte';
+  import { MENU_SELECTOR, shouldFocusComposer } from './type-to-focus';
   import { ComposerEditor } from './editor/composer-editor';
   import type { ActiveColors, ColorKind, FormatAction } from './editor/formatting';
   import type { EmoteMedia } from './editor/node-views';
   import { composerSchema } from './editor/schema';
   import { emoticonNode } from './editor/shortcodes';
   import type { BoardTab } from '#lib/ui/primitives/emote-board.js';
+  import { isDialogOpen, isEditableTarget, matchesBinding } from '#lib/ui/shortcuts/binding.js';
+  import { bindingFor } from '#lib/ui/shortcuts/bindings.svelte.js';
+  import { isMacPlatform } from '#lib/ui/shortcuts/global-shortcuts.js';
+  import type { ShortcutId } from '#lib/ui/shortcuts/shortcuts.js';
   import {
     commandTextOf,
     plainEditDoc,
@@ -90,33 +98,36 @@
   } from './editor/serialize';
   import { isServerScheduleUnsupported, ScheduledOriginalKept, sendFailure } from './send-failure';
   import { SendQueue } from './send-queue';
+  import { outgoingFile } from './outgoing-file';
   import {
     ADMIN_PREFIX,
     adminBot,
     adminBotCommands,
     adminCommandTree,
     adminScope,
-    loadAdminCommands,
-    type AdminCommand,
   } from './admin-commands';
   import {
     botCommandId,
     buildInvocation,
     draftsFromText,
     matchBotCommand,
-    parseBotCommands,
     type ArgumentDrafts,
     type BotCommand,
     type BotCommandInvocation,
   } from './bot-commands';
   import { parseSlash } from './slash-commands';
-  import { ROOM_MENTION, suggestionsFor } from './suggestions';
+  import { editStep, replyStep } from './step-shortcuts';
+  import { suggestionNode } from './suggestion-node';
+  import { rememberSuggestion } from './suggestion-usage';
+  import { emoteSuggestionId, suggestionsFor } from './suggestions';
+  import { TypingNotifier } from './typing-notifier';
   import VoiceRecorder from './VoiceRecorder.svelte';
   import { isVoiceRecordingSupported } from './voice-recorder-support';
   import './composer-chrome.css';
 
   interface Props {
     roomId: string;
+    roomMembers?: readonly MemberView[];
     onSend: (
       roomId: string,
       body: string,
@@ -168,8 +179,11 @@
     roomName?: string | null;
     readOnly?: boolean;
     encrypted?: boolean | null;
+    dismissedPreviews?: readonly string[];
+    onDismissPreview?: (url: string) => void;
     /** What the next send relates to: a message being replied to, or edited. */
     context?: ComposerContext | null;
+    restoredContext?: ComposerContext | null;
     onCancelContext?: () => void;
     onEditPersona?: (persona: PersonaView | null) => void;
     onToggleSilentReply?: () => void;
@@ -182,6 +196,7 @@
 
   let {
     roomId,
+    roomMembers,
     onSend,
     onSendBotCommand,
     onSendAttachment,
@@ -197,7 +212,10 @@
     roomName = null,
     readOnly = false,
     encrypted = null,
+    dismissedPreviews = [],
+    onDismissPreview,
     context = null,
+    restoredContext = null,
     onCancelContext,
     onEditPersona,
     onToggleSilentReply,
@@ -211,30 +229,33 @@
   const core = useCoreClient();
   const roomList = useRoomList();
   const personas = usePersonaStore();
-  const appLayout = createMediaQuery(BREAKPOINTS.appLayout);
-  const roomyPointer = createMediaQuery('(width >= 32rem) and (any-pointer: fine)');
+  const appLayout = new MediaQuery(BREAKPOINTS.appLayout);
+  const roomyPointer = new MediaQuery('(width >= 32rem) and (any-pointer: fine)');
   const composerShort = $derived(
     preferences.composerForm === 'short' ||
-      (preferences.composerForm === 'adaptive' && roomyPointer.matches)
+      (preferences.composerForm === 'adaptive' && roomyPointer.current)
   );
   const uid = $props.id();
   const hintId = `composer-hint-${uid}`;
   const listboxId = `composer-suggestions-${uid}`;
   const optionId = (index: number): string => `${listboxId}-${String(index)}`;
 
-  const DRAFT_PERSIST_MS = 500;
   const draftKey = (): string => (threadRoot === null ? roomId : `${roomId}/${threadRoot}`);
 
   let prefilledFor: string | null = null;
-  let activeDraftKey = $state<string | null>(null);
   let nextStagedId = 0;
-  let preEdit: ProseMirrorNode | undefined;
   let prefilledDoc: ProseMirrorNode | undefined;
-  let loadedMembersFor = $state<string | null>(null);
-  let loadedEmotesFor = $state<string | null>(null);
-  let typingTimeout: ReturnType<typeof setTimeout> | undefined;
-  let draftTimeout: ReturnType<typeof setTimeout> | undefined;
-  let seenRemoteDraft = 0;
+  const sources = new ComposerSources(core, {
+    roomId: () => roomId,
+    roomMembers: () => roomMembers,
+    botCommandsEnabled: () => onSendBotCommand !== undefined,
+  });
+  const typing = new TypingNotifier(
+    () => roomId,
+    (room, isTyping) => onTyping(room, isTyping)
+  );
+  let draftLinks = $state.raw<string[]>([]);
+  let draftLinksTimeout: ReturnType<typeof setTimeout> | undefined;
   let boardOpen = $state(false);
   let boardTab = $state<BoardTab>('emoticon');
   let boardQuery = $state('');
@@ -254,7 +275,7 @@
     );
   }
 
-  let staged = $state<StagedFile[]>([]);
+  let staged = $state.raw<StagedFile[]>([]);
   let inFlight = $state(0);
   let error = $state<string | null>(null);
   let retry = $state<{ text: string; run: () => void } | null>(null);
@@ -270,6 +291,9 @@
   let beforeEl = $state<HTMLElement>();
   let afterEl = $state<HTMLElement>();
   let measurerEl = $state<HTMLElement>();
+  let multiline = $state(false);
+  let pointerHidden = $state(false);
+  const shortLayout = $derived(composerShort && (!multiline || preferences.alwaysInlineEditor));
   let layoutFrame: number | undefined;
   let empty = $state(true);
   let showPlaceholder = $state(true);
@@ -279,26 +303,22 @@
   let richText = $derived(preferences.richTextComposer);
   let richSend = $derived(richText && !sourceMode);
   let configuredRich = preferences.richTextComposer;
-  let dragging = $state(false);
-  let dropTarget = $derived(roomName ?? $i18n.t('timeline.thisRoom'));
   let query = $state.raw<AutocompleteQuery | null>(null);
   let dismissedAt = $state<number | null>(null);
   let activeIndex = $state(0);
-  let previousContext: ComposerContext | null = null;
+  let previousContext: ComposerContext | null = untrack(() => restoredContext);
   let deleteEditTarget = $state.raw<ComposerContext | null>(null);
-  let members = $state.raw<MemberView[]>([]);
-  let emotes = $state.raw<PackImageView[]>([]);
-  let emotesFor: string | null = null;
-  let botCommands = $state.raw<BotCommand[]>([]);
-  let loadedBotCommandsFor = $state<string | null>(null);
-  let botCommandsFor: string | null = null;
-  let activeBotCommand = $state.raw<{
+  let members = $derived(roomMembers?.length ? roomMembers : sources.loadedMembers);
+  let activeBotCommand = $derived.by<{
     command: BotCommand;
     drafts: ArgumentDrafts;
     prefix: string;
-  } | null>(null);
+  } | null>(() => {
+    void roomId;
+    return null;
+  });
 
-  let desktop = $derived(appLayout.matches);
+  let desktop = $derived(appLayout.current);
   let sending = $derived(inFlight > 0);
   let editingCaption = $derived(context?.kind === 'edit' && context.mediaCaption === true);
   let hasContent = $derived(!empty || staged.length > 0 || editingCaption);
@@ -306,22 +326,13 @@
   let editingScheduled = $derived(context?.kind === 'schedule');
   let canVoice = $derived(context?.kind !== 'edit' && !editingScheduled && voiceSupported);
   let showVoice = $derived(preferences.composerVoiceButton && canVoice);
-  let sendLabel = $derived(
-    editingScheduled
-      ? $i18n.t('composer.scheduledSave')
-      : context?.kind === 'edit'
-        ? !hasContent && canDeleteEdited
-          ? $i18n.t('timeline.deleteMessage')
-          : $i18n.t('composer.saveChanges')
-        : $i18n.t('timeline.sendMessage')
-  );
   let contextAnnouncement = $derived(
     context?.kind === 'edit'
-      ? $i18n.t('composer.editing')
+      ? i18n.t('composer.editing')
       : context?.kind === 'schedule'
-        ? $i18n.t('composer.editingScheduled')
+        ? i18n.t('composer.editingScheduled')
         : context?.kind === 'reply'
-          ? $i18n.t('composer.replyingTo', { name: context.sender ?? '' })
+          ? i18n.t('composer.replyingTo', { name: context.sender ?? '' })
           : ''
   );
   let showPersonaPicker = $derived(preferences.personaPicker && personas.personas.length > 0);
@@ -329,7 +340,7 @@
   let canSchedule = $derived(onSchedule !== undefined && hasContent && !readOnly);
   let sendShortcut = $derived(!enterInsertsNewline() ? 'Enter' : 'Shift+Enter');
   let keyboardHint = $derived(
-    $i18n.t(
+    i18n.t(
       !hasContent && canDeleteEdited
         ? 'composer.deleteHint'
         : context?.kind === 'edit' || editingScheduled
@@ -341,24 +352,6 @@
       }
     )
   );
-  let sendTooltip = $derived(
-    desktop
-      ? $i18n.t(canSchedule ? 'composer.sendScheduleTooltip' : 'composer.sendTooltip', {
-          action: sendLabel,
-          shortcut: sendShortcut,
-        })
-      : canSchedule
-        ? $i18n.t('composer.scheduleTooltip', { action: sendLabel })
-        : sendLabel
-  );
-
-  const sendPress = new LongPress({
-    enabled: () => canSchedule,
-    delayMs: SCHEDULE_PRESS_MS,
-    onPress: () => {
-      scheduleOpen = true;
-    },
-  });
 
   $effect(() => {
     if (preferences.personaPicker || preferences.personaProxying) void personas.load();
@@ -375,11 +368,10 @@
     query !== null && dismissedAt !== query.start && (query.sigil !== '+:' || quickReactEnabled)
   );
   let admin = $derived(adminScope(roomId, roomList.rooms, core.session?.user_id));
-  let adminCommands = $state.raw<readonly AdminCommand[] | null>(null);
   let botCommandsEnabled = $derived(
     onSendBotCommand !== undefined && context?.kind !== 'edit' && !editingScheduled
   );
-  let offeredBotCommands = $derived(botCommandsEnabled ? botCommands : []);
+  let offeredBotCommands = $derived(botCommandsEnabled ? sources.botCommands : []);
   let serverBot = $derived(
     admin === 'adminRoom' && core.session ? adminBot(core.session.user_id) : null
   );
@@ -389,8 +381,8 @@
   );
   let serverCommands = $derived.by(() => {
     if (advertisedAdminCommands.length > 0) return advertisedAdminCommands;
-    if (!botCommandsEnabled || !admin || !adminCommands || !core.session) return [];
-    return adminBotCommands(adminCommands, adminBot(core.session.user_id), admin);
+    if (!botCommandsEnabled || !admin || !sources.adminCommands || !core.session) return [];
+    return adminBotCommands(sources.adminCommands, adminBot(core.session.user_id), admin);
   });
   let slashBotCommands = $derived(
     offeredBotCommands.filter((command) => command.sender !== serverBot)
@@ -399,14 +391,15 @@
     suggestionsFor(
       query,
       members,
-      emotes,
+      sources.emotes,
       roomList.rooms,
-      $i18n.t,
+      i18n.t,
       admin,
       advertisedAdminCommands.length > 0
         ? adminCommandTree(advertisedAdminCommands)
-        : adminCommands,
-      slashBotCommands
+        : sources.adminCommands,
+      slashBotCommands,
+      (userId, fallback) => profileOverrides.name(userId, fallback)
     )
   );
 
@@ -415,51 +408,35 @@
     const target = roomId;
     return core.subscribeEvents((event) => {
       if (event.type === 'bot_commands_changed' && event.room_id === target) {
-        loadedBotCommandsFor = null;
-        botCommandsFor = null;
-        botCommands = [];
+        sources.forgetBotCommands();
       }
     });
-  });
-
-  $effect(() => {
-    void roomId;
-    activeBotCommand = null;
   });
 
   $effect(() =>
     core.subscribeEvents((event) => {
       if (!isPackChange(event)) return;
-      loadedEmotesFor = null;
-      if (query?.sigil === ':' || query?.sigil === '+:') void loadEmotes();
+      sources.forgetEmotes();
+      if (query?.sigil === ':' || query?.sigil === '+:') void sources.loadEmotes();
     })
   );
 
-  async function loadAdminCatalog(): Promise<void> {
-    if (adminCommands) return;
-    try {
-      adminCommands = await loadAdminCommands();
-    } catch (error) {
-      console.warn('[sable composer] loading admin commands failed', error);
-    }
-  }
-
   $effect(() => {
-    if (query?.sigil === '!' && admin && !adminCommands) void loadAdminCatalog();
+    if (query?.sigil === '!' && admin && !sources.adminCommands) void sources.loadAdminCatalog();
   });
   let active = $derived(Math.min(activeIndex, Math.max(0, suggestions.length - 1)));
   let placeholder = $derived(
     staged.length > 0
-      ? $i18n.t(
+      ? i18n.t(
           staged.length === 1 && preferences.sendAttachmentAsCaption
             ? 'composer.addCaptionOrSend'
             : 'composer.addMessageOrSend'
         )
       : context?.kind === 'reply' && context.sender
-        ? $i18n.t('composer.replyPlaceholder', { name: context.sender })
+        ? i18n.t('composer.replyPlaceholder', { name: context.sender })
         : roomName
-          ? $i18n.t('composer.roomPlaceholder', { room: roomName })
-          : $i18n.t('timeline.messagePlaceholder')
+          ? i18n.t('composer.roomPlaceholder', { room: roomName })
+          : i18n.t('timeline.messagePlaceholder')
   );
 
   const media: EmoteMedia = {
@@ -472,8 +449,8 @@
     media,
     mentionName: (userId) =>
       members.find((member) => member.user_id === userId)?.display_name ?? null,
-    emotes: () => emotes,
-    label: () => $i18n.t('timeline.messagePlaceholder'),
+    emotes: () => sources.emotes,
+    label: () => i18n.t('timeline.messagePlaceholder'),
     describedBy: hintId,
     listboxId,
     activeOptionId: () => (panelOpen && suggestions.length > 0 ? optionId(active) : null),
@@ -490,18 +467,19 @@
       }
       activeIndex = 0;
       if (change.docChanged) {
-        updateTyping();
+        typing.update(empty);
+        scheduleDraftLinks();
         scheduleLayout();
-        schedulePersistDraft();
+        draft.schedulePersist();
       }
     },
     onQuery: (next) => {
       if (!next) dismissedAt = null;
       query = next;
-      if (next?.sigil === '@') void loadMembers();
-      if (next?.sigil === ':' || next?.sigil === '+:') void loadEmotes();
+      if (next?.sigil === '@') void sources.loadMembers();
+      if (next?.sigil === ':' || next?.sigil === '+:') void sources.loadEmotes();
       if (next?.sigil === '/' || (next?.sigil === '!' && admin === 'adminRoom')) {
-        void loadBotCommands();
+        void sources.loadBotCommands();
       }
     },
     onNavigate: navigate,
@@ -527,6 +505,14 @@
   function updateLayout(): void {
     const editable = editor.editable();
     if (!rowEl || !measurerEl || !editable) return;
+    multiline = isMultiline({
+      text: editor.text(),
+      row: rowEl,
+      before: beforeEl,
+      after: afterEl,
+      editable,
+      measurer: measurerEl,
+    });
   }
 
   function scheduleLayout(): void {
@@ -554,72 +540,35 @@
 
   const queue = new SendQueue();
 
-  let activeDraftAccount = '';
-
-  function persistDraft(key: string): void {
-    const doc = preEdit ?? (editor.isEmpty() ? undefined : editor.doc());
-    if (!doc && staged.length === 0) clearDraft(key, activeDraftAccount);
-    else writeDraft(key, { doc: doc?.toJSON() ?? null, staged, nextStagedId }, activeDraftAccount);
-  }
-
-  function schedulePersistDraft(): void {
-    clearTimeout(draftTimeout);
-    draftTimeout = setTimeout(() => {
-      draftTimeout = undefined;
-      if (activeDraftKey !== null) persistDraft(activeDraftKey);
-    }, DRAFT_PERSIST_MS);
-  }
+  const draft = new DraftSync({
+    editor,
+    files: () => ({ staged, nextStagedId }),
+    setFiles: (files) => {
+      staged = files.staged;
+      nextStagedId = files.nextStagedId;
+    },
+    onLeave: (previousRoomId) => {
+      prefilledFor = null;
+      prefilledDoc = undefined;
+      error = null;
+      typing.leave(previousRoomId);
+    },
+  });
 
   $effect(() => {
-    const key = draftKey();
-    const accountId = core.session?.account_id ?? '';
-    if (activeDraftKey === key && activeDraftAccount === accountId) return;
-    const previous = activeDraftKey;
-    clearTimeout(draftTimeout);
-    draftTimeout = undefined;
-    if (previous !== null) untrack(() => persistDraft(previous));
-    if (activeDraftAccount !== accountId) preEdit = undefined;
-    activeDraftKey = key;
-    activeDraftAccount = accountId;
-
-    untrack(() => {
-      seenRemoteDraft = remoteRevision(key, core.session?.account_id ?? '');
-      const draft = readDraft(key, activeDraftAccount);
-      if (draft) {
-        staged = draft.staged;
-        nextStagedId = draft.nextStagedId;
-        editor.clear();
-        if (draft.doc) editor.setDoc(composerSchema.nodeFromJSON(draft.doc));
-      } else if (previous !== null) {
-        staged = [];
-        nextStagedId = 0;
-        editor.clear();
-      }
-    });
+    draft.open(draftKey(), core.session?.account_id ?? '', roomId);
   });
 
   onDestroy(() => {
-    sendPress.cancel();
     if (layoutFrame !== undefined) cancelAnimationFrame(layoutFrame);
-    if (typingTimeout) clearTimeout(typingTimeout);
-    clearTimeout(draftTimeout);
-    stopTyping();
+    if (draftLinksTimeout) clearTimeout(draftLinksTimeout);
+    typing.stop();
     queue.dispose();
-    if (activeDraftKey !== null) persistDraft(activeDraftKey);
+    draft.dispose();
   });
 
   $effect(() => {
-    const key = draftKey();
-    const revision = remoteRevision(key, core.session?.account_id ?? '');
-    untrack(() => {
-      if (activeDraftKey !== key || revision === seenRemoteDraft) return;
-      seenRemoteDraft = revision;
-      if (draftTimeout !== undefined || preEdit !== undefined) return;
-
-      const draft = readDraft(key, activeDraftAccount);
-      editor.clear();
-      if (draft?.doc) editor.setDoc(composerSchema.nodeFromJSON(draft.doc));
-    });
+    draft.syncRemote(draftKey(), core.session?.account_id ?? '');
   });
 
   $effect(() => {
@@ -627,10 +576,10 @@
       (context?.kind === 'edit' || context?.kind === 'schedule') &&
       prefilledFor !== context.eventId
     ) {
-      if (prefilledFor === null && !editor.isEmpty()) preEdit = editor.doc();
+      if (prefilledFor === null && !editor.isEmpty()) draft.preEdit = editor.doc();
       prefilledFor = context.eventId;
       const formatted = formattedForEditing(context.html);
-      if (formatted === null) editor.setText(context.body);
+      if (formatted === null) editor.setLines(context.body);
       else if (richText) editor.setHtml(formatted);
       else editor.setDoc(plainEditDoc(context.body, formatted));
       prefilledDoc = editor.doc();
@@ -638,9 +587,9 @@
       const wasEditing = prefilledFor !== null;
       prefilledFor = null;
       prefilledDoc = undefined;
-      if (preEdit) {
-        editor.setDoc(preEdit);
-        preEdit = undefined;
+      if (draft.preEdit) {
+        editor.setDoc(draft.preEdit);
+        draft.preEdit = undefined;
       } else if (wasEditing) {
         editor.clear();
       }
@@ -651,12 +600,11 @@
     if (context === previousContext) return;
 
     const wasActive = previousContext !== null;
-    const wasEditing = previousContext?.kind === 'edit' || previousContext?.kind === 'schedule';
     previousContext = context;
     const frame = requestAnimationFrame(() => {
       if (context !== null) {
         editor.focus();
-      } else if (wasActive && (wasEditing || !desktop) && !sending) {
+      } else if (wasActive && !desktop && !sending) {
         editor.blur();
         const activeElement = document.activeElement;
         if (activeElement instanceof HTMLElement) activeElement.blur();
@@ -668,64 +616,10 @@
     };
   });
 
-  function stopTyping(): void {
-    onTyping(roomId, false).catch(() => {});
-  }
-
-  async function loadMembers(): Promise<void> {
-    if (loadedMembersFor === roomId) return;
-    loadedMembersFor = roomId;
-    try {
-      members = await core.commands.roomMembers(roomId);
-    } catch {
-      loadedMembersFor = null;
-    }
-  }
-
-  async function loadEmotes(): Promise<void> {
-    if (loadedEmotesFor === roomId) return;
-    const target = roomId;
-    loadedEmotesFor = target;
-    if (emotesFor !== target) emotes = [];
-    try {
-      const complete = await loadPacks(
-        core.commands,
-        target,
-        (packs) => {
-          if (roomId !== target) return;
-          emotesFor = target;
-          emotes = packs
-            .flatMap((pack) => pack.images)
-            .filter((image) => image.usage.includes('emoticon'));
-        },
-        core.session?.account_id ?? null
-      );
-      if (!complete && loadedEmotesFor === target) loadedEmotesFor = null;
-    } catch {
-      if (roomId === target) loadedEmotesFor = null;
-    }
-  }
-
-  async function loadBotCommands(): Promise<void> {
-    if (!onSendBotCommand || loadedBotCommandsFor === roomId) return;
-    const target = roomId;
-    loadedBotCommandsFor = target;
-    if (botCommandsFor !== target) botCommands = [];
-    try {
-      const commands = parseBotCommands(await core.commands.botCommands(target));
-      if (roomId !== target) return;
-      botCommandsFor = target;
-      botCommands = commands;
-    } catch (error) {
-      console.debug('[sable composer] bot commands unavailable', error);
-      if (loadedBotCommandsFor === target) loadedBotCommandsFor = null;
-    }
-  }
-
   function openBotCommand(command: BotCommand, args: string, prefix: string): void {
     activeBotCommand = { command, drafts: draftsFromText(command, args), prefix };
     error = null;
-    void loadMembers();
+    void sources.loadMembers();
   }
 
   function closeBotCommand(): void {
@@ -767,7 +661,7 @@
   async function typedBotCommand(text: string): Promise<boolean> {
     const doc = editor.doc();
     const targetRoomId = roomId;
-    await Promise.all([loadBotCommands(), admin ? loadAdminCatalog() : undefined]);
+    await Promise.all([sources.loadBotCommands(), admin ? sources.loadAdminCatalog() : undefined]);
     if (roomId !== targetRoomId || (doc && !editor.doc()?.eq(doc))) return true;
     const typed = text.startsWith('/')
       ? { line: text.slice(1), prefix: '/', commands: slashBotCommands }
@@ -777,7 +671,7 @@
 
     editor.clear();
     if (matched.command.parameters.length === 0 && matched.args !== '') {
-      const body = `${typed.prefix}${matched.command.command}${matched.rawArgs}`;
+      const body = `${typed.prefix}${matched.command.command}${matched.raw_args}`;
       if (
         !(await sendBotCommand(matched.command, body, {
           command: matched.command.command,
@@ -790,7 +684,7 @@
     }
     const drafts = draftsFromText(matched.command, matched.args);
     const result = buildInvocation(matched.command, drafts, typed.prefix);
-    if (result.ok) {
+    if (result.kind === 'built') {
       if (!(await sendBotCommand(matched.command, result.body, result.invocation))) {
         if (doc && roomId === targetRoomId && editor.isEmpty()) editor.setDoc(doc);
       }
@@ -829,27 +723,29 @@
     if (context?.kind === 'edit' || editingScheduled || !desktop) blurEditor();
   }
 
-  function updateTyping(): void {
-    if (typingTimeout) clearTimeout(typingTimeout);
-    if (empty) {
-      stopTyping();
-      return;
-    }
+  let shownLinks = $derived.by(() => {
+    const sources = previewSources(encrypted);
+    if (!sources.server && !sources.client) return [];
+    return draftLinks.filter((url) => !dismissedPreviews.includes(url));
+  });
 
-    onTyping(roomId, true).catch(() => {});
-    typingTimeout = setTimeout(() => {
-      stopTyping();
-    }, 4000);
+  function scheduleDraftLinks(): void {
+    if (draftLinksTimeout) clearTimeout(draftLinksTimeout);
+    draftLinksTimeout = setTimeout(() => {
+      const doc = editor.doc();
+      const message = doc ? (richSend ? serializeComposer(doc) : serializePlain(doc)) : null;
+      draftLinks = message?.formatted ? previewableLinks(message.formatted, message.body) : [];
+    }, 300);
   }
 
   function failureText(cause: unknown): string {
     const { key, values } = sendFailure(cause);
-    return $i18n.t(key, values);
+    return i18n.t(key, values);
   }
 
   function failRetryably(cause: unknown, run: () => void): void {
     const failure = sendFailure(cause);
-    error = $i18n.t(failure.key, failure.values);
+    error = i18n.t(failure.key, failure.values);
     retry = failure.retryable ? { text: error, run } : null;
   }
 
@@ -870,8 +766,16 @@
     if (typedLine !== null && (await typedBotCommand(typedLine))) return;
 
     const doc = editor.doc();
+    const untouched =
+      context?.kind === 'edit' &&
+      prefilledDoc !== undefined &&
+      doc?.eq(prefilledDoc) === true &&
+      staged.length === 0
+        ? { body: context.body, formatted: context.html ?? null }
+        : null;
     const rich = richSend;
-    const captionEdit = editingCaption;
+    const attachmentsCancelEdit = context?.kind === 'edit' && staged.length > 0;
+    const captionEdit = editingCaption && !attachmentsCancelEdit;
     const asCaption = preferences.sendAttachmentAsCaption;
     let unsent = staged;
 
@@ -880,12 +784,11 @@
     editor.clear();
     sourceMode = editor.leaveSource();
     staged = [];
-    if (typingTimeout) clearTimeout(typingTimeout);
-    stopTyping();
+    typing.stop();
 
     try {
       await queue.enqueue(async () => {
-        const message = doc
+        const serialized = doc
           ? rich
             ? serializeComposer(doc)
             : serializePlain(doc)
@@ -895,23 +798,24 @@
               mentions: { userIds: [], room: false },
               imageSourcePacks: [],
             };
+        const message = attachmentsCancelEdit
+          ? { ...serialized, body: '', formatted: null, mentions: { userIds: [], room: false } }
+          : untouched
+            ? { ...serialized, ...untouched }
+            : serialized;
         const captioned = asCaption && unsent.length === 1 && message.body !== '';
         const gallery =
           preferences.sendAttachmentsAsGallery &&
           onSendGallery !== undefined &&
           unsent.length > 1 &&
-          unsent.every((item) => !item.spoiler);
+          unsent.every((item) => !item.spoiler && previewKind(item.file) !== null);
 
         if (gallery) {
-          await onSendGallery(
-            roomId,
-            unsent.map((item) => item.file),
-            {
-              caption: message.body || null,
-              formattedCaption: message.formatted,
-              mentions: message.mentions,
-            }
-          );
+          await onSendGallery(roomId, await Promise.all(unsent.map(outgoingFile)), {
+            caption: message.body || null,
+            formattedCaption: message.formatted,
+            mentions: message.mentions,
+          });
           unsent = [];
           return;
         }
@@ -920,7 +824,7 @@
           const [next, ...rest] = unsent;
           await onSendAttachment(
             roomId,
-            next.file,
+            await outgoingFile(next),
             captioned
               ? {
                   caption: message.body,
@@ -972,7 +876,7 @@
     if (message.body === '' && staged.length === 0) return;
     if (dueTs <= Date.now()) return;
     if (staged.length > 0 && encrypted !== false) {
-      error = $i18n.t('composer.scheduleAttachmentEncrypted');
+      error = i18n.t('composer.scheduleAttachmentEncrypted');
       return;
     }
 
@@ -981,13 +885,17 @@
 
     editor.clear();
     staged = [];
-    if (typingTimeout) clearTimeout(typingTimeout);
-    stopTyping();
+    typing.stop();
 
     try {
       for (const attachment of attachments) {
         delayIds.push(
-          await core.commands.scheduleAttachment(roomId, attachment.file, dueTs, attachment.spoiler)
+          await core.media.scheduleAttachment(
+            roomId,
+            await outgoingFile(attachment),
+            dueTs,
+            attachment.spoiler
+          )
         );
       }
       if (message.body !== '') {
@@ -998,16 +906,16 @@
     } catch (cause) {
       console.debug('[sable composer] schedule failed', cause);
       await Promise.allSettled(
-        delayIds.map((delayId) => core.commands.cancelScheduledMessage(delayId))
+        delayIds.map((delayId) => core.rpc.messages.cancelScheduled({ delay_id: delayId }))
       );
       if (cause instanceof ScheduledOriginalKept) {
         editor.clearHistory();
-        error = $i18n.t('composer.scheduledOriginalKept');
+        error = i18n.t('composer.scheduledOriginalKept');
         return;
       }
       if (doc && editor.isEmpty()) editor.setDoc(doc);
       staged = [...attachments, ...staged];
-      error = $i18n.t(
+      error = i18n.t(
         attachments.length > 0 && isServerScheduleUnsupported(cause)
           ? 'composer.scheduleAttachmentUnsupported'
           : 'composer.scheduleFailed'
@@ -1052,7 +960,12 @@
         name: name.startsWith('@') ? name : `@${name}`,
       })
     );
-    updateTyping();
+    typing.update(empty);
+  }
+
+  // The popover hands focus back to its trigger as it closes.
+  function focusEditorAfterPick(): void {
+    requestAnimationFrame(() => editor.focus());
   }
 
   function pickUnicodeFromBoard(emoji: string): void {
@@ -1090,7 +1003,7 @@
     }
 
     editor.insert(emoticonNode(image));
-    updateTyping();
+    typing.update(empty);
   }
 
   async function stage(files: File[]): Promise<void> {
@@ -1100,39 +1013,55 @@
     const current = () => roomId === targetRoom && core.session?.account_id === accountId;
 
     try {
-      const { upload_size } = await core.commands.mediaConfig();
+      const { upload_size } = await core.rpc.messages.mediaConfig();
       if (!current() || readOnly) return;
       const tooLarge = files.find((file) => file.size > upload_size);
       if (tooLarge) {
-        error = $i18n.t('composer.tooLarge', {
+        error = i18n.t('composer.tooLarge', {
           name: tooLarge.name,
           limit: formatByteSize(upload_size),
         });
         return;
       }
 
+      if (context?.kind === 'edit') {
+        cancelContext();
+        await tick();
+      }
+
       error = null;
-      staged = stageFiles(staged, files, () => nextStagedId++);
+      staged = stageFiles(staged, files, () => nextStagedId++, preferences.imageMetadata);
+      if (desktop) editor.focus();
     } catch (cause) {
       if (current()) {
         const failure = sendFailure(cause);
-        error = $i18n.t(failure.key, failure.values);
+        error = i18n.t(failure.key, failure.values);
       }
     }
   }
 
-  function pick(accept: string): void {
-    void (async () => {
-      const picked = await pickFiles(accept);
-      if (picked !== null) {
-        await stage(picked);
-        return;
-      }
+  let picking = false;
 
-      if (!fileInput) return;
-      fileInput.accept = accept;
-      fileInput.removeAttribute('capture');
-      fileInput.click();
+  function pick(accept: string): void {
+    if (picking) return;
+    picking = true;
+    void (async () => {
+      try {
+        const picked = await pickFiles(accept, () => {
+          error = i18n.t('composer.pickFailed');
+        });
+        if (picked !== null) {
+          await stage(picked);
+          return;
+        }
+
+        if (!fileInput) return;
+        fileInput.accept = accept;
+        fileInput.removeAttribute('capture');
+        fileInput.click();
+      } finally {
+        picking = false;
+      }
     })();
   }
 
@@ -1150,72 +1079,11 @@
     input.value = '';
   }
 
-  function reorderDrag(event: DragEvent): boolean {
-    return event.dataTransfer?.types.includes(REORDER_DRAG_TYPE) ?? false;
-  }
-
-  function markInPageDrag(event: DragEvent): void {
-    event.dataTransfer?.setData(REORDER_DRAG_TYPE, '');
-  }
-
-  function handleDrop(event: DragEvent): void {
-    dragging = false;
-    if (event.defaultPrevented || readOnly || reorderDrag(event)) return;
-
-    const files = filesFrom(event.dataTransfer);
-    if (files.length === 0) return;
-    event.preventDefault();
-    void stage(files);
-  }
-
-  function handleDragover(event: DragEvent): void {
-    if (readOnly || reorderDrag(event) || !event.dataTransfer?.types.includes('Files')) return;
-    event.preventDefault();
-    dragging = true;
-  }
-
-  function handleDragleave(event: DragEvent): void {
-    if (event.relatedTarget !== null) return;
-    dragging = false;
-  }
-
-  $effect(() =>
-    listenNativeFileDrop({
-      onEnter: () => (dragging = !readOnly),
-      onLeave: () => (dragging = false),
-      onDrop: (files) => {
-        if (!readOnly) void stage(files);
-      },
-    })
-  );
-
-  function nodeFor(sigil: string, suggestion: Suggestion): ProseMirrorNode {
-    if (sigil === '/' || sigil === '!') return composerSchema.text(suggestion.insert);
-
-    if (sigil === '@') {
-      if (suggestion.id === ROOM_MENTION) return composerSchema.nodes.room_ping.create();
-      return composerSchema.nodes.mention.create({
-        userId: suggestion.id,
-        name: suggestion.label,
-      });
-    }
-
-    if (sigil === '#') {
-      return composerSchema.nodes.mention.create({ userId: suggestion.id, name: suggestion.label });
-    }
-
-    const shortcode = suggestion.id.replace(/^pack:/, '');
-    const image = emotes.find((candidate) => candidate.shortcode === shortcode);
-    if (!image) return composerSchema.text(suggestion.insert);
-
-    return emoticonNode(image);
-  }
-
   /** The servers cost a round trip, so the mention is inserted without them. */
   async function attachVia(address: string): Promise<void> {
     if (!address.startsWith('!')) return;
     try {
-      editor.attachVia(address, await core.commands.roomViaServers(address));
+      editor.attachVia(address, await core.rpc.rooms.viaServers({ room_id: address }));
     } catch (error) {
       console.debug('[sable composer] via servers unavailable', error);
     }
@@ -1228,6 +1096,7 @@
       if (quickReactEnabled) void quickReact(suggestion);
       return;
     }
+    if (current.sigil !== '!') rememberSuggestion(suggestion.id);
 
     const slashBot =
       current.sigil === '/'
@@ -1249,9 +1118,9 @@
       return;
     }
 
-    editor.replaceQuery(current, nodeFor(current.sigil, suggestion));
+    editor.replaceQuery(current, suggestionNode(current.sigil, suggestion, sources.emotes));
     if (current.sigil === '#') void attachVia(suggestion.id);
-    updateTyping();
+    typing.update(empty);
   }
 
   async function quickReact(suggestion: Suggestion): Promise<void> {
@@ -1259,11 +1128,10 @@
     const target = roomId;
     const doc = editor.doc();
     const image = suggestion.id.startsWith('pack:')
-      ? emotes.find((candidate) => `pack:${candidate.shortcode}` === suggestion.id)
+      ? sources.emotes.find((candidate) => emoteSuggestionId(candidate) === suggestion.id)
       : undefined;
     editor.clear();
-    if (typingTimeout) clearTimeout(typingTimeout);
-    stopTyping();
+    typing.stop();
     error = null;
     try {
       await onQuickReact(target, image?.url ?? suggestion.insert, image?.source_pack ?? null);
@@ -1275,22 +1143,47 @@
     }
   }
 
+  const boardShortcuts: Array<[ShortcutId, BoardTab]> = [
+    ['composer.toggleEmojiPicker', 'emoticon'],
+    ['composer.toggleStickerPicker', 'sticker'],
+    ['composer.toggleGifPicker', 'gif'],
+  ];
+
+  function canToggleBoard(event: KeyboardEvent): boolean {
+    if (isDialogOpen()) return false;
+    if (rowEl?.contains(event.target as Node | null)) return true;
+    if (isEditableTarget(event.target) || document.querySelector(MENU_SELECTOR) !== null)
+      return false;
+    return !lastFocusedRow?.isConnected || lastFocusedRow === rowEl;
+  }
+
+  function toggleBoard(event: KeyboardEvent): boolean {
+    if (!boardOpen && !canToggleBoard(event)) return false;
+
+    for (const [id, tab] of boardShortcuts) {
+      const binding = bindingFor(id);
+      if (!binding || !matchesBinding(binding, event, isMacPlatform())) continue;
+      if (tab === 'gif' && !onSendGif) return false;
+
+      event.preventDefault();
+      if (boardOpen && boardTab === tab) boardOpen = false;
+      else {
+        if (!desktop) blurEditor();
+        boardTab = tab;
+        boardOpen = true;
+      }
+      return true;
+    }
+    return false;
+  }
+
   function handleKeydown(event: KeyboardEvent): void {
     if (readOnly || event.defaultPrevented) return;
+    if (toggleBoard(event)) return;
     if (!shouldFocusComposer(event)) return;
 
     editor.focus();
   }
-
-  const REPLY_STEPS: Partial<Record<string, ReplyDirection>> = {
-    'room.replyOlder': 'older',
-    'room.replyNewer': 'newer',
-  };
-
-  const EDIT_STEPS: Partial<Record<string, ReplyDirection>> = {
-    'room.editOlder': 'older',
-    'room.editNewer': 'newer',
-  };
 
   function stepReply(event: KeyboardEvent): void {
     if (
@@ -1301,11 +1194,7 @@
       event.defaultPrevented
     )
       return;
-    const isMac = isMacPlatform();
-    const shortcut = effectiveShortcuts().find(
-      (candidate) => REPLY_STEPS[candidate.id] && matchesBinding(candidate.binding, event, isMac)
-    );
-    const direction = shortcut && REPLY_STEPS[shortcut.id];
+    const direction = replyStep(event);
     if (!direction) return;
 
     event.preventDefault();
@@ -1323,11 +1212,7 @@
       (!context && (!empty || staged.length > 0))
     )
       return;
-    const isMac = isMacPlatform();
-    const shortcut = effectiveShortcuts().find(
-      (candidate) => EDIT_STEPS[candidate.id] && matchesBinding(candidate.binding, event, isMac)
-    );
-    const direction = shortcut && EDIT_STEPS[shortcut.id];
+    const direction = editStep(event);
     if (!direction) return;
 
     event.preventDefault();
@@ -1400,36 +1285,27 @@
 
 <svelte:window
   onkeydown={handleKeydown}
-  ondragstart={markInPageDrag}
-  ondragover={handleDragover}
-  ondragleave={handleDragleave}
-  ondrop={handleDrop}
-  ondragend={() => (dragging = false)}
+  onmousemove={(event) => {
+    if (pointerHidden && (event.movementX !== 0 || event.movementY !== 0)) pointerHidden = false;
+  }}
 />
 
-{#if dragging}
-  <Portal>
-    <div class="drop-overlay" aria-hidden="true">
-      <div class="drop-card">
-        <FileIcon size={40} weight="light" />
-        <p class="drop-title">{$i18n.t('timeline.dropFiles', { room: dropTarget })}</p>
-      </div>
-    </div>
-  </Portal>
-{/if}
+<ComposerDropZone {roomName} {readOnly} onFiles={stage} />
 
-<div class="composer-stack">
+<div
+  class={['composer-stack', { short: composerShort && !readOnly, 'pointer-hidden': pointerHidden }]}
+>
   {#if readOnly}
     <div class="composer-shell">
       <div class="composer">
         <div class="composer-row">
-          <p class="locked">{$i18n.t('composer.readOnly')}</p>
+          <p class="locked">{i18n.t('composer.readOnly')}</p>
         </div>
       </div>
     </div>
   {:else}
     <div class="composer-shell">
-      <div class="composer" role="group" aria-label={$i18n.t('timeline.messagePlaceholder')}>
+      <div class="composer" role="group" aria-label={i18n.t('timeline.messagePlaceholder')}>
         {#if context}
           <ComposerContextBanner {context} onCancel={cancelContext} {onToggleSilentReply} />
         {/if}
@@ -1450,6 +1326,9 @@
             />
           {/key}
         {/if}
+        {#if onDismissPreview && context?.kind !== 'edit' && shownLinks.length > 0}
+          <ComposerLinkPreviews urls={shownLinks} onDismiss={onDismissPreview} />
+        {/if}
         {#if error}
           <ComposerError
             message={error}
@@ -1468,8 +1347,8 @@
               const removed = staged[index];
               staged = unstageFile(staged, id);
               if (!removed) return;
-              toasts.undoable($i18n.t('composer.attachmentRemoved', { name: removed.file.name }), {
-                label: $i18n.t('composer.undo'),
+              toasts.undoable(i18n.t('composer.attachmentRemoved', { name: removed.file.name }), {
+                label: i18n.t('common.undo'),
                 onUndo: () => {
                   staged = restoreFile(staged, removed, index);
                 },
@@ -1478,19 +1357,22 @@
             onToggleSpoiler={(id: number) => {
               staged = toggleSpoiler(staged, id);
             }}
+            onSetMetadata={(id: number, metadata: ImageMetadata) => {
+              staged = setMetadata(staged, id, metadata);
+            }}
           />
         {/if}
         <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
         <form
-          class="composer-row"
-          class:short={composerShort}
-          class:formatting-open={formattingOpen}
+          class={['composer-row', { short: shortLayout, 'formatting-open': formattingOpen }]}
           hidden={activeBotCommand !== null}
           bind:this={rowEl}
           onmousedown={focusFromRow}
+          onfocusin={() => (lastFocusedRow = rowEl)}
           onkeydown={(event) => {
             stepReply(event);
             stepEdit(event);
+            if (event.key.length === 1 && !event.ctrlKey && !event.metaKey) pointerHidden = true;
           }}
           onsubmit={(event) => {
             event.preventDefault();
@@ -1507,6 +1389,15 @@
               }}
             />
           {:else}
+            {#snippet personaButton()}
+              <PersonaPicker
+                {roomId}
+                onBeforeOpen={!desktop ? blurEditor : undefined}
+                edit={context?.kind === 'edit' && onEditPersona
+                  ? { current: context.persona ?? null, onChoose: onEditPersona }
+                  : undefined}
+              />
+            {/snippet}
             <div class="composer-before" bind:this={beforeEl}>
               <ComposerDoor
                 {desktop}
@@ -1529,6 +1420,10 @@
                   : undefined}
                 onVoice={canVoice && !showVoice ? startRecording : undefined}
                 onBeforeOpen={!desktop ? blurEditor : undefined}
+                extras={{
+                  ...(showPersonaPicker &&
+                    preferences.personaPickerLeftSide && { persona: personaButton }),
+                }}
               />
             </div>
             <input
@@ -1542,28 +1437,7 @@
               aria-hidden="true"
               onchange={stageFromInput}
             />
-            <div class="composer-field">
-              <ComposerEditorView {editor} {showPlaceholder} {placeholder} {expanded} />
-              <Tooltip label={$i18n.t(expanded ? 'composer.collapse' : 'composer.expand')}>
-                {#snippet trigger({ props })}
-                  <IconButton
-                    {...mergeProps(props, {
-                      onclick: () => {
-                        expanded = !expanded;
-                        editor.focus();
-                      },
-                    })}
-                    variant="ghost"
-                    size="small"
-                    class="composer-expand"
-                    aria-pressed={expanded}
-                    label={$i18n.t('composer.expand')}
-                  >
-                    {#if expanded}<ArrowsInSimpleIcon />{:else}<ArrowsOutSimpleIcon />{/if}
-                  </IconButton>
-                {/snippet}
-              </Tooltip>
-            </div>
+            <ComposerField {editor} {showPlaceholder} {placeholder} bind:expanded />
             {#if formattingOpen}
               <div class="composer-formatting">
                 <ComposerFormatting
@@ -1583,17 +1457,8 @@
                 />
               </div>
             {/if}
-            {#snippet personaButton()}
-              <PersonaPicker
-                {roomId}
-                onBeforeOpen={!desktop ? blurEditor : undefined}
-                edit={context?.kind === 'edit' && onEditPersona
-                  ? { current: context.persona ?? null, onChoose: onEditPersona }
-                  : undefined}
-              />
-            {/snippet}
             {#snippet formatButton()}
-              <Tooltip label={$i18n.t('composer.formatting')}>
+              <Tooltip label={i18n.t('composer.formatting')}>
                 {#snippet trigger({ props })}
                   <IconButton
                     {...mergeProps(props, {
@@ -1606,7 +1471,7 @@
                     class="composer-format selection-open"
                     aria-pressed={formattingOpen}
                     data-state={formattingOpen ? 'open' : 'closed'}
-                    label={$i18n.t('composer.formatting')}
+                    label={i18n.t('composer.formatting')}
                   >
                     <TextAaIcon />
                   </IconButton>
@@ -1624,13 +1489,15 @@
                 onPickUnicode={pickUnicodeFromBoard}
                 onPickGif={onSendGif ? pickGifFromBoard : undefined}
                 onBeforeOpen={!desktop ? blurEditor : undefined}
+                onPicked={desktop ? focusEditorAfterPick : undefined}
                 extras={{
-                  ...(showPersonaPicker && { persona: personaButton }),
+                  ...(showPersonaPicker &&
+                    !preferences.personaPickerLeftSide && { persona: personaButton }),
                   ...(preferences.composerFormatButton && { format: formatButton }),
                 }}
               />
               {#if showVoice}
-                <Tooltip label={$i18n.t('composer.voiceRecord')}>
+                <Tooltip label={i18n.t('composer.voiceRecord')}>
                   {#snippet trigger({ props })}
                     <IconButton
                       {...mergeProps(props, {
@@ -1639,65 +1506,25 @@
                       variant="ghost"
                       size="small"
                       class="composer-voice"
-                      label={$i18n.t('composer.voiceRecord')}
+                      label={i18n.t('composer.voiceRecord')}
                     >
                       <MicrophoneIcon />
                     </IconButton>
                   {/snippet}
                 </Tooltip>
               {/if}
-              <Tooltip label={sendTooltip}>
-                {#snippet trigger({ props })}
-                  <IconButton
-                    {...mergeProps(props, {
-                      onpointerdown: sendPress.start,
-                      onpointermove: sendPress.move,
-                      onpointerup: sendPress.lift,
-                      onkeydown: (event: KeyboardEvent) => {
-                        if (
-                          event.key === 'ContextMenu' ||
-                          (event.key === 'F10' && event.shiftKey)
-                        ) {
-                          sendPress.touch = false;
-                        }
-                      },
-                    })}
-                    type="submit"
-                    variant="ghost"
-                    size="small"
-                    class="composer-send"
-                    data-pressing={sendPress.pressing || undefined}
-                    style="--press-ms: {SCHEDULE_PRESS_MS}ms"
-                    disabled={!hasContent && !canDeleteEdited}
-                    label={sendLabel}
-                    onpointercancel={sendPress.end}
-                    oncontextmenu={(event: MouseEvent) => {
-                      if (sendPress.touch || touchContextMenu(event)) {
-                        event.preventDefault();
-                        return;
-                      }
-                      if (!canSchedule) return;
-                      event.preventDefault();
-                      scheduleOpen = true;
-                    }}
-                    onmousedown={(event: MouseEvent) => {
-                      if (hasContent) event.preventDefault();
-                    }}
-                  >
-                    {#if sending}
-                      <Spinner small />
-                    {:else if context?.kind === 'edit' || editingScheduled}
-                      {#if !hasContent && canDeleteEdited}
-                        <TrashIcon />
-                      {:else}
-                        <CheckIcon weight="bold" />
-                      {/if}
-                    {:else}
-                      <PaperPlaneIcon weight="fill" />
-                    {/if}
-                  </IconButton>
-                {/snippet}
-              </Tooltip>
+              <ComposerSendButton
+                {context}
+                {hasContent}
+                canDelete={canDeleteEdited}
+                {canSchedule}
+                {sending}
+                {desktop}
+                shortcut={sendShortcut}
+                onSchedule={() => {
+                  scheduleOpen = true;
+                }}
+              />
             </div>
           {/if}
         </form>
@@ -1706,14 +1533,14 @@
             id={listboxId}
             {optionId}
             heading={query.sigil === '@'
-              ? $i18n.t('composer.membersHeading', { query: query.query })
+              ? i18n.t('composer.membersHeading', { query: query.query })
               : query.sigil === '#'
-                ? $i18n.t('composer.roomsHeading', { query: query.query })
+                ? i18n.t('composer.roomsHeading', { query: query.query })
                 : query.sigil === '+:'
-                  ? $i18n.t('timeline.addReaction')
+                  ? i18n.t('timeline.addReaction')
                   : query.sigil === ':'
-                    ? $i18n.t('composer.emotesHeading', { query: query.query })
-                    : $i18n.t('composer.commandsHeading', { query: query.query })}
+                    ? i18n.t('composer.emotesHeading', { query: query.query })
+                    : i18n.t('composer.commandsHeading', { query: query.query })}
             {suggestions}
             {active}
             onSelect={commit}
@@ -1794,41 +1621,6 @@
 />
 
 <style>
-  .drop-overlay {
-    align-items: center;
-    background: var(--overlay);
-    display: flex;
-    inset: 0;
-    justify-content: center;
-    padding: var(--space-400);
-    pointer-events: none;
-    position: fixed;
-    z-index: var(--layer-overlay);
-  }
-
-  .drop-card {
-    align-items: center;
-    background: var(--bg-container);
-    border: var(--border-width) dashed var(--primary-main);
-    border-radius: var(--radius);
-    box-shadow: var(--shadow-dialog);
-    color: var(--primary-main);
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-200);
-    max-width: min(28rem, 100%);
-    padding: var(--space-600) var(--space-500);
-    text-align: center;
-  }
-
-  .drop-title {
-    font-size: var(--font-size-heading);
-    font-weight: var(--font-weight-bold);
-    line-height: var(--line-height-heading);
-    margin: 0;
-    overflow-wrap: anywhere;
-  }
-
   .composer-measurer {
     box-sizing: border-box;
     height: 0;
@@ -1858,21 +1650,5 @@
     pointer-events: none;
     position: absolute;
     width: 1px;
-  }
-
-  .composer-field :global(.icon-button-small.composer-expand) {
-    --button-height: var(--size-x500);
-    --button-icon-size: var(--size-x50);
-
-    color: var(--sec-main);
-    inset-block-start: var(--space-050);
-    inset-inline-end: var(--space-050);
-    position: absolute;
-  }
-
-  .composer-field :global(.composer-expand)::after {
-    content: '';
-    inset: calc((var(--size-x500) - var(--target-hit)) / 2);
-    position: absolute;
   }
 </style>

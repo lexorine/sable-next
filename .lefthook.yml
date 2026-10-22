@@ -1,0 +1,65 @@
+pre-commit:
+  parallel: true
+  skip:
+    - merge
+    - rebase
+  jobs:
+    - name: scripts
+      glob: '*.{js,mjs,cjs,ts,mts,cts}'
+      # oxfmt ignores src/generated, so a commit whose only TypeScript is
+      # regenerated bindings would hand it zero targets and fail.
+      exclude:
+        - 'src/generated/*'
+      group:
+        piped: true
+        jobs:
+          - run: pnpm exec eslint --fix --no-warn-ignored --max-warnings 0 {staged_files}
+            stage_fixed: true
+          - run: pnpm exec oxfmt {staged_files}
+            stage_fixed: true
+
+    - name: svelte
+      glob: '*.svelte'
+      group:
+        piped: true
+        jobs:
+          - run: pnpm exec eslint --fix --max-warnings 0 {staged_files}
+            stage_fixed: true
+          - run: pnpm exec oxfmt {staged_files}
+            stage_fixed: true
+          - run: pnpm exec stylelint --fix --max-warnings 0 {staged_files}
+            stage_fixed: true
+
+    - name: type-aware
+      glob: '*.{ts,tsx,mts,cts,svelte}'
+      exclude:
+        - 'src/generated/*'
+      run: pnpm exec oxlint --type-aware {staged_files}
+
+    - name: oxlint-js
+      glob: '*.{js,mjs,cjs}'
+      run: pnpm exec oxlint {staged_files}
+
+    - name: css
+      glob: '*.css'
+      run: pnpm exec stylelint --fix --max-warnings 0 {staged_files}
+      stage_fixed: true
+
+    - name: rust-fmt
+      glob: '*.rs'
+      run: cargo fmt --all
+      stage_fixed: true
+
+pre-push:
+  parallel: true
+  skip:
+    - merge
+    - rebase
+  jobs:
+    - name: svelte-check
+      run: pnpm exec svelte-kit sync && pnpm exec svelte-check --tsconfig ./tsconfig.json --fail-on-warnings
+
+commit-msg:
+  scripts:
+    'check-sign-off.sh':
+      runner: bash

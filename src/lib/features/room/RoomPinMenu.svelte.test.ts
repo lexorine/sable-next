@@ -17,16 +17,29 @@ vi.mock('#lib/personas/personas.svelte.js', () => ({
 import { core as baseCore } from '#lib/core/__mocks__/context.js';
 import { timelineMediaItems } from './media/media-items.js';
 import RoomPinMenuHarness from './RoomPinMenuHarness.test.svelte';
+import { withRowFields } from '#lib/features/room/timeline/row-fixtures.js';
 
-const core = Object.assign(baseCore, {
+const core = baseCore;
+Object.assign(core.rpc.rooms, {
+  cosmetics: vi.fn(() => Promise.resolve({ users: [], space_id: null })),
+});
+const timeline = Object.assign(baseCore.rpc.timeline, {
   pinnedEvents: vi.fn(() => Promise.resolve(['$image', '$second'])),
   eventItems: vi.fn(() => Promise.resolve([image, secondImage])),
-  roomAccountData: vi.fn(() => Promise.resolve(null)),
-  setRoomAccountData: vi.fn(() => Promise.resolve()),
-  roomCosmetics: vi.fn(() => Promise.resolve({ users: [], space_id: null })),
+  pinReadState: vi.fn(() =>
+    Promise.resolve({ pinned_ids: ['$image', '$second'], unread: 2, fresh_ids: [] })
+  ),
+  markPinsSeen: vi.fn(({ pinned_ids }: { room_id: string; pinned_ids: string[] }) =>
+    Promise.resolve({ pinned_ids, unread: 0, fresh_ids: [] })
+  ),
+  rpc: { account: {} },
 });
 
 const image = {
+  row: 'message',
+  forwardable: true,
+  redactable: true,
+  visibility: 'always',
   id: '$image',
   event_id: '$image',
   transaction_id: null,
@@ -65,12 +78,12 @@ const image = {
   forum_title: null,
 } satisfies TimelineItemView;
 
-const secondImage: TimelineItemView = {
+const secondImage = withRowFields({
   ...image,
   id: '$second',
   event_id: '$second',
   content: { ...image.content, filename: 'second.png', source: 'mxc://example.org/second' },
-};
+});
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -123,5 +136,50 @@ test.each([
   await vi.waitFor(() => {
     expect(screen.queryByRole('menu')).not.toBeInTheDocument();
     expect(screen.queryByRole('dialog', { name: 'Pinned messages' })).not.toBeInTheDocument();
+  });
+});
+
+test('shows the total pin count on the button, even once the pins are read', async () => {
+  timeline.pinReadState.mockResolvedValueOnce({
+    pinned_ids: ['$image', '$second'],
+    unread: 0,
+    fresh_ids: [],
+  });
+  render(RoomPinMenuHarness, {
+    menu: {
+      roomId: '!room:example.org',
+      members: [],
+      canPin: false,
+      onJump: vi.fn(),
+      onOpenMedia: vi.fn(),
+    },
+  });
+
+  const button = screen.getByRole('button', { name: 'Pinned messages' });
+  await vi.waitFor(() => {
+    expect(button).toHaveTextContent('2');
+  });
+});
+
+test('reports the unread pin count and clears it once the pins are seen', async () => {
+  const user = userEvent.setup({ delay: null });
+  const onUnread = vi.fn();
+  render(RoomPinMenuHarness, {
+    menu: {
+      roomId: '!room:example.org',
+      members: [],
+      canPin: false,
+      onJump: vi.fn(),
+      onOpenMedia: vi.fn(),
+      onUnread,
+    },
+  });
+
+  await vi.waitFor(() => {
+    expect(onUnread).toHaveBeenLastCalledWith(2);
+  });
+  await user.click(screen.getByRole('button', { name: 'Pinned messages' }));
+  await vi.waitFor(() => {
+    expect(onUnread).toHaveBeenLastCalledWith(0);
   });
 });

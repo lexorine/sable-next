@@ -40,7 +40,7 @@
   align="start"
   sideOffset={6}
   {label}
-  closeLabel={$i18n.t('composer.colorClose')}
+  closeLabel={i18n.t('composer.colorClose')}
   onOpenChange={(next) => {
     if (next) draft = value ?? '';
   }}
@@ -62,8 +62,7 @@
           <span class="color-icon">
             <Icon aria-hidden="true" />
             <span
-              class="color-bar"
-              class:set={value !== null}
+              class={['color-bar', { set: value !== null }]}
               style:background={value ?? undefined}
               aria-hidden="true"
             ></span>
@@ -74,15 +73,15 @@
   {/snippet}
 
   {#snippet children(sheet: boolean)}
-    <div class="color-picker" class:sheet>
+    <div class={['color-picker', { sheet }]}>
       <p class="color-title">{label}</p>
-      <div class="swatches" role="group" aria-label={$i18n.t('composer.colorPresets')}>
+      <div class="swatches" role="group" aria-label={i18n.t('composer.colorPresets')}>
         {#each COLOR_PRESETS as preset (preset.value)}
           <button
             type="button"
             class="swatch"
             style:background={preset.value}
-            aria-label={$i18n.t(preset.name)}
+            aria-label={i18n.t(preset.name)}
             aria-pressed={value === preset.value}
             onclick={() => {
               pick(preset.value);
@@ -102,15 +101,13 @@
         <span class="custom-preview" style:background={custom} aria-hidden="true"></span>
         <TextInput
           bind:value={draft}
-          aria-label={$i18n.t('composer.colorHex')}
+          aria-label={i18n.t('composer.colorHex')}
           placeholder="#RRGGBB"
           maxlength={7}
           spellcheck={false}
           autocomplete="off"
         />
-        <Button type="submit" size="small" disabled={!custom}
-          >{$i18n.t('composer.colorApply')}</Button
-        >
+        <Button type="submit" size="small" disabled={!custom}>{i18n.t('common.apply')}</Button>
       </form>
       {#if removable && value !== null}
         <Button
@@ -120,7 +117,7 @@
             pick(null);
           }}
         >
-          {$i18n.t('composer.colorRemove')}
+          {i18n.t('composer.colorRemove')}
         </Button>
       {/if}
     </div>
@@ -225,6 +222,7 @@
   .custom :global(.text-input) {
     flex: 1;
     font-family: var(--font-family-mono);
+    font-variant-ligatures: none;
     min-width: 0;
     text-transform: uppercase;
   }

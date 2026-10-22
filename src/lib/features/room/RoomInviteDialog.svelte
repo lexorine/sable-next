@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
-  import type { RoomSummary, UserDirectoryEntryView } from '#src/generated/protocol';
+  import { onDestroy, untrack } from 'svelte';
+  import type { RoomListItemView } from '#src/generated/protocol';
 
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
@@ -12,10 +12,12 @@
   import FormField from '#lib/ui/primitives/FormField.svelte';
   import TextInput from '#lib/ui/primitives/TextInput.svelte';
   import '#lib/ui/primitives/menu.css';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
+  import { UserDirectoryLookup } from './members/user-directory-lookup.svelte.js';
 
   interface Props {
     open: boolean;
-    room: RoomSummary | null;
+    room: RoomListItemView | null;
     onOpenChange: (open: boolean) => void;
   }
 
@@ -30,17 +32,17 @@
   let failed = $state(false);
   let convertPrompt = $state(false);
   let converting = $state(false);
-  let directory = $state.raw<UserDirectoryEntryView[]>([]);
-  let lookup = 0;
+  const directory = new UserDirectoryLookup(core);
 
   let roomId = $derived(room?.room_id ?? null);
   let isDirect = $derived(room?.is_direct ?? false);
+  let suggestions = $derived(directory.results.filter((entry) => entry.user_id !== draft.trim()));
 
   $effect(() => {
     void roomId;
     if (!open) return;
     untrack(() => {
-      draft = '';
+      setDraft('');
       invalid = false;
       invited = null;
       failed = false;
@@ -49,30 +51,14 @@
     });
   });
 
-  $effect(() => {
-    const query = draft.trim();
-    const current = ++lookup;
-    if (!query) {
-      directory = [];
-      return;
-    }
-    const timer = setTimeout(() => {
-      void findUsers(query, current);
-    }, 300);
-    return () => {
-      clearTimeout(timer);
-    };
-  });
-
-  async function findUsers(query: string, current: number): Promise<void> {
-    try {
-      const { results } = await core.commands.searchUserDirectory(query, 10);
-      if (current === lookup) directory = results;
-    } catch (error) {
-      console.warn('[sable room] user directory unavailable', error);
-      if (current === lookup) directory = [];
-    }
+  function setDraft(next: string): void {
+    draft = next;
+    directory.search(next.trim());
   }
+
+  onDestroy(() => {
+    directory.cancel();
+  });
 
   async function invite(candidate = draft.trim()): Promise<void> {
     const target = roomId;
@@ -86,9 +72,9 @@
     inviting = true;
     failed = false;
     try {
-      await core.commands.inviteUser(target, candidate);
+      await core.rpc.rooms.invite({ room_id: target, user_id: candidate });
       invited = candidate;
-      draft = '';
+      setDraft('');
     } catch (error) {
       console.warn('[sable room] invite failed', error);
       failed = true;
@@ -104,7 +90,7 @@
     converting = true;
     failed = false;
     try {
-      await core.commands.setDirect(target, false);
+      await core.rpc.account.setDirect({ room_id: target, direct: false, user_id: null });
       convertPrompt = false;
     } catch (error) {
       console.warn('[sable room] convert failed', error);
@@ -115,14 +101,14 @@
   }
 </script>
 
-<DialogFrame {open} {onOpenChange} variant="verification" label={$i18n.t('room.inviteTitle')}>
+<DialogFrame {open} {onOpenChange} variant="verification" label={i18n.t('room.inviteTitle')}>
   <div class="invite">
-    <h2>{$i18n.t('room.inviteTitle')}</h2>
+    <h2>{i18n.t('room.inviteTitle')}</h2>
 
     {#if convertPrompt}
-      <p class="explain">{$i18n.t('room.inviteConvertBody')}</p>
+      <p class="explain">{i18n.t('room.inviteConvertBody')}</p>
       {#if failed}
-        <Alert variant="critical" role="alert">{$i18n.t('room.inviteSendFailed')}</Alert>
+        <Alert variant="critical" role="alert">{i18n.t('room.inviteSendFailed')}</Alert>
       {/if}
       <DialogActions>
         <Button
@@ -131,7 +117,7 @@
             onOpenChange(false);
           }}
         >
-          {$i18n.t('room.inviteCancel')}
+          {i18n.t('common.cancel')}
         </Button>
         <Button
           loading={converting}
@@ -139,19 +125,19 @@
             void convertAndInvite();
           }}
         >
-          {$i18n.t('room.inviteConvertConfirm')}
+          {i18n.t('room.inviteConvertConfirm')}
         </Button>
       </DialogActions>
     {:else}
       <p class="explain">
-        {$i18n.t('room.inviteBody', { name: room?.name ?? room?.room_id ?? '' })}
+        {i18n.t('room.inviteBody', { name: room?.name ?? room?.room_id ?? '' })}
       </p>
 
-      <FormField fieldId="room-invite-user" label={$i18n.t('room.createInviteLabel')}>
+      <FormField fieldId="room-invite-user" label={i18n.t('common.invitePeople')}>
         <TextInput
           id="room-invite-user"
-          bind:value={draft}
-          placeholder={$i18n.t('room.createInvitePlaceholder')}
+          bind:value={() => draft, setDraft}
+          placeholder={i18n.t('room.createInvitePlaceholder')}
           onkeydown={(event: KeyboardEvent) => {
             if (event.key !== 'Enter') return;
             event.preventDefault();
@@ -160,16 +146,16 @@
         />
       </FormField>
 
-      {#if directory.length > 0}
-        <ul class="suggestions">
-          {#each directory as entry (entry.user_id)}
+      {#if suggestions.length > 0}
+        <ul class="suggestions" {@attach scrollHint}>
+          {#each suggestions as entry (entry.user_id)}
             <li>
               <button
                 type="button"
                 class="menu-item"
-                disabled={inviting}
                 onclick={() => {
-                  void invite(entry.user_id);
+                  setDraft(entry.user_id);
+                  document.getElementById('room-invite-user')?.focus();
                 }}
               >
                 <Avatar
@@ -189,12 +175,12 @@
       {/if}
 
       {#if invalid}
-        <Alert variant="critical" role="alert">{$i18n.t('room.createInviteInvalid')}</Alert>
+        <Alert variant="critical" role="alert">{i18n.t('common.userIdFormatHint')}</Alert>
       {:else if failed}
-        <Alert variant="critical" role="alert">{$i18n.t('room.inviteSendFailed')}</Alert>
+        <Alert variant="critical" role="alert">{i18n.t('room.inviteSendFailed')}</Alert>
       {:else if invited}
         <Alert variant="success" role="status">
-          {$i18n.t('room.inviteSent', { user: invited })}
+          {i18n.t('room.inviteSent', { user: invited })}
         </Alert>
       {/if}
 
@@ -205,7 +191,7 @@
             onOpenChange(false);
           }}
         >
-          {$i18n.t('room.inviteClose')}
+          {i18n.t('common.close')}
         </Button>
         <Button
           loading={inviting}
@@ -213,7 +199,7 @@
             void invite();
           }}
         >
-          {$i18n.t('room.inviteSubmit')}
+          {i18n.t('room.inviteSubmit')}
         </Button>
       </DialogActions>
     {/if}

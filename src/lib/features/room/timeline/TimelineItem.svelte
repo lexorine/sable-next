@@ -1,32 +1,27 @@
 <script lang="ts">
+  import { copyText } from '#lib/platform/clipboard.js';
   import { onDestroy, type Snippet } from 'svelte';
 
   import type {
     MemberView,
     PerMessageProfileView,
+    ReplyView,
     TimelineItemView,
   } from '#src/generated/protocol';
 
   import { useCoreClient } from '#lib/core/context.js';
   import '../members/avatar-button.css';
-  import { memberIdentity } from '../members/members.js';
   import { profileOverrides } from '#lib/profile/profile-overrides.svelte.js';
   import { cursorAnchor, type CursorAnchor } from '#lib/ui/cursor-anchor.js';
-  import { toasts } from '#lib/ui/toasts.svelte.js';
   import { LongPress, touchContextMenu } from '#lib/ui/long-press.svelte.js';
   import { DoubleTap } from '#lib/ui/double-tap.js';
   import { hapticFeedback } from '#lib/platform/haptics.js';
   import { mediaProgress } from '#lib/ui/media-progress.svelte.js';
-  import {
-    findMember,
-    personaWithColor,
-    senderDisplayColors,
-    stripReplyFallback,
-  } from '../members/members.js';
+  import { findMember, personaWithColor, senderDisplayColors } from '../members/members.js';
   import { previewableLinks } from '../media/link-preview.js';
-  import { stateEventText } from './state-event-text';
   import LinkEmbed from '../media/embeds/LinkEmbed.svelte';
   import { MessageSwipe } from '../messages/message-swipe.svelte.js';
+  import { isMediaCaptionContent } from '../messages/media-caption.js';
   import { i18n } from '#lib/i18n.js';
   import { splitDisplayNamePronouns, withDisplayNamePronouns } from '#lib/personas/pronouns.js';
   import { usePersonaStore } from '#lib/personas/personas.svelte.js';
@@ -35,8 +30,6 @@
   import Skeleton from '#lib/ui/primitives/Skeleton.svelte';
   import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
   import { nameColorOnDark, nameColorOnLight } from '#lib/ui/primitives/readable-color.js';
-  import PencilSimpleIcon from 'phosphor-svelte/lib/PencilSimpleIcon';
-  import ReplyIcon from 'phosphor-svelte/lib/ArrowBendUpLeftIcon';
 
   import FormattedBody from '../messages/FormattedBody.svelte';
   import MessageBody from '../messages/MessageBody.svelte';
@@ -45,9 +38,7 @@
   import TimelineNotice from './TimelineNotice.svelte';
   import type { TimelineEventIndex } from './timeline-event-index';
   import MessageActions from '../messages/MessageActions.svelte';
-  import type { MessageActions as MessageActionSet } from '../messages/message-menu-items.js';
 
-  import ThreadIcon from 'phosphor-svelte/lib/ChatCircleDotsIcon';
   import { useBookmarks } from '#lib/rooms/bookmarks.svelte.js';
   import { useMessageMenu } from '../messages/message-menu-open.svelte.js';
   import '#lib/ui/primitives/menu.css';
@@ -56,21 +47,24 @@
   import SenderName from '../members/SenderName.svelte';
   import RoleTagIcon from '../members/RoleTagIcon.svelte';
   import { hasSenderRoles, useSenderRoles } from '../members/sender-roles.js';
-  import { useRoomCosmetics } from '#lib/rooms/room-cosmetics.svelte.js';
+  import { useRoomCosmetics, type SenderCosmetics } from '#lib/rooms/room-cosmetics.svelte.js';
   import ForwardedLine from '../messages/ForwardedLine.svelte';
   import type { MatrixLink } from '#lib/rooms/matrix-link.js';
   import { useMessageDialogs } from '../messages/message-dialogs.svelte.js';
   import '../members/sender-identity.css';
   import { formatFullTimestamp, formatMessageTimestamp, formatTime } from '#lib/ui/date-time.js';
-  import {
-    isAnnotation,
-    isMessageRow,
-    jumboEmojiLevel,
-    jumboEmoticonLevel,
-  } from './timeline-format';
+  import Spinner from '#lib/ui/primitives/Spinner.svelte';
+  import { isAnnotation, isMessageRow } from './timeline-format';
 
   import { MessageActionExecutor } from '../messages/message-action-controller.svelte.js';
   import { TimelineItemProfiles } from './timeline-item-profiles.svelte';
+  import { TimelineItemEngagement } from './timeline-item-engagement.svelte';
+  import { selectedText, withSelectedText } from './timeline-item-selection';
+  import TimelineReplyPreview from './TimelineReplyPreview.svelte';
+  import TimelineSendFailure from './TimelineSendFailure.svelte';
+  import TimelineSwipeAction from './TimelineSwipeAction.svelte';
+  import TimelineThreadSummary from './TimelineThreadSummary.svelte';
+  import TimelineTransfer from './TimelineTransfer.svelte';
 
   import type { MessageCallbacks } from '../messages/message-action-controller.svelte.js';
 
@@ -97,12 +91,15 @@
     canPin?: boolean;
     encrypted?: boolean | null;
     selected?: boolean;
+    editing?: boolean;
+    editor?: Snippet;
     layout?: TimelineLayout;
     preview?: boolean;
     loadPreviewProfile?: boolean;
     timeAction?: { label: string; run: () => void };
     headerAction?: Snippet;
     alignOwn?: boolean;
+    avatarsInHeaders?: boolean;
     members?: readonly MemberView[];
     onJumpToEvent?: (eventId: string) => void;
     onOpenMedia?: (eventId: string) => void;
@@ -112,6 +109,7 @@
     onMenuOpenChange?: (open: boolean) => void;
     placeholder?: boolean;
     placeholderCharacters?: number;
+    overrideCosmetics?: SenderCosmetics | null;
   }
 
   let {
@@ -130,6 +128,7 @@
     currentUserId = null,
     onToggleReaction,
     onReply,
+    onCancelContext,
     onOpenThread,
     onEdit,
     onDelete,
@@ -140,12 +139,15 @@
     canPin = true,
     encrypted = null,
     selected = false,
+    editing = false,
+    editor,
     layout = 'modern',
     preview = false,
     loadPreviewProfile = false,
     timeAction,
     headerAction,
     alignOwn = true,
+    avatarsInHeaders = true,
     members = [],
     onJumpToEvent,
     onOpenMedia,
@@ -155,6 +157,7 @@
     onMenuOpenChange,
     placeholder = false,
     placeholderCharacters = 35,
+    overrideCosmetics = null,
   }: Props = $props();
 
   let defaultEmoteSize = $derived(preferences.timelineEmoteSize === 'default');
@@ -169,26 +172,20 @@
   const openMessageMenu = useMessageMenu();
   const itemProfiles = new TimelineItemProfiles(core);
   let profile = $derived(itemProfiles.sender);
-  let senderCosmetics = $derived(roomCosmetics?.for(item.sender) ?? null);
+  let senderCosmetics = $derived(overrideCosmetics ?? roomCosmetics?.for(item.sender) ?? null);
   let senderTimezone = $derived(profile?.timezone ?? null);
-  // Only a fallback: the core fills both fields, so most rows never scan.
-  let senderMember = $derived(
-    item.sender_name === null || item.sender_avatar === null
-      ? findMember(members, item.sender)
-      : undefined
-  );
+  let senderMember = $derived(findMember(members, item.sender));
   let roomIdentity = $derived({
-    name: item.sender_name ?? senderMember?.display_name ?? null,
-    avatar: item.sender_avatar ?? senderMember?.avatar_url ?? null,
+    name: senderMember ? senderMember.display_name : item.sender_name,
+    avatar: senderMember ? senderMember.avatar_url : item.sender_avatar,
   });
-  let spaceIdentity = $derived(roomCosmetics?.identity(item.sender, roomIdentity) ?? roomIdentity);
   let accountName = $derived(
     profileOverrides.name(
       item.sender ?? '',
-      spaceIdentity.name ??
-        profile?.display_name ??
+      roomIdentity.name ??
+        (senderMember ? null : profile?.display_name) ??
         item.sender ??
-        $i18n.t('timeline.unknownSender')
+        i18n.t('timeline.unknownSender')
     )
   );
   let persona = $derived(item.per_message_profile);
@@ -202,7 +199,7 @@
   let senderAvatar = $derived(
     persona?.avatar_url === ''
       ? null
-      : (persona?.avatar_url ?? profileOverrides.avatar(item.sender ?? '', spaceIdentity.avatar))
+      : (persona?.avatar_url ?? profileOverrides.avatar(item.sender ?? '', roomIdentity.avatar))
   );
   let personaTint = $derived(personaWithColor(persona));
   let pronouns = $derived(
@@ -217,80 +214,14 @@
         )
       : []
   );
-  let replyIdentity = $derived.by(() => {
-    const own = {
-      name:
-        item.in_reply_to?.sender_name ??
-        findMember(members, item.in_reply_to?.sender)?.display_name ??
-        null,
-      avatar: null,
-    };
-    return roomCosmetics?.identity(item.in_reply_to?.sender, own) ?? own;
-  });
-  let replyNameBase = $derived(
-    replyPersona?.display_name ??
-      profileOverrides.name(
-        item.in_reply_to?.sender ?? '',
-        replyIdentity.name ?? item.in_reply_to?.sender ?? $i18n.t('timeline.unknownSender')
-      )
+  let replyTarget = $derived(
+    item.in_reply_to ? (events?.get(item.in_reply_to.event_id) ?? null) : null
   );
-  let replyIsPinged = $derived(item.in_reply_to?.sender_mentioned ?? false);
-  let replyName = $derived(
-    replyIsPinged && !replyNameBase.startsWith('@') ? `@${replyNameBase}` : replyNameBase
-  );
-  let replyBody = $derived.by(() => {
-    const target = item.in_reply_to ? events?.get(item.in_reply_to.event_id) : null;
-    const kind = target?.content.kind;
-    if (
-      target &&
-      (kind === 'membership' ||
-        kind === 'profile_change' ||
-        kind === 'state_event' ||
-        kind === 'hidden_event')
-    ) {
-      return stateEventText(target, $i18n.t);
-    }
-    return stripReplyFallback(item.in_reply_to?.body ?? '', replyPersona);
-  });
-  let replyCosmetics = $derived(
-    replyPersona ? null : (roomCosmetics?.for(item.in_reply_to?.sender) ?? null)
-  );
-  let replyProfile = $derived(itemProfiles.reply);
-  let replySender = $derived(item.in_reply_to?.sender ?? null);
-  let replyColors = $derived(
-    senderDisplayColors(
-      replySender ?? '',
-      replyProfile,
-      replyPersona,
-      currentUserId !== null && replySender === currentUserId,
-      replyCosmetics,
-      replySender ? (senderRoles?.(replySender)?.color ?? null) : null
-    )
-  );
+  let replySender = $derived(item.in_reply_to?.sender ?? replyTarget?.sender ?? null);
   let emote = $derived(item.content.kind === 'message' && item.content.emote);
   let notice = $derived(item.content.kind === 'message' && item.content.notice);
-  let jumbo = $derived(
-    item.content.kind === 'message' && !item.content.emote
-      ? (jumboEmojiLevel(item.content.body) ?? jumboEmoticonLevel(item.content.html))
-      : null
-  );
+  let jumbo = $derived(item.content.kind === 'message' ? (item.content.jumbo ?? null) : null);
   let stalled = $derived(item.send_state?.status === 'failed' ? item.send_state : null);
-  let blocked = $derived(stalled?.blocked ?? null);
-  let changedNames = $derived(
-    blocked?.kind === 'identity_changed'
-      ? blocked.user_ids.map((userId) => memberIdentity(members, userId).name).join(', ')
-      : ''
-  );
-
-  async function sendAnyway(transactionId: string, userIds: readonly string[]): Promise<void> {
-    try {
-      for (const userId of userIds) await core.commands.withdrawVerification(userId);
-      onRetrySend?.(transactionId);
-    } catch (error) {
-      console.warn('[sable timeline] could not withdraw the verification', error);
-      toasts.error($i18n.t('errors.actionFailed'));
-    }
-  }
   let pending = $derived(item.send_state?.status === 'sending');
   let upload = $derived(
     item.send_state?.status === 'sending' ? (item.send_state.progress ?? null) : null
@@ -316,13 +247,13 @@
 
   let actionable = $derived(!preview && item.event_id !== null && stalled === null && !pending);
   let editable = $derived(
-    item.is_own && (item.content.kind === 'message' || item.content.kind === 'image')
+    item.is_own && (item.content.kind === 'message' || isMediaCaptionContent(item.content))
   );
   const swipe = new MessageSwipe({
     enabled: () => actionable && actions.onReply !== undefined,
     canEdit: () => actionable && actions.onEdit !== undefined,
-    onReply: () => actions.onReply?.(),
-    onEdit: () => actions.onEdit?.(),
+    onReply: () => (selected ? onCancelContext?.() : actions.onReply?.()),
+    onEdit: () => (editing ? onCancelContext?.() : actions.onEdit?.()),
   });
   let senderRole = $derived(item.sender ? (senderRoles?.(item.sender) ?? null) : null);
   let senderColors = $derived(
@@ -379,7 +310,9 @@
   let previewsRemoved = $derived(item.link_previews_removed === true);
   let bundledPreviews = $derived(previewsRemoved ? [] : item.bundled_link_previews);
   let previewUrls = $derived(
-    item.content.kind === 'message' && !previewsRemoved ? previewableLinks(item.content.html) : []
+    item.content.kind === 'message' && !previewsRemoved
+      ? previewableLinks(item.content.html, item.content.body)
+      : []
   );
   let receiptWidth = $state(0);
   let receiptsInline = $derived(
@@ -396,29 +329,11 @@
   let receiptsVisible = $derived(showReceiptBadge && (actionable || preview));
   let trailingReceiptBadge = $derived(receiptsVisible && !receiptsInline);
 
-  function selectedText(): string {
-    const selection = getSelection();
-    if (!selection || selection.isCollapsed || !messageRow) return '';
-    if (!messageRow.contains(selection.anchorNode) || !messageRow.contains(selection.focusNode)) {
-      return '';
-    }
-    return selection.toString();
-  }
-
-  function withSelectedText(base: MessageActionSet, text: string): MessageActionSet {
-    if (!text) return base;
-    return {
-      ...base,
-      onCopyText: () => void navigator.clipboard.writeText(text),
-      copyTextLabel: 'timeline.copySelection',
-    };
-  }
-
   const rowPress = new LongPress({
     enabled: () => actionable,
     onPress: () => {
       openMessageMenu.set(item.id, false);
-      const selected = selectedText();
+      const selected = selectedText(messageRow);
       dialogs.open(item, { kind: 'sheet', actions: () => withSelectedText(actions, selected) });
     },
   });
@@ -432,6 +347,7 @@
   function rowPointerDown(event: PointerEvent): void {
     rowPress.start(event);
     rowDoubleTap.down(event);
+    if (event.pointerType === 'mouse') engagement.hold();
   }
 
   function rowPointerUp(event: PointerEvent): void {
@@ -444,21 +360,8 @@
     rowDoubleTap.cancel();
   }
 
-  let engaged = $state(false);
+  const engagement = new TimelineItemEngagement(() => messageRow);
   let actionsPinned = $state(false);
-
-  function engage(): void {
-    engaged = true;
-  }
-
-  function disengage(event: FocusEvent | PointerEvent): void {
-    if (event instanceof FocusEvent && event.relatedTarget instanceof Node) {
-      if (messageRow?.contains(event.relatedTarget)) return;
-    } else if (!(event instanceof FocusEvent) && messageRow?.matches(':focus-within')) {
-      return;
-    }
-    engaged = false;
-  }
 
   function pinActions(open: boolean): void {
     if (open) emoteAnchor = null;
@@ -472,18 +375,20 @@
       if (actionable && !rowPress.pending && !dialogs.isOpen(item, 'sheet')) rowPress.fire(event);
       return;
     }
-    if (!actionable) return;
+    if (!actionable) {
+      if (pending) event.preventDefault();
+      return;
+    }
     event.preventDefault();
     emoteAnchor = cursorAnchor(event);
     const link =
       event.target instanceof Element
         ? event.target.closest<HTMLAnchorElement>('a[href]')?.href
         : null;
-    const selected = selectedText();
+    const selected = selectedText(messageRow);
     openMessageMenu.open(item.id, { x: event.clientX, y: event.clientY }, () => ({
       ...withSelectedText(actions, selected),
-      onCopyLink: link ? () => void navigator.clipboard.writeText(link) : actions.onCopyLink,
-      copyLinkLabel: link ? 'timeline.copyLink' : undefined,
+      onCopyHref: link ? () => void copyText(link) : undefined,
     }));
   }
 
@@ -491,6 +396,10 @@
   onDestroy(() => {
     rowPress.cancel();
   });
+
+  function cancelUpload(): void {
+    if (item.transaction_id) onCancelSend?.(item.transaction_id);
+  }
 
   function openSenderProfileAt(anchor: HTMLElement): void {
     if (item.sender) onSenderProfile?.(item.sender, anchor, persona);
@@ -505,7 +414,9 @@
   }
 
   let nameOpensProfile = $derived(
-    preferences.usernameClick === 'profile' && onSenderProfile !== undefined && item.sender !== null
+    (preferences.usernameClick === 'profile' || onMentionUser === undefined) &&
+      onSenderProfile !== undefined &&
+      item.sender !== null
   );
   let nameMentions = $derived(
     !nameOpensProfile && onMentionUser !== undefined && item.sender !== null
@@ -532,7 +443,7 @@
 {/snippet}
 
 {#snippet actionLayer()}
-  {#if actionable && (engaged || actionsPinned)}
+  {#if actionable && (engagement.engaged || actionsPinned)}
     <MessageActions
       onPickerOpenChange={pinActions}
       onOverflowOpenChange={pinActions}
@@ -541,11 +452,59 @@
   {/if}
 {/snippet}
 
+{#snippet replyPreview(reply: ReplyView)}
+  <TimelineReplyPreview
+    {reply}
+    target={replyTarget}
+    sender={replySender}
+    persona={replyPersona}
+    profile={itemProfiles.reply}
+    {currentUserId}
+    {members}
+    {onJumpToEvent}
+  />
+{/snippet}
+
+{#snippet senderAvatarButton(size: 'tiny' | 'small')}
+  {#if item.sender && onSenderProfile}
+    <button
+      class="avatar-button"
+      type="button"
+      aria-label={i18n.t('timeline.senderProfile', { name: senderName })}
+      onclick={openSenderProfile}
+    >
+      <Avatar
+        class="message-avatar"
+        src={senderAvatar}
+        {size}
+        id={personaTint ? null : item.sender}
+        name={senderName}
+      />
+    </button>
+  {:else}
+    <Avatar
+      class="message-avatar"
+      src={senderAvatar}
+      {size}
+      id={personaTint ? null : item.sender}
+      name={senderName}
+    />
+  {/if}
+{/snippet}
+
 {#snippet messageTime()}
-  <time
-    datetime={new Date(item.timestamp).toISOString()}
-    title={formatFullTimestamp(item.timestamp)}>{formatMessageTimestamp(item.timestamp)}</time
-  >
+  {#if pending}
+    <Spinner small label={i18n.t('timeline.sending')} />
+  {:else}
+    {@const fullTimestamp = formatFullTimestamp(item.timestamp)}
+    <Tooltip label={fullTimestamp}>
+      {#snippet trigger({ props })}
+        <time {...props} datetime={new Date(item.timestamp).toISOString()}>
+          {formatMessageTimestamp(item.timestamp)}
+        </time>
+      {/snippet}
+    </Tooltip>
+  {/if}
 {/snippet}
 
 {#if placeholder}
@@ -556,7 +515,7 @@
     {#if layout === 'compact'}
       <div class="compact-gutter">
         <time><Skeleton class="placeholder-time" /></time>
-        {#if !collapsed}<Skeleton class="compact-name placeholder-name" />{/if}
+        <Skeleton class="compact-name placeholder-name" />
       </div>
     {:else if !collapsed}
       <Skeleton class="avatar-root avatar-small message-avatar placeholder-avatar" />
@@ -577,16 +536,14 @@
       {/if}
     </div>
   </article>
-{:else if isMessageRow(item.content)}
+{:else if isMessageRow(item)}
   <article
     bind:this={messageRow}
     class={[
       'message',
-      'choice',
       `layout-${layout}`,
       {
         collapsed,
-        pending,
         highlighted,
         pressed: rowPress.pressing,
         'has-connected-reply':
@@ -613,99 +570,67 @@
     onpointermove={rowPress.move}
     onpointerup={rowPointerUp}
     onpointercancel={rowPointerCancel}
-    onpointerenter={engage}
-    onpointerleave={disengage}
-    onfocusin={engage}
-    onfocusout={disengage}
+    onpointerenter={engagement.engage}
+    onpointerleave={engagement.disengage}
+    onfocusin={engagement.engage}
+    onfocusout={engagement.disengage}
     oncontextmenu={openContextMenu}
     {@attach swipe.attach}
   >
     {#if swipe.offset > 0}
-      <div
-        class="swipe-action"
-        class:armed={swipe.action !== 'none'}
-        aria-hidden="true"
-        style:width={`${String(swipe.offset)}px`}
-        style:transform={`translateX(${String(swipe.offset)}px)`}
-      >
-        {#if swipe.action === 'edit'}
-          <PencilSimpleIcon weight="bold" />
-        {:else}
-          <ReplyIcon weight="bold" />
-        {/if}
-      </div>
+      <TimelineSwipeAction
+        offset={swipe.offset}
+        armed={swipe.action !== 'none'}
+        edit={swipe.action === 'edit'}
+      />
     {/if}
     {@render actionLayer()}
-    {#if !actionable && editable && item.transaction_id && engaged}
+    {#if !actionable && editable && item.transaction_id && engagement.engaged}
       <MessageActions {roomId} onEdit={actions.onEdit} />
     {/if}
-    {#if layout === 'compact'}
-      <div class="compact-gutter">
-        <time
-          datetime={new Date(item.timestamp).toISOString()}
-          title={formatFullTimestamp(item.timestamp)}>{formatTime(item.timestamp)}</time
-        >
-        {#if !collapsed}
-          <SenderName
-            displayName={senderName}
-            colors={senderColors}
-            {pronouns}
-            nameClass="compact-name"
-            onMention={nameMentions ? mentionSender : undefined}
-            onProfile={nameOpensProfile ? openSenderProfileAt : undefined}
-            compact={layout === 'compact'}
-          />
-        {/if}
-      </div>
-    {:else if !collapsed}
-      {#if item.sender && onSenderProfile}
-        <button
-          class="avatar-button"
-          type="button"
-          aria-label={$i18n.t('timeline.senderProfile', { name: senderName })}
-          onclick={openSenderProfile}
-        >
-          <Avatar
-            class="message-avatar"
-            src={senderAvatar}
-            size="small"
-            id={personaTint ? null : item.sender}
-            name={senderName}
-          />
-        </button>
-      {:else}
-        <Avatar
-          class="message-avatar"
-          src={senderAvatar}
-          size="small"
-          id={personaTint ? null : item.sender}
-          name={senderName}
-        />
-      {/if}
+    {#if layout !== 'compact' && !collapsed}
+      {@render senderAvatarButton('small')}
+    {:else if layout !== 'compact' && pending}
+      <span class="collapsed-pending">
+        <Spinner small label={i18n.t('timeline.sending')} />
+      </span>
     {/if}
     <div
       class="message-content"
       style:--receipt-reserve={trailingReceiptBadge ? `${String(receiptWidth)}px` : undefined}
     >
-      {#if item.in_reply_to && preferences.replyPreviewStyle === 'connected'}
-        {@const target = item.in_reply_to.event_id}
-        <button
-          class={['reply-preview', 'reply-connected']}
-          type="button"
-          onclick={() => {
-            onJumpToEvent?.(target);
-          }}
-        >
-          <span class="reply-copy"
-            ><SenderName
-              displayName={replyName}
-              colors={replyColors}
-              nameClass="reply-name"
-              compact
+      {#if layout === 'compact'}
+        {@const fullTimestamp = formatFullTimestamp(item.timestamp)}
+        <div class="compact-gutter">
+          {#if pending}
+            <Spinner small label={i18n.t('timeline.sending')} />
+          {:else}
+            <Tooltip label={fullTimestamp}>
+              {#snippet trigger({ props })}
+                <time {...props} datetime={new Date(item.timestamp).toISOString()}>
+                  {formatTime(item.timestamp)}
+                </time>
+              {/snippet}
+            </Tooltip>
+          {/if}
+          <div class="compact-user">
+            {#if avatarsInHeaders}
+              {@render senderAvatarButton('tiny')}
+            {/if}
+            <SenderName
+              displayName={senderName}
+              colors={senderColors}
+              {pronouns}
+              nameClass="compact-name"
+              onMention={nameMentions ? mentionSender : undefined}
+              onProfile={nameOpensProfile ? openSenderProfileAt : undefined}
+              compact={layout === 'compact'}
             />
-            <span class="reply-body">{replyBody}</span></span
-          >
-        </button>
+          </div>
+        </div>
+      {/if}
+      {#if item.in_reply_to && (preferences.replyPreviewStyle === 'connected' || layout === 'compact')}
+        {@render replyPreview(item.in_reply_to)}
       {/if}
       {#if !collapsed && layout !== 'compact'}
         <header>
@@ -737,7 +662,7 @@
               <button
                 class="via via-hidden"
                 type="button"
-                aria-label={$i18n.t('timeline.senderProfile', { name: item.sender })}
+                aria-label={i18n.t('timeline.senderProfile', { name: item.sender })}
                 onclick={openSenderProfile}>{item.sender}</button
               >
             {/if}
@@ -758,26 +683,8 @@
         </header>
       {/if}
       <div class="message-main">
-        {#if item.in_reply_to && preferences.replyPreviewStyle !== 'connected'}
-          {@const target = item.in_reply_to.event_id}
-          <button
-            class={['reply-preview', `reply-${preferences.replyPreviewStyle}`]}
-            type="button"
-            onclick={() => {
-              onJumpToEvent?.(target);
-            }}
-          >
-            <ReplyIcon class="reply-icon" />
-            <span class="reply-copy"
-              ><SenderName
-                displayName={replyName}
-                colors={replyColors}
-                nameClass="reply-name"
-                compact
-              />
-              <span class="reply-body">{replyBody}</span></span
-            >
-          </button>
+        {#if item.in_reply_to && preferences.replyPreviewStyle !== 'connected' && layout !== 'compact'}
+          {@render replyPreview(item.in_reply_to)}
         {/if}
         {#if item.forwarded}
           <div>
@@ -803,6 +710,8 @@
               {@render receiptSlot()}
             {/if}
           </div>
+        {:else if item.content.kind === 'message' && editor}
+          {@render editor()}
         {:else if item.content.kind === 'message'}
           {@const inlineReceipts = receiptsVisible && receiptsInline}
           <div
@@ -814,9 +723,9 @@
             {@attach inlineReceipts ? receiptReserve : undefined}
           >
             <FormattedBody html={item.content.html} {senderTimezone} {onMatrixLink} />
-            <!-- Trails the body, where the edit happened, not the header. -->
+            <!-- After the body, where the edit happened. -->
             {#if item.content.edited}
-              <span class="edited">{$i18n.t('timeline.edited')}</span>
+              <span class="edited">{i18n.t('timeline.edited')}</span>
             {/if}
             {#if inlineReceipts}
               <span class="receipt-space" aria-hidden="true"></span>
@@ -839,17 +748,23 @@
             style:--receipt-reserve={inlineReceipts ? `${String(receiptWidth)}px` : undefined}
             {@attach inlineReceipts ? receiptReserve : undefined}
           >
-            <MessageBody {item} {roomId} {canRedactOthers} {senderTimezone} {onMatrixLink} />
+            <MessageBody
+              {item}
+              {canRedactOthers}
+              {roomId}
+              {onMatrixLink}
+              redactionReason={item.event_id ? events?.redactionReason(item.event_id) : null}
+              redactedBy={events?.redactor(item) ?? item.content.redacted_by ?? null}
+            />
             {#if inlineReceipts}
               <span class="receipt-space" aria-hidden="true"></span>
               {@render receiptSlot()}
             {/if}
           </div>
         {:else}
-          <div class:content-bubble={layout === 'bubble' && nonTextContent}>
+          <div class={{ 'content-bubble': layout === 'bubble' && nonTextContent }}>
             <MessageBody
               {item}
-              {roomId}
               {senderTimezone}
               {members}
               {canRedactOthers}
@@ -864,35 +779,21 @@
         {/if}
         {#if threadSummary && onOpenThread && threadTarget}
           {@const target = threadTarget}
-          <button
-            type="button"
-            class="thread-summary"
-            onclick={() => {
+          <TimelineThreadSummary
+            summary={threadSummary}
+            persona={threadPersona}
+            onOpen={() => {
               onOpenThread(target);
             }}
-          >
-            <ThreadIcon size={14} aria-hidden="true" />
-            <span class="thread-count"
-              >{$i18n.t('timeline.threadReplies', { count: threadSummary.num_replies })}</span
-            >
-            {#if threadSummary.latest_body}
-              <span class="thread-latest"
-                >{stripReplyFallback(threadSummary.latest_body, threadPersona)}</span
-              >
-            {/if}
-          </button>
+          />
         {:else if item.thread_root && onOpenThread}
           {@const target = item.thread_root}
-          <button
-            type="button"
-            class="thread-summary"
-            onclick={() => {
+          <TimelineThreadSummary
+            summary={null}
+            onOpen={() => {
               onOpenThread(target);
             }}
-          >
-            <ThreadIcon size={14} aria-hidden="true" />
-            <span class="thread-count">{$i18n.t('timeline.thread')}</span>
-          </button>
+          />
         {/if}
         {#if item.reactions.length > 0}
           <MessageReactions
@@ -910,81 +811,37 @@
           />
         {/if}
         {#if uploadFraction !== null}
-          <div class="transfer">
-            <progress
-              class="upload"
-              max="1"
-              value={uploadFraction}
-              aria-label={$i18n.t('timeline.uploading')}
-            ></progress>
-            {#if uploadItem !== null}
-              <span class="transfer-count">
-                {$i18n.t('timeline.uploadingItem', { current: uploadItem, count: galleryCount })}
-              </span>
-            {/if}
-          </div>
+          <TimelineTransfer
+            label={i18n.t('timeline.uploading')}
+            max={1}
+            value={uploadFraction}
+            count={uploadItem === null
+              ? null
+              : i18n.t('timeline.uploadingItem', { current: uploadItem, count: galleryCount })}
+            onCancel={item.transaction_id ? cancelUpload : undefined}
+          />
         {:else if uploading}
-          <div class="transfer">
-            <progress class="upload" aria-label={$i18n.t('timeline.uploading')}></progress>
-          </div>
+          <TimelineTransfer
+            label={i18n.t('timeline.uploading')}
+            onCancel={item.transaction_id ? cancelUpload : undefined}
+          />
         {:else if saving.percent !== null}
-          <div class="transfer">
-            <progress
-              class="upload"
-              max="100"
-              value={saving.percent}
-              aria-label={$i18n.t('timeline.downloading')}
-            ></progress>
-          </div>
+          <TimelineTransfer
+            label={i18n.t('timeline.downloading')}
+            max={100}
+            value={saving.percent}
+          />
         {:else if actionExecutor.savingSlow}
-          <div class="transfer">
-            <progress class="upload" aria-label={$i18n.t('timeline.downloading')}></progress>
-          </div>
+          <TimelineTransfer label={i18n.t('timeline.downloading')} />
         {/if}
         {#if stalled}
-          <p class="send-failure">
-            <span title={stalled.error}>{$i18n.t('timeline.sendFailed')}</span>
-            {#if item.transaction_id && blocked?.kind === 'identity_changed'}
-              {@const transactionId = item.transaction_id}
-              {@const userIds = blocked.user_ids}
-              <button
-                type="button"
-                onclick={() => {
-                  void sendAnyway(transactionId, userIds);
-                }}
-              >
-                {$i18n.t('timeline.sendAnyway')}
-              </button>
-            {/if}
-            {#if item.transaction_id}
-              {@const transactionId = item.transaction_id}
-              <button
-                type="button"
-                onclick={() => {
-                  onRetrySend?.(transactionId);
-                }}
-              >
-                {$i18n.t('timeline.retrySend')}
-              </button>
-              <button
-                type="button"
-                onclick={() => {
-                  onCancelSend?.(transactionId);
-                }}
-              >
-                {$i18n.t('timeline.cancelSend')}
-              </button>
-            {/if}
-            <span class="send-failure-reason">
-              {#if blocked?.kind === 'identity_changed'}
-                {$i18n.t('timeline.sendBlockedIdentity', { names: changedNames })}
-              {:else if blocked?.kind === 'verify_this_device'}
-                {$i18n.t('timeline.sendBlockedVerify')}
-              {:else}
-                {stalled.error}
-              {/if}
-            </span>
-          </p>
+          <TimelineSendFailure
+            failure={stalled}
+            transactionId={item.transaction_id}
+            {members}
+            {onRetrySend}
+            {onCancelSend}
+          />
         {/if}
         {#if trailingReceiptBadge}
           <span class="receipt-tail" aria-hidden="true"></span>
@@ -1009,7 +866,7 @@
 {:else}
   <article
     bind:this={messageRow}
-    class={['message', 'event-row', 'choice', { highlighted }]}
+    class={['message', 'event-row', { highlighted }]}
     data-selected={selected ? 'true' : undefined}
     style:--sender-name-color={senderColors.nameColor}
     style:--name-color-on-light={senderColors.nameColorLight ?? undefined}
@@ -1020,23 +877,15 @@
     onpointermove={rowPress.move}
     onpointerup={rowPointerUp}
     onpointercancel={rowPointerCancel}
-    onpointerenter={engage}
-    onpointerleave={disengage}
-    onfocusin={engage}
-    onfocusout={disengage}
+    onpointerenter={engagement.engage}
+    onpointerleave={engagement.disengage}
+    onfocusin={engagement.engage}
+    onfocusout={engagement.disengage}
     oncontextmenu={openContextMenu}
     {@attach swipe.attach}
   >
     {#if swipe.offset > 0}
-      <div
-        class="swipe-action"
-        class:armed={swipe.action !== 'none'}
-        aria-hidden="true"
-        style:width={`${String(swipe.offset)}px`}
-        style:transform={`translateX(${String(swipe.offset)}px)`}
-      >
-        <ReplyIcon weight="bold" />
-      </div>
+      <TimelineSwipeAction offset={swipe.offset} armed={swipe.action !== 'none'} />
     {/if}
     {@render actionLayer()}
     <TimelineNotice
@@ -1113,39 +962,6 @@
     width: 3rem;
   }
 
-  .thread-summary {
-    align-items: center;
-    background: none;
-    border: none;
-    color: var(--primary-main);
-    cursor: pointer;
-    display: flex;
-    font: inherit;
-    font-size: var(--font-size-small);
-    gap: var(--space-200);
-    margin-top: var(--space-050);
-    max-width: 100%;
-    padding: 0;
-    text-align: left;
-  }
-
-  .thread-count {
-    flex: none;
-    font-weight: var(--font-weight-medium);
-  }
-
-  .thread-summary:hover .thread-count {
-    text-decoration: underline;
-  }
-
-  .thread-latest {
-    color: var(--surface-var-on-container);
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
   @media (pointer: coarse) {
     .message {
       touch-action: manipulation;
@@ -1191,12 +1007,6 @@
     padding-block: 0;
   }
 
-  .message.event-row :global(.message-actions) {
-    bottom: auto;
-    top: 50%;
-    translate: 0 -50%;
-  }
-
   .event-reactions {
     display: flex;
     gap: var(--timeline-row-gap);
@@ -1204,23 +1014,6 @@
 
   .event-rail {
     flex: 0 0 var(--avatar-size-small);
-  }
-
-  .swipe-action {
-    align-items: center;
-    bottom: 0;
-    color: var(--sec-main);
-    display: flex;
-    justify-content: center;
-    overflow: hidden;
-    pointer-events: none;
-    position: absolute;
-    right: 0;
-    top: 0;
-  }
-
-  .swipe-action.armed {
-    color: var(--primary-main);
   }
 
   .message:focus-within :global(.message-actions) {
@@ -1272,11 +1065,29 @@
     padding-left: calc(var(--avatar-size-small) + var(--timeline-row-gap) + var(--space-200));
   }
 
-  .message.pending {
-    opacity: 0.65;
+  .collapsed-pending {
+    display: flex;
+    inset-block-start: 0;
+    inset-inline-start: var(--page-gutter);
+    justify-content: center;
+    position: absolute;
+    width: var(--avatar-size-small);
+  }
+
+  .message.collapsed.mention-silent > .collapsed-pending,
+  .message.collapsed.mention-loud > .collapsed-pending {
+    inset-inline-start: var(--space-200);
+  }
+
+  .message.layout-bubble.own.align-own > .collapsed-pending {
+    inset-inline: auto var(--page-gutter);
   }
 
   .message.highlighted {
+    --message-highlight-duration: 6s;
+  }
+
+  .message.highlighted:not(.mention-silent, .mention-loud) {
     border-radius: var(--radius);
   }
 
@@ -1339,20 +1150,31 @@
 
   @media (prefers-reduced-motion: no-preference) {
     :global(html:not([data-reduced-motion='on'])) .message.highlighted {
-      animation: jump 6s var(--motion-easing-standard);
+      animation: jump var(--message-highlight-duration) var(--motion-easing-standard);
+    }
+  }
+
+  @keyframes jump-reduced {
+    0% {
+      background-color: var(--primary-container);
+      color: var(--primary-on-container);
+    }
+
+    33%,
+    100% {
+      background-color: transparent;
+      color: inherit;
     }
   }
 
   @media (prefers-reduced-motion: reduce) {
     .message.highlighted {
-      background-color: var(--primary-container);
-      color: var(--primary-on-container);
+      animation: jump-reduced var(--message-highlight-duration) steps(1, end);
     }
   }
 
   :global(html[data-reduced-motion='on']) .message.highlighted {
-    background-color: var(--primary-container);
-    color: var(--primary-on-container);
+    animation: jump-reduced var(--message-highlight-duration) steps(1, end);
   }
 
   @media (width >= 48rem) and (any-hover: hover) and (any-pointer: fine) {
@@ -1409,6 +1231,7 @@
 
   .receipt-slot {
     display: flex;
+    user-select: none;
   }
 
   .message-content > .receipt-slot {
@@ -1434,6 +1257,7 @@
   .receipt-space {
     display: inline-block;
     inline-size: var(--receipt-reserve);
+    user-select: none;
   }
 
   .has-receipts:global([data-receipt-narrow]) {
@@ -1470,18 +1294,9 @@
   }
 
   .persona {
-    --pmp-ink: var(--pmp-on-light, var(--sec-on-container));
-  }
-
-  @media (prefers-color-scheme: dark) {
-    :root:not(.light) .persona,
-    :root.dark .persona {
-      --pmp-ink: var(--pmp-on-dark, var(--sec-on-container));
-    }
-  }
-
-  :root.dark .persona {
-    --pmp-ink: var(--pmp-on-dark, var(--sec-on-container));
+    --ink-on-light: var(--pmp-on-light, var(--sec-on-container));
+    --ink-on-dark: var(--pmp-on-dark, var(--sec-on-container));
+    --pmp-ink: var(--ink);
   }
 
   .message.persona :global(.message-avatar) {
@@ -1496,11 +1311,14 @@
     background: none;
     border: none;
     cursor: pointer;
+    flex-grow: 1;
     letter-spacing: 0.01em;
+    max-width: max-content;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    width: 0;
   }
 
   .via.via-hidden {
@@ -1574,211 +1392,15 @@
 
   /* `m.notice` is usually a bot, and reads as an aside. */
   .notice {
-    color: var(--surface-var-on-container);
-  }
-
-  .send-failure {
-    align-items: baseline;
-    color: var(--crit-main);
-    display: flex;
-    flex-wrap: wrap;
-    font-size: var(--font-size-small);
-    gap: var(--space-050) var(--space-200);
-    margin-top: var(--space-050);
-  }
-
-  .send-failure-reason {
-    color: var(--surface-var-on-container);
-    flex-basis: 100%;
-    overflow-wrap: anywhere;
-  }
-
-  .send-failure button {
-    background: none;
-    border: 0;
-    color: inherit;
-    cursor: pointer;
-    font: inherit;
-    padding: 0;
-    position: relative;
-    text-decoration: underline;
-    text-underline-offset: 0.15em;
-  }
-
-  /* Small text buttons, so the tap area is grown without moving the baseline. */
-  .send-failure button::after {
-    content: '';
-    inset: -0.5rem -0.25rem;
-    position: absolute;
-  }
-
-  .send-failure button:focus-visible {
-    border-radius: var(--radii-200);
-    outline: var(--focus-ring-width) solid var(--focus-ring);
-    outline-offset: 0.15rem;
-  }
-
-  .transfer {
-    align-items: center;
-    display: flex;
-    gap: var(--space-100);
-    margin-top: var(--space-100);
-  }
-
-  .upload {
-    accent-color: var(--primary-main);
-    display: block;
-    flex: 0 1 16rem;
-    height: 0.25rem;
-    min-width: 0;
-  }
-
-  .transfer-count {
-    color: var(--surface-var-on-container);
-    font-size: var(--font-size-small);
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-  }
-
-  .reply-preview {
-    align-items: center;
-    background: transparent;
-    border: 0;
-    border-radius: var(--radius);
-    color: var(--surface-on-container);
-    cursor: pointer;
-    display: grid;
-    font: inherit;
-    font-size: var(--font-size-small);
-    gap: var(--space-200);
-    grid-template-columns: auto minmax(0, 1fr);
-    line-height: 1.4;
-    margin: 0;
-    margin-bottom: var(--space-100);
-    padding: var(--space-100) var(--space-200);
-    text-align: start;
-    width: 100%;
-  }
-
-  .reply-preview :global(.reply-icon) {
-    color: var(--primary-main);
-    height: var(--icon-size-small);
-    width: var(--icon-size-small);
-  }
-
-  .reply-copy {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  /* WebKit uses a clipped inline-block's bottom as its baseline. */
-  :global(.reply-name) {
-    display: inline-block;
-    overflow: clip;
-    vertical-align: top;
-  }
-
-  .reply-compact {
-    gap: var(--space-100);
-    padding: 0;
-  }
-
-  .reply-compact :global(.reply-icon) {
-    height: var(--size-x50);
-    width: var(--size-x50);
-  }
-
-  .reply-compact .reply-body,
-  .reply-connected .reply-body {
-    filter: brightness(var(--opacity-p300));
-  }
-
-  .reply-connected {
-    --reply-connector-width: var(--border-width-500);
-
-    grid-column: 1 / -1;
-    grid-template-columns: minmax(0, 1fr);
-    margin-bottom: var(--space-100);
-    min-height: var(--space-500);
-    overflow: visible;
-    padding-block: 0;
-    padding-inline: 0;
-    position: relative;
-  }
-
-  .reply-connected::before {
-    border-left: var(--reply-connector-width) solid var(--surface-on-container);
-    border-radius: var(--radius) 0 0;
-    border-top: var(--reply-connector-width) solid var(--surface-on-container);
-    content: '';
-    height: calc(var(--space-250) + var(--border-width-300));
-    left: calc(-1 * (var(--timeline-row-gap) + var(--avatar-size-small) / 2));
-    opacity: var(--opacity-placeholder);
-    pointer-events: none;
-    position: absolute;
-    top: calc(50% - var(--border-width-300));
-    width: calc(var(--timeline-row-gap) / 2 + var(--avatar-size-small) / 2);
-  }
-
-  .reply-connected:is(:hover, :focus-visible)::before {
-    opacity: var(--opacity-p300);
+    color: light-dark(
+      color-mix(var(--surface-var-on-container), var(--primary-main) 70%),
+      var(--surface-var-on-container)
+    );
   }
 
   .message.has-connected-reply:not(.layout-compact) > :global(.avatar-button),
   .message.has-connected-reply:not(.layout-compact) > :global(.avatar-root.message-avatar) {
     margin-top: var(--space-600);
-  }
-
-  .reply-expanded {
-    --reply-accent-width: var(--border-width-600);
-
-    align-items: start;
-    background: var(--surface-var-container);
-    color: var(--surface-var-on-container);
-    grid-template-columns: auto minmax(0, 1fr);
-    padding: var(--space-200) var(--space-300) var(--space-200)
-      calc(var(--space-300) + var(--reply-accent-width));
-    position: relative;
-  }
-
-  .reply-expanded::before {
-    background: var(--primary-main);
-    bottom: 0;
-    content: '';
-    left: 0;
-    pointer-events: none;
-    position: absolute;
-    top: 0;
-    width: var(--reply-accent-width);
-  }
-
-  .reply-expanded .reply-copy {
-    display: grid;
-    gap: var(--space-050);
-    white-space: normal;
-  }
-
-  .reply-expanded .reply-copy > span {
-    -webkit-box-orient: vertical;
-    display: -webkit-box;
-    -webkit-line-clamp: 6;
-    line-clamp: 6;
-    overflow: hidden;
-  }
-
-  .reply-preview:is(:hover, :focus-visible) .reply-body {
-    filter: brightness(var(--opacity-p500));
-  }
-
-  .reply-expanded:is(:hover, :focus-visible) {
-    background: var(--surface-var-container-hover);
-  }
-
-  .reply-preview:focus-visible .reply-copy {
-    text-decoration: underline;
-    text-decoration-thickness: var(--border-width);
-    text-underline-offset: 0.15em;
   }
 
   @media (prefers-reduced-motion: no-preference) {
@@ -1804,9 +1426,19 @@
 
   /* Layout modes stay in one block at the end: each overrides a base rule
      above, and a second copy elsewhere would drift out of sync. */
-  .message.layout-compact {
-    align-items: baseline;
-    gap: var(--space-300);
+  .message.layout-compact .message-content {
+    column-gap: var(--space-300);
+    grid-template-columns: clamp(7.5rem, 20%, 10.625rem) minmax(0, 1fr);
+  }
+
+  .message.layout-compact .message-content > :global(.reply-preview) {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .message.layout-compact .message-main {
+    grid-column: 2;
+    grid-row: 2;
   }
 
   .message.layout-compact.collapsed {
@@ -1814,14 +1446,20 @@
   }
 
   .compact-gutter {
-    align-items: baseline;
+    align-items: center;
     display: flex;
-    flex: 0 0 clamp(7.5rem, 20%, 10.625rem);
     gap: var(--space-200);
+    grid-column: 1;
+    grid-row: 2;
+    height: fit-content;
     justify-content: space-between;
     min-width: 0;
     overflow: hidden;
     white-space: nowrap;
+  }
+
+  .message.has-connected-reply .compact-gutter {
+    grid-row: 1;
   }
 
   .message.layout-compact .compact-gutter time {
@@ -1831,9 +1469,10 @@
     font-variant-numeric: tabular-nums;
   }
 
-  .message.layout-compact .reply-connected::before {
-    left: calc(var(--space-050) - var(--space-300));
-    width: calc(var(--space-300) - var(--space-150));
+  .compact-user {
+    display: flex;
+    font-size: inherit;
+    gap: var(--space-100);
   }
 
   .message.layout-bubble .message-main {
@@ -1842,7 +1481,10 @@
     flex-direction: column;
   }
 
-  .message.layout-bubble .message-main > * {
+  .message.layout-bubble .message-main > *,
+  .message.layout-bubble
+    .message-main
+    > :global(:where(.reply-preview, .thread-summary, .transfer, .send-failure)) {
     max-width: min(50rem, 100%);
     min-width: 0;
   }
@@ -1898,31 +1540,45 @@
     flex-wrap: wrap;
   }
 
-  .message:not(.layout-bubble) .message-main:has(> .receipt-tail) > * {
+  .message:not(.layout-bubble) .message-main:has(> .receipt-tail) > *,
+  .message:not(.layout-bubble)
+    .message-main:has(> .receipt-tail)
+    > :global(:where(.reply-preview, .thread-summary, .transfer, .send-failure)) {
     flex: 0 0 100%;
     min-width: 0;
   }
 
-  .message:not(.layout-bubble) .message-main:has(> .receipt-tail) > :nth-last-child(2) {
+  .message:not(.layout-bubble) .message-main:has(> .receipt-tail) > :nth-last-child(2),
+  .message:not(.layout-bubble)
+    .message-main:has(> .receipt-tail)
+    > :global(:where(.reply-preview, .thread-summary, .transfer, .send-failure)):nth-last-child(2) {
     flex: 0 1 auto;
   }
 
   .message:not(.layout-bubble.own.align-own)
     .message-main:has(> .receipt-tail)
-    > :global(.reactions):nth-last-child(2) {
+    > :global(.reactions):nth-last-child(2),
+  .message:not(.layout-bubble)
+    .message-main:has(> .receipt-tail)
+    > :nth-last-child(2):has(:global(.media-frame-audio, .poll, .location)) {
     flex-basis: calc(100% - var(--receipt-reserve) - var(--space-200));
     max-width: calc(100% - var(--receipt-reserve) - var(--space-200));
   }
 
   .message:not(.layout-bubble) .message-main > .receipt-tail {
+    block-size: var(--size-x300);
     flex: none;
     inline-size: calc(var(--receipt-reserve) + var(--space-200));
     margin-inline-start: auto;
+    user-select: none;
   }
 
   .message.layout-bubble:not(.own.align-own)
     .message-main:has(> .receipt-tail)
-    > :nth-last-child(2) {
+    > :nth-last-child(2),
+  .message.layout-bubble:not(.own.align-own)
+    .message-main:has(> .receipt-tail)
+    > :global(:where(.reply-preview, .thread-summary, .transfer, .send-failure)):nth-last-child(2) {
     margin-inline-end: calc(var(--receipt-reserve) + var(--space-200));
   }
 
@@ -1930,7 +1586,7 @@
     .message-main:has(> .receipt-tail)
     > :global(*):nth-last-child(2) {
     margin-inline-end: max(
-      0,
+      calc(var(--space-100) * 0),
       calc(var(--receipt-reserve) + var(--space-200) - var(--avatar-size-small) - var(--space-250))
     );
   }
@@ -1954,29 +1610,6 @@
   .message.layout-bubble.own.align-own .message-main {
     align-items: flex-end;
     grid-column: 1 / -1;
-  }
-
-  .message.layout-bubble.own.align-own .reply-preview {
-    grid-template-columns: minmax(0, 1fr) auto;
-    text-align: end;
-    width: auto;
-  }
-
-  .message.layout-bubble.own.align-own .reply-preview :global(.reply-icon) {
-    grid-column: 2;
-    grid-row: 1;
-  }
-
-  .message.layout-bubble.own.align-own .reply-connected {
-    text-align: end;
-  }
-
-  .message.layout-bubble.own.align-own .reply-connected::before {
-    border-left: 0;
-    border-radius: 0 var(--radius) 0 0;
-    border-right: var(--reply-connector-width) solid var(--surface-on-container);
-    left: auto;
-    right: calc(-1 * (var(--timeline-row-gap) + var(--avatar-size-small) / 2));
   }
 
   .message.layout-bubble.own.align-own header {

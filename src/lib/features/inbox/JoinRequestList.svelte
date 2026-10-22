@@ -1,6 +1,6 @@
 <script lang="ts">
   import { SvelteSet } from 'svelte/reactivity';
-  import type { MemberView, RoomPermissionsView, RoomSummary } from '#src/generated/protocol';
+  import type { MemberView, RoomPermissionsView, RoomListItemView } from '#src/generated/protocol';
 
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
@@ -11,7 +11,7 @@
   import Spinner from '#lib/ui/primitives/Spinner.svelte';
 
   interface JoinRequest {
-    room: RoomSummary;
+    room: RoomListItemView;
     member: MemberView;
     permissions: RoomPermissionsView;
   }
@@ -50,9 +50,12 @@
     );
     const results = await Promise.allSettled(
       rooms.map(async (room): Promise<JoinRequest[]> => {
-        const permissions = await core.commands.roomPermissions(room.room_id);
+        const permissions = await core.rpc.members.permissions({ room_id: room.room_id });
         if (!permissions.can_invite && !permissions.can_kick) return [];
-        const members = await core.commands.roomMembers(room.room_id, ['knock']);
+        const members = await core.rpc.members.list({
+          room_id: room.room_id,
+          memberships: ['knock'],
+        });
         return members
           .filter((member) => member.membership === 'knock')
           .map((member) => ({ room, member, permissions }));
@@ -72,11 +75,8 @@
     busy = true;
     actionFailed = false;
     try {
-      if (approve) await core.commands.inviteUser(room.room_id, member.user_id);
-      else
-        await core.commands.sendStateEvent(room.room_id, 'm.room.member', member.user_id, {
-          membership: 'leave',
-        });
+      if (approve) await core.rpc.rooms.invite({ room_id: room.room_id, user_id: member.user_id });
+      else await core.rpc.members.denyKnock({ room_id: room.room_id, user_id: member.user_id });
       answered.add(key(request));
     } catch (error) {
       console.warn('[sable inbox] answering join request failed', error);
@@ -90,19 +90,19 @@
 <div class="requests" aria-busy={loading}>
   {#if failed}
     <Alert variant="critical" role="alert">
-      <p>{$i18n.t('room.membersRequestsFailed')}</p>
+      <p>{i18n.t('room.membersRequestsFailed')}</p>
       <Button variant="secondary" size="small" onclick={() => void load()}>
-        {$i18n.t('inbox.retry')}
+        {i18n.t('common.tryAgain')}
       </Button>
     </Alert>
   {/if}
   {#if actionFailed}
-    <Alert variant="critical" role="alert">{$i18n.t('room.membersRequestActionFailed')}</Alert>
+    <Alert variant="critical" role="alert">{i18n.t('room.membersRequestActionFailed')}</Alert>
   {/if}
   {#if loading && pending.length === 0}
-    <p class="status" role="status"><Spinner small /> {$i18n.t('inbox.checking')}</p>
+    <p class="status" role="status"><Spinner small /> {i18n.t('inbox.checking')}</p>
   {:else if !failed && pending.length === 0}
-    <p class="status">{$i18n.t('room.membersNoRequests')}</p>
+    <p class="status">{i18n.t('room.membersNoRequests')}</p>
   {/if}
   <ul>
     {#each pending as request (key(request))}
@@ -117,7 +117,7 @@
         <div class="actions">
           {#if request.permissions.can_invite}
             <Button size="small" disabled={busy} onclick={() => void answer(request, true)}>
-              {$i18n.t('room.membersApprove')}
+              {i18n.t('room.membersApprove')}
             </Button>
           {/if}
           {#if request.permissions.can_kick && member.power_level < request.permissions.own_power_level}
@@ -127,7 +127,7 @@
               disabled={busy}
               onclick={() => void answer(request, false)}
             >
-              {$i18n.t('room.membersDeny')}
+              {i18n.t('room.membersDeny')}
             </Button>
           {/if}
         </div>

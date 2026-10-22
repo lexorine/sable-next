@@ -15,6 +15,7 @@
 
   import {
     selectedPushDistributor,
+    NoDistributorError,
     selectedPushProvider,
     switchPushDistributor,
     switchPushProvider,
@@ -26,7 +27,7 @@
     overrideProblem,
     type PushOverride,
     pushOverride,
-  } from './push-config';
+  } from '#lib/notifications/push-config.js';
   import '#lib/ui/primitives/settings-row.css';
 
   const problemLabels: Record<OverrideProblem, string> = {
@@ -45,10 +46,10 @@
   const core = useCoreClient();
   let android = $state(false);
   let native = $state(false);
-  let distributors = $state<string[]>([]);
+  let distributors = $state.raw<string[]>([]);
   let selected = $state('');
   let switching = $state(false);
-  let distributorError = $state(false);
+  let distributorError = $state<'failed' | 'none' | null>(null);
   let provider = $state<PushProvider>('auto');
   let serverPush = $state(false);
 
@@ -61,8 +62,9 @@
       return;
     }
     try {
-      serverPush = (await core.commands.webPusherSupport()).vapid !== null;
-    } catch {
+      serverPush = (await core.rpc.push.webPusherSupport()) !== null;
+    } catch (error) {
+      console.warn('[sable notifications] server push support check failed', error);
       serverPush = false;
     }
   }
@@ -75,9 +77,10 @@
       distributors = await listPushDistributors();
       selected = selectedPushDistributor();
       provider = selectedPushProvider();
-      distributorError = false;
-    } catch {
-      distributorError = true;
+      distributorError = null;
+    } catch (error) {
+      console.warn('[sable notifications] listing push distributors failed', error);
+      distributorError = 'failed';
     }
   }
 
@@ -89,12 +92,13 @@
   async function changeDistributor(name: string): Promise<void> {
     if (switching || !name || name === selected) return;
     switching = true;
-    distributorError = false;
+    distributorError = null;
     try {
       await switchPushDistributor(name, pushOverride(), core.session, core.accounts);
       selected = name;
-    } catch {
-      distributorError = true;
+    } catch (error) {
+      console.warn('[sable notifications] switching push distributor failed', error);
+      distributorError = 'failed';
       selected = selectedPushDistributor();
     } finally {
       switching = false;
@@ -104,13 +108,14 @@
   async function changeProvider(next: string): Promise<void> {
     if (switching || next === provider) return;
     switching = true;
-    distributorError = false;
+    distributorError = null;
     try {
       await switchPushProvider(next as PushProvider, pushOverride(), core.session, core.accounts);
       provider = next as PushProvider;
       selected = selectedPushDistributor();
-    } catch {
-      distributorError = true;
+    } catch (error) {
+      console.warn('[sable notifications] switching push provider failed', error);
+      distributorError = error instanceof NoDistributorError ? 'none' : 'failed';
       provider = selectedPushProvider();
     } finally {
       switching = false;
@@ -157,63 +162,65 @@
 {#if android}
   <section class="gateway settings-form" aria-labelledby="push-distributor">
     <div class="settings-heading-row">
-      <h3 id="push-distributor" data-settings-outline>{$i18n.t('settings.pushTransport')}</h3>
+      <h3 id="push-distributor" data-settings-outline>{i18n.t('settings.pushTransport')}</h3>
       <SettingsAnchorLink anchor="push-distributor" />
     </div>
-    <p class="hint">{$i18n.t('settings.pushTransportHint')}</p>
+    <p class="hint">{i18n.t('settings.pushTransportHint')}</p>
     <Select
       value={provider}
       items={[
-        { value: 'auto', label: $i18n.t('settings.pushTransportAuto') },
-        { value: 'fcm', label: $i18n.t('settings.pushTransportNative') },
-        { value: 'unifiedpush', label: $i18n.t('settings.pushTransportUnifiedPush') },
-        { value: 'embedded', label: $i18n.t('settings.pushDistributorBuiltIn') },
+        { value: 'auto', label: i18n.t('settings.pushTransportAuto') },
+        { value: 'fcm', label: i18n.t('settings.pushTransportNative') },
+        { value: 'unifiedpush', label: i18n.t('settings.pushTransportUnifiedPush') },
+        { value: 'embedded', label: i18n.t('settings.pushDistributorBuiltIn') },
       ]}
-      aria-label={$i18n.t('settings.pushTransport')}
+      aria-label={i18n.t('settings.pushTransport')}
       disabled={switching || core.status !== 'ready'}
       onValueChange={(value) => void changeProvider(value)}
     />
     {#if provider === 'unifiedpush'}
-      <p class="hint">{$i18n.t('settings.pushDistributorHint')}</p>
-      {#key selected + String(switching)}
-        <Select
-          value={selected}
-          items={distributors.map((value) => ({
-            value,
-            label:
-              value === 'embedded-websocket' ? $i18n.t('settings.pushDistributorBuiltIn') : value,
-          }))}
-          aria-label={$i18n.t('settings.pushDistributor')}
-          placeholder={$i18n.t('settings.pushDistributorChoose')}
-          disabled={switching || core.status !== 'ready'}
-          onValueChange={(value) => void changeDistributor(value)}
-        />
-      {/key}
+      <p class="hint">{i18n.t('settings.pushDistributorHint')}</p>
+      <Select
+        bind:value={() => selected, (value) => void changeDistributor(value)}
+        items={distributors.map((value) => ({
+          value,
+          label: value === 'embedded-websocket' ? i18n.t('settings.pushDistributorBuiltIn') : value,
+        }))}
+        aria-label={i18n.t('settings.pushDistributor')}
+        placeholder={i18n.t('settings.pushDistributorChoose')}
+        disabled={switching || core.status !== 'ready'}
+      />
     {/if}
     {#if distributorError}
-      <Alert variant="critical">{$i18n.t('settings.pushDistributorFailed')}</Alert>
+      <Alert variant="critical">
+        {i18n.t(
+          distributorError === 'none'
+            ? 'settings.pushDistributorNone'
+            : 'settings.pushDistributorFailed'
+        )}
+      </Alert>
     {/if}
   </section>
 {/if}
 
 <section class="gateway settings-form" aria-labelledby="push-gateway">
   <div class="settings-heading-row">
-    <h3 id="push-gateway" data-settings-outline>{$i18n.t('settings.pushGateway')}</h3>
+    <h3 id="push-gateway" data-settings-outline>{i18n.t('settings.pushGateway')}</h3>
     <SettingsAnchorLink anchor="push-gateway" />
   </div>
-  <p class="hint settings-description">{$i18n.t('settings.pushGatewayHint')}</p>
+  <p class="hint settings-description">{i18n.t('settings.pushGatewayHint')}</p>
 
   {#if !deliversWebPush() && !native}
     <Alert variant="info">
-      <p>{$i18n.t('settings.pushGatewayUnsupported')}</p>
+      <p>{i18n.t('settings.pushGatewayUnsupported')}</p>
     </Alert>
   {:else if !active && serverPush}
-    <p class="hint">{$i18n.t('settings.pushGatewayServer')}</p>
+    <p class="hint">{i18n.t('settings.pushGatewayServer')}</p>
   {:else if !active}
     {#await config then { push }}
       {#if push}
         <p class="hint">
-          {$i18n.t('settings.pushGatewayDefault', { gateway: push.pushNotifyUrl })}
+          {i18n.t('settings.pushGatewayDefault', { gateway: push.pushNotifyUrl })}
         </p>
       {/if}
     {/await}
@@ -222,7 +229,7 @@
   <div class="rows">
     {#each fields as field (field.key)}
       <label>
-        <span>{$i18n.t(field.label)}</span>
+        <span>{i18n.t(field.label)}</span>
         <TextInput
           bind:value={draft[field.key]}
           placeholder={field.placeholder}
@@ -236,11 +243,11 @@
 
   {#if problem !== null}
     <Alert variant="warning" role="status">
-      <p>{$i18n.t(problemLabels[problem])}</p>
+      <p>{i18n.t(problemLabels[problem])}</p>
     </Alert>
   {:else if active}
     <Alert variant="warning" role="status">
-      <p>{$i18n.t('settings.pushGatewayWarning')}</p>
+      <p>{i18n.t('settings.pushGatewayWarning')}</p>
     </Alert>
   {/if}
 
@@ -253,7 +260,7 @@
         apply(draft);
       }}
     >
-      {$i18n.t('settings.pushGatewayApply')}
+      {i18n.t('common.apply')}
     </Button>
     <Button
       variant="secondary"
@@ -263,7 +270,7 @@
         apply(BLANK);
       }}
     >
-      {$i18n.t('settings.pushGatewayReset')}
+      {i18n.t('settings.pushGatewayReset')}
     </Button>
   </div>
 </section>

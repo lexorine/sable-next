@@ -17,7 +17,8 @@
     try {
       await core.switchAccount(accountId);
       await goto(resolve('/(app)/rooms'));
-    } catch {
+    } catch (error) {
+      console.warn('[sable auth] switching account failed', error);
       switchFailed = true;
     } finally {
       switching = false;
@@ -30,7 +31,8 @@
     try {
       await skipV1Migration();
       await core.start();
-    } catch {
+    } catch (error) {
+      console.warn('[sable auth] skipping the migration failed', error);
       switchFailed = true;
     } finally {
       switching = false;
@@ -43,7 +45,8 @@
     try {
       await goto(resolve('login?addAccount=1'));
       core.beginSignInRecovery();
-    } catch {
+    } catch (error) {
+      console.warn('[sable auth] opening sign-in failed', error);
       switchFailed = true;
     } finally {
       switching = false;
@@ -53,26 +56,26 @@
 
 <main class="restore-error" aria-labelledby="restore-error-title">
   <div class="restore-card" role="alert">
-    <h1 id="restore-error-title">{$i18n.t('app.unableToStart')}</h1>
-    <p>{$i18n.t(core.migrationFailed ? 'app.migrationFailed' : 'app.startFailed')}</p>
+    <h1 id="restore-error-title">{i18n.t('app.unableToStart')}</h1>
+    <p>{i18n.t(core.migrationFailed ? 'app.migrationFailed' : 'app.startFailed')}</p>
     {#if core.migrationError}<p>{core.migrationError}</p>{/if}
     <Button disabled={busy} onclick={() => void core.start()}>
-      {$i18n.t('app.tryAgain')}
+      {i18n.t('common.tryAgain')}
     </Button>
     {#each core.accounts.filter((account) => !account.needs_reauth) as account (account.account_id)}
       <Button disabled={busy} onclick={() => void switchAccount(account.account_id)}>
-        {$i18n.t('nav.switchAccount')}: {account.user_id} ({account.device_id})
+        {i18n.t('nav.switchAccount')}: {account.user_id} ({account.device_id})
       </Button>
     {/each}
-    {#if switchFailed}<p role="alert">{$i18n.t('app.unableToStart')}</p>{/if}
+    {#if switchFailed}<p role="alert">{i18n.t('app.unableToStart')}</p>{/if}
     {#if core.migrationFailed}
-      <p>{$i18n.t('app.skipMigrationHint')}</p>
+      <p>{i18n.t('app.skipMigrationHint')}</p>
       <Button disabled={busy} onclick={() => void skipMigration()}>
-        {$i18n.t('app.skipMigration')}
+        {i18n.t('app.skipMigration')}
       </Button>
     {:else}
-      <p>{$i18n.t('app.signInRecoveryHint')}</p>
-      <Button disabled={busy} onclick={() => void signIn()}>{$i18n.t('auth.signInTitle')}</Button>
+      <p>{i18n.t('app.signInRecoveryHint')}</p>
+      <Button disabled={busy} onclick={() => void signIn()}>{i18n.t('auth.signInTitle')}</Button>
     {/if}
   </div>
 </main>

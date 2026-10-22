@@ -19,6 +19,7 @@ test('converts v1 percentages, layouts and renamed settings while keeping the so
     messageLayout: 2,
     messageSpacing: '100',
     hideNickAvatarEvents: false,
+    renderGlobalNameColors: false,
     editorButtonOrder: ['emoji', 'gif', 'sticker'],
     pmpNoFallback: true,
     useSystemTheme: true,
@@ -30,6 +31,7 @@ test('converts v1 percentages, layouts and renamed settings while keeping the so
     layout: 'bubble',
     messageSpacing: 'compact',
     hideProfileChanges: false,
+    renderProfileColors: false,
     personaFallback: false,
     theme: 'system',
   });
@@ -58,4 +60,17 @@ test('invalid v1 settings cannot replace valid v2 defaults', async () => {
   );
   const { preferences } = await import('#lib/settings/preferences.svelte.js');
   expect(preferences).toMatchObject({ pageZoom: 1, layout: 'modern', twitterEmoji: true });
+});
+
+test.each([
+  ['0', 'none'],
+  ['100', 'compact'],
+  ['200', 'compact'],
+  ['300', 'cozy'],
+  ['400', 'cozy'],
+  ['500', 'roomy'],
+])('v1 message spacing %s becomes %s', async (v1, v2) => {
+  localStorage.setItem('settings', JSON.stringify({ messageSpacing: v1 }));
+  const { preferences } = await import('#lib/settings/preferences.svelte.js');
+  expect(preferences.messageSpacing).toBe(v2);
 });

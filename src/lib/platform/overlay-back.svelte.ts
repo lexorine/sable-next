@@ -1,6 +1,8 @@
-import { goto } from '$app/navigation';
 import { page } from '$app/state';
 import { tick, untrack } from 'svelte';
+
+import { leaveUnlessUnsaved } from '#lib/ui/unsaved-guard.js';
+import { setPageState } from './page-state.js';
 
 export function overlayBackDepth(state: App.PageState): number {
   return state.overlay ?? 0;
@@ -42,10 +44,7 @@ export async function afterOverlayPops(): Promise<void> {
 
 async function pushEntry(depth: number): Promise<boolean> {
   try {
-    await goto('', {
-      shallow: true,
-      state: { ...untrack(() => page.state), overlay: depth },
-    });
+    await setPageState({ ...untrack(() => page.state), overlay: depth });
     return true;
   } catch (error) {
     console.warn('[sable overlay] the back guard could not hold a history entry', error);
@@ -57,29 +56,41 @@ async function pushEntry(depth: number): Promise<boolean> {
 
 export function holdOverlayBack(open: () => boolean, close: () => void): void {
   let held = $state(0);
+  let rearm: (() => void) | null = null;
 
   $effect(() => {
     if (!open()) return;
 
     let mine = true;
     const href = location.href;
-    const depth = (pushed += 1);
-    if (queued > 0) {
-      queued -= 1;
-      held = depth;
-    } else {
+    let depth = 0;
+    const acquire = (): void => {
+      const taken = (pushed += 1);
+      depth = taken;
+      if (queued > 0) {
+        queued -= 1;
+        held = taken;
+        return;
+      }
       pushing += 1;
-      void pushEntry(depth).then((ok) => {
-        if (!ok) pushed = depth - 1;
-        else if (mine) held = depth;
+      void pushEntry(taken).then((ok) => {
+        if (!ok) pushed = taken - 1;
+        else if (mine) held = taken;
         else popEntries(1);
       });
-    }
+    };
+    acquire();
+    rearm = () => {
+      void afterOverlayPops().then(() => {
+        if (mine) acquire();
+      });
+    };
 
     return () => {
       const armed = held;
       mine = false;
       held = 0;
+      rearm = null;
       if (armed === 0 || depth > pushed) return;
       if (location.href !== href) {
         pushed = depth - 1;
@@ -94,6 +105,10 @@ export function holdOverlayBack(open: () => boolean, close: () => void): void {
   $effect(() => {
     const current = overlayBackDepth(page.state);
     if (pushing === 0 && current < pushed) pushed = current;
-    if (held > 0 && current < held) close();
+    if (held > 0 && current < held) {
+      held = 0;
+      const restore = rearm;
+      leaveUnlessUnsaved(close, () => restore?.());
+    }
   });
 }

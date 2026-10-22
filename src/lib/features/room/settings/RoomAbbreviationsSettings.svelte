@@ -2,7 +2,7 @@
   import type {
     RoomPermissionsView,
     RoomPowerLevelsView,
-    RoomSummary,
+    RoomListItemView,
   } from '#src/generated/protocol';
   import PencilIcon from 'phosphor-svelte/lib/PencilIcon';
   import TrashIcon from 'phosphor-svelte/lib/TrashIcon';
@@ -26,7 +26,6 @@
   import {
     ABBREVIATIONS_EVENT_TYPE,
     abbreviationKey,
-    readAbbreviations,
     splitTerms,
     upsertAbbreviation,
     type AbbreviationEntry,
@@ -35,7 +34,7 @@
   import '#lib/ui/primitives/settings-row.css';
 
   interface Props {
-    room: RoomSummary | null;
+    room: RoomListItemView | null;
     permissions: RoomPermissionsView | null;
     levels: RoomPowerLevelsView | null;
   }
@@ -46,20 +45,30 @@
 
   type InheritedGroup = { spaceId: string; spaceName: string; entries: AbbreviationEntry[] };
 
-  let entries = $state.raw<AbbreviationEntry[]>([]);
   let inheritedGroups = $state.raw<InheritedGroup[]>([]);
   let term = $state('');
   let definition = $state('');
   let cased = $state(false);
   let editingKey = $state<string | null>(null);
-  let duplicate = $state(false);
+  let duplicate = $derived.by(() => {
+    void term;
+    void definition;
+    return false;
+  });
   let pendingRemoval = $state<AbbreviationEntry | null>(null);
   let busy = $state(false);
   let failed = $state(false);
-  let run = 0;
   let inheritedRun = 0;
 
   let roomId = $derived(room?.room_id ?? null);
+  let entries = $derived<AbbreviationEntry[]>(
+    roomId === null
+      ? []
+      : await core.rpc.room_state.abbreviations({ room_id: roomId }).catch((error: unknown) => {
+          console.debug('[sable room] abbreviations unavailable', error);
+          return [];
+        })
+  );
   let canEdit = $derived(
     canSendState(levels, permissions?.own_power_level ?? 0, ABBREVIATIONS_EVENT_TYPE)
   );
@@ -67,19 +76,8 @@
   let totalCount = $derived(entries.length + inheritedEntries.length);
 
   $effect(() => {
-    const target = roomId;
+    void roomId;
     resetForm();
-    if (!target) return;
-
-    const current = ++run;
-    void core.commands
-      .roomStateEvent(target, ABBREVIATIONS_EVENT_TYPE)
-      .then((content) => {
-        if (current === run) entries = readAbbreviations(content);
-      })
-      .catch((error: unknown) => {
-        console.debug('[sable room] abbreviations unavailable', error);
-      });
   });
 
   // Abbreviations inherited from parent spaces are read-only here, like v1:
@@ -88,7 +86,7 @@
     const target = roomId;
     void roomList.rooms;
     void abbreviationChanges.version;
-    if (!target || room?.is_space) {
+    if (!target || room?.room_kind === 'space') {
       inheritedGroups = [];
       return;
     }
@@ -99,9 +97,7 @@
       ids.map(async (spaceId) => {
         let list: AbbreviationEntry[] = [];
         try {
-          list = readAbbreviations(
-            await core.commands.roomStateEvent(spaceId, ABBREVIATIONS_EVENT_TYPE)
-          );
+          list = await core.rpc.room_state.abbreviations({ room_id: spaceId });
         } catch (error) {
           console.debug('[sable room] inherited abbreviations unavailable', error);
         }
@@ -114,12 +110,6 @@
     });
   });
 
-  $effect(() => {
-    void term;
-    void definition;
-    duplicate = false;
-  });
-
   async function save(next: readonly AbbreviationEntry[]): Promise<boolean> {
     const target = roomId;
     if (!target || busy) return false;
@@ -127,7 +117,10 @@
     busy = true;
     failed = false;
     try {
-      await core.commands.sendStateEvent(target, ABBREVIATIONS_EVENT_TYPE, '', { entries: next });
+      await core.rpc.room_state.setAbbreviations({
+        room_id: target,
+        entries: $state.snapshot([...next]),
+      });
       entries = [...next];
       abbreviationsChanged();
       return true;
@@ -159,7 +152,7 @@
     const drafted = splitTerms(term).map((nextTerm) => ({
       term: nextTerm,
       definition: nextDefinition,
-      ...(cased ? { cased: true } : {}),
+      cased,
     }));
     const unique = drafted.filter(
       (entry, index) =>
@@ -246,34 +239,34 @@
   {#if canEdit && editingKey === null}
     <SettingsSection
       headingId="room-settings-abbreviations-add"
-      title={$i18n.t('room.abbreviationsAdd')}
+      title={i18n.t('room.abbreviationsAdd')}
     >
       <form class="settings-form" onsubmit={add}>
         {#if failed}
-          <Alert variant="critical" role="alert">{$i18n.t('room.abbreviationsFailed')}</Alert>
+          <Alert variant="critical" role="alert">{i18n.t('room.abbreviationsFailed')}</Alert>
         {/if}
         {#if duplicate}
           <Alert variant="critical" role="alert">
-            {$i18n.t('room.abbreviationsDuplicate')}
+            {i18n.t('room.abbreviationsDuplicate')}
           </Alert>
         {/if}
-        <FormField fieldId="room-abbr-term" label={$i18n.t('room.abbreviationsTerm')}>
+        <FormField fieldId="room-abbr-term" label={i18n.t('room.abbreviationsTerm')}>
           <TextInput
             id="room-abbr-term"
             bind:value={term}
-            placeholder={$i18n.t('room.abbreviationsTermPlaceholder')}
+            placeholder={i18n.t('room.abbreviationsTermPlaceholder')}
           />
         </FormField>
-        <FormField fieldId="room-abbr-definition" label={$i18n.t('room.abbreviationsDefinition')}>
+        <FormField fieldId="room-abbr-definition" label={i18n.t('room.abbreviationsDefinition')}>
           <TextInput
             id="room-abbr-definition"
             bind:value={definition}
-            placeholder={$i18n.t('room.abbreviationsDefinitionPlaceholder')}
+            placeholder={i18n.t('room.abbreviationsDefinitionPlaceholder')}
           />
         </FormField>
         <label class="cased-option">
           <input type="checkbox" bind:checked={cased} />
-          {$i18n.t('room.abbreviationsCased')}
+          {i18n.t('room.abbreviationsCased')}
         </label>
         <div class="actions">
           <Button
@@ -281,7 +274,7 @@
             loading={busy}
             disabled={term.trim() === '' || definition.trim() === ''}
           >
-            {$i18n.t('room.abbreviationsAdd')}
+            {i18n.t('room.abbreviationsAdd')}
           </Button>
         </div>
       </form>
@@ -291,9 +284,9 @@
   <SettingsSection
     headingId="room-settings-abbreviations"
     title={totalCount > 0
-      ? $i18n.t('room.abbreviationsCount', { count: totalCount })
-      : $i18n.t('room.settingsAbbreviations')}
-    description={$i18n.t('room.abbreviationsHint')}
+      ? i18n.t('room.abbreviationsCount', { count: totalCount })
+      : i18n.t('room.settingsAbbreviations')}
+    description={i18n.t('room.abbreviationsHint')}
   >
     {#if entries.length > 0 || inheritedGroups.length > 0}
       <ul class="settings-rows">
@@ -304,37 +297,34 @@
                 <form class="inline-editor" onsubmit={applyEdit}>
                   {#if failed}
                     <Alert variant="critical" role="alert"
-                      >{$i18n.t('room.abbreviationsFailed')}</Alert
+                      >{i18n.t('room.abbreviationsFailed')}</Alert
                     >
                   {/if}
                   {#if duplicate}
                     <Alert variant="critical" role="alert">
-                      {$i18n.t('room.abbreviationsDuplicate')}
+                      {i18n.t('room.abbreviationsDuplicate')}
                     </Alert>
                   {/if}
-                  <FormField
-                    fieldId="room-abbr-edit-term"
-                    label={$i18n.t('room.abbreviationsTerm')}
-                  >
+                  <FormField fieldId="room-abbr-edit-term" label={i18n.t('room.abbreviationsTerm')}>
                     <TextInput
                       id="room-abbr-edit-term"
                       bind:value={term}
-                      placeholder={$i18n.t('room.abbreviationsTermPlaceholder')}
+                      placeholder={i18n.t('room.abbreviationsTermPlaceholder')}
                     />
                   </FormField>
                   <FormField
                     fieldId="room-abbr-edit-definition"
-                    label={$i18n.t('room.abbreviationsDefinition')}
+                    label={i18n.t('room.abbreviationsDefinition')}
                   >
                     <TextInput
                       id="room-abbr-edit-definition"
                       bind:value={definition}
-                      placeholder={$i18n.t('room.abbreviationsDefinitionPlaceholder')}
+                      placeholder={i18n.t('room.abbreviationsDefinitionPlaceholder')}
                     />
                   </FormField>
                   <label class="cased-option">
                     <input type="checkbox" bind:checked={cased} />
-                    {$i18n.t('room.abbreviationsCased')}
+                    {i18n.t('room.abbreviationsCased')}
                   </label>
                   <div class="actions">
                     <Button
@@ -342,7 +332,7 @@
                       loading={busy}
                       disabled={term.trim() === '' || definition.trim() === ''}
                     >
-                      {$i18n.t('room.abbreviationsSave')}
+                      {i18n.t('room.abbreviationsSave')}
                     </Button>
                   </div>
                 </form>
@@ -351,7 +341,7 @@
                 <IconButton
                   variant="subtle"
                   size="small"
-                  label={$i18n.t('room.abbreviationsCancel')}
+                  label={i18n.t('common.cancel')}
                   disabled={busy}
                   onclick={resetForm}
                 >
@@ -363,13 +353,13 @@
             <SettingsRow
               title={entry.term}
               description={entry.definition}
-              badge={entry.cased ? $i18n.t('room.abbreviationsCased') : undefined}
+              badge={entry.cased ? i18n.t('room.abbreviationsCased') : undefined}
             >
               {#if canEdit}
                 <IconButton
                   variant="subtle"
                   size="small"
-                  label={$i18n.t('room.abbreviationsEdit', { term: entry.term })}
+                  label={i18n.t('room.abbreviationsEdit', { term: entry.term })}
                   disabled={busy}
                   onclick={() => startEdit(entry)}
                 >
@@ -378,7 +368,7 @@
                 <IconButton
                   variant="subtle"
                   size="small"
-                  label={$i18n.t('room.abbreviationsRemove', { term: entry.term })}
+                  label={i18n.t('room.abbreviationsRemove', { term: entry.term })}
                   disabled={busy}
                   onclick={() => requestRemoval(entry)}
                 >
@@ -393,14 +383,14 @@
             <SettingsRow
               title={entry.term}
               description={entry.definition}
-              badge={$i18n.t('room.abbreviationsSpaceTag', { space: group.spaceName })}
+              badge={i18n.t('room.abbreviationsSpaceTag', { space: group.spaceName })}
             />
           {/each}
         {/each}
       </ul>
     {:else}
       <p class="settings-note settings-form">
-        {$i18n.t(canEdit ? 'room.abbreviationsEmptyForm' : 'room.abbreviationsEmpty')}
+        {i18n.t(canEdit ? 'room.abbreviationsEmptyForm' : 'room.abbreviationsEmpty')}
       </p>
     {/if}
   </SettingsSection>
@@ -411,8 +401,8 @@
   onOpenChange={(next: boolean) => {
     if (!next && busy === false) pendingRemoval = null;
   }}
-  title={$i18n.t('room.abbreviationsRemoveConfirm', { term: pendingRemoval?.term ?? '' })}
-  confirmLabel={$i18n.t('room.remove')}
+  title={i18n.t('room.abbreviationsRemoveConfirm', { term: pendingRemoval?.term ?? '' })}
+  confirmLabel={i18n.t('common.remove')}
   {busy}
   onConfirm={confirmRemoval}
 />

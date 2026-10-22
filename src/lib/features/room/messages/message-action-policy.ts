@@ -1,12 +1,8 @@
 import type { TimelineItemView } from '#src/generated/protocol';
 import { isRecord } from '#lib/guards.js';
 
-import { canForward, canRedact } from '../timeline/timeline-format';
-
-type DownloadableMedia = Extract<
-  TimelineItemView['content'],
-  { kind: 'image' | 'video' | 'audio' | 'file' }
->;
+import { canRedact } from '../timeline/timeline-format';
+import { isMediaCaptionContent, type MediaCaptionContent } from './media-caption';
 
 export type MessageActionPolicyInput = {
   item: TimelineItemView;
@@ -32,7 +28,7 @@ export type MessageActionPolicy = {
   editId: string;
   body: string | null;
   html: string | null;
-  media: DownloadableMedia | null;
+  media: MediaCaptionContent | null;
   mediaCaption: boolean;
   threadTarget: string | null;
   pinned: boolean;
@@ -79,21 +75,15 @@ export function messageActionPolicy({
   stealCount,
 }: MessageActionPolicyInput): MessageActionPolicy {
   const eventId = item.event_id ?? '';
+  const media = isMediaCaptionContent(item.content) ? item.content : null;
   const body =
     item.content.kind === 'message'
       ? item.content.body
-      : item.content.kind === 'image'
-        ? (item.content.caption ?? '')
+      : media !== null
+        ? (media.caption ?? '')
         : null;
-  const media =
-    item.content.kind === 'image' ||
-    item.content.kind === 'video' ||
-    item.content.kind === 'audio' ||
-    item.content.kind === 'file'
-      ? item.content
-      : null;
   const editable =
-    item.is_own && (item.content.kind === 'message' || item.content.kind === 'image');
+    item.is_own && item.forwarded === null && (item.content.kind === 'message' || media !== null);
   const hasRoomEvent = roomId !== '' && eventId !== '';
   const threadTarget = item.thread_root ?? item.event_id;
   const rawContent = item.content.kind === 'hidden_event' ? item.content.content : null;
@@ -101,25 +91,33 @@ export function messageActionPolicy({
   const canAnnotate =
     !isRecord(relation) ||
     (relation.rel_type !== 'm.annotation' && relation.rel_type !== 'm.replace');
+  const redacted = item.content.kind === 'redacted';
 
   return {
     eventId,
     editId: item.event_id ?? item.transaction_id ?? '',
     body,
-    html: item.content.kind === 'message' ? item.content.html : null,
+    html: item.content.kind === 'message' ? item.content.html : (media?.html ?? null),
     media,
-    mediaCaption: item.content.kind === 'image',
+    mediaCaption: media !== null,
     threadTarget,
     pinned,
     bookmarked,
     stealCount,
-    react: canToggleReaction && canAnnotate,
-    viewReactions: canAnnotate && item.reactions.length > 0,
+    react: canToggleReaction && canAnnotate && !redacted,
+    viewReactions: canAnnotate && !redacted && item.reactions.length > 0,
     readReceipts: true,
     markUnread: canMarkUnread && eventId !== '',
     reply: canReply,
     edit: editable && canEdit && body !== null,
-    reproxy: editable && canEdit && item.content.kind === 'message' && eventId !== '',
+    reproxy:
+      item.is_own &&
+      canEdit &&
+      eventId !== '' &&
+      (item.content.kind === 'message' ||
+        item.content.kind === 'gallery' ||
+        item.content.kind === 'location' ||
+        media !== null),
     redact: canDelete && canRedact(item, canRedactOwn, canRedactOthers),
     copyText: body !== null,
     openThread: canOpenThread && threadTarget !== null,
@@ -132,7 +130,7 @@ export function messageActionPolicy({
       item.link_previews_removed !== true,
     pin: canPin && hasRoomEvent,
     bookmark: hasRoomEvent,
-    forward: hasRoomEvent && canForward(item.content),
+    forward: hasRoomEvent && item.forwardable,
     download: media !== null,
     stealEmotes: stealCount > 0,
     editHistory: hasRoomEvent && item.content.kind === 'message' && item.content.edited,

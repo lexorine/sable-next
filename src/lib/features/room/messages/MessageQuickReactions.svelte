@@ -1,45 +1,24 @@
 <script lang="ts">
-  import type { ImagePackView } from '#src/generated/protocol';
-
+  import { useCoreClient } from '#lib/core/context.js';
+  import { RoomPacks } from '#lib/emoji/room-packs.svelte.js';
   import { i18n } from '#lib/i18n.js';
   import { shortcodeFor } from '#lib/emoji/emoji.js';
   import { readRecentReactions, rememberReaction } from '#lib/emoji/recents.svelte.js';
   import MediaImage from '#lib/ui/MediaImage.svelte';
 
-  import {
-    isCustomReaction,
-    loadReactionEmotePacks,
-    reactionEmoteLabel,
-  } from './reaction-emote-label.js';
+  import { isCustomReaction, reactionEmoteLabel } from './reaction-emote-label.js';
 
   interface Props {
     count: number;
-    loadImagePacks?: (roomId: string) => Promise<ImagePackView[]>;
     onReact: (emoji: string) => void;
     roomId?: string;
     roomy?: boolean;
   }
 
-  let { count, loadImagePacks, onReact, roomId, roomy = false }: Props = $props();
-  let imagePacks = $state.raw<ImagePackView[]>([]);
+  let { count, onReact, roomId, roomy = false }: Props = $props();
+  const core = useCoreClient();
+  const packs = new RoomPacks(core, () => roomId);
   let recents = $derived(readRecentReactions().slice(0, count));
-
-  $effect(() => {
-    if (roomId === undefined || loadImagePacks === undefined) {
-      imagePacks = [];
-      return;
-    }
-
-    let current = true;
-    void loadReactionEmotePacks(roomId, loadImagePacks)
-      .then((packs) => {
-        if (current) imagePacks = packs;
-      })
-      .catch(() => {});
-    return () => {
-      current = false;
-    };
-  });
 
   function react(emoji: string): void {
     rememberReaction(emoji);
@@ -48,9 +27,9 @@
 </script>
 
 {#if recents.length > 0}
-  <div class:roomy class="quick-strip" role="group" aria-label={$i18n.t('timeline.addReaction')}>
+  <div class={['quick-strip', { roomy }]} role="group" aria-label={i18n.t('timeline.addReaction')}>
     {#each recents as emoji (emoji)}
-      {@const label = reactionEmoteLabel(emoji, imagePacks, $i18n.t('timeline.customEmote'))}
+      {@const label = reactionEmoteLabel(emoji, packs.current, i18n.t('timeline.customEmote'))}
       <button
         type="button"
         class="quick-reaction"
@@ -67,6 +46,7 @@
             width={64}
             height={64}
             original
+            emoticon
           />
         {:else}
           {emoji}
@@ -132,5 +112,6 @@
   .quick-line {
     background: var(--surface-container-line);
     block-size: var(--border-width);
+    margin: var(--space-100) 0;
   }
 </style>

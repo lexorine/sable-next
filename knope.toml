@@ -43,11 +43,19 @@ type = "PrepareRelease"
 
 [[workflows.steps]]
 type = "Command"
-command = "node scripts/fastlane-changelog.mjs $version && git add fastlane/metadata/android/en-US/changelogs"
+command = "node scripts/release/fastlane-changelog.mjs $version"
 
 [[workflows.steps]]
 type = "Command"
-command = "node scripts/flatpak-metainfo-release.mjs $version && git add packaging/flatpak/moe.sable.client.metainfo.xml"
+command = "git add fastlane/metadata/android/en-US/changelogs"
+
+[[workflows.steps]]
+type = "Command"
+command = "node scripts/release/flatpak-metainfo-release.mjs $version"
+
+[[workflows.steps]]
+type = "Command"
+command = "git add packaging/flatpak"
 
 [[workflows.steps]]
 type = "Command"
@@ -58,25 +66,16 @@ type = "Command"
 command = "git push --force --set-upstream origin release"
 
 [[workflows.steps]]
-type = "CreatePullRequest"
-base = "main"
-
-[workflows.steps.title]
-template = "chore: prepare release $version"
-
-[workflows.steps.body]
-template = """
-> [!IMPORTANT]
-> Merging this PR will create a new release.
-
-$changelog"""
+type = "Command"
+command = "node scripts/release/forgejo-release-pr.mjs pr"
 
 [[workflows]]
 name = "release"
-help_text = "Create a Forgejo release"
+help_text = "Create the release and tag the prepared commit"
 
 [[workflows.steps]]
-type = "Release"
+type = "Command"
+command = "node scripts/release/forgejo-release-pr.mjs release"
 
 [[workflows]]
 name = "document-change"

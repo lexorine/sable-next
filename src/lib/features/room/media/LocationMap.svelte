@@ -38,7 +38,12 @@
       untrack(() => zoom)
     );
 
-    L.tileLayer(tileUrl(), { attribution: TILE_ATTRIBUTION, maxZoom: 19 }).addTo(map);
+    L.tileLayer(tileUrl(), {
+      attribution: TILE_ATTRIBUTION,
+      maxZoom: 19,
+      // OSM requires a Referer.
+      referrerPolicy: 'strict-origin',
+    }).addTo(map);
 
     if (picking) map.on('click', (event) => onPick?.(event.latlng.lat, event.latlng.lng));
 
@@ -87,8 +92,8 @@
   class="location-map"
   role={onPick ? 'application' : 'img'}
   aria-label={onPick
-    ? $i18n.t('composer.locationPickerAlt')
-    : $i18n.t('timeline.locationMapAlt', { label })}
+    ? i18n.t('composer.locationPickerAlt')
+    : i18n.t('timeline.locationMapAlt', { label })}
   {@attach leaflet}
 ></div>
 

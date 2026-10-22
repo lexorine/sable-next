@@ -1,12 +1,13 @@
 <script lang="ts">
+  import { copyText } from '#lib/platform/clipboard.js';
   import type {
     RoomPermissionsView,
     RoomPowerLevelsView,
-    RoomSummary,
+    RoomListItemView,
   } from '#src/generated/protocol';
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
-  import { saveFile, savesNatively } from '#lib/platform/files.js';
+  import { saveBytes } from '#lib/platform/files.js';
   import Alert from '#lib/ui/primitives/Alert.svelte';
   import Button from '#lib/ui/primitives/Button.svelte';
   import Label from '#lib/ui/primitives/Label.svelte';
@@ -20,7 +21,7 @@
     permissions,
     levels,
   }: {
-    room: RoomSummary;
+    room: RoomListItemView;
     permissions: RoomPermissionsView | null;
     levels: RoomPowerLevelsView | null;
   } = $props();
@@ -36,12 +37,13 @@
     copied = false;
     try {
       data = await collectRoomDebugData(
-        core.commands,
+        core.rpc,
         $state.snapshot(room),
         $state.snapshot(permissions),
         $state.snapshot(levels)
       );
-    } catch {
+    } catch (error) {
+      console.warn('[sable room] collecting debug data failed', error);
       failed = true;
     } finally {
       loading = false;
@@ -51,57 +53,51 @@
   async function copy(): Promise<void> {
     failed = false;
     try {
-      await navigator.clipboard.writeText(data);
+      await copyText(data);
       copied = true;
-    } catch {
+    } catch (error) {
+      console.warn('[sable room] copying debug data failed', error);
       failed = true;
     }
   }
 
   async function download(): Promise<void> {
     failed = false;
-    const filename = `sable-${room.is_space ? 'space' : 'room'}-data-${String(Date.now())}.json`;
-    const url = URL.createObjectURL(new Blob([data], { type: 'application/json' }));
+    const filename = `sable-${room.room_kind === 'space' ? 'space' : 'room'}-data-${String(Date.now())}.json`;
     try {
-      if (savesNatively()) {
-        failed = (await saveFile(url, filename)) === 'failed';
-      } else {
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = filename;
-        link.click();
-      }
-    } catch {
+      failed =
+        (await saveBytes(new TextEncoder().encode(data), filename, 'application/json')) ===
+        'failed';
+    } catch (error) {
+      console.warn('[sable room] saving debug data failed', error);
       failed = true;
-    } finally {
-      URL.revokeObjectURL(url);
     }
   }
 </script>
 
 <SettingsSection
   headingId="room-developer-data"
-  title={$i18n.t(room.is_space ? 'room.devSpaceDataTitle' : 'room.devRoomDataTitle')}
-  description={$i18n.t('room.devDataDescription')}
+  title={i18n.t(room.room_kind === 'space' ? 'room.devSpaceDataTitle' : 'room.devRoomDataTitle')}
+  description={i18n.t('room.devDataDescription')}
 >
   <div class="data settings-form">
     {#if data}
-      <Label for="room-dev-data">{$i18n.t('room.devDataJson')}</Label>
+      <Label for="room-dev-data">{i18n.t('room.devDataJson')}</Label>
       <TextArea id="room-dev-data" value={data} readonly rows={12} spellcheck="false" />
     {/if}
     {#if failed}
-      <Alert variant="critical" role="alert">{$i18n.t('room.devDataFailed')}</Alert>
+      <Alert variant="critical" role="alert">{i18n.t('room.devDataFailed')}</Alert>
     {/if}
     <div class="actions">
       <Button variant="secondary" {loading} onclick={() => void load()}>
-        {$i18n.t('room.devDataLoad')}
+        {i18n.t('room.devDataLoad')}
       </Button>
       {#if data}
         <Button variant="secondary" disabled={loading} onclick={() => void copy()}>
-          {$i18n.t(copied ? 'room.devDataCopied' : 'room.devDataCopy')}
+          {i18n.t(copied ? 'common.copied' : 'room.devDataCopy')}
         </Button>
         <Button variant="secondary" disabled={loading} onclick={() => void download()}>
-          {$i18n.t('room.devDataDownload')}
+          {i18n.t('room.devDataDownload')}
         </Button>
       {/if}
     </div>

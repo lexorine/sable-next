@@ -1,22 +1,22 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { invoke, isTauri } from '@tauri-apps/api/core';
-  import { type as osType } from '@tauri-apps/plugin-os';
   import { i18n } from '#lib/i18n.js';
+  import { loadAppIcons, setAppIcon } from '#lib/platform/app-icon.js';
+  import { isAndroid } from '#lib/platform/os.js';
   import Alert from '#lib/ui/primitives/Alert.svelte';
   import Select from '#lib/ui/primitives/Select.svelte';
   import SettingsRow from '#lib/ui/primitives/SettingsRow.svelte';
 
-  import defaultIcon from './app-icons/default.png';
-  import propeller from './app-icons/propeller.png';
-  import agender from './app-icons/agender.svg';
-  import bisexual from './app-icons/bisexual.svg';
-  import trans from './app-icons/trans.png';
-  import transgradient from './app-icons/transgradient.svg';
-  import intersex from './app-icons/intersex.svg';
-  import lesbian from './app-icons/lesbian.svg';
-  import mlm from './app-icons/mlm.svg';
-  import pride from './app-icons/pride.svg';
+  import defaultIcon from '#lib/supporter/app-icons/default.png';
+  import propeller from '#lib/supporter/app-icons/propeller.png';
+  import agender from '#lib/supporter/app-icons/agender.svg';
+  import bisexual from '#lib/supporter/app-icons/bisexual.svg';
+  import trans from '#lib/supporter/app-icons/trans.png';
+  import transgradient from '#lib/supporter/app-icons/transgradient.svg';
+  import intersex from '#lib/supporter/app-icons/intersex.svg';
+  import lesbian from '#lib/supporter/app-icons/lesbian.svg';
+  import mlm from '#lib/supporter/app-icons/mlm.svg';
+  import pride from '#lib/supporter/app-icons/pride.svg';
   import '#lib/ui/primitives/settings-row.css';
 
   const previews: Record<string, string> = {
@@ -31,29 +31,21 @@
     mlm,
     pride,
   };
-  let icons = $state<string[]>([]);
+  let icons = $state.raw<string[]>([]);
   let selected = $state('primary');
   let changing = $state(false);
   let failed = $state(false);
-  let selectVersion = $state(0);
   let android = $state(false);
 
   onMount(() => {
-    if (!isTauri() || !['android', 'ios'].includes(osType())) return;
-    android = osType() === 'android';
+    android = isAndroid();
     let cancelled = false;
-    void Promise.all([
-      invoke<string[]>('plugin:app-icon|get_available_icons'),
-      invoke<string | null>('plugin:app-icon|get_current_icon'),
-    ])
-      .then(([available, current]) => {
-        if (cancelled) return;
-        icons = available;
-        selected = current && available.includes(current) ? current : 'primary';
-      })
-      .catch(() => {
-        // Hide the picker if the plugin is unavailable.
-      });
+    void loadAppIcons().then((loaded) => {
+      if (cancelled || !loaded) return;
+      icons = loaded.available;
+      selected =
+        loaded.current && loaded.available.includes(loaded.current) ? loaded.current : 'primary';
+    });
     return () => {
       cancelled = true;
     };
@@ -61,43 +53,39 @@
 
   async function select(icon: string): Promise<void> {
     if (changing || selected === icon) return;
+    const previous = selected;
     changing = true;
     failed = false;
+    selected = icon;
     try {
-      await invoke('plugin:app-icon|set_icon', {
-        request: { icon: icon === 'primary' ? null : icon },
-      });
-      selected = icon;
+      await setAppIcon(icon === 'primary' ? null : icon);
     } catch {
+      selected = previous;
       failed = true;
     } finally {
       changing = false;
-      selectVersion += 1;
     }
   }
 </script>
 
 {#if icons.length}
-  <ul class="app-icons" class:android aria-busy={changing}>
-    <SettingsRow id="app-icon" title={$i18n.t('settings.appIconTitle')} wide>
-      {#key selectVersion}
-        <Select
-          value={selected}
-          disabled={changing}
-          aria-label={$i18n.t('settings.appIconTitle')}
-          items={['primary', ...icons].map((icon) => ({
-            value: icon,
-            label: $i18n.t(`settings.appIcons.${icon}`, { defaultValue: icon }),
-            image: previews[icon],
-            imageClass: android ? 'app-icon-image-android' : undefined,
-          }))}
-          onValueChange={(icon) => void select(icon)}
-        />
-      {/key}
+  <ul class={['app-icons', { android }]} aria-busy={changing}>
+    <SettingsRow id="app-icon" title={i18n.t('settings.appIconTitle')} wide>
+      <Select
+        bind:value={() => selected, (icon) => void select(icon)}
+        disabled={changing}
+        aria-label={i18n.t('settings.appIconTitle')}
+        items={[...new Set(['primary', ...icons])].map((icon) => ({
+          value: icon,
+          label: i18n.t(`settings.appIcons.${icon}`, { defaultValue: icon }),
+          image: previews[icon],
+          imageClass: android ? 'app-icon-image-android' : undefined,
+        }))}
+      />
     </SettingsRow>
   </ul>
   {#if failed}<div class="settings-form">
-      <Alert variant="critical" role="alert">{$i18n.t('settings.appIconFailed')}</Alert>
+      <Alert variant="critical" role="alert">{i18n.t('settings.appIconFailed')}</Alert>
     </div>{/if}
 {/if}
 

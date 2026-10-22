@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { RoomSummary } from '#src/generated/protocol';
+  import type { RoomListItemView } from '#src/generated/protocol';
 
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
@@ -16,19 +16,19 @@
 
   interface Props {
     open: boolean;
-    room: RoomSummary | null;
+    room: RoomListItemView | null;
     onOpenChange: (open: boolean) => void;
-    onLeft?: (room: RoomSummary) => void;
+    onLeft?: (room: RoomListItemView) => void;
   }
 
   let { open, room, onOpenChange, onLeft }: Props = $props();
   const core = useCoreClient();
   const roomList = useRoomList();
   let leaving = $state(false);
-  let failedNames = $state<string[]>([]);
+  let failedNames = $state.raw<string[]>([]);
 
   let children = $derived(
-    room?.is_space ? joinedSpaceChildrenLeaveOrder(roomList.rooms, room.room_id) : null
+    room?.room_kind === 'space' ? joinedSpaceChildrenLeaveOrder(roomList.rooms, room.room_id) : null
   );
 
   let childrenWarning = $derived.by(() => {
@@ -36,25 +36,25 @@
 
     const rooms =
       children.roomCount > 0
-        ? $i18n.t('room.leaveSpaceChildrenRoomsCount', { count: children.roomCount })
+        ? i18n.t('room.leaveSpaceChildrenRoomsCount', { count: children.roomCount })
         : null;
     const subspaces =
       children.subspaceCount > 0
-        ? $i18n.t('room.leaveSpaceChildrenSubspacesCount', { count: children.subspaceCount })
+        ? i18n.t('room.leaveSpaceChildrenSubspacesCount', { count: children.subspaceCount })
         : null;
 
     if (rooms && subspaces) {
-      return $i18n.t('room.leaveSpaceChildrenWarningBoth', { rooms, subspaces });
+      return i18n.t('room.leaveSpaceChildrenWarningBoth', { rooms, subspaces });
     }
-    if (rooms) return $i18n.t('room.leaveSpaceChildrenWarningRooms', { rooms });
-    return $i18n.t('room.leaveSpaceChildrenWarningSubspaces', { subspaces });
+    if (rooms) return i18n.t('room.leaveSpaceChildrenWarningRooms', { rooms });
+    return i18n.t('room.leaveSpaceChildrenWarningSubspaces', { subspaces });
   });
 
   async function leaveIds(ids: readonly string[]): Promise<string[]> {
     const failures: string[] = [];
     for (const id of ids) {
       try {
-        await core.commands.leaveRoom(id);
+        await core.rpc.rooms.leave({ room_id: id });
       } catch (error) {
         console.warn('[sable room] leave failed', error);
         failures.push(roomList.labelFor(id));
@@ -97,16 +97,16 @@
   }
 </script>
 
-<DialogFrame {open} {onOpenChange} variant="verification" label={$i18n.t('room.leaveConfirm')}>
+<DialogFrame {open} {onOpenChange} variant="verification" label={i18n.t('room.leaveConfirm')}>
   <div class="leave">
-    <h2>{$i18n.t('room.leaveTitle', { name: room?.name ?? room?.room_id ?? '' })}</h2>
-    <p class="explain">{$i18n.t('room.leaveBody')}</p>
+    <h2>{i18n.t('room.leaveTitle', { name: room?.name ?? room?.room_id ?? '' })}</h2>
+    <p class="explain">{i18n.t('room.leaveBody')}</p>
     {#if childrenWarning}
       <p class="explain">{childrenWarning}</p>
     {/if}
     {#if failedNames.length > 0}
       <Alert variant="critical" role="alert">
-        {$i18n.t('room.leaveFailedNames', { names: failedNames.join(', ') })}
+        {i18n.t('room.leaveFailedNames', { names: failedNames.join(', ') })}
       </Alert>
     {/if}
     <DialogActions>
@@ -116,15 +116,15 @@
           onOpenChange(false);
         }}
       >
-        {$i18n.t('room.leaveCancel')}
+        {i18n.t('common.cancel')}
       </Button>
       {#if children && children.order.length > 0}
         <Button variant="danger" loading={leaving} onclick={confirmAll}>
-          {$i18n.t('room.leaveAllConfirm')}
+          {i18n.t('room.leaveAllConfirm')}
         </Button>
       {/if}
       <Button variant="danger" loading={leaving} onclick={confirm}>
-        {$i18n.t('room.leaveConfirm')}
+        {i18n.t('room.leaveConfirm')}
       </Button>
     </DialogActions>
   </div>

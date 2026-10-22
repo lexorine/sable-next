@@ -1,41 +1,52 @@
 <script lang="ts">
+  import { copyText } from '#lib/platform/clipboard.js';
   import { i18n } from '#lib/i18n.js';
   import Button from '#lib/ui/primitives/Button.svelte';
   import DialogFrame from '#lib/ui/primitives/DialogFrame.svelte';
   import FormActions from '#lib/ui/primitives/FormActions.svelte';
   import { toasts } from '#lib/ui/toasts.svelte.js';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
 
   interface Props {
     open?: boolean;
     source: string;
+    encrypted?: boolean;
+    original?: string | null;
   }
 
-  let { open = $bindable(false), source }: Props = $props();
+  let { open = $bindable(false), source, encrypted = false, original = null }: Props = $props();
   let copied = $state(false);
 
   async function copy(): Promise<void> {
     try {
-      await navigator.clipboard.writeText(source);
+      await copyText(source);
       copied = true;
     } catch (error) {
       console.debug('[sable timeline] clipboard unavailable', error);
-      toasts.error($i18n.t('errors.actionFailed'));
+      toasts.error(i18n.t('errors.actionFailed'));
     }
   }
 </script>
 
-<DialogFrame bind:open variant="verification" label={$i18n.t('timeline.sourceTitle')}>
-  <h2>{$i18n.t('timeline.sourceTitle')}</h2>
-  <pre class="source">{source}</pre>
+<DialogFrame bind:open variant="verification" label={i18n.t('timeline.sourceTitle')}>
+  <h2>{i18n.t('timeline.sourceTitle')}</h2>
+  {#if encrypted}
+    <p class="encrypted">{i18n.t('timeline.sourceEncrypted')}</p>
+  {/if}
+  <pre class="source" {@attach scrollHint}>{source}</pre>
+  {#if original}
+    <h3>{i18n.t('timeline.sourceOriginal')}</h3>
+    <pre class="source" {@attach scrollHint}>{original}</pre>
+  {/if}
   <FormActions>
     <Button variant="secondary" onclick={copy}>
-      {copied ? $i18n.t('timeline.copied') : $i18n.t('timeline.copy')}
+      {copied ? i18n.t('common.copied') : i18n.t('common.copy')}
     </Button>
     <Button
       variant="ghost"
       onclick={() => {
         open = false;
-      }}>{$i18n.t('timeline.cancel')}</Button
+      }}>{i18n.t('common.cancel')}</Button
     >
   </FormActions>
 </DialogFrame>
@@ -47,12 +58,26 @@
     margin: 0 0 var(--space-300);
   }
 
+  h3 {
+    font-size: var(--font-size-body);
+    line-height: var(--line-height-body);
+    margin: 0 0 var(--space-200);
+  }
+
+  .encrypted {
+    color: var(--surface-var-on-container);
+    font-size: var(--font-size-small);
+    line-height: var(--line-height-small);
+    margin: 0 0 var(--space-200);
+  }
+
   .source {
     background: var(--surface-var-container);
     border-radius: var(--radii-400);
     color: var(--surface-var-on-container);
     font-family: var(--font-family-mono);
     font-size: var(--font-size-small);
+    font-variant-ligatures: none;
     line-height: var(--line-height-small);
     margin: 0 0 var(--space-400);
     max-height: 22rem;

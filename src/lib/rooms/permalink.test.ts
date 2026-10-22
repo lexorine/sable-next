@@ -1,13 +1,14 @@
 import { afterEach, expect, test, vi } from 'vitest';
 
-import type { RoomSummary } from '#src/generated/protocol';
+import type { RoomListItemView } from '#src/generated/protocol';
 
 import { parseMatrixLink } from '#lib/rooms/matrix-link.js';
+import { withCounts } from '#lib/rooms/summary-fixtures.js';
 
 import { copyRoomLink, matrixToUrl, permalinkTarget, roomSectionPath, viaFor } from './permalink';
 
-function room(roomId: string, overrides: Partial<RoomSummary> = {}): RoomSummary {
-  return {
+function room(roomId: string, overrides: Partial<RoomListItemView> = {}): RoomListItemView {
+  return withCounts({
     room_id: roomId,
     canonical_alias: null,
     name: roomId,
@@ -19,11 +20,10 @@ function room(roomId: string, overrides: Partial<RoomSummary> = {}): RoomSummary
     tags: [],
     state: 'joined',
     encrypted: null,
-    is_space: false,
     is_tombstoned: false,
-    is_voice: false,
+    room_kind: 'text',
     call_participants: [],
-    room_type: null,
+    screen_sharers: [],
     supports_knock: true,
     supports_restricted: true,
     supports_knock_restricted: true,
@@ -34,7 +34,7 @@ function room(roomId: string, overrides: Partial<RoomSummary> = {}): RoomSummary
     marked_unread: false,
     latest_event: null,
     ...overrides,
-  };
+  });
 }
 
 function child(roomId: string) {
@@ -53,7 +53,10 @@ test('a direct room lands under direct, not rooms', () => {
 
 test('a room reachable from a joined space lands under that space', () => {
   const rooms = [
-    room('!space:example.org', { is_space: true, space_children: [child('!inner:example.org')] }),
+    room('!space:example.org', {
+      room_kind: 'space',
+      space_children: [child('!inner:example.org')],
+    }),
     room('!inner:example.org'),
   ];
   expect(roomSectionPath(rooms, '!inner:example.org')).toBe(
@@ -63,8 +66,8 @@ test('a room reachable from a joined space lands under that space', () => {
 
 test('a room in a subspace lands under the root space the sidebar shows', () => {
   const rooms = [
-    room('!root:example.org', { is_space: true, space_children: [child('!sub:example.org')] }),
-    room('!sub:example.org', { is_space: true, space_children: [child('!inner:example.org')] }),
+    room('!root:example.org', { room_kind: 'space', space_children: [child('!sub:example.org')] }),
+    room('!sub:example.org', { room_kind: 'space', space_children: [child('!inner:example.org')] }),
     room('!inner:example.org'),
   ];
   expect(roomSectionPath(rooms, '!inner:example.org')).toBe(
@@ -74,9 +77,12 @@ test('a room in a subspace lands under the root space the sidebar shows', () => 
 
 test('a cycle between spaces still resolves to one of them', () => {
   const rooms = [
-    room('!left:example.org', { is_space: true, space_children: [child('!right:example.org')] }),
+    room('!left:example.org', {
+      room_kind: 'space',
+      space_children: [child('!right:example.org')],
+    }),
     room('!right:example.org', {
-      is_space: true,
+      room_kind: 'space',
       space_children: [child('!left:example.org'), child('!inner:example.org')],
     }),
     room('!inner:example.org'),
@@ -86,11 +92,12 @@ test('a cycle between spaces still resolves to one of them', () => {
   );
 });
 
-test('a space the user has not joined does not claim its children', () => {
+test.each(['invited', 'tombstoned'])('a %s space does not claim its children', (status) => {
   const rooms = [
     room('!space:example.org', {
-      is_space: true,
-      state: 'invited',
+      room_kind: 'space',
+      state: status === 'invited' ? 'invited' : 'joined',
+      is_tombstoned: status === 'tombstoned',
       space_children: [child('!inner:example.org')],
     }),
     room('!inner:example.org'),
@@ -99,14 +106,44 @@ test('a space the user has not joined does not claim its children', () => {
 });
 
 test('a space itself opens at its lobby', () => {
-  const rooms = [room('!space:example.org', { is_space: true })];
+  const rooms = [room('!space:example.org', { room_kind: 'space' })];
   expect(roomSectionPath(rooms, '!space:example.org')).toBe('/space/!space%3Aexample.org/lobby');
 });
 
-test('the canonical alias wins over the room id, matching the sidebar links', () => {
+test('an aliased room uses its canonical alias, matching the sidebar links', () => {
   const rooms = [room('!general:example.org', { canonical_alias: '#general:example.org' })];
   expect(roomSectionPath(rooms, '!general:example.org')).toBe('/rooms/%23general%3Aexample.org');
+  expect(roomSectionPath(rooms, '#general:example.org')).toBe('/rooms/%23general%3Aexample.org');
 });
+
+test.each([true, false])(
+  'spaces sharing an alias remain distinct with tombstone %s',
+  (tombstoned) => {
+    const rooms = [
+      room('!old:example.org', {
+        room_kind: 'space',
+        canonical_alias: '#community:example.org',
+        is_tombstoned: tombstoned,
+      }),
+      room('!current:example.org', {
+        room_kind: 'space',
+        canonical_alias: '#community:example.org',
+      }),
+    ];
+    const aliasPath = '/space/%23community%3Aexample.org/lobby';
+    const paths = tombstoned
+      ? ['/space/!old%3Aexample.org/lobby', aliasPath]
+      : [aliasPath, '/space/!current%3Aexample.org/lobby'];
+
+    for (const [index, space] of rooms.entries()) {
+      expect(permalinkTarget(rooms, encodeURIComponent(space.room_id))).toEqual({
+        kind: 'room',
+        path: paths[index],
+      });
+    }
+    expect(roomSectionPath(rooms, '#community:example.org')).toBe(aliasPath);
+  }
+);
 
 test('an unknown room still resolves, so the timeline can report the failure', () => {
   expect(roomSectionPath([], '!missing:example.org')).toBe('/rooms/!missing%3Aexample.org');
@@ -120,7 +157,7 @@ test('a focused event rides along as a query param', () => {
 });
 
 test('a space drops a focused event, having no timeline to focus it in', () => {
-  const rooms = [room('!space:example.org', { is_space: true })];
+  const rooms = [room('!space:example.org', { room_kind: 'space' })];
   expect(roomSectionPath(rooms, '!space:example.org', '$abc')).toBe(
     '/space/!space%3Aexample.org/lobby'
   );
@@ -202,8 +239,8 @@ test('a link the app generates parses back to what it named', () => {
   const url = matrixToUrl('!somewhere:example.org', ['elsewhere.ca'], '$event');
   expect(parseMatrixLink(url)).toEqual({
     kind: 'event',
-    roomId: '!somewhere:example.org',
-    eventId: '$event',
+    room_id: '!somewhere:example.org',
+    event_id: '$event',
   });
 });
 
@@ -231,7 +268,7 @@ function linkCore(via: string[] | Error) {
   const roomViaServers = vi.fn(() =>
     via instanceof Error ? Promise.reject(via) : Promise.resolve(via)
   );
-  return { core: { commands: { roomViaServers } } as never, roomViaServers };
+  return { core: { rpc: { rooms: { viaServers: roomViaServers } } } as never, roomViaServers };
 }
 
 test('copying a room id link asks for via servers and carries the event', async () => {
@@ -243,7 +280,7 @@ test('copying a room id link asks for via servers and carries the event', async 
     copyRoomLink(core, { room_id: '!room:example.org', canonical_alias: null }, '$event')
   ).resolves.toBe(true);
 
-  expect(roomViaServers).toHaveBeenCalledWith('!room:example.org');
+  expect(roomViaServers).toHaveBeenCalledWith({ room_id: '!room:example.org' });
   expect(writeText).toHaveBeenCalledWith(matrixToUrl('!room:example.org', ['a.example'], '$event'));
 });
 

@@ -7,7 +7,13 @@
 
   import LinkPreviewCard from '../LinkPreviewCard.svelte';
 
-  import { parseTiktokLink, tiktokPlayerUrl } from './tiktok';
+  import {
+    isTiktokShortLink,
+    parseTiktokLink,
+    resolveTiktokShortLink,
+    tiktokPlayerUrl,
+    type TiktokPost,
+  } from './tiktok';
 
   interface Props {
     url: string;
@@ -16,19 +22,35 @@
   }
 
   let { url, encrypted, bundled = null }: Props = $props();
-  let post = $derived(parseTiktokLink(url));
-  let playing = $state(false);
+  let direct = $derived(parseTiktokLink(url));
+  let short = $derived(direct === null && isTiktokShortLink(url));
+  let resolved = $state<TiktokPost | null | undefined>(undefined);
+  let post = $derived(direct ?? resolved ?? null);
+  let playing = $derived.by(() => {
+    void url;
+    return false;
+  });
   let title = $derived(post?.author ?? 'TikTok');
 
   $effect(() => {
-    void url;
-    playing = false;
+    const target = url;
+    const shortLink = short;
+    resolved = undefined;
+    if (!shortLink) return;
+
+    let cancelled = false;
+    void resolveTiktokShortLink(target).then((result) => {
+      if (!cancelled) resolved = result;
+    });
+    return () => {
+      cancelled = true;
+    };
   });
 </script>
 
 {#if post}
   <div class="tiktok-embed">
-    <a class="tiktok-header" href={url} target="_blank" rel="noopener noreferrer">
+    <a class="tiktok-header" href={url} target="_blank" rel="external noopener noreferrer">
       <span class="tiktok-site">TikTok</span>
       <span class="tiktok-title">{title}</span>
     </a>
@@ -44,7 +66,7 @@
         <button
           type="button"
           class="tiktok-poster"
-          aria-label={$i18n.t('timeline.playVideo', { name: title })}
+          aria-label={i18n.t('timeline.playVideo', { name: title })}
           onclick={() => (playing = true)}
         >
           <span class="tiktok-play" aria-hidden="true"><PlayIcon /></span>
@@ -52,7 +74,7 @@
       {/if}
     </div>
   </div>
-{:else}
+{:else if !short || resolved === null}
   <LinkPreviewCard {url} {encrypted} {bundled} />
 {/if}
 

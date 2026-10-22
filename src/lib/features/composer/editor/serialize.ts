@@ -18,9 +18,10 @@ import type { OutgoingMentions } from '#lib/core/client.svelte.js';
 import type { ImageSourcePackReferenceView } from '#src/generated/protocol';
 
 import { mfmUnixtime, parseMfmColor, parseMfmUnixtime, utcFallbackLabel } from '../time-markup';
+import { mathPlugin } from './math';
 import { mfmPlugin } from './mfm';
 import { isMscLink, linkMscs } from './msc-links';
-import { composerSchema, parseMatrixHtml, ROOM_PING } from './schema';
+import { codeLanguage, composerSchema, parseMatrixHtml, ROOM_PING } from './schema';
 import { docToMarkdown } from './to-markdown';
 
 export interface ComposerMessage {
@@ -177,11 +178,74 @@ const markdown = new MarkdownSerializer(
 );
 
 function withoutTrailingParagraph(doc: ProseMirrorNode): ProseMirrorNode {
-  const last = doc.lastChild;
-  if (doc.childCount < 2 || !last) return doc;
-  if (last.type !== composerSchema.nodes.paragraph || last.content.size > 0) return doc;
+  const kept: ProseMirrorNode[] = [];
+  doc.forEach((child) => kept.push(child));
+  while (kept.length > 1) {
+    const last = kept.at(-1);
+    if (last?.type !== composerSchema.nodes.paragraph || last.content.size > 0) break;
+    kept.pop();
+  }
 
-  return doc.copy(doc.content.cut(0, doc.content.size - last.nodeSize));
+  return kept.length === doc.childCount ? doc : doc.copy(Fragment.fromArray(kept));
+}
+
+function trimmedText(node: ProseMirrorNode, trim: (text: string) => string): ProseMirrorNode[] {
+  const text = trim(node.text ?? '');
+  return text === '' ? [] : [composerSchema.text(text, node.marks)];
+}
+
+const DROPPED_WHEN_BLANK = new Set([
+  'code_block',
+  'blockquote',
+  'bullet_list',
+  'ordered_list',
+  'list_item',
+]);
+
+function blank(node: ProseMirrorNode): boolean {
+  if (node.isLeaf) return false;
+  if (node.isTextblock) return node.content.size === 0;
+  let empty = true;
+  node.forEach((child) => {
+    empty &&= blank(child);
+  });
+  return empty;
+}
+
+function normalizedBlocks(node: ProseMirrorNode): ProseMirrorNode {
+  if (node.isLeaf || node.type === composerSchema.nodes.code_block) return node;
+
+  const children: ProseMirrorNode[] = [];
+  node.forEach((child) => {
+    if (child.isText && child.text?.includes('\n')) {
+      child.text.split('\n').forEach((line, index) => {
+        if (index > 0) children.push(composerSchema.nodes.hard_break.create());
+        if (line !== '') children.push(composerSchema.text(line, child.marks));
+      });
+      return;
+    }
+    const normalized = normalizedBlocks(child);
+    if (!DROPPED_WHEN_BLANK.has(normalized.type.name) || !blank(normalized)) {
+      children.push(normalized);
+    }
+  });
+  if (node.isTextblock) {
+    for (;;) {
+      const last = children.at(-1);
+      if (last?.type === composerSchema.nodes.hard_break) children.pop();
+      else if (last?.isText && last.text?.trimEnd() !== last.text)
+        children.splice(-1, 1, ...trimmedText(last, (text) => text.trimEnd()));
+      else break;
+    }
+    for (;;) {
+      const first = children.at(0);
+      if (first?.type === composerSchema.nodes.hard_break) children.shift();
+      else if (first?.isText && first.text?.trimStart() !== first.text)
+        children.splice(0, 1, ...trimmedText(first, (text) => text.trimStart()));
+      else break;
+    }
+  }
+  return node.copy(Fragment.fromArray(children));
 }
 
 function flattenRoomPings(node: ProseMirrorNode): ProseMirrorNode {
@@ -213,7 +277,7 @@ function isPlain(doc: ProseMirrorNode): boolean {
   return plain;
 }
 
-function mfmMarks(node: ProseMirrorNode, fg?: string, bg?: string): readonly Mark[] {
+function mfmMarks(node: ProseMirrorNode, fg: string | null, bg: string | null): readonly Mark[] {
   let marks = node.marks;
   if (fg) marks = composerSchema.marks.color.create({ value: fg }).addToSet(marks);
   if (bg) marks = composerSchema.marks.bg_color.create({ value: bg }).addToSet(marks);
@@ -290,6 +354,18 @@ function html(doc: ProseMirrorNode): string {
   holder.append(DOMSerializer.fromSchema(composerSchema).serializeFragment(doc.content));
   for (const paragraph of holder.querySelectorAll('li > p:only-child, dd > p:only-child')) {
     paragraph.replaceWith(...paragraph.childNodes);
+  }
+  for (const anchor of holder.querySelectorAll('a[data-org\\.matrix\\.msc4550\\.link]')) {
+    if (anchor.textContent === anchor.getAttribute('href')) {
+      anchor.removeAttribute('data-org.matrix.msc4550.link');
+    }
+  }
+
+  const spaced = document.createTreeWalker(holder, NodeFilter.SHOW_TEXT);
+  for (let node = spaced.nextNode(); node; node = spaced.nextNode()) {
+    if (node instanceof Text && !node.parentElement?.closest('pre')) {
+      node.data = node.data.replaceAll(/ (?= )/g, '\u00A0');
+    }
   }
 
   const texts = document.createTreeWalker(holder, NodeFilter.SHOW_TEXT);
@@ -397,7 +473,7 @@ function imageSourcePacksOf(doc: ProseMirrorNode): ImageSourcePackReferenceView[
 
 export function serializeComposer(doc: ProseMirrorNode): ComposerMessage {
   const mentions = mentionsOf(doc);
-  const source = withoutTrailingParagraph(flattenRoomPings(doc));
+  const source = withoutTrailingParagraph(normalizedBlocks(flattenRoomPings(doc)));
   const sourceWasPlain = isPlain(source);
   const flat = expandMfm(source);
   const linked = linkMscs(flat);
@@ -470,7 +546,8 @@ export function mentionsOf(doc: ProseMirrorNode): OutgoingMentions {
 
 const tokenizer = MarkdownIt('commonmark', { html: false })
   .enable(['strikethrough', 'table'])
-  .use(mfmPlugin);
+  .use(mfmPlugin)
+  .use(mathPlugin);
 
 const RECEIVER_FORMATS = new Set([
   'em_open',
@@ -479,6 +556,19 @@ const RECEIVER_FORMATS = new Set([
   'code_inline',
   'spoiler_open',
 ]);
+
+const quoteRules = new MarkdownIt('commonmark').block.ruler;
+quoteRules.enableOnly('blockquote');
+const [parseBlockquote] = quoteRules.getRules('');
+tokenizer.block.ruler.at(
+  'blockquote',
+  (state, startLine, endLine, silent) => {
+    const start = state.bMarks[startLine] + state.tShift[startLine];
+    if (!/^>[ \t]/.test(state.src.slice(start, state.eMarks[startLine]))) return false;
+    return parseBlockquote(state, startLine, endLine, silent);
+  },
+  { alt: ['paragraph', 'reference', 'blockquote'] }
+);
 
 function receiverFormats(text: string): boolean {
   return tokenizer
@@ -562,11 +652,13 @@ const PARSE_TOKENS: Record<string, ParseSpec> = {
     getAttrs: (token) => ({ level: Math.min(6, Number(token.tag.slice(1))) }),
   },
   subtext: { block: 'subtext' },
+  math_block: { node: 'math_block', getAttrs: (token) => ({ latex: token.content }) },
+  math_inline: { node: 'math_inline', getAttrs: (token) => ({ latex: token.content }) },
   code_block: { block: 'code_block', noCloseToken: true },
   fence: {
     block: 'code_block',
     noCloseToken: true,
-    getAttrs: (token) => ({ language: token.info.trim().split(/\s+/)[0] ?? '' }),
+    getAttrs: (token) => ({ language: codeLanguage(token.info.trim().split(/\s+/)[0] ?? '') }),
   },
   hardbreak: { node: 'hard_break' },
   softbreak: { node: 'hard_break' },

@@ -8,7 +8,11 @@ vi.mock('./call-telemetry', () => ({ CallTelemetry: vi.fn() }));
 
 import type { CoreClient } from '#lib/core/client.svelte.js';
 
+import { preferences } from '#lib/settings/preferences.svelte.js';
+
+import { recordCallDebug } from './call-debug.svelte.js';
 import { CallSession } from './call-session.svelte.js';
+import type { CallPin } from './call-layout';
 import type { CallParticipant } from './call-transport';
 import { idleTransportState } from './call-transport';
 import CallViewHarness from './CallViewHarness.test.svelte';
@@ -22,6 +26,7 @@ function mountBothSharing(
   watchedScreenShareIds = [shared.id]
 ) {
   const toggleWatchScreenShare = vi.fn();
+  let layout = $state.raw<CallPin>({ pinned: null, gridForced: false });
   const session = {
     lifecycle: 'active',
     mediaReady: true,
@@ -29,7 +34,12 @@ function mountBothSharing(
     deviceError: null,
     connectedAt: null,
     startedAt: null,
-    layout: { pinned: null, gridForced: false },
+    get layout() {
+      return layout;
+    },
+    set layout(next: CallPin) {
+      layout = next;
+    },
     watchedScreenShareIds,
     views: 0,
     deafened: false,
@@ -45,6 +55,7 @@ function mountBothSharing(
         identity: 'me:AAAA',
         backend_id: null,
         joined_ts: 0,
+        screen_sharing: false,
       },
       {
         user_id: otherUserId,
@@ -52,6 +63,7 @@ function mountBothSharing(
         identity: 'me:BBBB',
         backend_id: null,
         joined_ts: 0,
+        screen_sharing: false,
       },
     ],
     transport: {
@@ -77,17 +89,17 @@ test('pins either screen of an account sharing from two devices, and unpins to t
   const strip = () => within(screen.getByRole('list', { name: /participants?$/ }));
 
   expect(
-    spotlight().getByRole('button', { name: "Unpin @there:x's screen", pressed: true })
+    spotlight().getByRole('button', { name: 'Unpin @there:x’s screen', pressed: true })
   ).toBeInTheDocument();
 
-  await user.click(strip().getByRole('button', { name: "Pin @here:x's screen" }));
-  expect(spotlight().getByRole('button', { name: "Unpin @here:x's screen" })).toBeInTheDocument();
-  expect(strip().getAllByRole('button', { name: /^Pin .*'s screen$/ })).toHaveLength(1);
+  await user.click(strip().getByRole('button', { name: 'Pin @here:x’s screen' }));
+  expect(spotlight().getByRole('button', { name: 'Unpin @here:x’s screen' })).toBeInTheDocument();
+  expect(strip().getAllByRole('button', { name: /^Pin .*’s screen$/ })).toHaveLength(1);
 
-  await user.click(spotlight().getByRole('button', { name: "Unpin @here:x's screen" }));
-  expect(spotlight().getByRole('button', { name: "Unpin @there:x's screen" })).toBeInTheDocument();
+  await user.click(spotlight().getByRole('button', { name: 'Unpin @here:x’s screen' }));
+  expect(spotlight().getByRole('button', { name: 'Unpin @there:x’s screen' })).toBeInTheDocument();
 
-  await user.click(spotlight().getByRole('button', { name: "Unpin @there:x's screen" }));
+  await user.click(spotlight().getByRole('button', { name: 'Unpin @there:x’s screen' }));
   expect(container.querySelector('.featured')).not.toBeInTheDocument();
   expect(container.querySelector('.grid')).toBeInTheDocument();
 });
@@ -101,9 +113,9 @@ test('offers a separate tile for an available remote screen', async () => {
     []
   );
   expect(container.querySelector('.featured')).not.toBeInTheDocument();
-  expect(screen.getByText("@there:x's screen")).toBeInTheDocument();
+  expect(screen.getByText('@there:x’s screen')).toBeInTheDocument();
   expect(container.querySelector('video')).not.toBeInTheDocument();
-  await user.click(screen.getByRole('button', { name: "Watch @there:x's screen" }));
+  await user.click(screen.getByRole('button', { name: 'Watch @there:x’s screen' }));
   expect(toggleWatchScreenShare).toHaveBeenCalledWith('s');
 });
 
@@ -123,23 +135,23 @@ test('stopping a pinned screen keeps other screens playing', async () => {
   };
   const { container } = render(CallViewHarness, { session, members: [] });
 
-  expect(screen.getByText("@there:x's screen")).toBeInTheDocument();
+  expect(screen.getByText('@there:x’s screen')).toBeInTheDocument();
   expect(container.querySelector('video')).not.toBeInTheDocument();
-  await user.click(screen.getByRole('button', { name: "Watch @there:x's screen" }));
+  await user.click(screen.getByRole('button', { name: 'Watch @there:x’s screen' }));
   expect(container.querySelector('.featured video')).toBeInTheDocument();
-  await user.click(screen.getByRole('button', { name: "Watch @another:x's screen" }));
+  await user.click(screen.getByRole('button', { name: 'Watch @another:x’s screen' }));
   expect(container.querySelectorAll('.featured video')).toHaveLength(2);
-  await user.click(screen.getByRole('button', { name: "Pin @there:x's screen" }));
-  await user.click(screen.getByRole('button', { name: "Stop watching @there:x's screen" }));
-  expect(screen.getByText("@there:x's screen")).toBeInTheDocument();
+  await user.click(screen.getByRole('button', { name: 'Pin @there:x’s screen' }));
+  await user.click(screen.getByRole('button', { name: 'Stop watching @there:x’s screen' }));
+  expect(screen.getByText('@there:x’s screen')).toBeInTheDocument();
   expect(container.querySelectorAll('video')).toHaveLength(1);
   expect(
-    screen.getByRole('button', { name: "Stop watching @another:x's screen" })
+    screen.getByRole('button', { name: 'Stop watching @another:x’s screen' })
   ).toBeInTheDocument();
-  await user.click(screen.getByRole('button', { name: "Stop watching @another:x's screen" }));
+  await user.click(screen.getByRole('button', { name: 'Stop watching @another:x’s screen' }));
   expect(container.querySelector('video')).not.toBeInTheDocument();
   expect(container.querySelector('.featured')).not.toBeInTheDocument();
-  await user.click(screen.getByRole('button', { name: "Watch @there:x's screen" }));
+  await user.click(screen.getByRole('button', { name: 'Watch @there:x’s screen' }));
   expect(container.querySelector('.featured video')).toBeInTheDocument();
 
   session.transport = {
@@ -147,7 +159,7 @@ test('stopping a pinned screen keeps other screens playing', async () => {
     participants: [{ identity: '@another:x', screenShare: { ...shared, id: 'other' } }],
   };
   await vi.waitFor(() => {
-    expect(screen.queryByText("@there:x's screen")).not.toBeInTheDocument();
+    expect(screen.queryByText('@there:x’s screen')).not.toBeInTheDocument();
     expect(container.querySelector('video')).not.toBeInTheDocument();
   });
 });
@@ -172,7 +184,7 @@ test('a pin outlives the call view closing and opening again', async () => {
   const first = mountBothSharing();
   await user.click(
     within(screen.getByRole('list', { name: /participants?$/ })).getByRole('button', {
-      name: "Pin @here:x's screen",
+      name: 'Pin @here:x’s screen',
     })
   );
   const { session } = first;
@@ -182,15 +194,15 @@ test('a pin outlives the call view closing and opening again', async () => {
   const featured = container.querySelector<HTMLElement>('ul.featured');
   if (!featured) throw new Error('no featured list');
   expect(
-    within(featured).getByRole('button', { name: "Unpin @here:x's screen" })
+    within(featured).getByRole('button', { name: 'Unpin @here:x’s screen' })
   ).toBeInTheDocument();
 });
 
 test('two devices of one account are told apart by device', () => {
   mountBothSharing(undefined, undefined, '@here:x');
 
-  expect(screen.getByText("@here:x (this device)'s screen")).toBeInTheDocument();
-  expect(screen.getByText("@here:x (BBBB)'s screen")).toBeInTheDocument();
+  expect(screen.getByText('@here:x (this device)’s screen')).toBeInTheDocument();
+  expect(screen.getByText('@here:x (BBBB)’s screen')).toBeInTheDocument();
 });
 
 test('the call view counts itself as watching while it is on screen', () => {
@@ -198,4 +210,33 @@ test('the call view counts itself as watching while it is on screen', () => {
   expect(session.views).toBe(1);
   unmount();
   expect(session.views).toBe(0);
+});
+
+test('the debug overlay follows its own switch under developer tools', () => {
+  preferences.developerTools = true;
+  recordCallDebug({
+    requested: 'auto',
+    nativeForced: false,
+    mode: 'compatibility',
+    reason: undefined,
+    stickyAvailable: undefined,
+    peerModes: [],
+    transport: 'livekit-web',
+    backendCount: 1,
+    encrypted: false,
+  });
+  try {
+    preferences.callDebugOverlay = false;
+    const hidden = mountBothSharing();
+    expect(screen.queryByLabelText('Call mode debug')).not.toBeInTheDocument();
+    hidden.unmount();
+
+    preferences.callDebugOverlay = true;
+    mountBothSharing();
+    expect(screen.getByLabelText('Call mode debug')).toBeInTheDocument();
+  } finally {
+    recordCallDebug(null);
+    preferences.developerTools = false;
+    preferences.callDebugOverlay = true;
+  }
 });

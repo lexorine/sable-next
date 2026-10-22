@@ -1,0 +1,12 @@
+{
+  "extends": "../tsconfig.json",
+  "include": [
+    "../src/app.d.ts",
+    "../src/**/*.browser.test.ts",
+    "e2e/fixtures/*.browser.test.ts",
+    "e2e/fixtures/timeline-probe.ts",
+    "vitest-browser-setup.ts"
+  ],
+  "exclude": ["../src/service-worker"],
+  "compilerOptions": { "types": ["$app/types", "@vitest/browser-playwright"] }
+}

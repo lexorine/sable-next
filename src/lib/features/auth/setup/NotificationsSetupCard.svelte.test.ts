@@ -21,7 +21,10 @@ import { core } from '#lib/core/__mocks__/context.js';
 
 const setDefaultNotificationMode = vi.fn(() => Promise.resolve());
 const defaultNotificationModes = vi.fn(() => Promise.resolve({ group: 'all', direct: 'all' }));
-Object.assign(core, { setDefaultNotificationMode, defaultNotificationModes });
+Object.assign(core.rpc.notifications, {
+  setDefaultMode: setDefaultNotificationMode,
+  defaultModes: defaultNotificationModes,
+});
 
 import NotificationsSetupCard from './NotificationsSetupCard.svelte';
 
@@ -52,7 +55,7 @@ test('all messages is the pre-selected group default, written to push rules', as
   await vi.waitFor(() => {
     expect(onComplete).toHaveBeenCalledOnce();
   });
-  expect(setDefaultNotificationMode).toHaveBeenCalledWith(false, 'all');
+  expect(setDefaultNotificationMode).toHaveBeenCalledWith({ direct: false, mode: 'all' });
 });
 
 test('choosing mentions writes mentions instead', async () => {
@@ -61,7 +64,7 @@ test('choosing mentions writes mentions instead', async () => {
   await user.click(screen.getByRole('radio', { name: /Mentions and keywords/ }));
   await user.click(continueButton());
   await vi.waitFor(() => {
-    expect(setDefaultNotificationMode).toHaveBeenCalledWith(false, 'mentions');
+    expect(setDefaultNotificationMode).toHaveBeenCalledWith({ direct: false, mode: 'mentions' });
   });
 });
 
@@ -94,6 +97,22 @@ test('the OS prompt runs inside the click, and a grant turns the alerts on', asy
   expect(screen.getByText(/Notifications are on/)).toBeInTheDocument();
 });
 
+test('message text is offered once alerts are allowed and off until chosen', async () => {
+  present.permissionState.mockResolvedValueOnce('granted');
+  const { user } = await setup();
+
+  const toggle = screen.getByRole('switch', { name: 'Show message text' });
+  expect(toggle).not.toBeChecked();
+  await user.click(toggle);
+  expect(prefs.setPreference).toHaveBeenCalledWith('notificationContent', true);
+});
+
+test('message text is not offered while permission is pending', async () => {
+  await setup();
+
+  expect(screen.queryByRole('switch', { name: 'Show message text' })).not.toBeInTheDocument();
+});
+
 test('a permission already denied is not asked for again', async () => {
   present.permissionState.mockResolvedValueOnce('denied');
   await setup();
@@ -107,6 +126,6 @@ test('a failed write stays on the step and says so', async () => {
   const { user, onComplete } = await setup();
 
   await user.click(continueButton());
-  expect(await screen.findByText(/couldn't be saved/)).toBeInTheDocument();
+  expect(await screen.findByText(/couldn’t be saved/)).toBeInTheDocument();
   expect(onComplete).not.toHaveBeenCalled();
 });

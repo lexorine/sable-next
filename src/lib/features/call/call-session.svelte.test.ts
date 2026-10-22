@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 
 import type { CoreEvent } from '#src/generated/protocol';
 import type { CoreClient } from '#lib/core/client.svelte.js';
+import { preferences } from '#lib/settings/preferences.svelte.js';
 
 const hdr = vi.hoisted(() => ({
   hdrShareSupported: vi.fn(() => false),
@@ -13,6 +14,30 @@ vi.mock('#lib/platform/screen-audio.js', async (original) => ({
   ...(await original<typeof import('#lib/platform/screen-audio.js')>()),
   screenAudioSupported: screenAudio.supported,
 }));
+
+let gains: { gain: { value: number } }[];
+class MockAudioContext {
+  state: AudioContextState = 'running';
+  destination = {} as AudioDestinationNode;
+  decodeAudioData = vi.fn<() => Promise<AudioBuffer>>().mockResolvedValue({} as AudioBuffer);
+  resume = vi.fn<() => Promise<void>>().mockResolvedValue(undefined);
+  close = vi.fn<() => Promise<void>>().mockResolvedValue(undefined);
+  createBufferSource = vi.fn<() => AudioBufferSourceNode>(
+    () =>
+      ({
+        addEventListener: vi.fn(),
+        buffer: null,
+        connect: vi.fn((node: AudioNode) => node),
+        start: vi.fn(),
+      }) as unknown as AudioBufferSourceNode
+  );
+  createGain = vi.fn<() => GainNode>(() => {
+    const node = { gain: { value: 1 }, connect: vi.fn((next: AudioNode) => next) };
+    gains.push(node);
+    return node as unknown as GainNode;
+  });
+}
+// vi.stubGlobal('AudioContext', MockAudioContext);
 
 import { CallSession, voiceStates } from './call-session.svelte.js';
 import { MatrixKeyProvider } from './key-provider';
@@ -28,6 +53,7 @@ type Harness = {
   transport: CallTransport & { connected: CallTransportState[] };
   joinCall: ReturnType<typeof vi.fn>;
   leaveCall: ReturnType<typeof vi.fn>;
+  setCallScreenSharing: ReturnType<typeof vi.fn>;
 };
 
 function harness(
@@ -74,14 +100,15 @@ function harness(
       url: 'wss://sfu.example.org',
       jwt: 'jwt',
       identity: '@erwan:example.org:LAPTOP',
-      encryptMedia: options.encryptMedia ?? false,
-      canPublish: options.canPublish,
+      encrypt_media: options.encryptMedia ?? false,
+      can_publish: options.canPublish,
     });
   });
   const leaveCall = vi.fn(() => Promise.resolve());
+  const setCallScreenSharing = vi.fn(() => Promise.resolve());
 
   const client = {
-    commands: { joinCall, leaveCall },
+    rpc: { calls: { join: joinCall, leave: leaveCall, setScreenSharing: setCallScreenSharing } },
     subscribeEvents: (listener: (event: CoreEvent) => void) => {
       listeners.add(listener);
       return () => listeners.delete(listener);
@@ -104,6 +131,7 @@ function harness(
     transport,
     joinCall,
     leaveCall,
+    setCallScreenSharing,
   };
 }
 
@@ -118,6 +146,11 @@ const ownKey = (session = 7): CoreEvent => ({
 });
 
 beforeEach(() => {
+  globalThis.AudioContext = MockAudioContext as unknown as typeof AudioContext;
+  gains = [];
+  globalThis.fetch = vi.fn<() => Promise<Response>>().mockResolvedValue({
+    arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
+  } as Response);
   resetCallOwner();
 });
 
@@ -172,6 +205,22 @@ test('joining clears screen shares watched in an earlier call', async () => {
   await session.join('!room:example.org', { microphone: true, camera: false });
 
   expect(session.watchedScreenShareIds).toEqual([]);
+});
+
+test('the core is told when the local screen share starts and stops', async () => {
+  const { client, transport, emitTransportState, setCallScreenSharing } = harness();
+  const session = new CallSession(client, { createTransport: () => transport });
+  await session.join('!room:example.org', { microphone: true, camera: false });
+
+  const connected = { ...idleTransportState(), connection: 'connected' as const };
+  emitTransportState({ ...connected, screenShareEnabled: true });
+  emitTransportState({ ...connected, screenShareEnabled: true });
+  emitTransportState({ ...connected, screenShareEnabled: false });
+
+  expect(setCallScreenSharing.mock.calls).toEqual([
+    [{ session: 7, active: true }],
+    [{ session: 7, active: false }],
+  ]);
 });
 
 test('a call tears down after a successful join reports disconnected', async () => {
@@ -314,20 +363,22 @@ test('a key emitted during the join is not lost', async () => {
   const transport = harness({ encryptMedia: true }).transport;
 
   const client = {
-    commands: {
-      joinCall: vi.fn(() => {
-        listeners.forEach((listener) => {
-          listener(ownKey());
-        });
-        return Promise.resolve({
-          session: 7,
-          url: 'wss://sfu.example.org',
-          jwt: 'jwt',
-          identity: '@erwan:example.org:LAPTOP',
-          encryptMedia: true,
-        });
-      }),
-      leaveCall: vi.fn(() => Promise.resolve()),
+    rpc: {
+      calls: {
+        join: vi.fn(() => {
+          listeners.forEach((listener) => {
+            listener(ownKey());
+          });
+          return Promise.resolve({
+            session: 7,
+            url: 'wss://sfu.example.org',
+            jwt: 'jwt',
+            identity: '@erwan:example.org:LAPTOP',
+            encrypt_media: true,
+          });
+        }),
+        leave: vi.fn(() => Promise.resolve()),
+      },
     },
     subscribeEvents: (listener: (event: CoreEvent) => void) => {
       listeners.add(listener);
@@ -357,7 +408,7 @@ test('an encrypted call refuses to start where e2ee is unsupported', async () =>
 
   expect(session.failure).toBe('e2ee-unsupported');
   expect(transport.connect).not.toHaveBeenCalled();
-  expect(leaveCall).toHaveBeenCalledWith(7);
+  expect(leaveCall).toHaveBeenCalledWith({ session: 7 });
 });
 
 test('a room with no focus reports it rather than failing generically', async () => {
@@ -385,6 +436,7 @@ test('a key for another session is ignored', async () => {
         identity: '@bob:example.org:X',
         backend_id: null,
         joined_ts: 0,
+        screen_sharing: false,
       },
     ],
   });
@@ -403,6 +455,7 @@ test('the call is timed from the earliest member still in it', async () => {
     identity: `@bob:example.org:${device}`,
     backend_id: null,
     joined_ts: joined,
+    screen_sharing: false,
   });
 
   emit({
@@ -424,7 +477,7 @@ test('leaving releases the lease and tells the core', async () => {
   await session.leave();
 
   expect(session.lifecycle).toBe('idle');
-  expect(leaveCall).toHaveBeenCalledWith(7);
+  expect(leaveCall).toHaveBeenCalledWith({ session: 7 });
   expect(transport.disconnect).toHaveBeenCalledOnce();
 
   const next = new CallSession(client, { createTransport: () => transport });
@@ -437,17 +490,19 @@ test('a key arriving while the transport is still being built is not lost', asyn
   const transport = harness({ encryptMedia: true }).transport;
 
   const client = {
-    commands: {
-      joinCall: vi.fn(() =>
-        Promise.resolve({
-          session: 7,
-          url: 'wss://sfu.example.org',
-          jwt: 'jwt',
-          identity: '@erwan:example.org:LAPTOP',
-          encryptMedia: true,
-        })
-      ),
-      leaveCall: vi.fn(() => Promise.resolve()),
+    rpc: {
+      calls: {
+        join: vi.fn(() =>
+          Promise.resolve({
+            session: 7,
+            url: 'wss://sfu.example.org',
+            jwt: 'jwt',
+            identity: '@erwan:example.org:LAPTOP',
+            encrypt_media: true,
+          })
+        ),
+        leave: vi.fn(() => Promise.resolve()),
+      },
     },
     subscribeEvents: (listener: (event: CoreEvent) => void) => {
       listeners.add(listener);
@@ -517,17 +572,19 @@ function livekitHarness() {
   } as unknown as CallTransport;
 
   const client = {
-    commands: {
-      joinCall: vi.fn(() =>
-        Promise.resolve({
-          session: 7,
-          url: 'wss://sfu.example.org',
-          jwt: 'jwt',
-          identity: '@erwan:example.org:LAPTOP',
-          encryptMedia: true,
-        })
-      ),
-      leaveCall: vi.fn(() => Promise.resolve()),
+    rpc: {
+      calls: {
+        join: vi.fn(() =>
+          Promise.resolve({
+            session: 7,
+            url: 'wss://sfu.example.org',
+            jwt: 'jwt',
+            identity: '@erwan:example.org:LAPTOP',
+            encrypt_media: true,
+          })
+        ),
+        leave: vi.fn(() => Promise.resolve()),
+      },
     },
     subscribeEvents: (listener: (event: CoreEvent) => void) => {
       listeners.add(listener);
@@ -607,7 +664,7 @@ test('canceling while the grant is pending retracts the late grant and permits a
     url: string;
     jwt: string;
     identity: string;
-    encryptMedia: boolean;
+    encrypt_media: boolean;
   }) => void;
   h.joinCall.mockReturnValueOnce(
     new Promise((resolve) => {
@@ -625,7 +682,7 @@ test('canceling while the grant is pending retracts the late grant and permits a
     url: 'wss://sfu.example.org',
     jwt: 'jwt',
     identity: '@erwan:example.org:LAPTOP',
-    encryptMedia: false,
+    encrypt_media: false,
   });
   await joining;
   expect(session.lifecycle).toBe('idle');
@@ -753,10 +810,20 @@ test('a join sends the camera intent', async () => {
   const h = harness();
   const session = new CallSession(h.client, { createTransport: () => h.transport });
   await session.join('!room:example.org', { microphone: true, camera: true });
-  expect(h.joinCall).toHaveBeenCalledWith('!room:example.org', null, null, 'video');
+  expect(h.joinCall).toHaveBeenCalledWith({
+    room_id: '!room:example.org',
+    livekit_service_url: null,
+    mode: null,
+    intent: 'video',
+  });
   await session.leave();
   await session.join('!room:example.org', { microphone: true, camera: false });
-  expect(h.joinCall).toHaveBeenLastCalledWith('!room:example.org', null, null, 'audio');
+  expect(h.joinCall).toHaveBeenLastCalledWith({
+    room_id: '!room:example.org',
+    livekit_service_url: null,
+    mode: null,
+    intent: 'audio',
+  });
 });
 
 test('a backend snapshot after connect forwards its publisher id', async () => {
@@ -813,6 +880,20 @@ test('unmuting while deafened undeafens', async () => {
   await session.setMicrophoneEnabled(true);
 
   expect(session.deafened).toBe(false);
+});
+
+test('the microphone mute is remembered for the next call', async () => {
+  const { client, transport } = harness();
+  const session = new CallSession(client, { createTransport: () => transport });
+  await session.join('!room:example.org', { microphone: true, camera: false });
+  expect(preferences.callMicrophoneMuted).toBe(false);
+
+  await session.setMicrophoneEnabled(false);
+  await session.leave();
+  expect(preferences.callMicrophoneMuted).toBe(true);
+
+  await session.join('!room:example.org', { microphone: true, camera: false });
+  expect(preferences.callMicrophoneMuted).toBe(false);
 });
 
 test('a camera that cannot start is reported, not swallowed', async () => {
@@ -925,6 +1006,7 @@ test('two devices of one account keep their own voice state', () => {
     identity: `@me:x:${device}`,
     backend_id: null,
     joined_ts: 0,
+    screen_sharing: false,
   });
   const states = voiceStates(
     [member('BBBB'), member('AAAA')],
@@ -995,4 +1077,23 @@ test('on Linux the HDR choice is carried through the screen sound picker', async
   await session.shareScreenWith({ kind: 'none' });
   expect(setEnabled).toHaveBeenLastCalledWith(true, { kind: 'none' }, undefined);
   screenAudio.supported.mockReturnValue(false);
+});
+
+test('toggling a running screen share stops it without reopening a picker', async () => {
+  const { client, transport, emitTransportState } = harness();
+  const setEnabled = vi.fn(() => Promise.resolve());
+  transport.capabilities = { screenShare: { setEnabled } };
+  const session = new CallSession(client, { createTransport: () => transport });
+  await session.join('!room:example.org', { microphone: true, camera: false });
+  emitTransportState({
+    ...idleTransportState(),
+    connection: 'connected',
+    screenShareEnabled: true,
+  });
+
+  await session.toggleScreenShare();
+
+  expect(setEnabled).toHaveBeenCalledExactlyOnceWith(false);
+  expect(session.choosingScreenAudio).toBe(false);
+  expect(session.choosingScreenSource).toBeNull();
 });

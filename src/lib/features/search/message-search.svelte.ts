@@ -1,13 +1,14 @@
 import type { SearchHitView, SearchOrder } from '#src/generated/protocol';
 
 import type { CoreClient } from '#lib/core/client.svelte.js';
+import { searchMessages } from '#lib/core/api/search.svelte.js';
 
 import {
   parseSearchQuery,
-  toSearchFilter,
+  resolveSearchQuery,
   type ParsedQuery,
-  type QueryResolvers,
   type ResolvedQuery,
+  type SearchDirectory,
   type SearchToken,
 } from './search-query';
 
@@ -41,23 +42,19 @@ export class MessageSearch {
   pages = $state(0);
 
   #core: CoreClient;
-  #resolvers: () => QueryResolvers;
   #debounce: ReturnType<typeof setTimeout> | undefined;
   #generation = 0;
   #served = 0;
   #olderCursor: string | null = null;
+  readonly resolved: ResolvedQuery;
 
-  constructor(core: CoreClient, resolvers: () => QueryResolvers) {
+  constructor(core: CoreClient, directory: () => SearchDirectory) {
     this.#core = core;
-    this.#resolvers = resolvers;
+    this.resolved = $derived(resolveSearchQuery(this.query, directory()));
   }
 
   get parsed(): ParsedQuery {
     return parseSearchQuery(this.query);
-  }
-
-  get resolved(): ResolvedQuery {
-    return toSearchFilter(this.parsed, this.#resolvers());
   }
 
   get unresolved(): SearchToken[] {
@@ -95,7 +92,7 @@ export class MessageSearch {
       return;
     }
 
-    if (this.unresolved.length > 0 || this.resolved.matchesNothing) {
+    if (this.unresolved.length > 0 || this.resolved.matches_nothing) {
       this.hits = [];
       this.searching = false;
       this.refining = false;
@@ -135,7 +132,7 @@ export class MessageSearch {
     const { text } = this.parsed;
 
     try {
-      const page = await this.#core.commands.searchMessages(text, {
+      const page = await searchMessages(this.#core.rpc, text, {
         filter: this.resolved.filter,
         order: this.order,
         limit: PAGE_SIZE,
@@ -156,7 +153,8 @@ export class MessageSearch {
       this.exhausted = page.hits.length < PAGE_SIZE && !this.older;
       this.failed = false;
       this.pages += 1;
-    } catch {
+    } catch (error) {
+      console.warn('[sable search] searching messages failed', error);
       if (generation !== this.#generation) return;
       if (offset === 0) this.hits = [];
       this.failed = true;
@@ -171,7 +169,7 @@ export class MessageSearch {
 
   async #runOlder(generation: number, cursor: string): Promise<void> {
     try {
-      const page = await this.#core.commands.searchMessages(this.parsed.text, {
+      const page = await searchMessages(this.#core.rpc, this.parsed.text, {
         filter: this.resolved.filter,
         order: this.order,
         limit: PAGE_SIZE,
@@ -185,7 +183,8 @@ export class MessageSearch {
       this.exhausted = page.older === null;
       this.failed = false;
       this.pages += 1;
-    } catch {
+    } catch (error) {
+      console.warn('[sable search] loading older results failed', error);
       if (generation !== this.#generation) return;
       this.failed = true;
       this.exhausted = true;

@@ -5,6 +5,7 @@ import type {
 import { uint8ArrayToBase64 } from 'uint8array-extras';
 
 import { loadNativeCalls } from '#lib/platform/calls.js';
+import { isAndroid } from '#lib/platform/os.js';
 import { preferences } from '#lib/settings/preferences.svelte.js';
 
 import type {
@@ -15,7 +16,7 @@ import type {
   CallTransportConnection,
   CallTransportState,
 } from './call-transport';
-import { idleTransportState, ignoreError } from './call-transport';
+import { idleTransportState } from './call-transport';
 
 type Plugin = NonNullable<Awaited<ReturnType<typeof loadNativeCalls>>>;
 
@@ -99,8 +100,8 @@ export async function createNativeTransport(
     for (const listener of listeners) {
       try {
         listener(view);
-      } catch {
-        ignoreError();
+      } catch (error) {
+        console.warn('[sable call] state listener failed', error);
       }
     }
   };
@@ -148,8 +149,8 @@ export async function createNativeTransport(
       if (options.cameraEnabled) {
         try {
           adopt(await plugin.setNativeCallCameraEnabled({ callId, enabled: true }));
-        } catch {
-          ignoreError();
+        } catch (error) {
+          console.warn('[sable call] could not enable camera', error);
         }
       }
     },
@@ -198,6 +199,21 @@ export async function createNativeTransport(
           adopt(await plugin.clearNativeCallLocalVideoOverlay({ callId }));
         },
       },
+      remoteVideo: {
+        place: async ({ identity, trackId, ...rect }) => {
+          adopt(
+            await plugin.setNativeCallRemoteVideoOverlay({
+              callId,
+              participantIdentity: identity,
+              trackId,
+              ...rect,
+            })
+          );
+        },
+        clear: async (trackId) => {
+          adopt(await plugin.clearNativeCallRemoteVideoOverlay({ callId, trackId }));
+        },
+      },
       audioRoutes: {
         list: async () => {
           const response = await plugin.getAudioRoutes({ callId });
@@ -208,6 +224,18 @@ export async function createNativeTransport(
           adopt(await plugin.setAudioRoute({ callId, routeId }));
         },
       },
+      audioInputs: isAndroid()
+        ? {
+            list: async () => {
+              const response = await plugin.getAudioRoutes({ callId });
+              adopt(response.receiver);
+              return response.inputs ?? [];
+            },
+            select: async (inputId) => {
+              adopt(await plugin.setAudioInput({ callId, inputId }));
+            },
+          }
+        : undefined,
       screenShare: {
         setEnabled: async (enabled) => {
           adopt(await plugin.setNativeCallScreenShareEnabled({ callId, enabled }));

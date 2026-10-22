@@ -1,9 +1,10 @@
 import { SvelteMap } from 'svelte/reactivity';
 
 import { readJson, writeJson } from '#lib/platform/local-json.js';
+import { supportsDesktopWindow } from '#lib/platform/window-decorations.js';
 
 import { findShortcutConflicts } from './binding.js';
-import { SHORTCUTS, type ShortcutDefinition, type ShortcutId } from './shortcuts.js';
+import { SHORTCUTS, shortcutScope, type ShortcutDefinition, type ShortcutId } from './shortcuts.js';
 
 const STORAGE_KEY = 'sable-shortcut-bindings';
 const SHORTCUT_IDS = new Set<string>(SHORTCUTS.map((shortcut) => shortcut.id));
@@ -32,7 +33,9 @@ export function isRebound(id: ShortcutId): boolean {
 }
 
 export function effectiveShortcuts(): ShortcutDefinition[] {
-  return SHORTCUTS.map((shortcut) => ({ ...shortcut, binding: effectiveBinding(shortcut) }));
+  return SHORTCUTS.filter((shortcut) => !shortcut.desktopOnly || supportsDesktopWindow()).map(
+    (shortcut) => ({ ...shortcut, binding: effectiveBinding(shortcut) })
+  );
 }
 
 export function rebind(id: ShortcutId, binding: string): void {
@@ -58,10 +61,15 @@ export function conflictsWith(id: ShortcutId, binding: string, isMac: boolean): 
   const candidates = effectiveShortcuts().map((shortcut) => ({
     id: shortcut.id,
     binding: shortcut.id === id ? binding : shortcut.binding,
-    scope: 'global',
+    scope: shortcutScope(shortcut),
   }));
 
   return findShortcutConflicts(candidates, isMac)
     .filter(([a, b]) => a.id === id || b.id === id)
     .map(([a, b]) => (a.id === id ? b.id : a.id) as ShortcutId);
+}
+
+export function bindingFor(id: string): string | undefined {
+  const shortcut = SHORTCUTS.find((candidate) => candidate.id === id);
+  return shortcut ? effectiveBinding(shortcut) : undefined;
 }

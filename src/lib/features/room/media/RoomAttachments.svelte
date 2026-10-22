@@ -33,6 +33,7 @@
   import { PanelWidth, remFromPixels } from '#lib/ui/panel-width.svelte.js';
   import Skeleton from '#lib/ui/primitives/Skeleton.svelte';
   import Spinner from '#lib/ui/primitives/Spinner.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
 
   import { groupByMonth } from './attachment-groups';
   import { RoomAttachmentsPager } from './room-attachments-pager.svelte';
@@ -41,6 +42,7 @@
   import { galleryItemId } from './media-items.js';
   import { memberName } from '../members/members';
   import { formatDate } from '#lib/ui/date-time.js';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
 
   interface Props {
     roomId: string;
@@ -190,6 +192,7 @@
             blurhash: content.blurhash,
             thumbnail: content.thumbnail,
             spoiler: content.spoiler,
+            playback: null,
           },
         ];
       case 'file':
@@ -275,7 +278,7 @@
   }
 
   function itemLabel(item: RoomAttachmentView, name: string): string {
-    return $i18n.t('timeline.attachmentsOpenItem', {
+    return i18n.t('timeline.attachmentsOpenItem', {
       name,
       sender: senderOf(item),
       date: formatDate(item.timestamp),
@@ -286,11 +289,11 @@
     if (content.kind === 'link') return '';
     if ((content.kind === 'image' || content.kind === 'video') && content.spoiler !== null) {
       return content.spoiler
-        ? $i18n.t('timeline.attachmentsSpoilerReason', { reason: content.spoiler })
-        : $i18n.t('timeline.attachmentsSpoiler');
+        ? i18n.t('timeline.attachmentsSpoilerReason', { reason: content.spoiler })
+        : i18n.t('timeline.attachmentsSpoiler');
     }
     if (content.kind === 'video') {
-      return $i18n.t('timeline.attachmentsVideoNamed', { name: content.filename });
+      return i18n.t('timeline.attachmentsVideoNamed', { name: content.filename });
     }
     return content.filename;
   }
@@ -368,7 +371,7 @@
       {:else if preview === null}
         <span class="tile-placeholder">
           <FileVideoIcon aria-hidden="true" />
-          <span class="tile-placeholder-label">{$i18n.t('timeline.attachmentsVideo')}</span>
+          <span class="tile-placeholder-label">{i18n.t('timeline.attachmentsVideo')}</span>
         </span>
       {:else}
         <MediaImage
@@ -427,25 +430,29 @@
       <span class="link-text">
         {#each content.urls.slice(0, LINKS_PER_ROW) as url (url)}
           {@const parts = splitUrl(url)}
-          <a
-            class="link"
-            href={url}
-            target="_blank"
-            rel="noopener noreferrer"
-            title={url}
-            onclick={(event) => {
-              followLink(event, url);
-            }}
-          >
-            <span class="link-host">{parts.host}</span>
-            {#if parts.rest}
-              <span class="link-rest">{parts.rest}</span>
-            {/if}
-          </a>
+          <Tooltip label={url} multiline>
+            {#snippet trigger({ props })}
+              <a
+                {...props}
+                class="link"
+                href={url}
+                target="_blank"
+                rel="external noopener noreferrer"
+                onclick={(event) => {
+                  followLink(event, url);
+                }}
+              >
+                <span class="link-host">{parts.host}</span>
+                {#if parts.rest}
+                  <span class="link-rest">{parts.rest}</span>
+                {/if}
+              </a>
+            {/snippet}
+          </Tooltip>
         {/each}
         {#if content.urls.length > LINKS_PER_ROW}
           <span class="link-more">
-            {$i18n.t('timeline.attachmentsMoreLinks', {
+            {i18n.t('timeline.attachmentsMoreLinks', {
               count: content.urls.length - LINKS_PER_ROW,
             })}
           </span>
@@ -459,7 +466,7 @@
         class="link-jump"
         variant="ghost"
         size="small"
-        label={`${$i18n.t('timeline.attachmentsJump')}: ${senderOf(item)}, ${formatDate(item.timestamp)}`}
+        label={`${i18n.t('common.jumpToMessage')}: ${senderOf(item)}, ${formatDate(item.timestamp)}`}
         onclick={() => {
           jump(item.event_id);
         }}
@@ -473,7 +480,7 @@
 {#snippet body()}
   <aside
     class={['attachments', { modal }]}
-    aria-label={$i18n.t('timeline.attachmentsTitle')}
+    aria-label={i18n.t('timeline.attachmentsTitle')}
     style:width={modal ? null : `${panelWidth.width}rem`}
   >
     {#if !modal}
@@ -481,7 +488,7 @@
         value={panelWidth.width}
         min={panelWidth.min}
         max={panelWidth.max}
-        label={$i18n.t('timeline.attachmentsResize')}
+        label={i18n.t('timeline.attachmentsResize')}
         grow="left"
         step={1}
         fromPixels={remFromPixels}
@@ -489,18 +496,18 @@
         onCommit={() => panelWidth.commit()}
       />
     {/if}
-    <PanelHeader class="attachments-header" title={$i18n.t('timeline.attachmentsTitle')}>
+    <PanelHeader class="attachments-header" title={i18n.t('timeline.attachmentsTitle')}>
       {#snippet prefix()}
         <ImagesIcon aria-hidden="true" />
       {/snippet}
       {#snippet suffix()}
-        <PanelHeaderButton label={$i18n.t('timeline.attachmentsClose')} onclick={onClose}>
+        <PanelHeaderButton label={i18n.t('timeline.attachmentsClose')} onclick={onClose}>
           <XIcon />
         </PanelHeaderButton>
       {/snippet}
     </PanelHeader>
 
-    <div class="tabs" role="tablist" aria-label={$i18n.t('timeline.attachmentsTitle')}>
+    <div class="tabs" role="tablist" aria-label={i18n.t('timeline.attachmentsTitle')}>
       {#each tabs as tab (tab.id)}
         <Button
           size="small"
@@ -516,15 +523,15 @@
             selectTab(tab.id, false);
           }}
         >
-          {$i18n.t(tab.label)}
+          {i18n.t(tab.label)}
         </Button>
       {/each}
     </div>
     {#if !showEmpty}
-      <p class="attachments-scope">{$i18n.t('timeline.attachmentsIndexed')}</p>
+      <p class="attachments-scope">{i18n.t('timeline.attachmentsIndexed')}</p>
     {/if}
     <p class="screen-reader-only" aria-live="polite">
-      {items.length > 0 ? $i18n.t('timeline.attachmentsLoaded', { count: items.length }) : ''}
+      {items.length > 0 ? i18n.t('timeline.attachmentsLoaded', { count: items.length }) : ''}
     </p>
 
     <div
@@ -533,6 +540,7 @@
       id="attachments-panel"
       aria-labelledby={`attachments-tab-${kind}`}
       aria-busy={loading}
+      {@attach scrollHint}
     >
       {#if items.length > 0}
         {#each groups as group (group.key)}
@@ -556,14 +564,14 @@
       {:else if loading}
         {@render skeleton()}
       {:else if showEmpty}
-        <p class="attachments-status">{$i18n.t(emptyLabel)}</p>
+        <p class="attachments-status">{i18n.t(emptyLabel)}</p>
       {/if}
 
       {#if failed}
         <div class="attachments-failure" role="alert">
-          <p>{$i18n.t('timeline.attachmentsFailed')}</p>
+          <p>{i18n.t('timeline.attachmentsFailed')}</p>
           <Button size="small" variant="secondary" onclick={() => pager.retry()}>
-            {$i18n.t('timeline.attachmentsRetry')}
+            {i18n.t('common.tryAgain')}
           </Button>
         </div>
       {:else if loading && items.length > 0}
@@ -571,7 +579,7 @@
       {:else if !exhausted && !loading}
         <div class="attachments-more" {@attach nearEnd}>
           <Button size="small" variant="secondary" onclick={loadMore}>
-            {$i18n.t('timeline.attachmentsLoadMore')}
+            {i18n.t('common.loadMore')}
           </Button>
         </div>
       {/if}
@@ -586,7 +594,7 @@
       if (!open) onClose();
     }}
     variant="drawer"
-    label={$i18n.t('timeline.attachmentsTitle')}
+    label={i18n.t('timeline.attachmentsTitle')}
   >
     {@render body()}
   </DialogFrame>

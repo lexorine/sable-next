@@ -1,20 +1,25 @@
 <script lang="ts">
+  import { copyText } from '#lib/platform/clipboard.js';
   import ArrowClockwiseIcon from 'phosphor-svelte/lib/ArrowClockwiseIcon';
   import CheckIcon from 'phosphor-svelte/lib/CheckIcon';
   import CopyIcon from 'phosphor-svelte/lib/CopyIcon';
   import LinkSimpleIcon from 'phosphor-svelte/lib/LinkSimpleIcon';
+  import { onMount } from 'svelte';
 
   import type { RegisteredPusherView } from '#src/generated/protocol';
   import { runtimeConfig } from '#lib/config/runtime-config.js';
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n, t } from '#lib/i18n.js';
+  import { nativeDevicePusher } from '#lib/platform/native-notifications.js';
+  import { isNativeMobile } from '#lib/platform/os.js';
   import SettingsAnchorLink from '#lib/ui/primitives/SettingsAnchorLink.svelte';
-  import { pushOverride, trimmed } from '#lib/features/notifications/push-config.js';
+  import { pushOverride, trimmed } from '#lib/notifications/push-config.js';
   import Alert from '#lib/ui/primitives/Alert.svelte';
   import Button from '#lib/ui/primitives/Button.svelte';
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
   import Spinner from '#lib/ui/primitives/Spinner.svelte';
   import StatusBadge from '#lib/ui/primitives/StatusBadge.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
 
   import { currentPushKey, SERVER_PUSHER_KIND, WEBPUSH_APP_ID } from './web-push';
   import '#lib/ui/primitives/settings-row.css';
@@ -28,7 +33,7 @@
   let confirming = $state<string | null>(null);
   let removing = $state<string | null>(null);
   let copied = $state<string | null>(null);
-  let ownApps = $state<string[]>([]);
+  let ownApps = $state.raw<string[]>([]);
   let ownKey = $state<string | null>(null);
   let section = $state<HTMLElement>();
 
@@ -50,7 +55,10 @@
   }
 
   async function refreshIdentity(): Promise<void> {
-    const config = await runtimeConfig().catch(() => null);
+    const config = await runtimeConfig().catch((cause: unknown) => {
+      console.debug('[sable notifications] runtime config unavailable', cause);
+      return null;
+    });
     if (!alive) return;
     const override = trimmed(pushOverride());
     const ids = [
@@ -63,13 +71,20 @@
     ownApps = [
       ...new Set(ids.filter((id): id is string => id !== undefined && id !== null && id !== '')),
     ];
-    const key = await currentPushKey();
+    const key = await devicePushKey();
     if (alive) ownKey = key;
+  }
+
+  async function devicePushKey(): Promise<string | null> {
+    if (!isNativeMobile()) return currentPushKey();
+    const session = core.session;
+    if (!session) return null;
+    return (await nativeDevicePusher(session.user_id, session.device_id))?.pushkey ?? null;
   }
 
   async function reload(): Promise<void> {
     try {
-      const next = await core.commands.webPushers();
+      const next = await core.rpc.push.webPushers();
       if (!alive) return;
       pushers = next;
       error = null;
@@ -79,7 +94,7 @@
     }
   }
 
-  $effect(() => {
+  onMount(() => {
     void reload().finally(() => {
       if (alive) loading = false;
     });
@@ -92,7 +107,9 @@
 
   function holdFocus(event: Event): void {
     const target = event.currentTarget;
-    if (target instanceof HTMLElement) target.closest('li')?.focus({ preventScroll: true });
+    if (target instanceof HTMLElement) {
+      (target.closest('li') ?? section)?.focus({ preventScroll: true });
+    }
   }
 
   function startRemoval(pusher: RegisteredPusherView, event: Event): void {
@@ -106,7 +123,7 @@
   }
 
   async function copyValue(id: string, value: string): Promise<void> {
-    await navigator.clipboard.writeText(value);
+    await copyText(value);
     copied = id;
     setTimeout(() => {
       if (copied === id) copied = null;
@@ -114,11 +131,12 @@
   }
 
   async function remove(pusher: RegisteredPusherView): Promise<void> {
+    if (removing !== null) return;
     const key = keyOf(pusher);
     removing = key;
     error = null;
     try {
-      await core.commands.removePusher(pusher.pushkey, pusher.app_id);
+      await core.rpc.push.removePusher({ pushkey: pusher.pushkey, app_id: pusher.app_id });
       if (!alive) return;
       section?.focus({ preventScroll: true });
       confirming = null;
@@ -128,6 +146,32 @@
       if (alive) error = 'settings.pushersRemoveFailed';
     } finally {
       if (alive) removing = null;
+    }
+  }
+
+  async function removeAll(): Promise<void> {
+    if (removing !== null || pushers.length === 0) return;
+    removing = 'all';
+    error = null;
+    const removed: string[] = [];
+    let failed = false;
+    for (const pusher of [...pushers]) {
+      try {
+        await core.rpc.push.removePusher({ pushkey: pusher.pushkey, app_id: pusher.app_id });
+        removed.push(keyOf(pusher));
+      } catch (cause) {
+        console.warn('[sable notifications] removing a pusher failed', cause);
+        failed = true;
+      }
+    }
+    if (!alive) return;
+    section?.focus({ preventScroll: true });
+    confirming = null;
+    pushers = pushers.filter((pusher) => !removed.includes(keyOf(pusher)));
+    await reload();
+    if (alive) {
+      if (failed) error = 'settings.pushersRemoveAllFailed';
+      removing = null;
     }
   }
 </script>
@@ -140,31 +184,64 @@
 >
   <div class="pushers-head">
     <div class="settings-heading-row">
-      <h3 id="pushers-heading" data-settings-outline>{$i18n.t('settings.pushers')}</h3>
+      <h3 id="pushers-heading" data-settings-outline>{i18n.t('settings.pushers')}</h3>
       <SettingsAnchorLink anchor="pushers-heading" />
     </div>
+    {#if pushers.length > 0 && confirming !== 'all'}
+      <Button
+        variant="danger"
+        size="small"
+        disabled={loading || removing !== null}
+        onclick={(event) => {
+          holdFocus(event);
+          confirming = 'all';
+        }}
+      >
+        {i18n.t('settings.pushersRemoveAll')}
+      </Button>
+    {/if}
     <IconButton
       variant="ghost"
       size="small"
-      label={$i18n.t('settings.pushersRefresh')}
+      label={i18n.t('settings.pushersRefresh')}
       onclick={() => void reload()}
-      disabled={loading}
+      disabled={loading || removing !== null}
     >
       <ArrowClockwiseIcon />
     </IconButton>
   </div>
-  <p class="hint settings-description">{$i18n.t('settings.pushersHint')}</p>
+  <p class="hint settings-description">{i18n.t('settings.pushersHint')}</p>
+
+  {#if confirming === 'all'}
+    <form
+      class="pusher-confirm"
+      onsubmit={(event) => {
+        event.preventDefault();
+        void removeAll();
+      }}
+    >
+      <span>{i18n.t('settings.pushersConfirmAll')}</span>
+      <div class="pusher-confirm-actions">
+        <Button type="submit" variant="danger" size="small" loading={removing === 'all'}>
+          {i18n.t('settings.pushersRemoveAll')}
+        </Button>
+        <Button variant="ghost" size="small" disabled={removing !== null} onclick={cancelRemoval}>
+          {i18n.t('common.cancel')}
+        </Button>
+      </div>
+    </form>
+  {/if}
 
   {#if error}
     <Alert variant="warning" role="status">
-      <p>{$i18n.t(error)}</p>
+      <p>{i18n.t(error)}</p>
     </Alert>
   {/if}
 
   {#if loading}
-    <p class="pushers-empty"><Spinner small label={$i18n.t('a11y.loading')} /></p>
+    <p class="pushers-empty"><Spinner small label={i18n.t('a11y.loading')} /></p>
   {:else if pushers.length === 0 && error !== 'settings.pushersLoadFailed'}
-    <p class="pushers-empty">{$i18n.t('settings.pushersEmpty')}</p>
+    <p class="pushers-empty">{i18n.t('settings.pushersEmpty')}</p>
   {:else}
     <ul class="pusher-list">
       {#each pushers as pusher (keyOf(pusher))}
@@ -177,92 +254,111 @@
               <div class="pusher-name-line">
                 <span class="pusher-name">{name}</span>
                 {#if pusher.pushkey === ownKey}
-                  <StatusBadge variant="primary" label={$i18n.t('settings.pushersThisDevice')} />
+                  <StatusBadge variant="primary" label={i18n.t('settings.currentDevice')} />
                 {:else if ownApps.includes(pusher.app_id)}
                   <StatusBadge variant="neutral" label="Sable" />
                 {/if}
                 {#if pusher.activated !== null}
-                  <span
-                    title={pusher.activated ? undefined : $i18n.t('settings.pushersPendingHint')}
+                  {@const activationLabel = i18n.t(
+                    pusher.activated ? 'settings.pushersActive' : 'settings.pushersPending'
+                  )}
+                  <Tooltip
+                    label={i18n.t('settings.pushersPendingHint')}
+                    disabled={pusher.activated}
                   >
-                    <StatusBadge
-                      variant={pusher.activated ? 'success' : 'warning'}
-                      label={$i18n.t(
-                        pusher.activated ? 'settings.pushersActive' : 'settings.pushersPending'
-                      )}
-                    />
-                  </span>
+                    {#snippet trigger({ props })}
+                      <span {...props}>
+                        <StatusBadge
+                          variant={pusher.activated ? 'success' : 'warning'}
+                          label={activationLabel}
+                        />
+                      </span>
+                    {/snippet}
+                  </Tooltip>
                 {/if}
               </div>
               <div class="pusher-meta">
                 <span class="pusher-kind">{kindLabel(pusher.kind)}</span>
-                <button
-                  class="pusher-value"
-                  type="button"
-                  title={pusher.app_id}
-                  aria-label={$i18n.t('settings.pushersCopyAppId')}
-                  onclick={() => void copyValue(`app\u0000${key}`, pusher.app_id)}
-                >
-                  {#if copied === `app\u0000${key}`}
-                    {$i18n.t('settings.copied')}
-                  {:else}
-                    <code>{pusher.app_id}</code>
-                  {/if}
-                </button>
-                <button
-                  class="pusher-value pusher-key"
-                  type="button"
-                  title={pusher.pushkey}
-                  aria-label={$i18n.t('settings.pushersCopyKey')}
-                  onclick={() => void copyValue(`key\u0000${key}`, pusher.pushkey)}
-                >
-                  {#if copied === `key\u0000${key}`}
-                    {$i18n.t('settings.copied')}
-                  {:else}
-                    <code>{pusher.pushkey}</code>
-                  {/if}
-                </button>
+                <Tooltip label={pusher.app_id} multiline>
+                  {#snippet trigger({ props })}
+                    <button
+                      {...props}
+                      class="pusher-value"
+                      type="button"
+                      aria-label={i18n.t('settings.pushersCopyAppId')}
+                      onclick={() => void copyValue(`app\u0000${key}`, pusher.app_id)}
+                    >
+                      {#if copied === `app\u0000${key}`}
+                        {i18n.t('common.copied')}
+                      {:else}
+                        <code>{pusher.app_id}</code>
+                      {/if}
+                    </button>
+                  {/snippet}
+                </Tooltip>
+                <Tooltip label={pusher.pushkey} multiline>
+                  {#snippet trigger({ props })}
+                    <button
+                      {...props}
+                      class="pusher-value pusher-key"
+                      type="button"
+                      aria-label={i18n.t('settings.pushersCopyKey')}
+                      onclick={() => void copyValue(`key\u0000${key}`, pusher.pushkey)}
+                    >
+                      {#if copied === `key\u0000${key}`}
+                        {i18n.t('common.copied')}
+                      {:else}
+                        <code>{pusher.pushkey}</code>
+                      {/if}
+                    </button>
+                  {/snippet}
+                </Tooltip>
               </div>
               {#if gateway !== null}
-                <button
-                  class="pusher-gateway"
-                  type="button"
-                  title={gateway}
-                  aria-label={$i18n.t(
-                    copied === `gateway\u0000${key}`
-                      ? 'settings.copied'
-                      : 'settings.pushersCopyProvider'
-                  )}
-                  onclick={() => void copyValue(`gateway\u0000${key}`, gateway)}
-                >
-                  <LinkSimpleIcon class="pusher-gateway-link" aria-hidden="true" />
-                  <span class="pusher-gateway-copy">
-                    <span class="pusher-gateway-label">
-                      {$i18n.t(
+                <Tooltip label={gateway} multiline>
+                  {#snippet trigger({ props })}
+                    <button
+                      {...props}
+                      class="pusher-gateway"
+                      type="button"
+                      aria-label={i18n.t(
                         copied === `gateway\u0000${key}`
-                          ? 'settings.copied'
-                          : 'settings.pushersProvider'
+                          ? 'common.copied'
+                          : 'settings.pushersCopyProvider'
                       )}
-                    </span>
-                    <code>{gateway}</code>
-                  </span>
-                  {#if copied === `gateway\u0000${key}`}
-                    <CheckIcon class="pusher-gateway-action" weight="bold" aria-hidden="true" />
-                  {:else}
-                    <CopyIcon class="pusher-gateway-action" aria-hidden="true" />
-                  {/if}
-                </button>
+                      onclick={() => void copyValue(`gateway\u0000${key}`, gateway)}
+                    >
+                      <LinkSimpleIcon class="pusher-gateway-link" aria-hidden="true" />
+                      <span class="pusher-gateway-copy">
+                        <span class="pusher-gateway-label">
+                          {i18n.t(
+                            copied === `gateway\u0000${key}`
+                              ? 'common.copied'
+                              : 'settings.pushersProvider'
+                          )}
+                        </span>
+                        <code>{gateway}</code>
+                      </span>
+                      {#if copied === `gateway\u0000${key}`}
+                        <CheckIcon class="pusher-gateway-action" weight="bold" aria-hidden="true" />
+                      {:else}
+                        <CopyIcon class="pusher-gateway-action" aria-hidden="true" />
+                      {/if}
+                    </button>
+                  {/snippet}
+                </Tooltip>
               {/if}
             </div>
             {#if confirming !== key}
               <Button
                 variant="danger"
                 size="small"
+                disabled={removing !== null}
                 onclick={(event) => {
                   startRemoval(pusher, event);
                 }}
               >
-                {$i18n.t('settings.pushersRemove')}
+                {i18n.t('common.remove')}
               </Button>
             {/if}
           </div>
@@ -275,16 +371,16 @@
                 void remove(pusher);
               }}
             >
-              <span>{$i18n.t('settings.pushersConfirmTitle', { name })}</span>
+              <span>{i18n.t('settings.pushersConfirmTitle', { name })}</span>
               <div class="pusher-confirm-actions">
                 <Button
                   type="submit"
                   variant="danger"
                   size="small"
                   loading={removing === key}
-                  aria-label={$i18n.t('settings.pushersRemoveNamed', { name })}
+                  aria-label={i18n.t('settings.pushersRemoveNamed', { name })}
                 >
-                  {$i18n.t('settings.pushersRemove')}
+                  {i18n.t('common.remove')}
                 </Button>
                 <Button
                   type="button"
@@ -293,7 +389,7 @@
                   disabled={removing === key}
                   onclick={cancelRemoval}
                 >
-                  {$i18n.t('settings.cancel')}
+                  {i18n.t('common.cancel')}
                 </Button>
               </div>
             </form>
@@ -308,6 +404,7 @@
   .pushers-head {
     align-items: center;
     display: flex;
+    flex-wrap: wrap;
     gap: var(--space-200);
   }
 

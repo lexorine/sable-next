@@ -6,6 +6,7 @@
   import TextInput from './TextInput.svelte';
   import './menu.css';
   import type { HTMLInputAttributes } from 'svelte/elements';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
 
   /** Free text is a valid value, so the input always shows `value` itself.
       `label` is the list's display and filter text and must not diverge from it. */
@@ -101,7 +102,7 @@
       {/snippet}
     </BitsCombobox.Input>
 
-    <BitsCombobox.Trigger aria-label={$i18n.t('combobox.showOptions')}>
+    <BitsCombobox.Trigger aria-label={i18n.t('combobox.showOptions')}>
       {#snippet child({ props })}
         <button {...props} class="combobox-trigger selection-open">
           <CaretDownIcon class="combobox-icon" />
@@ -116,15 +117,17 @@
         {#if open && filteredItems.length > 0}
           <div {...wrapperProps} {...overlayLayer()} class="combobox-positioner">
             <div {...props} class="menu-surface combobox-menu">
-              {#each filteredItems as item (item.value)}
-                <BitsCombobox.Item value={item.value} label={item.label} disabled={item.disabled}>
-                  {#snippet child({ props })}
-                    <div {...props} class="menu-item">
-                      {item.label}
-                    </div>
-                  {/snippet}
-                </BitsCombobox.Item>
-              {/each}
+              <div class="menu-scroll-content" {@attach scrollHint}>
+                {#each filteredItems as item (item.value)}
+                  <BitsCombobox.Item value={item.value} label={item.label} disabled={item.disabled}>
+                    {#snippet child({ props })}
+                      <div {...props} class="menu-item">
+                        {item.label}
+                      </div>
+                    {/snippet}
+                  </BitsCombobox.Item>
+                {/each}
+              </div>
             </div>
           </div>
         {/if}

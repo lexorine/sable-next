@@ -15,6 +15,7 @@ const video: TimelineItemContentView = {
   blurhash: null,
   thumbnail: null,
   spoiler: null,
+  playback: null,
 };
 
 test.each([
@@ -38,7 +39,15 @@ test.each([
   ['fallback', '', 'fallback'],
 ])('a preview renders %s', (body, html, expected) => {
   expect(
-    replyPreviewBody({ kind: 'message', body, html, emote: false, notice: false, edited: false })
+    replyPreviewBody({
+      kind: 'message',
+      body,
+      html,
+      emote: false,
+      notice: false,
+      edited: false,
+      jumbo: null,
+    })
   ).toBe(expected);
 });
 
@@ -89,7 +98,7 @@ test('every renderable message kind yields a preview', () => {
 });
 
 test('an event with no body still yields a quotable empty preview', () => {
-  expect(replyPreviewBody({ kind: 'redacted', reason: null })).toBe('');
+  expect(replyPreviewBody({ kind: 'redacted', reason: null, redacted_by: null })).toBe('');
   expect(
     replyPreviewBody({
       kind: 'hidden_event',
@@ -109,6 +118,7 @@ test('a spoiler stays hidden in the preview', () => {
       emote: false,
       notice: false,
       edited: false,
+      jumbo: null,
     })
   ).toBe('look [Spoiler] here & there');
   expect(

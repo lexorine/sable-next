@@ -1,12 +1,19 @@
-import type { MemberView, PackImageView, RoomSummary } from '#src/generated/protocol';
+import type {
+  ImagePackView,
+  MemberView,
+  PackImageView,
+  RoomListItemView,
+} from '#src/generated/protocol';
 
 import { REACTION_EMOJI, searchReactionEmoji } from '#lib/emoji/emoji.js';
+import { packName } from '#lib/emoji/pack-name.js';
 import { t } from '#lib/i18n.js';
 
 import { adminSuggestions, type AdminCommand, type AdminScope } from './admin-commands';
 import type { AutocompleteQuery, Suggestion } from './autocomplete';
 import { botCommandId, botCommandNames, type BotCommand } from './bot-commands';
-import { descriptionKey, SLASH_COMMANDS } from './slash-commands';
+import { descriptionKey, slashCommandNames } from './slash-commands';
+import { byUsage, usageOf } from './suggestion-usage';
 
 const limit = 8;
 
@@ -33,41 +40,63 @@ function roomMention(needle: string, translate: Translate): Suggestion[] {
   ];
 }
 
-function memberSuggestions(needle: string, members: readonly MemberView[]): Suggestion[] {
+export type DisplayName = (userId: string, fallback: string) => string;
+
+const atName = (name: string): string => (name.startsWith('@') ? name : `@${name}`);
+
+function memberSuggestions(
+  needle: string,
+  members: readonly MemberView[],
+  displayName: DisplayName
+): Suggestion[] {
   return members
-    .map((member) => ({
-      member,
-      name: member.display_name ?? member.user_id,
-      localpart: localpartOf(member.user_id),
+    .map((member) => {
+      const name = member.display_name ?? member.user_id;
+      return {
+        member,
+        name,
+        shown: displayName(member.user_id, name),
+        localpart: localpartOf(member.user_id),
+      };
+    })
+    .map((entry) => ({
+      ...entry,
+      keys: [entry.shown, entry.name, entry.localpart].map((key) => key.toLowerCase()),
     }))
-    .filter(
-      ({ name, localpart }) =>
-        name.toLowerCase().includes(needle) || localpart.toLowerCase().includes(needle)
-    )
+    .filter(({ keys }) => keys.some((key) => key.includes(needle)))
     .sort((left, right) => {
       const byPrefix = rank(
-        left.name.toLowerCase().startsWith(needle) ||
-          left.localpart.toLowerCase().startsWith(needle),
-        right.name.toLowerCase().startsWith(needle) ||
-          right.localpart.toLowerCase().startsWith(needle)
+        left.keys.some((key) => key.startsWith(needle)),
+        right.keys.some((key) => key.startsWith(needle))
       );
-      return byPrefix === 0 ? left.name.localeCompare(right.name) : byPrefix;
+      return (
+        byPrefix ||
+        byUsage(left.member.user_id, right.member.user_id) ||
+        left.shown.localeCompare(right.shown)
+      );
     })
     .slice(0, limit)
-    .map(({ member, name }) => {
-      const label = name.startsWith('@') ? name : `@${name}`;
-      return {
-        id: member.user_id,
-        insert: label,
-        label,
-        detail: member.user_id,
-        avatarUrl: member.avatar_url,
-      };
-    });
+    .map(({ member, name, shown }) => ({
+      id: member.user_id,
+      insert: atName(name),
+      label: atName(shown),
+      detail: member.user_id,
+      avatarUrl: member.avatar_url,
+    }));
 }
 
-function emoteSuggestions(needle: string, emotes: readonly PackImageView[]): Suggestion[] {
-  const shortcodes = new Set<string>();
+export type PackEmote = PackImageView & { pack: ImagePackView };
+
+export function emoteSuggestionId(image: PackImageView): string {
+  return `pack:${image.shortcode} ${image.url}`;
+}
+
+function emoteSuggestions(
+  needle: string,
+  emotes: readonly PackEmote[],
+  translate: Translate
+): Suggestion[] {
+  const ids = new Set<string>();
   const packs = emotes
     .filter((image) => image.shortcode.toLowerCase().includes(needle))
     .sort((left, right) => {
@@ -75,25 +104,28 @@ function emoteSuggestions(needle: string, emotes: readonly PackImageView[]): Sug
         left.shortcode.toLowerCase().startsWith(needle),
         right.shortcode.toLowerCase().startsWith(needle)
       );
-      return byPrefix === 0 ? left.shortcode.localeCompare(right.shortcode) : byPrefix;
+      return (
+        byPrefix ||
+        byUsage(emoteSuggestionId(left), emoteSuggestionId(right)) ||
+        left.shortcode.localeCompare(right.shortcode)
+      );
     })
     .filter((image) => {
-      if (shortcodes.has(image.shortcode)) return false;
-      shortcodes.add(image.shortcode);
+      const id = emoteSuggestionId(image);
+      if (ids.has(id)) return false;
+      ids.add(id);
       return true;
     })
     .slice(0, limit)
     .map((image) => ({
-      id: `pack:${image.shortcode}`,
+      id: emoteSuggestionId(image),
       insert: `:${image.shortcode}:`,
       label: `:${image.shortcode}:`,
-      detail: image.body,
+      detail: [image.body, packName(image.pack, translate)].filter(Boolean).join(' · '),
       imageUrl: image.url,
     }));
 
-  const emojiMatches = needle
-    ? searchReactionEmoji(needle, limit - packs.length)
-    : REACTION_EMOJI.slice(0, limit - packs.length);
+  const emojiMatches = needle ? searchReactionEmoji(needle, Infinity) : REACTION_EMOJI;
   const native = emojiMatches.map((emoji) => ({
     id: `emoji:${emoji.emoji}`,
     insert: emoji.emoji,
@@ -101,10 +133,26 @@ function emoteSuggestions(needle: string, emotes: readonly PackImageView[]): Sug
     detail: `:${emoji.shortcode}:`,
   }));
 
-  return [...packs, ...native];
+  const exact = `:${needle}:`;
+  const isExact = (suggestion: Suggestion) =>
+    suggestion.label === exact || suggestion.detail === exact;
+  const reserved = Math.min(packs.length, 3);
+  const pool = native.filter(
+    (suggestion, index) => index < limit - reserved || usageOf(suggestion.id) > 0
+  );
+  return [...pool, ...packs]
+    .map((suggestion, index) => ({ suggestion, index }))
+    .sort(
+      (left, right) =>
+        byUsage(left.suggestion.id, right.suggestion.id) ||
+        rank(isExact(left.suggestion), isExact(right.suggestion)) ||
+        left.index - right.index
+    )
+    .slice(0, limit)
+    .map(({ suggestion }) => suggestion);
 }
 
-function roomSuggestions(needle: string, rooms: readonly RoomSummary[]): Suggestion[] {
+function roomSuggestions(needle: string, rooms: readonly RoomListItemView[]): Suggestion[] {
   const normalized = (text: string) => text.toLowerCase().replace(/\s/g, '');
   const normalizedNeedle = normalized(needle);
   if (!normalizedNeedle) return [];
@@ -128,7 +176,14 @@ function roomSuggestions(needle: string, rooms: readonly RoomSummary[]): Suggest
         left.searchName.startsWith(normalizedNeedle),
         right.searchName.startsWith(normalizedNeedle)
       );
-      return byPrefix === 0 ? left.name.localeCompare(right.name) : byPrefix;
+      return (
+        byPrefix ||
+        byUsage(
+          left.room.canonical_alias ?? left.room.room_id,
+          right.room.canonical_alias ?? right.room.room_id
+        ) ||
+        left.name.localeCompare(right.name)
+      );
     })
     .map(({ room, name }) => ({
       id: room.canonical_alias ?? room.room_id,
@@ -145,27 +200,27 @@ function roomSuggestions(needle: string, rooms: readonly RoomSummary[]): Suggest
     .slice(0, limit);
 }
 
-const builtIn = new Set(SLASH_COMMANDS.map((command) => command.name));
-
 function commandSuggestions(
   needle: string,
   translate: Translate,
   botCommands: readonly BotCommand[]
 ): Suggestion[] {
-  const local = SLASH_COMMANDS.map((command) => ({
-    name: command.name,
-    names: [command.name],
+  const names = slashCommandNames();
+  const builtIn = new Set(names);
+  const local = names.map((name) => ({
+    name,
+    names: [name],
     suggestion: {
-      id: command.name,
-      insert: `/${command.name}`,
-      label: `/${command.name}`,
-      detail: translate(descriptionKey(command)),
+      id: name,
+      insert: `/${name}`,
+      label: `/${name}`,
+      detail: translate(descriptionKey(name)),
     },
   }));
   const bots = botCommands
     .filter((command) => !builtIn.has(command.command.toLowerCase()))
     .map((command) => {
-      const bot = command.senderName ?? command.sender;
+      const bot = command.sender_name ?? command.sender;
       return {
         name: command.command.toLowerCase(),
         names: botCommandNames(command).map((name) => name.toLowerCase()),
@@ -174,7 +229,7 @@ function commandSuggestions(
           insert: `/${command.command}`,
           label: `/${command.command}`,
           detail: command.description ? `${bot} · ${command.description}` : bot,
-          avatarUrl: command.senderAvatar,
+          avatarUrl: command.sender_avatar,
         },
       };
     });
@@ -186,7 +241,11 @@ function commandSuggestions(
         left.names.some((name) => name.startsWith(needle)),
         right.names.some((name) => name.startsWith(needle))
       );
-      return byPrefix === 0 ? left.name.localeCompare(right.name) : byPrefix;
+      return (
+        byPrefix ||
+        byUsage(left.suggestion.id, right.suggestion.id) ||
+        left.name.localeCompare(right.name)
+      );
     })
     .slice(0, limit)
     .map(({ suggestion }) => suggestion);
@@ -197,12 +256,13 @@ export type Translate = (key: string) => string;
 export function suggestionsFor(
   query: AutocompleteQuery | null,
   members: readonly MemberView[],
-  emotes: readonly PackImageView[],
-  rooms: readonly RoomSummary[],
+  emotes: readonly PackEmote[],
+  rooms: readonly RoomListItemView[],
   translate: Translate = t,
   admin: AdminScope = null,
   adminCommands: readonly AdminCommand[] | null = null,
-  botCommands: readonly BotCommand[] = []
+  botCommands: readonly BotCommand[] = [],
+  displayName: DisplayName = (_userId, fallback) => fallback
 ): Suggestion[] {
   if (!query) return [];
   if (query.sigil === '!') return adminSuggestions(query.query, admin, adminCommands);
@@ -210,11 +270,11 @@ export function suggestionsFor(
 
   if (query.sigil === '/') return commandSuggestions(needle, translate, botCommands);
   if (query.sigil === '@') {
-    return [...roomMention(needle, translate), ...memberSuggestions(needle, members)].slice(
-      0,
-      limit
-    );
+    return [
+      ...roomMention(needle, translate),
+      ...memberSuggestions(needle, members, displayName),
+    ].slice(0, limit);
   }
   if (query.sigil === '#') return roomSuggestions(needle, rooms);
-  return emoteSuggestions(needle, emotes);
+  return emoteSuggestions(needle, emotes, translate);
 }

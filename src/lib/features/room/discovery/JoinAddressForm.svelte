@@ -3,6 +3,7 @@
   import { resolve } from '$app/paths';
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
+  import { joinOrOfferKnock, knockPagePath } from '#lib/rooms/join-or-knock.js';
   import { roomPathParamFromId } from '#lib/rooms/room-list.svelte.js';
   import Alert from '#lib/ui/primitives/Alert.svelte';
   import Button from '#lib/ui/primitives/Button.svelte';
@@ -29,8 +30,13 @@
 
     joining = true;
     try {
-      const roomId = await core.commands.joinRoom(parsed.address, parsed.via);
-      await goto(resolve('/(app)/rooms/[roomId]', { roomId: roomPathParamFromId(roomId) }));
+      const result = await joinOrOfferKnock(core.rpc, parsed.address, parsed.via);
+      await goto(
+        // eslint-disable-next-line svelte/no-navigation-without-resolve -- knockPagePath() resolves the route itself
+        result.kind === 'knock'
+          ? knockPagePath(result.address, result.via)
+          : resolve('/(app)/rooms/[roomId]', { roomId: roomPathParamFromId(result.roomId) })
+      );
     } catch (error) {
       console.warn('[sable room] join failed', error);
       failed = true;
@@ -42,7 +48,7 @@
 
 <form class="join-address settings-form" onsubmit={submit}>
   <div class="examples">
-    <p>{$i18n.t('room.joinExamplesLabel')}</p>
+    <p>{i18n.t('room.joinExamplesLabel')}</p>
     <ul>
       <li><code>#room:server</code></li>
       <li><code>https://matrix.to/#/#room:server</code></li>
@@ -52,8 +58,8 @@
 
   <FormField
     fieldId="join-address-input"
-    label={$i18n.t('room.joinAddressLabel')}
-    error={invalid ? $i18n.t('room.joinInvalid') : null}
+    label={i18n.t('room.joinAddressLabel')}
+    error={invalid ? i18n.t('room.joinInvalid') : null}
   >
     <TextInput
       id="join-address-input"
@@ -63,16 +69,16 @@
       spellcheck={false}
       aria-invalid={invalid}
       aria-describedby={invalid ? 'join-address-input-error' : undefined}
-      placeholder={$i18n.t('room.joinAddressPlaceholder')}
+      placeholder={i18n.t('room.joinAddressPlaceholder')}
     />
   </FormField>
 
   {#if failed}
-    <Alert variant="critical" role="alert">{$i18n.t('room.joinFailed')}</Alert>
+    <Alert variant="critical" role="alert">{i18n.t('common.roomJoinFailed')}</Alert>
   {/if}
 
   <Button type="submit" variant="primary" loading={joining} disabled={address.trim() === ''}>
-    {$i18n.t('room.joinSubmit')}
+    {i18n.t('common.join')}
   </Button>
 </form>
 

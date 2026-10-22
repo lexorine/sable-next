@@ -8,11 +8,9 @@ import { imageMime } from '#lib/ui/media-url.js';
 import { extensionFor } from './pack-archive.js';
 import type { PackTransferCore } from './pack-transfer.js';
 import {
-  infoContent,
   normalizeShortcode,
   shortcodeWithoutExtension,
   uniqueShortcode,
-  usageContent,
   type PackImageDraft,
 } from './pack-content.js';
 
@@ -83,11 +81,11 @@ export async function uploadCandidates(
 ): Promise<PackImageDraft[]> {
   const added: PackImageDraft[] = [];
   for (const pick of picks) {
-    const bytes = await core.commands.fetchMedia(pick.source, 0, 0, true);
+    const bytes = await core.media.fetchMedia(pick.source, 0, 0, true);
     const mimetype = pick.mime ?? imageMime(bytes) ?? null;
     added.push({
       shortcode: pick.shortcode,
-      url: await core.commands.uploadMedia(mimetype ?? 'application/octet-stream', bytes),
+      url: await core.media.uploadMedia(mimetype ?? 'application/octet-stream', bytes),
       body: pick.body,
       usage: pick.usage,
       info: { width: pick.width, height: pick.height, mimetype, size: bytes.length },
@@ -104,9 +102,9 @@ export async function downloadCandidates(
   const used = new Set<string>();
 
   for (const pick of picks) {
-    const bytes = await core.commands.fetchMedia(pick.source, 0, 0, true);
+    const bytes = await core.media.fetchMedia(pick.source, 0, 0, true);
     const mime = pick.mime ?? imageMime(bytes) ?? null;
-    const shortcode = uniqueShortcode(pick.shortcode, (candidate) => used.has(candidate));
+    const shortcode = uniqueShortcode(pick.shortcode, used);
     used.add(shortcode);
     files.push({ name: `${shortcode}.${extensionFor(mime)}`, bytes, mime });
   }
@@ -121,27 +119,4 @@ export async function downloadCandidates(
     `sable-emotes-${String(Date.now())}.zip`,
     'application/zip'
   );
-}
-
-export function mergedPackContent(
-  current: unknown,
-  additions: PackImageDraft[]
-): Record<string, unknown> {
-  const pack: Record<string, unknown> =
-    typeof current === 'object' && current !== null ? { ...current } : {};
-  const held = pack.images;
-  const images: Record<string, unknown> =
-    typeof held === 'object' && held !== null ? { ...held } : {};
-
-  for (const image of additions) {
-    const shortcode = uniqueShortcode(image.shortcode, (candidate) => candidate in images);
-    images[shortcode] = {
-      url: image.url,
-      body: image.body ?? undefined,
-      usage: usageContent(image.usage),
-      info: infoContent(image.info),
-    };
-  }
-
-  return { ...pack, images };
 }

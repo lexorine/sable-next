@@ -9,6 +9,7 @@
   import TrashIcon from 'phosphor-svelte/lib/TrashIcon';
 
   import type { ScheduledMessageView } from '#src/generated/protocol';
+  import { sendMessage } from '#lib/core/api/messages.svelte.js';
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
   import ActionMenu from '#lib/ui/primitives/ActionMenu.svelte';
@@ -17,9 +18,14 @@
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
   import { toasts } from '#lib/ui/toasts.svelte.js';
 
-  import type { ScheduledTarget } from './composer-context';
+  import type { ScheduledTarget } from '#lib/composer/composer-context.js';
   import { scheduledTimeLabel } from './schedule-time.js';
-  import { dequeue, enqueue, queueFor, type QueuedMessage } from './scheduled-queue.svelte.js';
+  import {
+    dequeue,
+    enqueue,
+    queueFor,
+    type QueuedMessage,
+  } from '#lib/composer/scheduled-queue.svelte.js';
 
   interface Props {
     roomId: string;
@@ -49,8 +55,8 @@
     void revision;
     let alive = true;
 
-    void core.commands
-      .scheduledMessages(room)
+    void core.rpc.messages
+      .scheduled({ room_id: room })
       .then((messages) => {
         if (alive) fetched = messages ?? [];
       })
@@ -66,14 +72,14 @@
   const PREVIEW_LABEL_LENGTH = 40;
 
   function when(ts: number | null): string {
-    if (ts === null) return $i18n.t('composer.scheduledPending');
-    return $i18n.t('composer.scheduledFor', { when: scheduledTimeLabel(ts, Date.now()) });
+    if (ts === null) return i18n.t('composer.scheduledPending');
+    return i18n.t('composer.scheduledFor', { when: scheduledTimeLabel(ts, Date.now()) });
   }
 
   function actionsLabel(body: string): string {
     const preview =
       body.length > PREVIEW_LABEL_LENGTH ? `${body.slice(0, PREVIEW_LABEL_LENGTH)}…` : body;
-    return $i18n.t('composer.scheduledActions', { preview });
+    return i18n.t('composer.scheduledActions', { preview });
   }
 
   function settle(delayId: string): void {
@@ -87,11 +93,11 @@
 
   async function cancelRemote(delayId: string): Promise<void> {
     try {
-      await core.commands.cancelScheduledMessage(delayId);
+      await core.rpc.messages.cancelScheduled({ delay_id: delayId });
       fetched = fetched.filter((message) => message.delay_id !== delayId);
     } catch (error) {
       console.warn('[sable composer] cancelling a scheduled message failed', error);
-      failure = $i18n.t('composer.scheduledDeleteFailed');
+      failure = i18n.t('composer.scheduledDeleteFailed');
     } finally {
       settle(delayId);
     }
@@ -99,8 +105,8 @@
 
   function deleteRemote(delayId: string): void {
     hold(delayId);
-    toasts.undoable($i18n.t('composer.scheduledDeleted'), {
-      label: $i18n.t('composer.undo'),
+    toasts.undoable(i18n.t('composer.scheduledDeleted'), {
+      label: i18n.t('common.undo'),
       onUndo: () => {
         settle(delayId);
       },
@@ -113,11 +119,11 @@
   async function sendRemote(delayId: string): Promise<void> {
     hold(delayId);
     try {
-      await core.commands.sendScheduledMessage(delayId);
+      await core.rpc.messages.sendScheduled({ delay_id: delayId });
       fetched = fetched.filter((message) => message.delay_id !== delayId);
     } catch (error) {
       console.warn('[sable composer] sending a scheduled message failed', error);
-      failure = $i18n.t('composer.scheduledSendFailed');
+      failure = i18n.t('composer.scheduledSendFailed');
     } finally {
       settle(delayId);
     }
@@ -128,13 +134,13 @@
     const accountId = core.session?.account_id ?? '';
     dequeue(message.id, accountId);
     try {
-      await core.commands.sendMessage(message.roomId, message.body, {
+      await sendMessage(core.rpc, message.roomId, message.body, {
         formatted: message.formatted,
       });
     } catch (error) {
       console.warn('[sable composer] sending a queued message failed', error);
       enqueue(message, accountId);
-      failure = $i18n.t('composer.scheduledSendFailed');
+      failure = i18n.t('composer.scheduledSendFailed');
     }
   }
 
@@ -142,8 +148,8 @@
     failure = null;
     const accountId = core.session?.account_id ?? '';
     dequeue(message.id, accountId);
-    toasts.undoable($i18n.t('composer.scheduledDeleted'), {
-      label: $i18n.t('composer.undo'),
+    toasts.undoable(i18n.t('composer.scheduledDeleted'), {
+      label: i18n.t('common.undo'),
       onUndo: () => {
         enqueue(message, accountId);
       },
@@ -173,16 +179,16 @@
         {#if onEditMessage}
           <ActionMenuItem onSelect={onEditMessage}>
             <PencilSimpleIcon />
-            {$i18n.t('composer.scheduledEdit')}
+            {i18n.t('common.edit')}
           </ActionMenuItem>
         {/if}
         <ActionMenuItem onSelect={onSendNow}>
           <PaperPlaneTiltIcon />
-          {$i18n.t('composer.scheduledSendNow')}
+          {i18n.t('composer.scheduledSendNow')}
         </ActionMenuItem>
         <ActionMenuItem destructive onSelect={onDelete}>
           <TrashIcon />
-          {$i18n.t('composer.scheduledDelete')}
+          {i18n.t('common.delete')}
         </ActionMenuItem>
       </IconContext>
     </ActionMenu>
@@ -190,7 +196,7 @@
 {/snippet}
 
 {#if total > 0}
-  <section class="scheduled" aria-label={$i18n.t('composer.scheduledCount', { count: total })}>
+  <section class="scheduled" aria-label={i18n.t('composer.scheduledCount', { count: total })}>
     <button
       type="button"
       class="pill"
@@ -200,7 +206,7 @@
       }}
     >
       <ClockIcon aria-hidden="true" />
-      {$i18n.t('composer.scheduledPill', { count: total })}
+      {i18n.t('composer.scheduledPill', { count: total })}
       {#if expanded}
         <CaretUpIcon aria-hidden="true" />
       {:else}

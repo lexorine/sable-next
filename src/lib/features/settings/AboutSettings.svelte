@@ -1,39 +1,46 @@
 <script lang="ts">
+  import { copyText } from '#lib/platform/clipboard.js';
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
 
-  import type { HomeserverSoftwareView } from '#src/generated/protocol';
   import { SABLE_DONATE_URL, SABLE_SOURCE_URL } from '#lib/config/links.js';
   import { useCoreClient } from '#lib/core/context.js';
   import { restartSetup } from '#lib/features/auth/setup/setup-record.js';
   import { i18n } from '#lib/i18n.js';
+  import { desktopUpdate, installPendingUpdate } from '#lib/platform/desktop-update.svelte.js';
   import {
     checkForMobileUpdate,
     checkForUpdate,
+    relaunchApp,
     supportsAutoUpdate,
     updatePlatform,
   } from '#lib/platform/updates.js';
+  import { isElectron } from '#lib/platform/electron.js';
   import { hostsServiceWorker } from '#lib/platform/service-worker.js';
   import { checkForWebUpdate } from '#lib/platform/web-updates.svelte.js';
   import { preferences, setPreference } from '#lib/settings/preferences.svelte.js';
   import { supporter } from '#lib/supporter/supporter.svelte.js';
   import SableBrandMark from '#lib/ui/SableBrandMark.svelte';
   import Button from '#lib/ui/primitives/Button.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
   import ConfirmDialog from '#lib/ui/primitives/ConfirmDialog.svelte';
   import LinkButton from '#lib/ui/primitives/LinkButton.svelte';
   import SettingsRow from '#lib/ui/primitives/SettingsRow.svelte';
   import SettingsSection from '#lib/ui/primitives/SettingsSection.svelte';
+  import Select from '#lib/ui/primitives/Select.svelte';
   import Switch from '#lib/ui/primitives/Switch.svelte';
   import '#lib/ui/primitives/settings-row.css';
   import CodeIcon from 'phosphor-svelte/lib/CodeIcon';
   import HeartIcon from 'phosphor-svelte/lib/HeartIcon';
+  import CheckIcon from 'phosphor-svelte/lib/CheckIcon';
+  import CopySimpleIcon from 'phosphor-svelte/lib/CopySimpleIcon';
 
+  import HomeserverInfo from './HomeserverInfo.svelte';
   import SupporterSettings from './SupporterSettings.svelte';
 
   const core = useCoreClient();
   const version = `v${import.meta.env.VITE_APP_VERSION ?? 'dev'}`;
   const automaticUpdateChecksSupported = supportsAutoUpdate() || hostsServiceWorker();
-  let info = $state<{ homeserver: string; server: HomeserverSoftwareView | null } | null>(null);
   let confirmingReset = $state(false);
   let resetting = $state(false);
   let resetFailed = $state(false);
@@ -44,19 +51,17 @@
     null
   );
 
-  $effect(() => {
-    let cancelled = false;
-    void core.commands
-      .homeserverInfo()
-      .then((next) => {
-        if (!cancelled) info = next;
-      })
-      .catch(() => {});
+  const pendingUpdate = $derived(supportsAutoUpdate() ? desktopUpdate.update : null);
+  const pendingStage = $derived(desktopUpdate.stage);
 
-    return () => {
-      cancelled = true;
-    };
-  });
+  let versionCopied = $state(false);
+  async function copyVersion(): Promise<void> {
+    await copyText(version);
+    versionCopied = true;
+    setTimeout(() => {
+      versionCopied = false;
+    }, 2000);
+  }
 
   async function resetCaches(): Promise<void> {
     resetting = true;
@@ -116,13 +121,29 @@
     <div>
       <div class="product-name">
         <h1>Sable</h1>
-        <span>{version}</span>
+        <Tooltip label={i18n.t(versionCopied ? 'common.copied' : 'common.copy')}>
+          {#snippet trigger({ props })}
+            <button
+              {...props}
+              class="version-copy-button"
+              type="button"
+              onclick={() => void copyVersion()}
+            >
+              {version}
+              {#if versionCopied}
+                <CheckIcon size="1em" aria-hidden="true" />
+              {:else}
+                <CopySimpleIcon size="1em" aria-hidden="true" />
+              {/if}
+            </button>
+          {/snippet}
+        </Tooltip>
       </div>
-      <p>{$i18n.t('settings.aboutTagline')}</p>
+      <p>{i18n.t('settings.aboutTagline')}</p>
       <div class="product-actions">
         <LinkButton href={SABLE_SOURCE_URL} target="_blank" rel="noopener noreferrer" size="small">
           <CodeIcon aria-hidden="true" />
-          {$i18n.t('settings.aboutSource')}
+          {i18n.t('common.sourceCode')}
         </LinkButton>
         <LinkButton
           href={SABLE_DONATE_URL}
@@ -132,7 +153,7 @@
           size="small"
         >
           <HeartIcon aria-hidden="true" />
-          {$i18n.t('settings.aboutSupport')}
+          {i18n.t('common.supportSable')}
         </LinkButton>
       </div>
     </div>
@@ -142,86 +163,125 @@
     <SupporterSettings />
   {/if}
 
-  {#if info}
-    <SettingsSection title={$i18n.t('settings.aboutHomeserver')} headingId="about-homeserver">
-      <ul class="settings">
-        <SettingsRow id="homeserver-url" title={$i18n.t('settings.aboutHomeserverUrl')}>
-          <span class="value">{info.homeserver.replace(/\/+$/, '')}</span>
-        </SettingsRow>
-        <SettingsRow id="homeserver-software" title={$i18n.t('settings.aboutHomeserverSoftware')}>
-          <span class="value"
-            >{info.server?.name ?? $i18n.t('settings.aboutHomeserverUnknown')}</span
-          >
-        </SettingsRow>
-        <SettingsRow id="homeserver-version" title={$i18n.t('settings.aboutHomeserverVersion')}>
-          <span class="value"
-            >{info.server?.version ?? $i18n.t('settings.aboutHomeserverUnknown')}</span
-          >
-        </SettingsRow>
-      </ul>
-    </SettingsSection>
-  {/if}
+  <svelte:boundary>
+    <HomeserverInfo />
 
-  <SettingsSection title={$i18n.t('settings.aboutOptions')} headingId="about-options">
+    {#snippet pending()}{/snippet}
+  </svelte:boundary>
+
+  <SettingsSection title={i18n.t('settings.aboutOptions')} headingId="about-options">
     <ul class="settings">
-      <SettingsRow id="report-issue" title={$i18n.t('settings.aboutReportIssue')}>
+      <SettingsRow id="report-issue" title={i18n.t('settings.aboutReportIssue')}>
         <LinkButton href={resolve('bugreport')} size="small">
-          {$i18n.t('settings.aboutReport')}
+          {i18n.t('settings.aboutReport')}
         </LinkButton>
       </SettingsRow>
       {#if automaticUpdateChecksSupported}
         <SettingsRow
           id="auto-update-check"
-          title={$i18n.t('settings.autoUpdateCheck')}
-          description={$i18n.t('settings.autoUpdateCheckHint')}
+          key="autoUpdateCheck"
+          title={i18n.t('settings.autoUpdateCheck')}
+          description={i18n.t('settings.autoUpdateCheckHint')}
           control="auto-update-check-switch"
         >
           <Switch
             id="auto-update-check-switch"
             checked={preferences.autoUpdateCheck}
-            label={$i18n.t('settings.autoUpdateCheck')}
+            label={i18n.t('settings.autoUpdateCheck')}
             onCheckedChange={(checked) => setPreference('autoUpdateCheck', checked)}
           />
         </SettingsRow>
       {/if}
-      <SettingsRow id="check-for-updates" title={$i18n.t('settings.aboutCheckForUpdates')}>
+      {#if isElectron()}
+        <SettingsRow
+          id="update-channel"
+          key="updateChannel"
+          title={i18n.t('settings.updateChannel')}
+          description={i18n.t('settings.updateChannelHint')}
+        >
+          <Select
+            bind:value={
+              () => preferences.updateChannel, (value) => setPreference('updateChannel', value)
+            }
+            aria-label={i18n.t('settings.updateChannel')}
+            items={[
+              { value: 'stable', label: i18n.t('settings.updateChannelStable') },
+              { value: 'nightly', label: i18n.t('settings.updateChannelNightly') },
+            ]}
+          />
+        </SettingsRow>
+      {/if}
+      <SettingsRow id="check-for-updates" title={i18n.t('settings.aboutCheckForUpdates')}>
         <Button size="small" loading={checkingForUpdate} onclick={() => void checkForUpdates()}>
-          {$i18n.t('settings.aboutCheckForUpdates')}
+          {i18n.t('settings.aboutCheckForUpdates')}
         </Button>
       </SettingsRow>
+      {#if pendingUpdate}
+        {@const version = pendingUpdate.version}
+        <SettingsRow
+          id="pending-update"
+          title={pendingStage.name === 'staged'
+            ? i18n.t('settings.updateBannerStagedTitle')
+            : pendingStage.name === 'failed'
+              ? i18n.t('settings.updateBannerFailedTitle')
+              : i18n.t('settings.updateBannerTitle')}
+          description={pendingStage.name === 'staged'
+            ? i18n.t('settings.updateBannerStagedBody', { version })
+            : pendingStage.name === 'failed'
+              ? pendingStage.message
+              : pendingStage.name === 'downloading'
+                ? i18n.t('settings.updateBannerProgress', { percent: pendingStage.percent })
+                : i18n.t('settings.updateBannerBody', { version })}
+        >
+          {#if pendingStage.name === 'staged'}
+            <Button variant="primary" size="small" onclick={() => void relaunchApp()}>
+              {i18n.t('settings.updateBannerRestart')}
+            </Button>
+          {:else}
+            <Button
+              variant="primary"
+              size="small"
+              loading={pendingStage.name === 'downloading'}
+              onclick={() => void installPendingUpdate()}
+            >
+              {pendingStage.name === 'failed' ? i18n.t('common.retry') : i18n.t('common.install')}
+            </Button>
+          {/if}
+        </SettingsRow>
+      {/if}
       {#if updateCheckResult === 'current'}
         <li class="settings-form status" aria-live="polite">
-          {$i18n.t('settings.aboutUpToDate')}
+          {i18n.t('settings.aboutUpToDate')}
         </li>
-      {:else if updateCheckResult === 'available'}
+      {:else if updateCheckResult === 'available' && !pendingUpdate}
         <li class="settings-form status" aria-live="polite">
-          {$i18n.t('settings.aboutUpdateAvailable')}
+          {i18n.t('settings.aboutUpdateAvailable')}
         </li>
       {:else if updateCheckResult === 'mobile-available'}
         <li class="settings-form status" aria-live="polite">
-          {$i18n.t('settings.aboutMobileUpdateAvailable')}
+          {i18n.t('settings.aboutMobileUpdateAvailable')}
         </li>
       {:else if updateCheckResult === 'failed'}
         <li class="settings-form error" role="alert">
-          {$i18n.t('settings.aboutUpdateCheckFailed')}
+          {i18n.t('settings.aboutUpdateCheckFailed')}
         </li>
       {/if}
       <SettingsRow
         id="run-setup-again"
-        title={$i18n.t('settings.aboutRunSetup')}
-        description={$i18n.t('settings.aboutRunSetupHint')}
+        title={i18n.t('settings.aboutRunSetup')}
+        description={i18n.t('settings.aboutRunSetupHint')}
       >
         <Button size="small" loading={restarting} onclick={() => void runSetupAgain()}>
-          {$i18n.t('settings.aboutRunSetupAction')}
+          {i18n.t('settings.aboutRunSetupAction')}
         </Button>
       </SettingsRow>
       {#if restartFailed}
-        <li class="settings-form error" role="alert">{$i18n.t('settings.actionFailed')}</li>
+        <li class="settings-form error" role="alert">{i18n.t('settings.actionFailed')}</li>
       {/if}
       <SettingsRow
         id="reset-cache"
-        title={$i18n.t('settings.aboutResetCache')}
-        description={$i18n.t('settings.aboutResetCacheHint')}
+        title={i18n.t('settings.aboutResetCache')}
+        description={i18n.t('settings.aboutResetCacheHint')}
       >
         <Button
           size="small"
@@ -230,11 +290,11 @@
             confirmingReset = true;
           }}
         >
-          {$i18n.t('settings.aboutReset')}
+          {i18n.t('common.reset')}
         </Button>
       </SettingsRow>
       {#if resetFailed}
-        <li class="settings-form error" role="alert">{$i18n.t('settings.aboutResetFailed')}</li>
+        <li class="settings-form error" role="alert">{i18n.t('settings.aboutResetFailed')}</li>
       {/if}
     </ul>
   </SettingsSection>
@@ -242,9 +302,9 @@
 
 <ConfirmDialog
   bind:open={confirmingReset}
-  title={$i18n.t('settings.aboutResetCacheConfirmTitle')}
-  description={$i18n.t('settings.aboutResetCacheConfirmDescription')}
-  confirmLabel={$i18n.t('settings.aboutReset')}
+  title={i18n.t('settings.aboutResetCacheConfirmTitle')}
+  description={i18n.t('settings.aboutResetCacheConfirmDescription')}
+  confirmLabel={i18n.t('common.reset')}
   busy={resetting}
   onConfirm={() => void resetCaches()}
 />
@@ -277,7 +337,7 @@
 
   .product-name,
   .product-actions {
-    align-items: center;
+    align-items: baseline;
     display: flex;
     flex-wrap: wrap;
     gap: var(--space-300);
@@ -289,9 +349,23 @@
     margin: 0;
   }
 
-  .product-name span,
-  p,
-  .value {
+  .version-copy-button {
+    align-items: end;
+    background: none;
+    border: none;
+    cursor: pointer;
+    display: flex;
+    font-size: var(--font-size-subheading);
+    gap: var(--space-150);
+    height: var(--line-height-heading);
+    line-height: var(--line-height-heading);
+    margin: 0;
+    padding: 0;
+    user-select: text;
+  }
+
+  .version-copy-button,
+  p {
     color: var(--surface-var-on-container);
   }
 
@@ -303,12 +377,6 @@
     list-style: none;
     margin: 0;
     padding: 0;
-  }
-
-  .value {
-    font-family: var(--font-family-mono);
-    font-size: var(--font-size-small);
-    overflow-wrap: anywhere;
   }
 
   .error {

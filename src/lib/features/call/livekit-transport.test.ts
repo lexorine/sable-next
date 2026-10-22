@@ -1,4 +1,4 @@
-import { afterEach, expect, test, vi } from 'vitest';
+import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { ConnectionState, RoomEvent, type Room } from 'livekit-client';
 
 import { createLivekitTransport } from './livekit-transport';
@@ -11,6 +11,7 @@ const screenAudio = vi.hoisted(() => ({
   screenAudioSupported: vi.fn(() => false),
   captureScreenAudio: vi.fn<() => Promise<MediaStreamTrack>>(),
   stopScreenAudio: vi.fn(() => Promise.resolve()),
+  unmuteScreenAudio: vi.fn(() => Promise.resolve()),
 }));
 vi.mock('#lib/platform/screen-audio.js', () => screenAudio);
 
@@ -102,6 +103,13 @@ const connectOptions = {
   encryptionKeys: [],
 };
 
+beforeEach(() => {
+  vi.stubGlobal('screen', { width: 1920, height: 1080 });
+  vi.stubGlobal('devicePixelRatio', 1);
+  preferences.callScreenResolution = 'auto';
+  preferences.callScreenFramerate = 'auto';
+});
+
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
@@ -123,6 +131,7 @@ test('automatic video quality leaves capture and encoding choices to LiveKit', a
   await transport.capabilities.screenShare?.setEnabled(true);
   const [, capture, publish] = fixture.localParticipant.setScreenShareEnabled.mock.calls[0];
   expect(capture).not.toHaveProperty('resolution');
+  expect(capture).toHaveProperty('contentHint', 'motion');
   expect(publish).not.toHaveProperty('screenShareEncoding');
   expect(publish).not.toHaveProperty('videoCodec');
   await transport.disconnect();
@@ -205,6 +214,33 @@ test.each([false, true])(
     }
   }
 );
+
+test('a fresh profile shares the screen at 720p and 30 fps', async () => {
+  vi.resetModules();
+  const { preferences: fresh } = await import('#lib/settings/preferences.svelte.js');
+  expect(fresh.callScreenResolution).toBe('720');
+  expect(fresh.callScreenFramerate).toBe('30');
+});
+
+test('screen frame rate caps capture and encoding', async () => {
+  preferences.callScreenFramerate = '60';
+  const fixture = roomFixture();
+  const transport = createLivekitTransport({ encryptMedia: false, createRoom: () => fixture.room });
+  try {
+    await transport.connect(connectOptions);
+    await transport.capabilities.screenShare?.setEnabled(true);
+    expect(fixture.localParticipant.setScreenShareEnabled).toHaveBeenLastCalledWith(
+      true,
+      expect.objectContaining({ resolution: { width: 1920, height: 1080, frameRate: 60 } }),
+      expect.objectContaining({
+        screenShareEncoding: { maxBitrate: 8_000_000, maxFramerate: 60 },
+      })
+    );
+  } finally {
+    preferences.callScreenFramerate = 'auto';
+    await transport.disconnect();
+  }
+});
 
 test('HDR sharing uses the screen resolution and publish quality', async () => {
   preferences.callScreenResolution = '480';
@@ -449,7 +485,7 @@ test('a share without our own audio capture asks the browser for stereo system a
         restrictOwnAudio: true,
       }) as unknown,
     }),
-    expect.objectContaining({ forceStereo: true, dtx: false, red: false })
+    expect.objectContaining({ forceStereo: false, dtx: true, red: true })
   );
 
   await transport.capabilities.screenShare?.setEnabled(false);
@@ -528,13 +564,46 @@ test('publishes the screen audio beside the share, and tears it down with it', a
   expect(screenAudio.captureScreenAudio).toHaveBeenCalledWith({ kind: 'apps', include: ['mpv'] });
   expect(participant.publishTrack).toHaveBeenCalledWith(
     expect.anything(),
-    expect.objectContaining({ source: 'screen_share_audio', forceStereo: true })
+    expect.objectContaining({ source: 'screen_share_audio', forceStereo: false })
+  );
+  expect(screenAudio.unmuteScreenAudio).toHaveBeenCalledOnce();
+  expect(screenAudio.unmuteScreenAudio.mock.invocationCallOrder[0]).toBeGreaterThan(
+    participant.publishTrack.mock.invocationCallOrder[0]
   );
 
   await transport.capabilities.screenShare?.setEnabled(false);
 
   expect(participant.unpublishTrack).toHaveBeenCalledOnce();
   expect(screenAudio.stopScreenAudio).toHaveBeenCalledOnce();
+  screenAudio.screenAudioSupported.mockReturnValue(false);
+});
+
+test('keeps screen audio muted until publication finishes', async () => {
+  const fixture = roomFixture();
+  const participant = withPublishing(fixture);
+  screenAudio.screenAudioSupported.mockReturnValue(true);
+  screenAudio.captureScreenAudio.mockResolvedValue(audioTrackStub());
+  let published!: () => void;
+  participant.publishTrack.mockImplementationOnce(
+    () =>
+      new Promise<void>((resolve) => {
+        published = resolve;
+      })
+  );
+  const transport = createLivekitTransport({ encryptMedia: false, createRoom: () => fixture.room });
+  await transport.connect(connectOptions);
+  const sharing = transport.capabilities.screenShare?.setEnabled(true, {
+    kind: 'system',
+    exclude: [],
+  });
+  await vi.waitFor(() => {
+    expect(participant.publishTrack).toHaveBeenCalledOnce();
+  });
+  expect(screenAudio.unmuteScreenAudio).not.toHaveBeenCalled();
+  published();
+  await sharing;
+  expect(screenAudio.unmuteScreenAudio).toHaveBeenCalledOnce();
+  await transport.disconnect();
   screenAudio.screenAudioSupported.mockReturnValue(false);
 });
 

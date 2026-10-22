@@ -8,7 +8,11 @@ use tokio::sync::mpsc;
 
 use crate::{
     Core,
-    protocol::{Command, CoreEvent, VerificationView},
+    api::encryption::{
+        AcceptVerificationParams, ConfirmVerificationParams, RequestVerificationParams,
+        ScanVerificationQrParams, StartSasVerificationParams,
+    },
+    protocol::{CoreEvent, VerificationView},
     session::Session,
     store::MemorySessionStore,
 };
@@ -225,14 +229,14 @@ async fn crossed_self_verification_requests_are_cancelled_without_retrying() {
         .await;
 
     old.core
-        .dispatch(Command::RequestVerification {
+        .run(RequestVerificationParams {
             user_id: user_id.clone(),
             device_id: Some(device_id!("BBBBBBBB").to_owned()),
         })
         .await
         .unwrap();
     new.core
-        .dispatch(Command::RequestVerification {
+        .run(RequestVerificationParams {
             user_id: user_id.clone(),
             device_id: Some(device_id!("AAAAAAAA").to_owned()),
         })
@@ -266,7 +270,7 @@ async fn a_self_verification_completes_with_a_qr_code() {
         .await;
 
     new.core
-        .dispatch(Command::RequestVerification {
+        .run(RequestVerificationParams {
             user_id: user_id.clone(),
             device_id: Some(device_id!("AAAAAAAA").to_owned()),
         })
@@ -276,7 +280,7 @@ async fn a_self_verification_completes_with_a_qr_code() {
 
     let (flow_id, _) = old.last_live().unwrap().clone();
     old.core
-        .dispatch(Command::AcceptVerification {
+        .run(AcceptVerificationParams {
             user_id: user_id.clone(),
             flow_id: flow_id.clone(),
         })
@@ -301,7 +305,7 @@ async fn a_self_verification_completes_with_a_qr_code() {
 
     let code = old.core.qr(&user_id, &flow_id).await.unwrap();
     new.core
-        .dispatch(Command::ScanVerificationQr {
+        .run(ScanVerificationQrParams {
             user_id: user_id.clone(),
             flow_id: flow_id.clone(),
             data: base64::engine::general_purpose::STANDARD.encode(code.to_bytes().unwrap()),
@@ -320,7 +324,7 @@ async fn a_self_verification_completes_with_a_qr_code() {
     ));
 
     old.core
-        .dispatch(Command::ConfirmVerification { user_id, flow_id })
+        .run(ConfirmVerificationParams { user_id, flow_id })
         .await
         .unwrap();
     deliver(&server, &queue, &mut [&mut old, &mut new]).await;
@@ -330,5 +334,238 @@ async fn a_self_verification_completes_with_a_qr_code() {
             device.last_live().unwrap().1,
             VerificationView::Done
         ));
+    }
+}
+
+#[tokio::test]
+async fn the_requester_accepts_an_emoji_start_from_the_other_device() {
+    let server = MatrixMockServer::new().await;
+    let (mut old, mut new, queue) = two_devices(&server, true).await;
+    let user_id = old.client.user_id().unwrap().to_owned();
+    let _traffic = server
+        .capture_put_to_device_traffic(&user_id, queue.clone())
+        .await;
+
+    new.core
+        .run(RequestVerificationParams {
+            user_id: user_id.clone(),
+            device_id: Some(device_id!("AAAAAAAA").to_owned()),
+        })
+        .await
+        .unwrap();
+    deliver(&server, &queue, &mut [&mut old, &mut new]).await;
+
+    let (flow_id, _) = old.last_live().unwrap().clone();
+    old.core
+        .run(AcceptVerificationParams {
+            user_id: user_id.clone(),
+            flow_id: flow_id.clone(),
+        })
+        .await
+        .unwrap();
+    deliver(&server, &queue, &mut [&mut old, &mut new]).await;
+
+    old.core
+        .run(StartSasVerificationParams { user_id, flow_id })
+        .await
+        .unwrap();
+    deliver(&server, &queue, &mut [&mut old, &mut new]).await;
+
+    for device in [&old, &new] {
+        let (_, state) = device.last_live().unwrap();
+        assert!(
+            matches!(state, VerificationView::Compare { .. }),
+            "{:?}",
+            device.states
+        );
+    }
+}
+
+#[tokio::test]
+async fn both_devices_choosing_emoji_at_once_converge_on_one_comparison() {
+    let server = MatrixMockServer::new().await;
+    let (mut old, mut new, queue) = two_devices(&server, true).await;
+    let user_id = old.client.user_id().unwrap().to_owned();
+    let _traffic = server
+        .capture_put_to_device_traffic(&user_id, queue.clone())
+        .await;
+
+    new.core
+        .run(RequestVerificationParams {
+            user_id: user_id.clone(),
+            device_id: Some(device_id!("AAAAAAAA").to_owned()),
+        })
+        .await
+        .unwrap();
+    deliver(&server, &queue, &mut [&mut old, &mut new]).await;
+
+    let (flow_id, _) = old.last_live().unwrap().clone();
+    old.core
+        .run(AcceptVerificationParams {
+            user_id: user_id.clone(),
+            flow_id: flow_id.clone(),
+        })
+        .await
+        .unwrap();
+    deliver(&server, &queue, &mut [&mut old, &mut new]).await;
+
+    for device in [&old, &new] {
+        device
+            .core
+            .run(StartSasVerificationParams {
+                user_id: user_id.clone(),
+                flow_id: flow_id.clone(),
+            })
+            .await
+            .unwrap();
+    }
+    deliver(&server, &queue, &mut [&mut old, &mut new]).await;
+
+    for device in [&old, &new] {
+        let (_, state) = device.last_live().unwrap();
+        assert!(
+            matches!(state, VerificationView::Compare { .. }),
+            "{:?}",
+            device.states
+        );
+    }
+    let emojis = |device: &Device| match &device.last_live().unwrap().1 {
+        VerificationView::Compare { emojis, .. } => {
+            emojis.iter().map(|e| e.symbol.clone()).collect::<Vec<_>>()
+        }
+        _ => Vec::new(),
+    };
+    assert_eq!(emojis(&old), emojis(&new));
+
+    for device in [&old, &new] {
+        device
+            .core
+            .run(ConfirmVerificationParams {
+                user_id: user_id.clone(),
+                flow_id: flow_id.clone(),
+            })
+            .await
+            .unwrap();
+    }
+    deliver(&server, &queue, &mut [&mut old, &mut new]).await;
+
+    for device in [&old, &new] {
+        assert!(
+            matches!(device.last_live().unwrap().1, VerificationView::Done),
+            "{:?}",
+            device.states
+        );
+    }
+}
+
+#[tokio::test]
+async fn choosing_emoji_after_a_qr_scan_does_not_leave_either_side_waiting() {
+    use base64::Engine;
+
+    let server = MatrixMockServer::new().await;
+    let (mut old, mut new, queue) = two_devices(&server, true).await;
+    let user_id = old.client.user_id().unwrap().to_owned();
+    let _traffic = server
+        .capture_put_to_device_traffic(&user_id, queue.clone())
+        .await;
+
+    new.core
+        .run(RequestVerificationParams {
+            user_id: user_id.clone(),
+            device_id: Some(device_id!("AAAAAAAA").to_owned()),
+        })
+        .await
+        .unwrap();
+    deliver(&server, &queue, &mut [&mut old, &mut new]).await;
+    let (flow_id, _) = old.last_live().unwrap().clone();
+    old.core
+        .run(AcceptVerificationParams {
+            user_id: user_id.clone(),
+            flow_id: flow_id.clone(),
+        })
+        .await
+        .unwrap();
+    deliver(&server, &queue, &mut [&mut old, &mut new]).await;
+
+    let code = old.core.qr(&user_id, &flow_id).await.unwrap();
+    new.core
+        .run(ScanVerificationQrParams {
+            user_id: user_id.clone(),
+            flow_id: flow_id.clone(),
+            data: base64::engine::general_purpose::STANDARD.encode(code.to_bytes().unwrap()),
+        })
+        .await
+        .unwrap();
+    deliver(&server, &queue, &mut [&mut old, &mut new]).await;
+
+    let _ = new
+        .core
+        .run(StartSasVerificationParams {
+            user_id: user_id.clone(),
+            flow_id: flow_id.clone(),
+        })
+        .await;
+    deliver(&server, &queue, &mut [&mut old, &mut new]).await;
+
+    for device in [&old, &new] {
+        let (_, state) = device.last_live().or_else(|| device.states.last()).unwrap();
+        assert!(
+            !matches!(state, VerificationView::Waiting),
+            "{:?}",
+            device.states
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_account_data_key_is_shared_only_with_a_verified_own_device() {
+    use std::sync::atomic::Ordering;
+
+    use matrix_sdk_base::crypto::LocalTrust;
+    use serde_json::json;
+
+    use crate::sealed_account_data::{
+        AccountDataKey, cache_key, cached_key, request_account_data_key,
+    };
+
+    for trusted in [false, true] {
+        let server = MatrixMockServer::new().await;
+        let (mut old, mut new, queue) = two_devices(&server, true).await;
+        let user_id = old.client.user_id().unwrap().to_owned();
+        let _traffic = server
+            .capture_put_to_device_traffic(&user_id, queue.clone())
+            .await;
+
+        let key = AccountDataKey::generate().unwrap();
+        cache_key(&old.client, &key).await;
+        for (device, other, trusts) in [(&old, &new, trusted), (&new, &old, true)] {
+            if trusts {
+                device
+                    .client
+                    .encryption()
+                    .get_device(&user_id, other.client.device_id().unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .set_local_trust(LocalTrust::Verified)
+                    .await
+                    .unwrap();
+            }
+            let generation = device.core.session_generation.load(Ordering::SeqCst);
+            device
+                .core
+                .watch_account_data_key_sharing(&device.client, generation);
+        }
+
+        request_account_data_key(&new.client).await;
+        deliver(&server, &queue, &mut [&mut old, &mut new]).await;
+
+        let shared = cached_key(&new.client).await;
+        assert_eq!(shared.is_some(), trusted);
+        if let Some(shared) = shared {
+            let content = json!({ "v": 1 });
+            let sealed = key.seal("moe.sable.next.drafts", &content).unwrap();
+            assert_eq!(shared.open("moe.sable.next.drafts", &sealed), Some(content));
+        }
     }
 }

@@ -21,7 +21,15 @@ pnpm fmt:check
 pnpm knip        # unused files and exports
 ```
 
-`pnpm check` runs the repo's own guards, which are described in `CLAUDE.md`.
+## Accessibility
+
+Browser component tests (`*.browser.test.ts`) can use `src/lib/test-support/a11y.ts` and `keyboard.ts`:
+
+- `expectNoA11yViolations(element)` runs axe-core (WCAG 2.2 AA and best practices) on a rendered component.
+- `expectSingleTabStop(widget)` asserts a toolbar, tablist, tree or listbox is one tab stop.
+- `tabStops(root)` lists what Tab reaches inside `root`.
+
+`tests/e2e/a11y.spec.ts` runs axe over whole pages. Storybook fails stories on axe violations.
 
 ## End to end
 
@@ -30,7 +38,7 @@ pnpm test:e2e        # Playwright against a fake core, no homeserver needed
 pnpm test:timeline   # the timeline scenarios, with their own config
 ```
 
-The e2e specs talk to `tests/e2e/fake-core.ts`, which answers commands from scripts. A new `Command` variant that a route calls on mount needs a branch there. Run the specs from a clean worktree: a `pnpm` command that reinstalls mid-run breaks the Playwright teardown.
+The e2e specs talk to `tests/e2e/fake-core.ts`, which answers commands from scripts. A new RPC method that a route calls on mount needs an entry in its `rpcHandlers`, keyed by the wire name (`'rooms.open'`). Run the specs from a clean worktree: a `pnpm` command that reinstalls mid-run breaks the Playwright teardown.
 
 ## Rust
 

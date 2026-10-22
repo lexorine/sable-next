@@ -7,7 +7,28 @@ use serde::{Deserialize, Serialize};
 
 use crate::Core;
 use crate::ResultExt;
-use crate::protocol::{CommandErr, SidebarItemView};
+use crate::protocol::{RpcError, SidebarItemView};
+
+/// The sidebar written over whatever else the account data already carries.
+#[derive(Serialize)]
+struct SidebarPatch {
+    sidebar: Vec<StoredItem>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl SidebarPatch {
+    fn new(
+        items: &[SidebarItemView],
+        mut extra: serde_json::Map<String, serde_json::Value>,
+    ) -> Self {
+        extra.remove("sidebar");
+        Self {
+            sidebar: stored_items(items),
+            extra,
+        }
+    }
+}
 
 const SIDEBAR_EVENT_TYPE: &str = "in.cinny.spaces";
 
@@ -54,7 +75,9 @@ pub fn items(content: &SidebarSpacesEventContent) -> Vec<SidebarItemView> {
                 let Some(room_id) = fresh_room_id(&room_id, &mut seen_rooms) else {
                     continue;
                 };
-                items.push(SidebarItemView::Space { room_id });
+                items.push(SidebarItemView::Space {
+                    room_id: room_id.into(),
+                });
             }
             StoredItem::Unknown(_) => {}
             StoredItem::Folder { id, name, content } => {
@@ -62,9 +85,10 @@ pub fn items(content: &SidebarSpacesEventContent) -> Vec<SidebarItemView> {
                     continue;
                 }
 
-                let content: Vec<OwnedRoomId> = content
+                let content: Vec<String> = content
                     .iter()
                     .filter_map(|room_id| fresh_room_id(room_id, &mut seen_rooms))
+                    .map(Into::into)
                     .collect();
                 if content.is_empty() {
                     continue;
@@ -97,18 +121,18 @@ fn stored_items(items: &[SidebarItemView]) -> Vec<StoredItem> {
     items
         .iter()
         .map(|item| match item {
-            SidebarItemView::Space { room_id } => StoredItem::Space(room_id.to_string()),
+            SidebarItemView::Space { room_id } => StoredItem::Space(room_id.clone()),
             SidebarItemView::Folder { id, name, content } => StoredItem::Folder {
                 id: id.clone(),
                 name: name.clone(),
-                content: content.iter().map(ToString::to_string).collect(),
+                content: content.clone(),
             },
         })
         .collect()
 }
 
 impl Core {
-    pub(crate) async fn space_sidebar(&self) -> Result<Vec<SidebarItemView>, CommandErr> {
+    pub(crate) async fn space_sidebar(&self) -> Result<Vec<SidebarItemView>, RpcError> {
         sidebar(&self.client().await?)
             .await
             .or_failed(self, "space_sidebar")
@@ -117,7 +141,7 @@ impl Core {
     pub(crate) async fn set_space_sidebar(
         &self,
         items: &[SidebarItemView],
-    ) -> Result<(), CommandErr> {
+    ) -> Result<(), RpcError> {
         set_sidebar(&self.client().await?, items)
             .await
             .or_failed(self, "set_space_sidebar")
@@ -152,9 +176,9 @@ pub async fn set_sidebar(
     items: &[SidebarItemView],
 ) -> Result<(), matrix_sdk::Error> {
     let event_type = GlobalAccountDataEventType::from(SIDEBAR_EVENT_TYPE);
-    let mut content = client
+    let extra = client
         .account()
-        .account_data_raw(event_type.clone())
+        .fetch_account_data(event_type.clone())
         .await?
         .and_then(|raw| {
             raw.deserialize_as_unchecked::<serde_json::Map<String, serde_json::Value>>()
@@ -162,10 +186,7 @@ pub async fn set_sidebar(
         })
         .unwrap_or_default();
 
-    content.insert(
-        "sidebar".to_owned(),
-        serde_json::to_value(stored_items(items))?,
-    );
+    let content = SidebarPatch::new(items, extra);
 
     client
         .account()
@@ -345,7 +366,10 @@ mod server_tests {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
 
-        assert!(sidebar(&client).await.expect("layout").is_empty());
+        assert_eq!(
+            sidebar(&client).await.expect("layout"),
+            [] as [sable_model::sidebar::SidebarItemView; 0]
+        );
     }
 
     #[tokio::test]
@@ -364,6 +388,18 @@ mod server_tests {
                     }
                 }));
             })
+            .await;
+
+        let _get = Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/user/.*/account_data/in\.cinny\.spaces$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sidebar": ["!one:example.org"],
+                "shortcut": ["!one:example.org"],
+                "org.example.other": { "kept": true }
+            })))
+            .mount_as_scoped(server.server())
             .await;
 
         let _put = Mock::given(method("PUT"))
@@ -390,5 +426,20 @@ mod server_tests {
         )
         .await
         .expect("write");
+    }
+
+    #[test]
+    fn a_sidebar_patch_replaces_the_sidebar_and_keeps_the_rest() {
+        let existing = serde_json::json!({"sidebar": ["!old:x"], "shortcut": ["!kept:x"]});
+        let patch = super::SidebarPatch::new(
+            &[SidebarItemView::Space {
+                room_id: "!new:x".to_owned(),
+            }],
+            existing.as_object().unwrap().clone(),
+        );
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap(),
+            serde_json::json!({"sidebar": ["!new:x"], "shortcut": ["!kept:x"]})
+        );
     }
 }

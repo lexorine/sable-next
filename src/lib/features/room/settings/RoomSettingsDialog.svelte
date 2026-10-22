@@ -3,7 +3,7 @@
   import type {
     RoomPermissionsView,
     RoomPowerLevelsView,
-    RoomSummary,
+    RoomListItemView,
   } from '#src/generated/protocol';
 
   import { useCoreClient } from '#lib/core/context.js';
@@ -16,6 +16,7 @@
   import Avatar from '#lib/ui/primitives/Avatar.svelte';
   import DialogFrame from '#lib/ui/primitives/DialogFrame.svelte';
   import SettingsNav from '#lib/ui/primitives/SettingsNav.svelte';
+  import { leaveUnlessUnsaved } from '#lib/ui/unsaved-guard.js';
 
   import RoomAbbreviationsSettings from './RoomAbbreviationsSettings.svelte';
   import RoomAppearanceSettings from './RoomAppearanceSettings.svelte';
@@ -26,11 +27,10 @@
   import RoomMembersSettings from './RoomMembersSettings.svelte';
   import RoomPermissionsSettings from './RoomPermissionsSettings.svelte';
   import { roomSettingsSections, type RoomSettingsSectionId } from './room-settings-sections';
-  import { canSendState } from './permission-groups';
 
   interface Props {
     open: boolean;
-    room: RoomSummary | null;
+    room: RoomListItemView | null;
     initialSection?: RoomSettingsSectionId | null;
     onOpenChange: (open: boolean) => void;
   }
@@ -38,7 +38,7 @@
   let { open, room, initialSection = null, onOpenChange }: Props = $props();
   const core = useCoreClient();
 
-  let permissions = $state<RoomPermissionsView | null>(null);
+  let permissions = $state.raw<RoomPermissionsView | null>(null);
   let levels = $state<RoomPowerLevelsView | null>(null);
   let section = $state<RoomSettingsSectionId | null>(null);
 
@@ -49,18 +49,7 @@
 
   let roomId = $derived(room?.room_id ?? null);
   let roomName = $derived(room?.name ?? room?.room_id ?? '');
-  let ownPowerLevel = $derived(permissions?.own_power_level ?? 0);
-
-  function editable(eventType: string): boolean {
-    return levels === null || canSendState(levels, ownPowerLevel, eventType);
-  }
-
-  let sections = $derived(
-    roomSettingsSections(room?.is_space ?? false).filter((entry) => {
-      if (entry.id === 'emojis-stickers') return editable('m.room.image_pack');
-      return true;
-    })
-  );
+  let sections = $derived(roomSettingsSections(room?.room_kind === 'space'));
 
   $effect(() => {
     void roomId;
@@ -77,16 +66,16 @@
     let current = true;
     permissions = null;
     levels = null;
-    void core.commands
-      .roomPermissions(target)
+    void core.rpc.members
+      .permissions({ room_id: target })
       .then((next) => {
         if (current) permissions = next;
       })
       .catch((error: unknown) => {
         console.debug('[sable room] permissions unavailable', error);
       });
-    void core.commands
-      .roomPowerLevels(target)
+    void core.rpc.members
+      .powerLevels({ room_id: target })
       .then((next) => {
         if (current) levels = next;
       })
@@ -99,28 +88,36 @@
   });
 
   function close(): void {
-    onOpenChange(false);
+    leaveUnlessUnsaved(() => {
+      onOpenChange(false);
+    });
+  }
+
+  function show(next: RoomSettingsSectionId | null): void {
+    leaveUnlessUnsaved(() => {
+      section = next;
+    });
   }
 
   function sectionLabel(id: string): string {
-    return $i18n.t(sections.find((entry) => entry.id === id)?.label ?? 'room.settingsTitle');
+    return i18n.t(sections.find((entry) => entry.id === id)?.label ?? 'room.settingsTitle');
   }
 </script>
 
-<DialogFrame {open} {onOpenChange} variant="settings" label={$i18n.t('room.settingsTitle')}>
+<DialogFrame {open} {onOpenChange} variant="settings" label={i18n.t('room.settingsTitle')}>
   <SettingsShell
     {section}
     fallback={() => sections[0]?.id ?? null}
-    label={$i18n.t('room.settingsTitle')}
-    description={$i18n.t('room.settingsDialogDescription')}
-    closeLabel={$i18n.t('room.settingsClose')}
-    backLabel={$i18n.t('room.settingsBack')}
+    label={i18n.t('room.settingsTitle')}
+    description={i18n.t('room.settingsDialogDescription')}
+    closeLabel={i18n.t('room.settingsClose')}
+    backLabel={i18n.t('common.back')}
     {sectionLabel}
     {heading}
     {nav}
     {content}
     onBack={() => {
-      section = null;
+      show(null);
     }}
     onClose={close}
   />
@@ -135,11 +132,11 @@
 
 {#snippet nav(state: SettingsShellNav)}
   <SettingsNav
-    entries={sections.map((entry) => ({ ...entry, label: $i18n.t(entry.label) }))}
+    entries={sections.map((entry) => ({ ...entry, label: i18n.t(entry.label) }))}
     activeId={state.openSection}
-    ariaLabel={$i18n.t('room.settingsSections')}
+    ariaLabel={i18n.t('room.settingsSections')}
     onSelect={(_, id) => {
-      section = id as RoomSettingsSectionId;
+      show(id as RoomSettingsSectionId);
     }}
     showChevron={!state.desktop}
     large={!state.desktop}
@@ -155,13 +152,21 @@
 
 {#snippet page(active: RoomSettingsSectionId)}
   {#if active === 'general'}
-    <RoomGeneralSettings {room} {permissions} {levels} onClose={close} />
+    <svelte:boundary>
+      <RoomGeneralSettings {room} {permissions} {levels} onClose={close} />
+
+      {#snippet pending()}{/snippet}
+    </svelte:boundary>
   {:else if active === 'members'}
     <RoomMembersSettings {room} {permissions} />
   {:else if active === 'permissions'}
     <RoomPermissionsSettings {room} {permissions} />
   {:else if active === 'abbreviations'}
-    <RoomAbbreviationsSettings {room} {permissions} {levels} />
+    <svelte:boundary>
+      <RoomAbbreviationsSettings {room} {permissions} {levels} />
+
+      {#snippet pending()}{/snippet}
+    </svelte:boundary>
   {:else if active === 'appearance'}
     <RoomAppearanceSettings {room} />
   {:else if active === 'cosmetics'}

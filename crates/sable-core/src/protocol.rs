@@ -1,5 +1,21 @@
-use matrix_sdk::ruma::{OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedUserId};
+use matrix_sdk::RoomState;
+use matrix_sdk::ruma::{
+    OwnedDeviceId, OwnedEventId, OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId, OwnedServerName,
+    OwnedUserId,
+};
+pub use sable_model::calendar::{CalendarRsvpView, RsvpStatusView};
+pub use sable_model::event_preview::ReplyFallbackView;
+pub use sable_model::markdown::{ComposerContent, ComposerMentions, ComposerPill};
+pub use sable_model::member_look::{FieldEdit, PronounView};
+pub use sable_model::notifications::NotificationModeView;
+pub use sable_model::power_levels::{PowerLevelAction, PowerLevelLocation, RoomPowerLevelsView};
+pub use sable_model::search_filter::{SearchAttachment, SearchFilter};
+pub use sable_model::sidebar::SidebarItemView;
+pub use sable_model::slash::{GestureView, MessageKind};
+pub use sable_model::spaces::{RoomJoinRuleView, SpaceChildEdge};
 use serde::{Deserialize, Serialize};
+
+use crate::api::rooms::RoomKind;
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
@@ -63,1926 +79,6 @@ pub struct GalleryAttachmentView {
     pub info: Option<AttachmentInfoView>,
 }
 
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Command {
-    DiscoverHomeserver {
-        server_name: String,
-    },
-    Login {
-        reauth_account_id: Option<String>,
-        homeserver: String,
-        identifier: LoginIdentifier,
-        password: String,
-    },
-    LoginFlows {
-        homeserver: String,
-    },
-    RegistrationFlows {
-        homeserver: String,
-    },
-    Register {
-        homeserver: String,
-        username: String,
-        password: String,
-        registration_email: Option<String>,
-        registration_token: Option<String>,
-    },
-    RequestRegistrationEmail {
-        email: String,
-    },
-    SubmitRegistrationEmail {
-        token: String,
-    },
-    ContinueRegistration,
-    CancelRegistration,
-    RequestPasswordResetEmail {
-        homeserver: String,
-        email: String,
-        client_secret: Option<String>,
-        send_attempt: u32,
-    },
-    ResetPassword {
-        homeserver: String,
-        client_secret: String,
-        sid: String,
-        new_password: String,
-        logout_devices: bool,
-    },
-    StartOidcLogin {
-        reauth_account_id: Option<String>,
-        homeserver: String,
-        redirect_uri: String,
-        intent: AuthIntent,
-    },
-    CompleteOidcLogin {
-        callback_url: String,
-    },
-    StartSsoLogin {
-        reauth_account_id: Option<String>,
-        homeserver: String,
-        redirect_uri: String,
-        idp_id: Option<String>,
-        intent: AuthIntent,
-    },
-    CompleteSsoLogin {
-        callback_url: String,
-    },
-    Restore,
-    ListAccounts,
-    SwitchAccount {
-        account_id: String,
-    },
-    RemoveAccount {
-        account_id: String,
-    },
-    Logout,
-    ResetLocalCache,
-    HomeserverInfo,
-    RequestOpenIdToken,
-
-    SubscribeRoomList,
-    SubscribeTimeline {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[serde(default)]
-        focus: TimelineFocusView,
-        /// Relaxes the event filter so events the SDK would otherwise drop
-        /// arrive as `HiddenEvent`. Baked into the timeline, so flipping it
-        /// means re-subscribing.
-        hidden_events: bool,
-    },
-    Unsubscribe {
-        subscription: SubscriptionId,
-    },
-
-    Paginate {
-        subscription: SubscriptionId,
-        direction: PaginationDirection,
-        count: u16,
-    },
-    RoomMembers {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[serde(default)]
-        memberships: Vec<MembershipView>,
-    },
-    RoomPermissions {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    NotificationSettings {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    RoomNotificationModes {
-        #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
-        room_ids: Vec<OwnedRoomId>,
-    },
-    DefaultNotificationModes,
-    MentionNotifications,
-    EventNotifications,
-    MasterMute,
-    Notification {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-    },
-    PushEvent {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-    },
-    ImagePacks {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[serde(default)]
-        cached_only: bool,
-    },
-    AllImagePacks,
-    UserProfile {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-    },
-    UserRelations {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-    },
-    SendMessage {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        body: String,
-        formatted: Option<String>,
-        #[serde(default)]
-        kind: MessageKind,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        thread_root: Option<OwnedEventId>,
-        #[serde(default)]
-        /// Replying inside a thread needs no extra field: the SDK infers the
-        /// thread from the replied-to event.
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        in_reply_to: Option<OwnedEventId>,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
-        mentions: Vec<OwnedUserId>,
-        #[serde(default)]
-        mentions_room: bool,
-        #[serde(default)]
-        silent_reply: bool,
-        #[serde(default)]
-        persona: Option<PerMessageProfileView>,
-        #[serde(default)]
-        link_previews: Vec<UrlPreviewView>,
-        #[serde(default)]
-        image_source_packs: Vec<ImageSourcePackReferenceView>,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<specta_typescript::Unknown>))]
-        bot_command: Option<serde_json::Value>,
-        #[serde(default)]
-        forum_title: Option<String>,
-    },
-    SendRawEvent {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        event_type: String,
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Unknown))]
-        content: serde_json::Value,
-    },
-    SendRedaction {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-        reason: Option<String>,
-    },
-    CalendarEntries {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    SaveCalendarEvent {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Unknown))]
-        event: serde_json::Value,
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        replaces: Option<OwnedEventId>,
-    },
-    SendSticker {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        url: String,
-        body: String,
-        #[serde(default)]
-        info: Option<PackImageInfoView>,
-        #[serde(default)]
-        source_pack: Option<ImageSourcePackView>,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        in_reply_to: Option<OwnedEventId>,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        thread_root: Option<OwnedEventId>,
-        #[serde(default)]
-        persona: Option<PerMessageProfileView>,
-    },
-    SendGif {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        /// `mxc://` only; the core rejects anything else.
-        url: String,
-        body: String,
-        #[cfg_attr(feature = "typegen", specta(type = Option<specta_typescript::Number>))]
-        width: Option<u32>,
-        #[cfg_attr(feature = "typegen", specta(type = Option<specta_typescript::Number>))]
-        height: Option<u32>,
-        mimetype: String,
-        #[cfg_attr(feature = "typegen", specta(type = Option<specta_typescript::Number>))]
-        size: Option<u32>,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        in_reply_to: Option<OwnedEventId>,
-        #[serde(default)]
-        silent_reply: bool,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        thread_root: Option<OwnedEventId>,
-        #[serde(default)]
-        persona: Option<PerMessageProfileView>,
-    },
-    RemoveLinkPreviews {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        thread_root: Option<OwnedEventId>,
-    },
-    /// `edited` on the view flips once the server has the replacement.
-    EditMessage {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        event_id: Option<OwnedEventId>,
-        #[serde(default)]
-        transaction_id: Option<String>,
-        body: String,
-        formatted: Option<String>,
-        #[serde(default)]
-        kind: MessageKind,
-        #[serde(default)]
-        media_caption: bool,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        thread_root: Option<OwnedEventId>,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
-        mentions: Vec<OwnedUserId>,
-        #[serde(default)]
-        mentions_room: bool,
-        #[serde(default)]
-        persona: Option<PerMessageProfileView>,
-        #[serde(default)]
-        forum_title: Option<String>,
-    },
-    /// The filled-in details arrive as a timeline diff, not as the response.
-    FetchEventDetails {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        thread_root: Option<OwnedEventId>,
-    },
-    Redact {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-        reason: Option<String>,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        thread_root: Option<OwnedEventId>,
-    },
-    DeleteThread {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        root_event_id: OwnedEventId,
-        reason: Option<String>,
-    },
-    BulkRedact {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        senders: Vec<String>,
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-        after_ts: u64,
-        event_types: Vec<String>,
-        reason: Option<String>,
-    },
-    /// MSC2815: read a redacted event's original content.
-    ///
-    /// Refused with [`CommandErr::Denied`] for anyone below the room's `redact`
-    /// level, and with [`CommandErr::Unsupported`] when the homeserver does not
-    /// implement MSC2815 at all.
-    RedactedContent {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-    },
-    PinnedEvents {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    ReactionShortcodes {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-    },
-    SetPinned {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-        pinned: bool,
-    },
-    RoomPowerLevels {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    RoomVersions,
-    RoomAliases {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    CreateRoomAlias {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        alias: String,
-    },
-    DeleteRoomAlias {
-        alias: String,
-    },
-    PublicRooms {
-        server: Option<String>,
-        search: Option<String>,
-        since: Option<String>,
-        room_type: Option<DirectoryRoomType>,
-    },
-    RoomDirectoryVisibility {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    SetRoomDirectoryVisibility {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        public: bool,
-    },
-    UpgradeRoom {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        new_version: String,
-        #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
-        additional_creators: Vec<OwnedUserId>,
-    },
-    RoomStateEvent {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        event_type: String,
-        state_key: String,
-    },
-    RoomStateEvents {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        event_type: String,
-    },
-    BotCommands {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    RoomHasSpaceParent {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    UnjoinedSpaceParents {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    ReplacedRooms,
-    RoomCosmetics {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        space_id: Option<OwnedRoomId>,
-    },
-    RoomOpen {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    RoomSummary {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    UrlPreview {
-        url: String,
-    },
-    ListThreads {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        from: Option<String>,
-    },
-    EventItems {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
-        event_ids: Vec<OwnedEventId>,
-    },
-    RoomAttachments {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        kind: RoomAttachmentKind,
-        limit: u32,
-        from: Option<String>,
-    },
-    NotificationKeywords,
-    AddNotificationKeyword {
-        keyword: String,
-    },
-    RemoveNotificationKeyword {
-        keyword: String,
-    },
-    SetNotificationKeywordMode {
-        keyword: String,
-        mode: MentionNotificationModeView,
-    },
-    TimestampToEvent {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-        ts: u64,
-        direction: PaginationDirection,
-    },
-    RoomAccountData {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        event_type: String,
-    },
-    ReadMarker {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    EventCached {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-    },
-    AccountDataTypes,
-    AccessToken,
-    AccountData {
-        event_type: String,
-    },
-    SetAccountData {
-        event_type: String,
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Unknown))]
-        content: serde_json::Value,
-    },
-    SealedAccountData {
-        event_type: String,
-    },
-    SetSealedAccountData {
-        event_type: String,
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Unknown))]
-        content: serde_json::Value,
-    },
-    SetRoomAccountData {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        event_type: String,
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Unknown))]
-        content: serde_json::Value,
-    },
-    ReportMessage {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-        reason: Option<String>,
-    },
-    ReportRoom {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        reason: String,
-    },
-    ReportUser {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-        reason: String,
-    },
-    EventSource {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-    },
-    EditHistory {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-    },
-    ForwardMessage {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        to_room_id: OwnedRoomId,
-    },
-    Personas,
-    SavePersona {
-        persona: PersonaView,
-        #[serde(default)]
-        previous_id: Option<String>,
-    },
-    RemovePersona {
-        id: String,
-    },
-    ReorderPersonas {
-        ids: Vec<String>,
-    },
-    SetPersonaSelection {
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        room_id: Option<OwnedRoomId>,
-        persona_id: Option<String>,
-        #[cfg_attr(feature = "typegen", specta(type = Option<specta_typescript::Number>))]
-        valid_until: Option<u64>,
-    },
-    DisableRoomPersonas {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    Bookmarks,
-    InboxNotifications {
-        filter: InboxFilter,
-        include_read: bool,
-        limit: u32,
-        #[cfg_attr(feature = "typegen", specta(type = Option<specta_typescript::Number>))]
-        before_ts: Option<u64>,
-    },
-    BackfillInbox {
-        include_read: bool,
-    },
-    SetBookmark {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-        bookmarked: bool,
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-        now_ms: u64,
-    },
-    React {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-        key: String,
-        #[serde(default)]
-        source_pack: Option<ImageSourcePackView>,
-        #[serde(default)]
-        shortcode: Option<String>,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        thread_root: Option<OwnedEventId>,
-        #[serde(default)]
-        subscription: Option<SubscriptionId>,
-    },
-    SendLocation {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        body: String,
-        geo_uri: String,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        in_reply_to: Option<OwnedEventId>,
-        #[serde(default)]
-        silent_reply: bool,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        thread_root: Option<OwnedEventId>,
-    },
-    RoomTimelineEvents {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        event_type: String,
-        #[serde(default)]
-        msgtype: Option<String>,
-        #[serde(default)]
-        state_key: Option<String>,
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-        limit: u32,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        since: Option<OwnedEventId>,
-    },
-    RoomStateEventsRaw {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        event_type: String,
-        #[serde(default)]
-        state_key: Option<String>,
-    },
-    RoomFullState {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    SearchUserDirectory {
-        term: String,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<specta_typescript::Number>))]
-        limit: Option<u32>,
-    },
-    OpenIdToken,
-    WidgetSendDelayedEvent {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        event_type: String,
-        #[serde(default)]
-        state_key: Option<String>,
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Unknown))]
-        content: serde_json::Value,
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-        delay_ms: u64,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<specta_typescript::Number>))]
-        sticky_duration_ms: Option<u32>,
-    },
-    WidgetSendStickyEvent {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        event_type: String,
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Unknown))]
-        content: serde_json::Value,
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-        sticky_duration_ms: u32,
-    },
-    RestartDelayedEvent {
-        delay_id: String,
-    },
-    WidgetSendToDevice {
-        event_type: String,
-        encrypted: bool,
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Unknown))]
-        messages: serde_json::Value,
-    },
-    RoomAccountDataRaw {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        event_type: String,
-    },
-    RoomStickyEvents {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    RoomEventRelations {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-        #[serde(default)]
-        rel_type: Option<String>,
-        #[serde(default)]
-        event_type: Option<String>,
-        #[serde(default)]
-        from: Option<String>,
-        #[serde(default)]
-        to: Option<String>,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<specta_typescript::Number>))]
-        limit: Option<u32>,
-        #[serde(default)]
-        direction: Option<PaginationDirection>,
-    },
-    TurnServer,
-    RtcTransports,
-    RtcLivekit {
-        endpoint: RtcLivekitEndpoint,
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Unknown))]
-        body: serde_json::Value,
-    },
-    SetWidgetFeed {
-        enabled: bool,
-    },
-    KnownRooms,
-    IntegrationManagerUrl {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    ScheduleMessage {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        body: String,
-        #[serde(default)]
-        formatted: Option<String>,
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-        delay_ms: u64,
-    },
-    ScheduleAttachment {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        filename: String,
-        mime: String,
-        url: String,
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-        size: u64,
-        #[serde(default)]
-        info: Option<AttachmentInfoView>,
-        #[serde(default)]
-        spoiler: bool,
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-        delay_ms: u64,
-    },
-    ScheduledMessages {
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        room_id: Option<OwnedRoomId>,
-    },
-    CancelScheduledMessage {
-        delay_id: String,
-    },
-    SendScheduledMessage {
-        delay_id: String,
-    },
-    MediaConfig,
-    DelayedEventsSupported,
-    /// MSC3381.
-    CreatePoll {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        question: String,
-        answers: Vec<String>,
-        /// Withholds the tally until the poll closes.
-        undisclosed: bool,
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-        max_selections: u32,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        thread_root: Option<OwnedEventId>,
-    },
-    /// Replaces any earlier vote by this account. An empty selection abstains.
-    VotePoll {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        /// The poll's start event.
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-        /// Answer ids, not their text.
-        answers: Vec<String>,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        thread_root: Option<OwnedEventId>,
-    },
-    /// Irreversible.
-    EndPoll {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        thread_root: Option<OwnedEventId>,
-    },
-    MarkRead {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        event_id: Option<OwnedEventId>,
-        #[serde(default)]
-        private_receipt: bool,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        thread_root: Option<OwnedEventId>,
-        #[serde(default)]
-        subscription: Option<SubscriptionId>,
-        #[serde(default)]
-        fully_read: bool,
-    },
-    SetFullyRead {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-    },
-    MarkUnread {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        read_marker: Option<OwnedEventId>,
-    },
-    RetrySend {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        transaction_id: String,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        thread_root: Option<OwnedEventId>,
-    },
-    RetryDecryption {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        session_id: String,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        sender: OwnedUserId,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        thread_root: Option<OwnedEventId>,
-    },
-    /// A local echo is not on the server, so it cannot be redacted.
-    CancelSend {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        transaction_id: String,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        thread_root: Option<OwnedEventId>,
-    },
-
-    CreateRoom {
-        name: Option<String>,
-        topic: Option<String>,
-        kind: CreateRoomKind,
-        /// Published in the directory, joinable by link.
-        public: bool,
-        /// Ignored for a space or a public room.
-        encrypted: bool,
-        #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
-        invite: Vec<OwnedUserId>,
-        /// Adds an `m.space.child` edge from this space.
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        parent_space: Option<OwnedRoomId>,
-        alias: Option<String>,
-        room_version: Option<String>,
-        join_rule: Option<CreateJoinRuleView>,
-        federate: bool,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        predecessor: Option<OwnedRoomId>,
-    },
-    CreateDm {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-        #[serde(default)]
-        encrypted: Option<bool>,
-    },
-    AddToSpace {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        space_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        suggested: Option<bool>,
-    },
-    SetSpaceChildOrder {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        space_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        order: Option<String>,
-    },
-    SetSpaceChildSuggested {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        space_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        suggested: bool,
-    },
-    SpaceHierarchy {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        space_id: OwnedRoomId,
-        from: Option<String>,
-    },
-    RemoveFromSpace {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        space_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    SpaceSidebar,
-    SetSpaceSidebar {
-        items: Vec<SidebarItemView>,
-    },
-
-    /// Accepting an invite is `JoinRoom`, declining it `LeaveRoom`.
-    ///
-    /// Describes a room this account has not joined, so a link to one can be
-    /// shown before committing to the join.
-    RoomPreview {
-        /// A room id or an alias, as `JoinRoom` takes.
-        address: String,
-        /// Servers to try when the id is not resolvable on ours, or empty.
-        via: Vec<String>,
-    },
-    JoinRoom {
-        /// A room id or an alias. A pasted address could be either.
-        address: String,
-        /// Servers to try when the id is not resolvable on ours, or empty.
-        via: Vec<String>,
-    },
-    /// Asks to be let into a `knock` room. A separate endpoint from joining, and
-    /// the only one that works when the join rule is `knock`.
-    KnockRoom {
-        address: String,
-        via: Vec<String>,
-        reason: Option<String>,
-    },
-    /// The servers to advertise in a permalink to this room, per the routing
-    /// rules in the spec appendices. Empty when the room has a canonical alias,
-    /// which is routable on its own.
-    RoomViaServers {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    LeaveRoom {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    InviteUser {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-    },
-
-    EncryptionStatus,
-    KeyBackupStatus,
-    DownloadKeyBackup {
-        request_id: String,
-    },
-    SignOutSafety,
-    SyncStatus,
-    SearchCoverage,
-    SearchMetrics,
-    Devices,
-    UserSecurity {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-    },
-    RecoverIdentity {
-        recovery_key: String,
-    },
-    /// First-time cross-signing and key backup. Without it a lone session can
-    /// never verify a second. The returned key is unrecoverable, so a UI must
-    /// make the user store it.
-    EnableRecovery {
-        /// A passphrase to unlock the key with. The key is returned either way.
-        passphrase: Option<String>,
-    },
-    ResetRecoveryKey {
-        passphrase: Option<String>,
-    },
-    /// Destructive from the first call: the key backup and secret storage are
-    /// gone before the server is asked for authentication.
-    ResetIdentity,
-    /// OAuth polls for the approval for up to two minutes.
-    ContinueIdentityReset {
-        password: Option<String>,
-    },
-    CancelIdentityReset,
-    ExportRoomKeys {
-        passphrase: String,
-    },
-    ImportRoomKeys {
-        export: String,
-        passphrase: String,
-    },
-    /// Call without a password first: the server states its terms in an
-    /// `interactive_auth_required` error, and only then is there a prompt.
-    DeleteDevice {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        device_id: OwnedDeviceId,
-        password: Option<String>,
-    },
-    RenameDevice {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        device_id: OwnedDeviceId,
-        display_name: String,
-    },
-    DiscardRoomKey {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-
-    /// `null` clears it.
-    SetDisplayName {
-        name: Option<String>,
-        propagate_to: ProfilePropagationView,
-    },
-    /// An `mxc:` URI from the carrier's `uploadMedia`. `null` clears it.
-    SetAvatarUrl {
-        url: Option<String>,
-        propagate_to: ProfilePropagationView,
-    },
-    SetProfileField {
-        field: String,
-        #[cfg_attr(feature = "typegen", specta(type = Option<specta_typescript::Unknown>))]
-        value: Option<serde_json::Value>,
-    },
-    AccountContacts,
-    IgnoredUsers,
-    InviteTriage,
-    /// `m.direct` is client-owned account data. Nothing else will correct it.
-    SetDirect {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        direct: bool,
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        user_id: Option<OwnedUserId>,
-    },
-    /// Server-side, so it survives a reinstall.
-    IgnoreUser {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-    },
-    UnignoreUser {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-    },
-    /// The server expires it by itself, so a missed `false` is not fatal.
-    SetTyping {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        typing: bool,
-    },
-    SetRoomTag {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        tag: RoomTag,
-        /// False removes it.
-        set: bool,
-    },
-    SetPusher {
-        pusher: PusherView,
-    },
-    RemovePusher {
-        pushkey: String,
-        app_id: String,
-    },
-    /// The homeserver's web push support: a VAPID key means server delivery.
-    WebPusherSupport,
-    SetWebPusher {
-        pusher: WebPusherView,
-    },
-    WebPushers,
-    PingPushGateway {
-        url: String,
-    },
-    DiscoverPushGateway {
-        endpoint: String,
-    },
-    SendDiagnosticPush {
-        pushkey: String,
-        app_id: String,
-    },
-    AckWebPusher {
-        app_id: String,
-        ack_token: String,
-    },
-    /// Mirrors the reader's choice so a native shell can apply it too.
-    SetNotificationContent {
-        visible: bool,
-        encrypted: bool,
-    },
-    SetNotificationSounds {
-        enabled: bool,
-    },
-    SetNotifyOnce {
-        enabled: bool,
-    },
-    SetNotificationsEnabled {
-        enabled: bool,
-    },
-    SetSearchOptions {
-        disk_budget_mb: u32,
-        crawler: bool,
-        unmetered_only: bool,
-        server_search: bool,
-        tuning: SearchTuning,
-        foreground: bool,
-    },
-    SetReadRoom {
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        room_id: Option<OwnedRoomId>,
-    },
-    SetPresence {
-        presence: PresenceView,
-        status_message: Option<String>,
-    },
-    /// Fills in users the presence poll has not pushed yet.
-    FetchPresence {
-        #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
-        user_ids: Vec<OwnedUserId>,
-    },
-    SetRoomNotificationMode {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        /// `null` drops the room's own rules so it follows the default again.
-        mode: Option<NotificationModeView>,
-    },
-    SetDefaultNotificationMode {
-        direct: bool,
-        mode: NotificationModeView,
-    },
-    SetMentionNotifications {
-        rule: MentionRuleView,
-        mode: MentionNotificationModeView,
-    },
-    SetEventNotification {
-        event: EventNotificationView,
-        enabled: bool,
-    },
-    SetMasterMute {
-        muted: bool,
-    },
-
-    SetRoomName {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        name: Option<String>,
-    },
-    SetRoomTopic {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        topic: String,
-    },
-    SetRoomAvatar {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        url: Option<String>,
-    },
-    SetRoomJoinRule {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        rule: JoinRuleView,
-    },
-    /// Escape hatch for unmodelled state. `content` is validated only by the
-    /// server, so prefer a typed command.
-    SendStateEvent {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        event_type: String,
-        state_key: String,
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Unknown))]
-        content: serde_json::Value,
-    },
-    /// Lowering our own cannot be undone. The level to raise it is gone.
-    SetUserPowerLevel {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-        power_level: i32,
-    },
-
-    KickUser {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-        reason: Option<String>,
-    },
-    /// Also removes them from the room.
-    BanUser {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-        reason: Option<String>,
-    },
-    UnbanUser {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-        reason: Option<String>,
-    },
-    /// Our own user id self-verifies another session. Progress arrives as
-    /// `CoreEvent::Verification`.
-    RequestVerification {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-        #[serde(default)]
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        device_id: Option<OwnedDeviceId>,
-    },
-    WithdrawVerification {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-    },
-    SetDeviceBlocked {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        device_id: OwnedDeviceId,
-        blocked: bool,
-    },
-    /// Signs this device in from another one (MSC4108). `scanned` is the
-    /// other device's code, base64 encoded; without it this device shows one.
-    StartQrLogin {
-        homeserver: Option<String>,
-        redirect_uri: String,
-        scanned: Option<String>,
-    },
-    /// Lets another device sign in to this account (MSC4108).
-    StartQrGrant {
-        scanned: Option<String>,
-    },
-    QrCheckCode {
-        code: u8,
-    },
-    QrGrantContinue {
-        confirm: bool,
-    },
-    CancelQr,
-    /// Also transitions into SAS, so the emoji need no further round trip.
-    AcceptVerification {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-        flow_id: String,
-    },
-    /// The bytes read from the other device's code, base64 encoded.
-    ScanVerificationQr {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-        flow_id: String,
-        data: String,
-    },
-    /// Leaves the codes for emoji.
-    StartSasVerification {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-        flow_id: String,
-    },
-    /// The emoji matched, or the other device showed that it scanned our code.
-    ConfirmVerification {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-        flow_id: String,
-    },
-    CancelVerification {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-        flow_id: String,
-        /// The emoji differed. An attack signal the other side must be told
-        /// about. A plain cancel is not.
-        mismatch: bool,
-    },
-
-    SearchMessages {
-        query: String,
-        #[serde(default)]
-        filter: SearchFilter,
-        #[serde(default)]
-        order: SearchOrder,
-        limit: u32,
-        offset: u32,
-        #[serde(default)]
-        context: u32,
-        #[serde(default)]
-        older: Option<String>,
-    },
-
-    JoinCall {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        livekit_service_url: Option<String>,
-        #[serde(default)]
-        mode: Option<CallMode>,
-        #[serde(default)]
-        intent: Option<CallIntent>,
-    },
-
-    CallSupport {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        #[serde(default)]
-        livekit_service_url: Option<String>,
-    },
-    LeaveCall {
-        session: CallSessionId,
-    },
-    DeclineCall {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-        notification_event_id: String,
-    },
-}
-
-/// Paired with `Command` by variant name, so the generated TS resolves a
-/// response type from a command type.
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum CommandOk {
-    DiscoverHomeserver {
-        homeserver: String,
-    },
-    Login {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-    },
-    LoginFlows {
-        flows: LoginFlowsView,
-    },
-    RegistrationFlows {
-        flows: RegistrationFlowsView,
-    },
-    Register {
-        result: RegistrationResultView,
-    },
-    ContinueRegistration {
-        result: RegistrationResultView,
-    },
-    RequestRegistrationEmail {
-        result: RegistrationResultView,
-    },
-    SubmitRegistrationEmail {
-        result: RegistrationResultView,
-    },
-    CancelRegistration,
-    RequestPasswordResetEmail {
-        client_secret: String,
-        sid: String,
-    },
-    ResetPassword,
-    StartOidcLogin {
-        authorization_url: String,
-    },
-    CompleteOidcLogin {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-    },
-    StartSsoLogin {
-        authorization_url: String,
-    },
-    CompleteSsoLogin {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        user_id: OwnedUserId,
-    },
-    Restore {
-        session: Option<SessionInfo>,
-    },
-    ListAccounts {
-        accounts: Vec<SessionInfo>,
-    },
-    SwitchAccount {
-        session: SessionInfo,
-    },
-    RemoveAccount,
-    Logout,
-    ResetLocalCache,
-    HomeserverInfo {
-        homeserver: String,
-        server: Option<HomeserverSoftwareView>,
-    },
-    RequestOpenIdToken {
-        access_token: String,
-        matrix_server_name: String,
-        expires_in: u32,
-    },
-
-    /// The snapshot. Everything after it carries the same `subscription`.
-    SubscribeRoomList {
-        subscription: SubscriptionId,
-        rooms: Vec<RoomSummary>,
-    },
-    SubscribeTimeline {
-        subscription: SubscriptionId,
-        items: Vec<TimelineItemView>,
-        aggregations: Vec<TimelineItemView>,
-    },
-    Unsubscribe,
-
-    Paginate {
-        direction: PaginationDirection,
-        reached_end: bool,
-    },
-    RoomMembers {
-        members: Vec<MemberView>,
-    },
-    SearchMessages {
-        hits: Vec<SearchHitView>,
-        older: Option<String>,
-    },
-    JoinCall {
-        session: CallSessionId,
-        url: String,
-        jwt: String,
-        identity: String,
-        encrypt_media: bool,
-        mode: CallMode,
-        can_publish: bool,
-        publisher_id: String,
-        backends: Vec<CallBackendView>,
-    },
-    CallSupport(CallSupportView),
-    LeaveCall,
-    DeclineCall,
-    RoomPermissions(RoomPermissionsView),
-    NotificationSettings(NotificationSettingsView),
-    RoomNotificationModes {
-        modes: Vec<RoomNotificationModeView>,
-    },
-    DefaultNotificationModes {
-        modes: DefaultNotificationModesView,
-    },
-    MentionNotifications {
-        modes: MentionNotificationsView,
-    },
-    EventNotifications {
-        events: EventNotificationsView,
-    },
-    MasterMute {
-        muted: Option<bool>,
-    },
-    /// `Some` carries the VAPID key subscriptions must be minted under.
-    WebPusherSupport {
-        vapid: Option<String>,
-    },
-    SetWebPusher,
-    WebPushers {
-        pushers: Vec<RegisteredPusherView>,
-    },
-    PingPushGateway {
-        reached: Option<bool>,
-    },
-    DiscoverPushGateway {
-        gateway: Option<String>,
-    },
-    SendDiagnosticPush {
-        push: DiagnosticPushView,
-    },
-    AckWebPusher,
-    /// `null` when the event notifies nobody, or is gone, or cannot be read.
-    Notification {
-        notification: Option<NotificationView>,
-    },
-    PushEvent {
-        fetched: PushFetchView,
-    },
-    ImagePacks {
-        packs: Vec<ImagePackView>,
-        complete: bool,
-    },
-    AllImagePacks {
-        packs: Vec<ImagePackView>,
-    },
-    /// Boxed: the extended fields make this the widest variant by far.
-    UserProfile {
-        profile: Box<ProfileView>,
-    },
-    UserRelations {
-        mutual_rooms: Vec<MutualRoomView>,
-        ignored: bool,
-    },
-    SetProfileField,
-    AccountContacts {
-        emails: Vec<String>,
-    },
-    IgnoredUsers {
-        #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
-        users: Vec<OwnedUserId>,
-    },
-    InviteTriage {
-        invites: Vec<InviteTriageView>,
-    },
-    /// The local echo arrives on the timeline diff stream.
-    SendMessage,
-    SendRawEvent {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-    },
-    SendRedaction {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-    },
-    CalendarEntries(CalendarView),
-    SaveCalendarEvent,
-    SendSticker,
-    SendGif,
-    SendLocation,
-    EditMessage,
-    RemoveLinkPreviews,
-    FetchEventDetails,
-    Redact,
-    DeleteThread,
-    BulkRedact {
-        redacted: u32,
-    },
-    /// MSC2815.
-    RedactedContent {
-        content: RedactedContentView,
-    },
-    PinnedEvents {
-        #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
-        event_ids: Vec<OwnedEventId>,
-    },
-    ReactionShortcodes {
-        shortcodes: Vec<ReactionShortcodeView>,
-    },
-    SetPinned {
-        #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
-        event_ids: Vec<OwnedEventId>,
-    },
-    RoomPowerLevels(RoomPowerLevelsView),
-    RoomVersions(RoomVersionsView),
-    RoomAliases {
-        #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
-        aliases: Vec<String>,
-    },
-    CreateRoomAlias,
-    DeleteRoomAlias,
-    PublicRooms {
-        rooms: Vec<PublicRoomView>,
-        next_batch: Option<String>,
-        #[cfg_attr(feature = "typegen", specta(type = Option<specta_typescript::Number>))]
-        total: Option<u64>,
-    },
-    RoomDirectoryVisibility {
-        public: bool,
-    },
-    SetRoomDirectoryVisibility,
-    UpgradeRoom {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        replacement_room: OwnedRoomId,
-    },
-    RoomStateEvent {
-        #[cfg_attr(feature = "typegen", specta(type = Option<specta_typescript::Unknown>))]
-        content: Option<serde_json::Value>,
-    },
-    RoomStateEvents {
-        events: Vec<RoomStateEventView>,
-    },
-    BotCommands {
-        commands: Vec<BotCommandDescriptionView>,
-    },
-    RoomHasSpaceParent {
-        has_space_parent: bool,
-    },
-    UnjoinedSpaceParents {
-        parents: Vec<SpaceParentView>,
-    },
-    ReplacedRooms {
-        rooms: Vec<RoomSummary>,
-    },
-    RoomCosmetics(RoomCosmeticsView),
-    RoomOpen(RoomOpenView),
-    RoomSummary {
-        room: RoomSummary,
-    },
-    UrlPreview {
-        preview: Option<UrlPreviewView>,
-    },
-    ListThreads {
-        roots: Vec<TimelineItemView>,
-        next_batch: Option<String>,
-    },
-    EventItems {
-        items: Vec<TimelineItemView>,
-    },
-    RoomAttachments {
-        items: Vec<RoomAttachmentView>,
-        next_batch: Option<String>,
-    },
-    NotificationKeywords {
-        keywords: Vec<KeywordNotificationView>,
-    },
-    AddNotificationKeyword,
-    RemoveNotificationKeyword,
-    SetNotificationKeywordMode,
-    TimestampToEvent {
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        event_id: Option<OwnedEventId>,
-    },
-    RoomAccountData {
-        #[cfg_attr(feature = "typegen", specta(type = Option<specta_typescript::Unknown>))]
-        content: Option<serde_json::Value>,
-    },
-    ReadMarker {
-        #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
-        event_id: Option<OwnedEventId>,
-    },
-    EventCached {
-        cached: bool,
-    },
-    AccountDataTypes {
-        event_types: Vec<String>,
-    },
-    AccessToken {
-        token: Option<String>,
-    },
-    SetRoomAccountData,
-    AccountData {
-        #[cfg_attr(feature = "typegen", specta(type = Option<specta_typescript::Unknown>))]
-        content: Option<serde_json::Value>,
-    },
-    SetAccountData,
-    SealedAccountData {
-        document: SealedAccountDataView,
-    },
-    SetSealedAccountData,
-    ReportMessage,
-    ReportRoom,
-    ReportUser,
-    EventSource {
-        source: String,
-    },
-    EditHistory {
-        versions: Vec<EditVersionView>,
-    },
-    ForwardMessage,
-    Personas {
-        catalog: PersonaCatalogView,
-    },
-    SavePersona {
-        personas: Vec<PersonaView>,
-    },
-    RemovePersona {
-        personas: Vec<PersonaView>,
-    },
-    ReorderPersonas {
-        personas: Vec<PersonaView>,
-    },
-    SetPersonaSelection,
-    DisableRoomPersonas,
-    Bookmarks {
-        bookmarks: Vec<BookmarkView>,
-    },
-    InboxNotifications {
-        items: Vec<InboxItemView>,
-        has_more: bool,
-    },
-    BackfillInbox {
-        recorded: u32,
-        has_more: bool,
-    },
-    SetBookmark {
-        bookmarked: bool,
-    },
-    React,
-    RoomTimelineEvents {
-        #[cfg_attr(feature = "typegen", specta(type = Vec<specta_typescript::Unknown>))]
-        events: Vec<serde_json::Value>,
-    },
-    RoomStateEventsRaw {
-        #[cfg_attr(feature = "typegen", specta(type = Vec<specta_typescript::Unknown>))]
-        events: Vec<serde_json::Value>,
-    },
-    RoomFullState {
-        #[cfg_attr(feature = "typegen", specta(type = Vec<specta_typescript::Unknown>))]
-        events: Vec<serde_json::Value>,
-    },
-    SearchUserDirectory {
-        limited: bool,
-        results: Vec<UserDirectoryEntryView>,
-    },
-    OpenIdToken {
-        token: OpenIdTokenView,
-    },
-    WidgetSendDelayedEvent {
-        delay_id: String,
-    },
-    WidgetSendStickyEvent {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-    },
-    RestartDelayedEvent,
-    WidgetSendToDevice,
-    RoomAccountDataRaw {
-        #[cfg_attr(feature = "typegen", specta(type = Option<specta_typescript::Unknown>))]
-        event: Option<serde_json::Value>,
-    },
-    RoomStickyEvents {
-        #[cfg_attr(feature = "typegen", specta(type = Vec<specta_typescript::Unknown>))]
-        events: Vec<serde_json::Value>,
-    },
-    RoomEventRelations {
-        relations: RelationsView,
-    },
-    TurnServer {
-        server: TurnServerView,
-    },
-    RtcTransports {
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Unknown))]
-        body: serde_json::Value,
-    },
-    RtcLivekit {
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Unknown))]
-        body: serde_json::Value,
-    },
-    SetWidgetFeed,
-    KnownRooms {
-        #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
-        room_ids: Vec<OwnedRoomId>,
-    },
-    IntegrationManagerUrl {
-        url: String,
-    },
-    ScheduleMessage {
-        delay_id: String,
-    },
-    ScheduleAttachment {
-        delay_id: String,
-    },
-    ScheduledMessages {
-        messages: Vec<ScheduledMessageView>,
-    },
-    CancelScheduledMessage,
-    SendScheduledMessage,
-    MediaConfig {
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-        upload_size: u64,
-    },
-    DelayedEventsSupported {
-        supported: bool,
-    },
-    CreatePoll,
-    VotePoll,
-    EndPoll,
-    MarkRead,
-    SetFullyRead,
-    MarkUnread,
-    RetrySend,
-    RetryDecryption,
-    /// False when there was no such echo left to discard.
-    CancelSend {
-        cancelled: bool,
-    },
-
-    CreateRoom {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    CreateDm {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    AddToSpace,
-    SpaceHierarchy {
-        rooms: Vec<SpaceHierarchyRoomView>,
-        /// Pass back as `from` for the next page; `null` at the end.
-        next_batch: Option<String>,
-    },
-    RemoveFromSpace,
-    SetSpaceChildOrder,
-    SetSpaceChildSuggested,
-    SpaceSidebar {
-        items: Vec<SidebarItemView>,
-    },
-    SetSpaceSidebar,
-
-    RoomPreview {
-        preview: RoomPreviewView,
-    },
-    /// Resolved, since the caller may have joined by alias.
-    JoinRoom {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    KnockRoom {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    RoomViaServers {
-        servers: Vec<String>,
-    },
-    LeaveRoom,
-    InviteUser,
-
-    EncryptionStatus {
-        status: EncryptionStatusView,
-    },
-    KeyBackupStatus {
-        status: KeyBackupStatusView,
-    },
-    DownloadKeyBackup {
-        download: KeyBackupDownloadView,
-    },
-    SignOutSafety {
-        safety: SignOutSafetyView,
-    },
-    SyncStatus {
-        status: SyncStatus,
-    },
-    SearchCoverage {
-        coverage: SearchCoverageView,
-    },
-    SearchMetrics {
-        metrics: SearchMetricsView,
-    },
-    Devices {
-        devices: Vec<DeviceView>,
-        account_management: bool,
-        /// Signed in with OAuth, which is what linking a device by QR code needs.
-        oauth: bool,
-    },
-    UserSecurity {
-        security: UserSecurityView,
-    },
-    RecoverIdentity,
-    /// Unrecoverable once discarded.
-    EnableRecovery {
-        recovery_key: String,
-    },
-    ResetRecoveryKey {
-        recovery_key: String,
-    },
-    ResetIdentity {
-        step: IdentityResetStep,
-    },
-    ContinueIdentityReset {
-        recovery_key: String,
-    },
-    CancelIdentityReset,
-    ExportRoomKeys {
-        export: String,
-    },
-    ImportRoomKeys {
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-        imported: u64,
-        #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-        total: u64,
-    },
-    DeleteDevice {
-        management_url: Option<String>,
-    },
-    RenameDevice,
-    DiscardRoomKey,
-
-    SetDisplayName,
-    SetAvatarUrl,
-    IgnoreUser,
-    UnignoreUser,
-    SetTyping,
-    SetRoomTag,
-    SetPusher,
-    RemovePusher,
-    SetNotificationContent,
-    SetNotificationSounds,
-    SetNotifyOnce,
-    SetNotificationsEnabled,
-    SetSearchOptions,
-    SetReadRoom,
-    SetPresence,
-    FetchPresence,
-    SetRoomNotificationMode,
-    SetDefaultNotificationMode,
-    SetMentionNotifications,
-    SetEventNotification,
-    SetMasterMute,
-
-    SetDirect,
-    SetRoomName,
-    SetRoomTopic,
-    SetRoomAvatar,
-    SetRoomJoinRule,
-    SendStateEvent {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-    },
-    SetUserPowerLevel,
-
-    KickUser,
-    BanUser,
-    UnbanUser,
-
-    /// Carried by every later command and event for this verification.
-    RequestVerification {
-        flow_id: String,
-    },
-    WithdrawVerification,
-    SetDeviceBlocked,
-    StartQrLogin,
-    StartQrGrant,
-    QrCheckCode,
-    QrGrantContinue,
-    CancelQr,
-    AcceptVerification,
-    ScanVerificationQr,
-    StartSasVerification,
-    ConfirmVerification,
-    CancelVerification,
-}
-
 /// Stable serialized codes. Source chains, inputs and bodies stay native-side
 /// and are logged there, so nothing leaks across the wire. The last four words
 /// match the platform ports, so a core failure and a capability failure read
@@ -1990,7 +86,7 @@ pub enum CommandOk {
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
 #[serde(tag = "code", rename_all = "snake_case")]
-pub enum CommandErr {
+pub enum RpcError {
     NotLoggedIn,
     UnknownSubscription,
     UnknownCall,
@@ -2018,6 +114,19 @@ pub enum CommandErr {
     SlidingSyncUnsupported,
     AccountLocked,
     AccountSuspended,
+    /// MSC2545 allows `[a-zA-Z0-9-_]`, at most 100 bytes, each once per pack.
+    InvalidShortcode {
+        shortcode: String,
+    },
+    /// A file that is not a backup this app wrote.
+    InvalidBackup,
+    /// Not an `http` or `https` URL.
+    InvalidUrl,
+    /// A search filter naming something that is not a room or user id.
+    InvalidSearchFilter,
+    /// A sealed document this device cannot open, so writing it would erase
+    /// what the other devices stored.
+    DocumentLocked,
     /// Static: safe to hide UI.
     Unsupported,
     /// Retryable: keep UI.
@@ -2051,49 +160,12 @@ pub enum CommandErr {
     },
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum LoginIdentifier {
-    User { user: String },
-    Email { address: String },
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
-#[serde(rename_all = "snake_case")]
-pub enum DirectoryRoomType {
-    Rooms,
-    Spaces,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
-#[serde(rename_all = "snake_case")]
-pub enum AuthIntent {
-    Login,
-    Register,
-}
-
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum PaginationDirection {
     Backward,
     Forward,
-}
-
-/// The `m.room.create` type to ask for: `m.space`, the MSC3417 call type, the
-/// forum type, or none at all.
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
-#[serde(rename_all = "snake_case")]
-pub enum CreateRoomKind {
-    Text,
-    Space,
-    Voice,
-    Forum,
-    Calendar,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -2151,7 +223,7 @@ pub enum CoreEvent {
     /// One batch is one render, so it stays batched all the way to the UI.
     RoomListDiff {
         subscription: SubscriptionId,
-        diffs: Vec<VectorDiff<RoomSummary>>,
+        diffs: Vec<VectorDiff<RoomListItemView>>,
     },
     TimelineDiff {
         subscription: SubscriptionId,
@@ -2234,7 +306,17 @@ pub enum CoreEvent {
 
     ProfileChanged {
         #[cfg_attr(feature = "typegen", specta(type = String))]
+        room_id: OwnedRoomId,
+        #[cfg_attr(feature = "typegen", specta(type = String))]
         user_id: OwnedUserId,
+        display_name: Option<String>,
+        avatar_url: Option<String>,
+    },
+
+    /// A member event of any kind arrived: join, leave, kick, ban, invite or a profile change.
+    MembersChanged {
+        #[cfg_attr(feature = "typegen", specta(type = String))]
+        room_id: OwnedRoomId,
     },
 
     BotCommandsChanged {
@@ -2325,15 +407,6 @@ pub enum CoreEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
-#[serde(rename_all = "snake_case")]
-pub enum ProfilePropagationView {
-    All,
-    Unchanged,
-    None,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
@@ -2392,28 +465,6 @@ pub struct SubscriptionId(pub u32);
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
 pub struct CallSessionId(pub u32);
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
-#[serde(rename_all = "snake_case")]
-pub enum SearchOrder {
-    #[default]
-    Rank,
-    Recent,
-    Oldest,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
-#[serde(rename_all = "snake_case")]
-pub enum SearchAttachment {
-    Image,
-    Video,
-    Audio,
-    File,
-    Link,
-    Poll,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
@@ -2434,17 +485,6 @@ pub struct SearchCoverageView {
     #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
     pub rooms_failed: usize,
     pub state: SearchCoverageState,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
-pub struct SearchTuning {
-    pub crawl_pause_ms: u32,
-    pub trickle_pause_ms: u32,
-    pub flush_interval_secs: u32,
-    pub batch: u32,
-    pub base_events: u32,
-    pub max_events: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -2509,39 +549,7 @@ pub struct SearchMetricsView {
     pub running_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
-#[serde(default)]
-pub struct SearchFilter {
-    #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
-    pub rooms: Vec<OwnedRoomId>,
-    #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
-    pub senders: Vec<OwnedUserId>,
-    #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
-    pub mentions: Vec<OwnedUserId>,
-    pub has: Vec<SearchAttachment>,
-    #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
-    pub not_rooms: Vec<OwnedRoomId>,
-    #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
-    pub not_senders: Vec<OwnedUserId>,
-    #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
-    pub not_mentions: Vec<OwnedUserId>,
-    pub not_has: Vec<SearchAttachment>,
-    #[cfg_attr(feature = "typegen", specta(type = Option<specta_typescript::Number>))]
-    pub after_ts: Option<u64>,
-    #[cfg_attr(feature = "typegen", specta(type = Option<specta_typescript::Number>))]
-    pub before_ts: Option<u64>,
-    pub phrases: Vec<String>,
-    pub exclude: Vec<String>,
-    pub pinned: Option<bool>,
-    pub in_thread: Option<bool>,
-    pub file_types: Vec<String>,
-    pub not_file_types: Vec<String>,
-    pub pattern: Option<String>,
-    pub state_events: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
 pub struct CallMemberView {
     #[cfg_attr(feature = "typegen", specta(type = String))]
@@ -2551,6 +559,7 @@ pub struct CallMemberView {
     pub backend_id: Option<String>,
     #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
     pub joined_ts: u64,
+    pub screen_sharing: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2561,6 +570,17 @@ pub enum CallMode {
     Compatibility,
     #[serde(rename = "matrix_2")]
     Matrix2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+#[serde(rename_all = "snake_case")]
+pub enum CallModeReason {
+    Requested,
+    StickyOnly,
+    LegacyPeer,
+    StickyPeer,
+    Fresh,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2623,12 +643,12 @@ pub struct SearchContextView {
 
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
-// These are independent room capabilities, not a state machine.
+// Independent room capabilities.
 #[expect(
     clippy::struct_excessive_bools,
     reason = "wire type mirroring the protocol"
 )]
-pub struct RoomSummary {
+pub struct RoomListItemView {
     #[cfg_attr(feature = "typegen", specta(type = String))]
     pub room_id: OwnedRoomId,
     pub canonical_alias: Option<String>,
@@ -2641,19 +661,17 @@ pub struct RoomSummary {
     pub join_rule: RoomJoinRuleView,
     /// Only the tags this client models; others are dropped.
     pub tags: Vec<RoomTag>,
-    /// An `invited` room is an invitation to accept, not a room to open.
     pub state: RoomStateView,
     /// `null` until the state event loads, which is not the same as `false`.
     pub encrypted: Option<bool>,
-    pub is_space: bool,
     pub is_tombstoned: bool,
-    pub room_type: Option<String>,
-    /// An `m.room.create` with the MSC3417 call type.
-    pub is_voice: bool,
+    pub room_kind: Option<RoomKind>,
     /// Members in the room's call, oldest first and one entry per user however
     /// many devices they joined with.
     #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
     pub call_participants: Vec<OwnedUserId>,
+    #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
+    pub screen_sharers: Vec<OwnedUserId>,
     pub supports_knock: bool,
     pub supports_restricted: bool,
     pub supports_knock_restricted: bool,
@@ -2663,7 +681,21 @@ pub struct RoomSummary {
     pub notifying: u32,
     pub highlight: u32,
     pub marked_unread: bool,
+    pub notification: NotificationSettingsView,
+    /// The counts above under the room's mode.
+    pub counts: RoomUnreadView,
     pub latest_event: Option<LatestEventView>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+pub struct RoomUnreadView {
+    pub unread: u32,
+    /// What the push rules notified on, which is what the inbox counts.
+    pub notifying: u32,
+    pub highlight: u32,
+    /// Set by hand, so it survives a mute.
+    pub marked: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -2847,9 +879,9 @@ pub struct EmojiView {
     pub description: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
-// These are independent facts about one device, not a state machine.
+// Independent facts about one device.
 #[expect(
     clippy::struct_excessive_bools,
     reason = "wire type mirroring the protocol"
@@ -2904,21 +936,6 @@ pub enum JoinRuleView {
     KnockRestricted,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
-#[serde(rename_all = "snake_case")]
-pub enum RoomJoinRuleView {
-    Public,
-    Invite,
-    Knock,
-    /// Members of an allowed space may join.
-    Restricted,
-    KnockRestricted,
-    Private,
-    /// Not loaded, or a rule this client has no name for.
-    Unknown,
-}
-
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
@@ -2937,6 +954,18 @@ pub enum RoomStateView {
     Banned,
 }
 
+impl From<RoomState> for RoomStateView {
+    fn from(value: RoomState) -> Self {
+        match value {
+            RoomState::Joined => Self::Joined,
+            RoomState::Invited => Self::Invited,
+            RoomState::Knocked => Self::Knocked,
+            RoomState::Left => Self::Left,
+            RoomState::Banned => Self::Banned,
+        }
+    }
+}
+
 /// A room as the server describes it to someone who may not be in it.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
@@ -2944,24 +973,35 @@ pub struct RoomPreviewView {
     /// Resolved, since the preview may have been asked for by alias.
     #[cfg_attr(feature = "typegen", specta(type = String))]
     pub room_id: OwnedRoomId,
-    pub canonical_alias: Option<String>,
+    #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
+    pub canonical_alias: Option<OwnedRoomAliasId>,
     pub name: Option<String>,
     pub topic: Option<String>,
-    pub avatar_url: Option<String>,
-    pub is_space: bool,
-    pub is_voice: bool,
-    pub num_joined_members: u32,
+    #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
+    pub avatar_url: Option<OwnedMxcUri>,
+    pub room_kind: Option<RoomKind>,
+    /// `null` when the server did not say.
+    pub num_joined_members: Option<u32>,
     pub join_rule: RoomJoinRuleView,
     /// `null` when this account has no membership in the room.
     pub state: Option<RoomStateView>,
+    pub via: RoomPreviewViaView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+pub enum RoomPreviewViaView {
+    Client,
+    Remote {
+        #[cfg_attr(feature = "typegen", specta(type = String))]
+        server: OwnedServerName,
+    },
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "wire type mirroring the protocol"
-)]
 pub struct PublicRoomView {
     #[cfg_attr(feature = "typegen", specta(type = String))]
     pub room_id: OwnedRoomId,
@@ -2969,8 +1009,7 @@ pub struct PublicRoomView {
     pub name: Option<String>,
     pub topic: Option<String>,
     pub avatar_url: Option<String>,
-    pub is_space: bool,
-    pub is_voice: bool,
+    pub room_kind: Option<RoomKind>,
     pub num_joined_members: u32,
     pub join_rule: RoomJoinRuleView,
     pub guest_can_join: bool,
@@ -2988,8 +1027,7 @@ pub struct SpaceHierarchyRoomView {
     pub name: Option<String>,
     pub topic: Option<String>,
     pub avatar_url: Option<String>,
-    pub is_space: bool,
-    pub is_voice: bool,
+    pub room_kind: Option<RoomKind>,
     pub num_joined_members: u32,
     pub join_rule: RoomJoinRuleView,
     /// The rooms a `restricted` or `knock_restricted` join rule admits members of.
@@ -3009,34 +1047,30 @@ pub struct SpaceParentView {
     pub via: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// How a timeline row is drawn: a message carries a sender, a hover menu and
+/// reactions; an event is a one-line notice; an annotation is a divider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
-pub struct SpaceChildEdge {
-    #[cfg_attr(feature = "typegen", specta(type = String))]
-    pub room_id: OwnedRoomId,
-    pub via: Vec<String>,
-    /// `m.space.child.content.order`, unordered children sort last.
-    pub order: Option<String>,
-    #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-    pub origin_server_ts: u64,
-    /// The parent marked this child as worth surfacing first.
-    pub suggested: bool,
+#[serde(rename_all = "snake_case")]
+pub enum TimelineRowKind {
+    Message,
+    Event,
+    Annotation,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Which reader preference can hide a row; `always` rows are always shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SidebarItemView {
-    Space {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        room_id: OwnedRoomId,
-    },
-    Folder {
-        id: String,
-        name: Option<String>,
-        #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
-        content: Vec<OwnedRoomId>,
-    },
+#[serde(rename_all = "snake_case")]
+pub enum TimelineVisibility {
+    Always,
+    Membership,
+    /// A membership event that changed nothing a reader would notice.
+    MembershipOther,
+    ProfileChange,
+    Tombstone,
+    /// Shown only with hidden events on.
+    Hidden,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3044,6 +1078,13 @@ pub enum SidebarItemView {
 pub struct TimelineItemView {
     /// Not an event id. Stable across a local echo becoming remote.
     pub id: String,
+    pub row: TimelineRowKind,
+    /// Content another room can receive as it is.
+    pub forwardable: bool,
+    /// Whether the event can be redacted at all; the room's power levels
+    /// decide whether the reader may.
+    pub redactable: bool,
+    pub visibility: TimelineVisibility,
     /// Absent while the event is still a local echo.
     #[cfg_attr(feature = "typegen", specta(type = Option<String>))]
     pub event_id: Option<OwnedEventId>,
@@ -3207,20 +1248,10 @@ pub struct RoomStateEventView {
 
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
-pub struct BotCommandDescriptionView {
-    pub sender: String,
-    pub sender_name: Option<String>,
-    pub sender_avatar: Option<String>,
-    #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Unknown))]
-    pub content: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
 pub struct RoomOpenView {
     pub permissions: RoomPermissionsView,
-    #[cfg_attr(feature = "typegen", specta(type = Option<specta_typescript::Unknown>))]
-    pub power_level_tags: Option<serde_json::Value>,
+    #[cfg_attr(feature = "typegen", specta(type = std::collections::BTreeMap<String, PowerLevelTagView>))]
+    pub power_level_tags: PowerLevelTagsView,
     pub widgets: Vec<RoomStateEventView>,
     #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
     pub pinned_event_ids: Vec<OwnedEventId>,
@@ -3258,7 +1289,7 @@ pub struct PredecessorRoomView {
 /// What this account may do in one room, resolved from `m.room.power_levels`.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
-// Each field is an independent capability, not a state machine.
+// Independent capabilities.
 #[expect(
     clippy::struct_excessive_bools,
     reason = "wire type mirroring the protocol"
@@ -3285,32 +1316,37 @@ pub struct RoomPermissionsView {
     pub can_manage_children: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// A role name for a power level, from `in.cinny.room.power_level_tags`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
-pub struct RoomPowerLevelsView {
-    #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-    pub ban: i64,
-    #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-    pub kick: i64,
-    #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-    pub redact: i64,
-    #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-    pub invite: i64,
-    #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-    pub events_default: i64,
-    #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-    pub state_default: i64,
-    #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-    pub users_default: i64,
-    #[cfg_attr(feature = "typegen", specta(type = std::collections::BTreeMap<String, specta_typescript::Number<i64>>))]
-    pub events: std::collections::BTreeMap<String, i64>,
-    #[cfg_attr(feature = "typegen", specta(type = std::collections::BTreeMap<String, specta_typescript::Number<i64>>))]
-    pub users: std::collections::BTreeMap<String, i64>,
-    #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-    pub notifications_room: i64,
+pub struct PowerLevelTagView {
+    pub name: String,
+    pub color: Option<String>,
+    /// A Unicode emoji or an `mxc://` URI.
+    pub icon: Option<String>,
 }
 
+/// Keyed by the power level.
+pub type PowerLevelTagsView = std::collections::BTreeMap<i64, PowerLevelTagView>;
+
 #[derive(Debug, Clone, Copy, Serialize)]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+pub struct CallCompatibilityView {
+    pub sticky_events: bool,
+    pub delayed_events: bool,
+    pub rtc_transports: RtcTransportSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+#[serde(rename_all = "snake_case")]
+pub enum RtcTransportSource {
+    Endpoint,
+    WellKnown,
+    None,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
 pub struct CallSupportView {
     pub has_focus: bool,
@@ -3329,32 +1365,6 @@ pub struct RoomVersionsView {
 pub struct RoomVersionView {
     pub id: String,
     pub stable: bool,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TimelineFocusView {
-    #[default]
-    Live,
-    Event {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        event_id: OwnedEventId,
-    },
-    Thread {
-        #[cfg_attr(feature = "typegen", specta(type = String))]
-        root_event_id: OwnedEventId,
-    },
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
-#[serde(rename_all = "snake_case")]
-pub enum MessageKind {
-    #[default]
-    Text,
-    Emote,
-    Notice,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -3410,6 +1420,16 @@ pub struct PersonaView {
     #[serde(default)]
     pub triggers: Vec<PersonaTriggerView>,
     pub pluralkit: Option<PluralkitImportView>,
+    #[cfg_attr(feature = "typegen", specta(type = Option<specta_typescript::Number>))]
+    pub last_used: Option<u64>,
+    pub alternate_avatars: Option<Vec<PersonaAlternateAvatarView>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+pub struct PersonaAlternateAvatarView {
+    pub id: String,
+    pub avatar_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3434,6 +1454,7 @@ pub struct PluralkitImportView {
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
 pub struct PersonaSelectionView {
     pub persona_id: String,
+    pub alternate_avatar_id: Option<String>,
     #[cfg_attr(feature = "typegen", specta(type = Option<specta_typescript::Number>))]
     pub valid_until: Option<u64>,
 }
@@ -3449,7 +1470,7 @@ pub struct PersonaCatalogView {
 
 /// The SDK loads the body lazily, so it is absent for an event we have never
 /// seen until `FetchEventDetails` fills it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
 pub struct ReplyView {
     #[cfg_attr(feature = "typegen", specta(type = String))]
@@ -3459,6 +1480,8 @@ pub struct ReplyView {
     pub sender_mentioned: bool,
     pub sender_name: Option<String>,
     pub body: Option<String>,
+    /// Set instead of `body` when the replied-to event has none to show.
+    pub fallback: Option<ReplyFallbackView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3471,31 +1494,6 @@ pub struct EditVersionView {
     pub html: String,
 }
 
-/// MSC2815: what a redacted event originally said.
-///
-/// `content` is `None` when the server answered but had nothing to give — an
-/// event that was never redacted, a state event, or a homeserver that ignored
-/// the query parameter. The UI reads that as "nothing to show" rather than as
-/// an error, because the request itself succeeded.
-#[derive(Debug, Clone, Default, Serialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
-pub struct RedactedContentView {
-    /// The original message, rendered exactly as the timeline renders a live
-    /// one: same variants, same sanitised HTML.
-    pub content: Option<TimelineItemContentView>,
-    /// The sender's per-message profile, which for a redacted message only
-    /// survives inside the event the server returned.
-    pub per_message_profile: Option<PerMessageProfileView>,
-}
-
-impl RedactedContentView {
-    /// The empty answer, for a response with nothing in it.
-    #[must_use]
-    pub fn empty() -> Self {
-        Self::default()
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
 pub struct ThreadSummaryView {
@@ -3506,6 +1504,8 @@ pub struct ThreadSummaryView {
     /// event.
     pub latest_event_id: Option<String>,
     pub latest_body: Option<String>,
+    /// What the latest reply was when it has no body to show.
+    pub latest_fallback: Option<ReplyFallbackView>,
 }
 
 /// Without this a failed send renders as an ordinary message.
@@ -3607,6 +1607,10 @@ pub enum TimelineItemContentView {
         emote: bool,
         notice: bool,
         edited: bool,
+        /// Drawn larger, 1 to 4, when the message is nothing but emoji or
+        /// inline emotes.
+        #[cfg_attr(feature = "typegen", specta(optional))]
+        jumbo: Option<u8>,
     },
     Image {
         filename: String,
@@ -3641,6 +1645,7 @@ pub enum TimelineItemContentView {
         blurhash: Option<String>,
         thumbnail: Option<String>,
         spoiler: Option<String>,
+        playback: Option<VideoPlaybackView>,
     },
     Audio {
         filename: String,
@@ -3698,6 +1703,12 @@ pub enum TimelineItemContentView {
         updated_at: Option<u64>,
     },
     CallInvite,
+    VerificationRequest,
+    /// The `im.fluffychat.cute_event` msgtype, such as a hug or a wave.
+    Cute {
+        cute_type: Option<String>,
+        body: String,
+    },
     Malformed {
         event_type: String,
     },
@@ -3715,6 +1726,8 @@ pub enum TimelineItemContentView {
     },
     Redacted {
         reason: Option<String>,
+        #[cfg_attr(feature = "typegen", specta(optional))]
+        redacted_by: Option<String>,
     },
     UnableToDecrypt {
         reason: UtdCauseView,
@@ -3882,14 +1895,6 @@ pub struct UserDirectoryEntryView {
     pub avatar_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
-#[serde(rename_all = "snake_case")]
-pub enum RtcLivekitEndpoint {
-    GetToken,
-    DelegateDelayedLeave,
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
 pub struct TurnServerView {
@@ -3907,6 +1912,13 @@ pub struct RelationsView {
     pub chunk: Vec<serde_json::Value>,
     pub next_batch: Option<String>,
     pub prev_batch: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+pub struct TermsPolicyView {
+    pub url: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4010,39 +2022,10 @@ pub struct ReactionGroup {
 
 #[derive(Debug, Clone, Deserialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
-pub struct PusherView {
-    pub pushkey: String,
-    pub app_id: String,
-    /// The gateway's `_matrix/push/v1/notify`.
-    pub url: String,
-    pub device_display_name: String,
-    /// Web push delivery, as `UnifiedPush` and a browser use: `pushkey` is then
-    /// the `p256dh` and the gateway encrypts to these.
-    pub web_push: Option<WebPushKeys>,
-    pub event_id_only: bool,
-    /// False replaces any pusher already holding this key.
-    pub append: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
 pub struct WebPushKeys {
     pub endpoint: String,
     pub p256dh: String,
     pub auth: String,
-}
-
-/// MSC4174 web push: the homeserver encrypts and delivers, so no gateway.
-#[derive(Debug, Clone, Deserialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
-pub struct WebPusherView {
-    pub pushkey: String,
-    pub app_id: String,
-    pub device_display_name: String,
-    /// The browser subscription, where a gateway pusher carries a `url`.
-    pub endpoint: String,
-    pub auth: String,
-    pub event_id_only: bool,
 }
 
 /// Read raw: ruma's `Pusher` carries neither a custom kind nor `activated`.
@@ -4059,6 +2042,16 @@ pub struct RegisteredPusherView {
     pub gateway: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+#[serde(rename_all = "snake_case")]
+pub enum ShareHistoryView {
+    Shared,
+    Unencrypted,
+    NoCrossSigning,
+    HistoryNotShared,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -4070,15 +2063,6 @@ pub enum DiagnosticPushView {
         event_id: String,
         accepted: Option<bool>,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
-#[serde(rename_all = "snake_case")]
-pub enum NotificationModeView {
-    All,
-    Mentions,
-    Mute,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -4146,19 +2130,10 @@ pub struct KeywordNotificationView {
     pub mode: MentionNotificationModeView,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
 pub struct NotificationSettingsView {
     /// The room's own rule. `null` means it follows `default`.
-    pub room: Option<NotificationModeView>,
-    pub default: NotificationModeView,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
-pub struct RoomNotificationModeView {
-    #[cfg_attr(feature = "typegen", specta(type = String))]
-    pub room_id: OwnedRoomId,
     pub room: Option<NotificationModeView>,
     pub default: NotificationModeView,
 }
@@ -4196,6 +2171,8 @@ pub struct PushEventView {
     pub sender_display_name: Option<String>,
     pub room_name: String,
     pub room_avatar_url: Option<String>,
+    pub encrypted: bool,
+    pub noisy: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4259,9 +2236,13 @@ pub struct ImagePackView {
     pub room_id: Option<String>,
     pub name: Option<String>,
     pub avatar_url: Option<String>,
+    pub declared_name: Option<String>,
+    pub declared_avatar_url: Option<String>,
     pub attribution: Option<String>,
     pub usage: Vec<ImageUsageView>,
     pub images: Vec<PackImageView>,
+    pub stable_event: bool,
+    pub legacy_event: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -4308,7 +2289,7 @@ pub struct ImageSourcePackReferenceView {
     pub source: ImageSourcePackView,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
 #[serde(default)]
 pub struct PackImageInfoView {
@@ -4321,7 +2302,7 @@ pub struct PackImageInfoView {
     pub size: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum ImageUsageView {
@@ -4388,7 +2369,7 @@ pub struct InviteTriageView {
     pub inviter_banned: bool,
 }
 
-/// MSC4426 `m.status`. The emoji is optional here even though the MSC requires
+/// MSC4426 status. The emoji is optional here even though the MSC requires
 /// it, because the older single-string status fields carry no emoji.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
@@ -4411,21 +2392,24 @@ pub struct CalendarEntryView {
 
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
-pub struct CalendarRsvpView {
-    pub sender: String,
-    pub calendar_event_id: String,
-    pub uid: String,
-    pub recurrence_id: Option<String>,
-    pub status: String,
-    #[cfg_attr(feature = "typegen", specta(type = specta_typescript::Number))]
-    pub timestamp: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
 pub struct CalendarView {
     pub entries: Vec<CalendarEntryView>,
     pub rsvps: Vec<CalendarRsvpView>,
+}
+
+/// Bridge hints from a video's `info`: the `fi.mau.*` flags mautrix sets on gifs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "wire type mirroring the protocol"
+)]
+pub struct VideoPlaybackView {
+    pub gif: bool,
+    pub autoplay: bool,
+    pub looping: bool,
+    pub hide_controls: bool,
+    pub no_audio: bool,
 }
 
 /// MSC4549 track details from an `m.audio` event's `info`.
@@ -4438,12 +2422,142 @@ pub struct AudioMetadataView {
     pub cover_art_blurhash: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+pub struct PinReadStateView {
+    #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
+    pub pinned_ids: Vec<OwnedEventId>,
+    pub unread: u32,
+    /// Pins added since this account last looked.
+    #[cfg_attr(feature = "typegen", specta(type = Vec<String>))]
+    pub fresh_ids: Vec<OwnedEventId>,
+}
+
+/// MSC4529 keeps three states apart: no override, an override that removes
+/// the value, and an override that replaces it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OverrideTextView {
+    Unset,
+    Cleared,
+    Set { value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OverrideColorView {
+    Unset,
+    Cleared,
+    Set {
+        light: Option<String>,
+        dark: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+pub struct ProfileOverrideView {
+    #[cfg_attr(feature = "typegen", specta(type = String))]
+    pub user_id: OwnedUserId,
+    pub display_name: OverrideTextView,
+    /// An `mxc://` URI, or an encrypted file's JSON that `fetch_media` opens.
+    pub avatar: OverrideTextView,
+    pub color: OverrideColorView,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+pub struct ProfileOverridesView {
+    pub overrides: Vec<ProfileOverrideView>,
+    pub protection: SealStateView,
+    pub can_seal: bool,
+}
+
+/// MSC4278. `None` means the event does not say.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+pub struct MediaPreviewConfigView {
+    pub media_previews: Option<MediaPreviewsView>,
+    pub invite_avatars: Option<InviteAvatarsView>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+#[serde(rename_all = "snake_case")]
+pub enum MediaPreviewsView {
+    On,
+    /// Only in rooms that are not public.
+    Private,
+    Off,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+#[serde(rename_all = "snake_case")]
+pub enum InviteAvatarsView {
+    On,
+    Off,
+}
+
+/// What the pack editor holds; the core turns it into MSC2545 content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
-pub struct PronounView {
-    pub summary: String,
-    /// Absent when the writer did not tag the set with a language.
-    pub language: Option<String>,
+pub struct PackDraftView {
+    pub name: String,
+    pub avatar_url: Option<String>,
+    pub attribution: String,
+    pub usage: Vec<ImageUsageView>,
+    pub images: Vec<PackImageDraftView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+pub struct PackImageDraftView {
+    pub shortcode: String,
+    pub url: String,
+    pub body: Option<String>,
+    pub usage: Vec<ImageUsageView>,
+    pub info: Option<PackImageInfoView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+pub struct PackAddressView {
+    #[cfg_attr(feature = "typegen", specta(type = String))]
+    pub room_id: OwnedRoomId,
+    pub state_key: String,
+}
+
+/// A term the room explains on hover. An uncased term matches any casing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+pub struct AbbreviationView {
+    pub term: String,
+    pub definition: String,
+    #[serde(default)]
+    pub cased: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryVisibilityView {
+    Shared,
+    Invited,
+    Joined,
+    WorldReadable,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "typegen", derive(specta::Type))]
+pub struct MemberLookView {
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub color_on_light: Option<String>,
+    pub color_on_dark: Option<String>,
+    pub pronouns: Vec<PronounView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4463,7 +2577,7 @@ pub struct ProfileFieldView {
 
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "typegen", derive(specta::Type))]
-// These are independent server capabilities, not a state machine.
+// Independent server capabilities.
 #[expect(
     clippy::struct_excessive_bools,
     reason = "wire type mirroring the protocol"
@@ -4472,6 +2586,7 @@ pub struct LoginFlowsView {
     pub password: bool,
     pub oidc: bool,
     pub oidc_registration: bool,
+    pub qr_login: bool,
     pub sso: bool,
     pub oauth_aware_preferred: bool,
     pub sso_identity_providers: Vec<SsoIdentityProviderView>,
@@ -4529,15 +2644,6 @@ pub enum SyncStatus {
     Syncing,
     Live,
     Error { message: String },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[cfg_attr(feature = "typegen", derive(specta::Type))]
-#[serde(rename_all = "snake_case")]
-pub enum InboxFilter {
-    All,
-    Mentions,
-    Direct,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

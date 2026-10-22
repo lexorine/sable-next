@@ -3,8 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
-import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { collectSymbols } from './upload-sentry-symbols.mjs';
 
 test('finds app symbols and excludes dependencies and bundles', async () => {
@@ -18,6 +17,7 @@ test('finds app symbols and excludes dependencies and bundles', async () => {
       'release/bundle/app',
       'debug/app',
       'build/archive/Sable.app.dSYM/Contents/Resources/DWARF/Sable',
+      'build/archive/Sentry.framework.dSYM/Contents/Resources/DWARF/Sentry',
     ];
     for (const file of files) {
       await mkdir(join(root, file, '..'), { recursive: true });
@@ -45,7 +45,11 @@ test('fails when a symbol directory cannot be read', async () => {
 
 test(
   'validates debug data and requires every build output',
-  { skip: process.platform !== 'linux' },
+  {
+    skip:
+      process.platform !== 'linux' ||
+      ['cc', 'strip'].some((tool) => spawnSync(tool, ['--version']).error),
+  },
   async () => {
     const root = await mkdtemp(join(tmpdir(), 'sable-symbols-'));
     try {
@@ -55,7 +59,7 @@ test(
       await mkdir(release);
       await writeFile(source, 'int main(void) { return 0; }');
       execFileSync('cc', ['-g', '-Wl,--build-id', source, '-o', binary]);
-      const script = fileURLToPath(new URL('./upload-sentry-symbols.mjs', import.meta.url));
+      const script = join(import.meta.dirname, 'upload-sentry-symbols.mjs');
       const validate = (...paths) =>
         execFileSync(process.execPath, [script, '--dry-run', ...paths], {
           encoding: 'utf8',

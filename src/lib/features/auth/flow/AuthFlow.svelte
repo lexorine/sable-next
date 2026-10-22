@@ -5,11 +5,11 @@
   import { resolve } from '$app/paths';
   import { page } from '$app/state';
   import { onMount, untrack } from 'svelte';
+  import { SvelteURLSearchParams } from 'svelte/reactivity';
   import { i18n } from '#lib/i18n.js';
   import { shouldReduceMotion } from '#lib/ui/motion.js';
   import { useCoreClient } from '#lib/core/context.js';
-  import AuthFooter from '#lib/features/auth/shared/AuthFooter.svelte';
-  import AuthHeader from '#lib/features/auth/shared/AuthHeader.svelte';
+  import AuthPage from '#lib/features/auth/shared/AuthPage.svelte';
   import AuthRedirectBridge from './AuthRedirectBridge.svelte';
   import AuthRail from './AuthRail.svelte';
   import AuthStageCard from './AuthStageCard.svelte';
@@ -29,7 +29,6 @@
   import { RedirectController } from './redirect-controller.svelte';
   import { homeserverFromAuthUrl, registrationTokenFromAuthUrl } from './auth-url';
   import { homeservers } from '../shared/homeservers.svelte.js';
-  import Spinner from '#lib/ui/primitives/Spinner.svelte';
   import { takeAfterLogin } from '#lib/auth/after-login.js';
   import { readText, writeJson, writeText } from '#lib/platform/local-json.js';
 
@@ -171,8 +170,7 @@
   );
   let isLaunchingLogin = $derived(redirect.pendingIntent === 'login' && redirect.isLaunching);
   let canForward = $derived(
-    displayedStage < furthestReached ||
-      (displayedStage === 0 && hasSecondaryStage) ||
+    (displayedStage === 0 && hasSecondaryStage && flow.loginProviderReady) ||
       (displayedStage === 1 && signedIn)
   );
 
@@ -215,7 +213,7 @@
     const reauth = core.accounts.find((account) => account.account_id === reauthAccountId());
     if (reauth) flow.homeserver = reauth.homeserver;
     void untrack(() =>
-      flow.validateHomeserver(displayedStage).finally(() => {
+      flow.validateInitialHomeserver(displayedStage).finally(() => {
         hasCompletedInitialHomeserverCheck = true;
       })
     );
@@ -227,6 +225,7 @@
     if (isSetupRoute || loginPending) return;
     if (redirect.pendingIntent === 'login' && redirect.isCompleting) return;
     if (readText(profileOnboardingMarker(userId))) void openSetup();
+    // eslint-disable-next-line svelte/no-navigation-without-resolve -- takeAfterLogin() returns a resolved path
     else void goto(takeAfterLogin(resolve('/(app)/rooms')));
   });
 
@@ -246,7 +245,9 @@
     return () => {
       redirect.cleanup();
       if (!redirect.isCallbackWindow)
-        void core.commands.cancelRegistration().catch(() => undefined);
+        void core.rpc.auth.cancelRegistration().catch((error: unknown) => {
+          console.debug('[sable auth] cancelling registration failed', error);
+        });
     };
   });
 
@@ -256,9 +257,9 @@
   }
 
   function forward(): void {
-    if (displayedStage < furthestReached) activateStage(displayedStage + 1);
-    else if (displayedStage === 0 && hasSecondaryStage) activateStage(1);
-    else if (displayedStage === 1 && signedIn) void openSetup();
+    if (!canForward) return;
+    if (displayedStage === 0) activateStage(1);
+    else void openSetup();
   }
 
   function activateStage(index: number): void {
@@ -270,6 +271,7 @@
       if (shouldReduceMotion()) enteringStage = null;
     }
     pendingStage = index;
+    // eslint-disable-next-line svelte/no-navigation-without-resolve -- stageRoute() extends a resolved stage route
     void goto(stageRoute(index), { reset: false }).finally(() => {
       pendingStage = null;
     });
@@ -286,8 +288,15 @@
       !server.includes('#')
         ? `${base}/${encodeURIComponent(server)}`
         : base;
-    if (index !== 1 || !registration.registrationToken?.trim()) return route;
-    return `${route}?registration_token=${encodeURIComponent(registration.registrationToken.trim())}`;
+    const query = new SvelteURLSearchParams();
+    for (const key of ['addAccount', 'reauth']) {
+      const value = page.url.searchParams.get(key);
+      if (value !== null) query.set(key, value);
+    }
+    const token = registration.registrationToken?.trim();
+    if (index === 1 && token) query.set('registration_token', token);
+    const search = query.toString();
+    return search ? `${route}?${search}` : route;
   }
 
   function invalidateAfter(index: number): void {
@@ -310,7 +319,7 @@
 
 <svelte:head>
   <title>
-    {$i18n.t(
+    {i18n.t(
       isSetupRoute
         ? 'setup.title'
         : displayedStage === 0
@@ -350,141 +359,143 @@
           qrLoginOpen = true;
         }}
     onCreateAccount={showCreateAccount ? showRegistrationStage : undefined}
+    onCancel={isAddingAccount ? () => goto(resolve('home')) : undefined}
     followUserServer={!reauthAccountId()}
   />
 {/snippet}
 
-<main class="auth-page">
-  <AuthRedirectBridge
-    onCallback={(url: string) => {
-      void redirect.complete(url);
-    }}
-    onRegistrationComplete={() => {
-      void core.start().then(() => {
-        if (core.status === 'ready') void openSetup();
-      });
-    }}
-    onCallbackWindow={() => {
-      redirect.markCallbackWindow();
-    }}
-  />
-  <section class="auth-content" aria-labelledby="sable-title">
-    <AuthHeader {hasLoggedInBefore} title={isSetupRoute ? $i18n.t('setup.title') : undefined} />
-    <div class="auth-main">
-      {#if core.status === 'starting' || core.status === 'idle' || (core.status === 'signed-out' && !hasCompletedInitialHomeserverCheck)}
-        <div class="bootstrap" role="status">
-          <Spinner />
-          <p>{$i18n.t('auth.starting')}</p>
-        </div>
-      {:else if isSetupRoute}
-        <SetupFlow />
-      {:else}
-        <AuthRail
-          activeIndex={displayedStage}
-          total={visibleFurthestStage + 1}
-          canBack={displayedStage > 0}
-          {canForward}
-          onBack={back}
-          onForward={forward}
-        >
-          <AuthStageCard
-            active={displayedStage === 0}
-            before={displayedStage > 0}
-            accessibilityLabel={$i18n.t(stages[0].accessibilityLabel)}
-            onActivate={() => {
-              activateStage(0);
-            }}
-          >
-            <!-- eslint-disable-next-line @typescript-eslint/no-confusing-void-expression -->
-            {@render loginStageContent(true)}
-          </AuthStageCard>
+<AuthRedirectBridge
+  onCallback={(url: string) => {
+    void redirect.complete(url);
+  }}
+  onRegistrationComplete={() => {
+    void core.start().then(() => {
+      if (core.status === 'ready') void openSetup();
+    });
+  }}
+  onCallbackWindow={() => {
+    redirect.markCallbackWindow();
+  }}
+/>
+<AuthPage
+  {hasLoggedInBefore}
+  title={isSetupRoute
+    ? i18n.t('setup.title')
+    : isAddingAccount
+      ? i18n.t('common.addAccount')
+      : undefined}
+  status={core.status === 'starting' ||
+  core.status === 'idle' ||
+  (core.status === 'signed-out' && !hasCompletedInitialHomeserverCheck)
+    ? i18n.t('common.startingSable')
+    : undefined}
+>
+  {#if isSetupRoute}
+    <SetupFlow />
+  {:else}
+    <AuthRail
+      activeIndex={displayedStage}
+      total={visibleFurthestStage + 1}
+      canBack={displayedStage > 0}
+      {canForward}
+      onBack={back}
+      onForward={forward}
+    >
+      <AuthStageCard
+        active={displayedStage === 0}
+        before={displayedStage > 0}
+        accessibilityLabel={i18n.t(stages[0].accessibilityLabel)}
+        onActivate={() => {
+          activateStage(0);
+        }}
+      >
+        <!-- eslint-disable-next-line @typescript-eslint/no-confusing-void-expression -->
+        {@render loginStageContent(true)}
+      </AuthStageCard>
 
-          {#if visibleFurthestStage >= 1}
-            <AuthStageCard
-              active={displayedStage === 1}
-              after={displayedStage < 1}
-              entering={enteringStage === 1}
-              removing={retiringAfter === 0}
-              accessibilityLabel={$i18n.t(stages[1].accessibilityLabel)}
-              onActivate={() => {
-                activateStage(1);
+      {#if visibleFurthestStage >= 1}
+        <AuthStageCard
+          active={displayedStage === 1}
+          after={displayedStage < 1}
+          entering={enteringStage === 1}
+          removing={retiringAfter === 0}
+          accessibilityLabel={i18n.t(stages[1].accessibilityLabel)}
+          onActivate={() => {
+            activateStage(1);
+          }}
+          onMotionComplete={() => {
+            completeStageMotion(retiringAfter ?? 1);
+          }}
+        >
+          {#if signedIn}
+            <AccountSummaryCard
+              homeserver={flow.homeserver}
+              {userId}
+              onContinue={() => void openSetup()}
+            />
+          {:else}
+            <RegistrationCard
+              homeserver={flow.homeserver}
+              registrationToken={registration.registrationToken}
+              loginFlows={flow.loginFlows}
+              registrationFlows={flow.registrationFlows}
+              isCheckingHomeserver={flow.isCheckingHomeserver}
+              {isRegistering}
+              isEditingHomeserver={flow.isEditingHomeserver}
+              fallback={registration.fallback}
+              emailStep={registration.emailStep}
+              username={registration.username}
+              registrationEmail={registration.registrationEmail}
+              password={registration.password}
+              confirmPassword={registration.confirmPassword}
+              error={registrationError}
+              invalidRegistrationField={registration.invalidField}
+              registrationFieldError={registration.fieldError}
+              onHomeserverInput={(value: string) => {
+                flow.homeserverInput(value);
+                login.resetForHomeserverChange();
+                registration.resetForHomeserverChange();
               }}
-              onMotionComplete={() => {
-                completeStageMotion(retiringAfter ?? 1);
+              onRegistrationTokenInput={(value: string) => {
+                registration.setToken(value);
               }}
-            >
-              {#if signedIn}
-                <AccountSummaryCard
-                  homeserver={flow.homeserver}
-                  {userId}
-                  onContinue={() => void openSetup()}
-                />
-              {:else}
-                <RegistrationCard
-                  homeserver={flow.homeserver}
-                  registrationToken={registration.registrationToken}
-                  loginFlows={flow.loginFlows}
-                  registrationFlows={flow.registrationFlows}
-                  isCheckingHomeserver={flow.isCheckingHomeserver}
-                  {isRegistering}
-                  isEditingHomeserver={flow.isEditingHomeserver}
-                  fallback={registration.fallback}
-                  emailStep={registration.emailStep}
-                  username={registration.username}
-                  registrationEmail={registration.registrationEmail}
-                  password={registration.password}
-                  confirmPassword={registration.confirmPassword}
-                  error={registrationError}
-                  invalidRegistrationField={registration.invalidField}
-                  registrationFieldError={registration.fieldError}
-                  onHomeserverInput={(value: string) => {
-                    flow.homeserverInput(value);
-                    login.resetForHomeserverChange();
-                    registration.resetForHomeserverChange();
-                  }}
-                  onRegistrationTokenInput={(value: string) => {
-                    registration.setToken(value);
-                  }}
-                  onValidateHomeserver={() => void flow.validateRegistrationHomeserver()}
-                  onClearFieldError={(field: Exclude<RegistrationField, 'homeserver'>) => {
-                    registration.clearFieldError(field);
-                  }}
-                  onStartRegistration={() => void registration.start()}
-                  onLaunchRedirectLogin={(type: 'oidc' | 'sso', id?: string) => {
-                    void redirect.launch(type, id, 'register');
-                  }}
-                  onOpenFallback={() => {
-                    registration.openFallback();
-                  }}
-                  onContinueFallback={() => void registration.continueFallback()}
-                  onRequestRegistrationEmail={(address: string) => {
-                    void registration.requestEmail(address);
-                  }}
-                  onSubmitRegistrationEmail={(token: string) => {
-                    void registration.submitEmail(token);
-                  }}
-                  onUsernameInput={(value: string) => {
-                    registration.setUsername(value);
-                  }}
-                  onRegistrationEmailInput={(value: string) => {
-                    registration.setEmail(value);
-                  }}
-                  onPasswordInput={(value: string) => {
-                    registration.setPassword(value);
-                  }}
-                  onConfirmPasswordInput={(value: string) => {
-                    registration.setConfirmPassword(value);
-                  }}
-                />
-              {/if}
-            </AuthStageCard>
+              onValidateHomeserver={() => void flow.validateRegistrationHomeserver()}
+              onClearFieldError={(field: Exclude<RegistrationField, 'homeserver'>) => {
+                registration.clearFieldError(field);
+              }}
+              onStartRegistration={() => void registration.start()}
+              onLaunchRedirectLogin={(type: 'oidc' | 'sso', id?: string) => {
+                void redirect.launch(type, id, 'register');
+              }}
+              onOpenFallback={() => {
+                registration.openFallback();
+              }}
+              onContinueFallback={() => void registration.continueFallback()}
+              onRequestRegistrationEmail={(address: string) => {
+                void registration.requestEmail(address);
+              }}
+              onSubmitRegistrationEmail={(token: string) => {
+                void registration.submitEmail(token);
+              }}
+              onUsernameInput={(value: string) => {
+                registration.setUsername(value);
+              }}
+              onRegistrationEmailInput={(value: string) => {
+                registration.setEmail(value);
+              }}
+              onPasswordInput={(value: string) => {
+                registration.setPassword(value);
+              }}
+              onConfirmPasswordInput={(value: string) => {
+                registration.setConfirmPassword(value);
+              }}
+            />
           {/if}
-        </AuthRail>
+        </AuthStageCard>
       {/if}
-    </div>
-  </section>
-  <AuthFooter />
-</main>
+    </AuthRail>
+  {/if}
+</AuthPage>
 
 <DeviceVerificationDialog />
 
@@ -501,47 +512,3 @@
     void openSetup();
   }}
 />
-
-<style>
-  .auth-page {
-    display: flex;
-    flex-direction: column;
-    min-height: 100%;
-    padding: var(--space-700) var(--space-600);
-    padding-block: calc(var(--space-700) + var(--safe-top))
-      calc(var(--space-700) + var(--safe-bottom));
-    padding-inline: max(var(--space-600), var(--safe-left)) max(var(--space-600), var(--safe-right));
-  }
-
-  .auth-content {
-    display: grid;
-    flex: 1 0 auto;
-    grid-template-rows: calc((100dvh - 4rem) / 3) auto;
-    margin: 0 auto;
-    max-width: 78rem;
-    width: 100%;
-  }
-
-  .auth-main {
-    align-self: start;
-    min-width: 0;
-    padding-bottom: var(--space-800);
-  }
-
-  .bootstrap {
-    align-items: center;
-    display: flex;
-    gap: var(--space-300);
-    justify-content: center;
-  }
-
-  .bootstrap p {
-    margin: 0;
-  }
-
-  @media (width <= 48rem) {
-    .auth-content {
-      grid-template-rows: clamp(9rem, 18dvh, 12rem) auto;
-    }
-  }
-</style>

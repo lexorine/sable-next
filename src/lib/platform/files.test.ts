@@ -6,12 +6,15 @@ import {
   mimeFromName,
   pickFiles,
   saveBytes,
+  saveUrl,
   saveFile,
   saveImageToPhotos,
   savesNatively,
   shareFile,
   sharesNatively,
+  withResolvedMime,
 } from './files';
+import type { ElectronBridge } from './electron';
 
 const mocks = vi.hoisted(() => ({
   androidFs: {
@@ -50,6 +53,7 @@ vi.mock('@tauri-apps/plugin-fs', () => ({
 }));
 vi.mock('@tauri-apps/api/path', () => ({
   appCacheDir: mocks.appCacheDir,
+  downloadDir: () => Promise.resolve('/dl'),
   join: (...parts: string[]) => Promise.resolve(parts.join('/')),
 }));
 vi.mock('@choochmeque/tauri-plugin-sharekit-api', () => ({ shareFile: mocks.shareNative }));
@@ -92,6 +96,10 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+function stubElectron(bridge: Partial<ElectronBridge>): void {
+  vi.stubGlobal('sableElectron', bridge satisfies Partial<ElectronBridge>);
+}
+
 test('the web build keeps the browser download, having no native dialog', () => {
   expect(savesNatively()).toBe(false);
 });
@@ -118,6 +126,21 @@ test('an archive and an animated png carry the type their handler needs', () => 
 test('an unknown or absent extension falls back to a generic type', () => {
   expect(mimeFromName('archive.zzz')).toBe('application/octet-stream');
   expect(mimeFromName('README')).toBe('application/octet-stream');
+});
+
+test.each(['', 'application/octet-stream', 'application/ogg'])(
+  'an ogg file reported as %j resolves to audio/ogg',
+  (type) => {
+    const file = new File([new Uint8Array(1)], 'memo.ogg', { type });
+    expect(withResolvedMime(file).type).toBe('audio/ogg');
+  }
+);
+
+test('a file with a trustworthy type is left untouched', () => {
+  const file = new File([new Uint8Array(1)], 'memo.ogg', { type: 'video/ogg' });
+  expect(withResolvedMime(file)).toBe(file);
+  const unknown = new File([new Uint8Array(1)], 'blob.zzz', { type: '' });
+  expect(withResolvedMime(unknown)).toBe(unknown);
 });
 
 test('a wildcard accept expands to every extension of that type', () => {
@@ -232,6 +255,22 @@ test('Android saves downloads to the public Downloads collection', async () => {
   expect(mocks.androidFs.scanPublicFile).toHaveBeenCalledWith({ uri: 'content://downloads/file' });
 });
 
+test('Android names a download with no extension after its bytes and drops path characters (#1139)', async () => {
+  mocks.isTauri.mockReturnValue(true);
+  mocks.osType.mockReturnValue('android');
+  const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(png)));
+
+  await expect(saveFile('blob:avatar', 'she/her')).resolves.toBe('saved');
+
+  expect(mocks.androidFs.createNewPublicFile).toHaveBeenCalledWith(
+    'Download',
+    'she_her.png',
+    'image/png',
+    { isPending: true, requestPermission: true }
+  );
+});
+
 test('Android saves images to the public Pictures collection', async () => {
   mocks.isTauri.mockReturnValue(true);
   mocks.osType.mockReturnValue('android');
@@ -246,6 +285,31 @@ test('Android saves images to the public Pictures collection', async () => {
     'photo.jpg',
     'image/jpeg',
     { isPending: true, requestPermission: true }
+  );
+});
+
+test('Android retries a public image under a new name when MediaStore refuses the first (#1165)', async () => {
+  mocks.isTauri.mockReturnValue(true);
+  mocks.osType.mockReturnValue('android');
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Uint8Array([1, 2, 3]))));
+  vi.spyOn(Date, 'now').mockReturnValue(1000);
+  mocks.androidFs.createNewPublicImageFile
+    .mockRejectedValueOnce(new Error('Failed to build unique file'))
+    .mockResolvedValueOnce({ uri: 'content://pictures/second' });
+
+  await expect(saveImageToPhotos('https://example.org/image.png', 'image.png')).resolves.toBe(
+    'saved'
+  );
+
+  expect(mocks.androidFs.createNewPublicImageFile).toHaveBeenLastCalledWith(
+    'Pictures',
+    'image-1000.png',
+    'image/png',
+    { isPending: true, requestPermission: true }
+  );
+  expect(mocks.androidFs.writeFile).toHaveBeenCalledWith(
+    { uri: 'content://pictures/second' },
+    new Uint8Array([1, 2, 3])
   );
 });
 
@@ -456,6 +520,34 @@ test('saved bytes reach Android Downloads with the type their name declares', as
   );
 });
 
+test('a desktop download goes straight to the Downloads folder when it is not asked about', async () => {
+  mocks.isTauri.mockReturnValue(true);
+  mocks.osType.mockReturnValue('linux');
+  mocks.fsWriteFile.mockResolvedValue(undefined);
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Uint8Array([1, 2, 3]))));
+
+  await expect(saveFile('blob:wave', 'wave.png', false)).resolves.toBe('saved');
+
+  expect(mocks.dialogSave).not.toHaveBeenCalled();
+  expect(mocks.fsWriteFile).toHaveBeenCalledWith('/dl/wave.png', new Uint8Array([1, 2, 3]), {
+    createNew: true,
+  });
+});
+
+test('a desktop download keeps an existing file by retrying under a new name', async () => {
+  mocks.isTauri.mockReturnValue(true);
+  mocks.osType.mockReturnValue('linux');
+  vi.spyOn(Date, 'now').mockReturnValue(1000);
+  mocks.fsWriteFile.mockRejectedValueOnce(new Error('exists')).mockResolvedValueOnce(undefined);
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Uint8Array([1]))));
+
+  await expect(saveFile('blob:wave', 'wave.png', false)).resolves.toBe('saved');
+
+  expect(mocks.fsWriteFile).toHaveBeenLastCalledWith('/dl/wave-1000.png', new Uint8Array([1]), {
+    createNew: true,
+  });
+});
+
 test('saved bytes go through the iOS save dialog rather than an anchor', async () => {
   mocks.isTauri.mockReturnValue(true);
   mocks.osType.mockReturnValue('ios');
@@ -481,4 +573,82 @@ test('a cancelled save dialog is not reported as a failure', async () => {
   await expect(saveBytes(new Uint8Array([1, 2, 3]), 'wave.png', 'image/png')).resolves.toBe(
     'cancelled'
   );
+});
+
+test('a browser saves a url through a download link', async () => {
+  const link = { click: vi.fn(), href: '', download: '' };
+  vi.stubGlobal('document', { createElement: () => link });
+
+  await expect(saveUrl('blob:clip', 'clip.mp4')).resolves.toBe('saved');
+
+  expect(link).toMatchObject({ href: 'blob:clip', download: 'clip.mp4' });
+  expect(link.click).toHaveBeenCalledOnce();
+});
+
+test('Electron saves natively, having a dialog of its own', () => {
+  expect(savesNatively()).toBe(false);
+
+  stubElectron({});
+
+  expect(savesNatively()).toBe(true);
+});
+
+test('Electron opens the native dialog and hands back the files', async () => {
+  const pick = vi
+    .fn<ElectronBridge['pickFiles']>()
+    .mockResolvedValue([{ name: 'photo.jpg', bytes: new Uint8Array([1, 2, 3]) }]);
+  stubElectron({ pickFiles: pick });
+
+  const files = await pickFiles('image/*');
+
+  expect(pick).toHaveBeenCalledOnce();
+  const request = pick.mock.calls[0][0];
+  expect(request.multiple).toBe(true);
+  expect(request.filters.flatMap((filter) => filter.extensions)).toContain('jpg');
+  expect(files?.map(({ name, type }) => ({ name, type }))).toEqual([
+    { name: 'photo.jpg', type: 'image/jpeg' },
+  ]);
+});
+
+test('a cancelled Electron dialog leaves the caller without files', async () => {
+  stubElectron({ pickFiles: vi.fn().mockResolvedValue([]) });
+
+  expect(await pickFiles('image/*')).toEqual([]);
+});
+
+test('a refused Electron pick reports the failure rather than throwing', async () => {
+  stubElectron({ pickFiles: vi.fn().mockRejectedValue(new Error('no dialog')) });
+  const onFailure = vi.fn();
+
+  await expect(pickFiles('image/*', onFailure)).resolves.toEqual([]);
+  expect(onFailure).toHaveBeenCalled();
+});
+
+test('Electron saves through the native dialog', async () => {
+  const save = vi.fn().mockResolvedValue({ path: '/tmp/wave.png' });
+  stubElectron({ saveFile: save });
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Uint8Array([1, 2, 3]))));
+
+  await expect(saveFile('blob:wave', 'wave.png')).resolves.toBe('saved');
+
+  expect(save).toHaveBeenCalledWith(
+    expect.objectContaining({ name: 'wave.png', askLocation: true })
+  );
+});
+
+test('a cancelled Electron save is not reported as a failure', async () => {
+  stubElectron({ saveFile: vi.fn().mockResolvedValue(null) });
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Uint8Array([1]))));
+
+  await expect(saveFile('blob:wave', 'wave.png')).resolves.toBe('cancelled');
+});
+
+test('an Electron download skips the dialog when it is not asked about', async () => {
+  const save = vi.fn().mockResolvedValue({ path: '/dl/wave.png' });
+  stubElectron({ saveFile: save });
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Uint8Array([1, 2, 3]))));
+
+  await expect(saveFile('blob:wave', 'wave.png', false)).resolves.toBe('saved');
+
+  expect(save).toHaveBeenCalledWith(expect.objectContaining({ askLocation: false }));
 });

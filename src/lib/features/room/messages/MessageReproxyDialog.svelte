@@ -5,11 +5,10 @@
   import type { PerMessageProfileView, PersonaView } from '#src/generated/protocol';
 
   import { i18n } from '#lib/i18n.js';
-  import { BREAKPOINTS } from '#lib/ui/breakpoints.js';
-  import { createMediaQuery } from '#lib/ui/media-query.svelte.js';
   import Avatar from '#lib/ui/primitives/Avatar.svelte';
-  import BottomSheet from '#lib/ui/primitives/BottomSheet.svelte';
-  import DialogFrame from '#lib/ui/primitives/DialogFrame.svelte';
+  import ResponsiveDialog from '#lib/ui/primitives/ResponsiveDialog.svelte';
+  import TextInput from '#lib/ui/primitives/TextInput.svelte';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
 
   interface Props {
     open?: boolean;
@@ -19,8 +18,15 @@
   }
 
   let { open = $bindable(false), personas, current, onChoose }: Props = $props();
-  const appLayout = createMediaQuery(BREAKPOINTS.appLayout);
-  let desktop = $derived(appLayout.matches);
+  let query = $state('');
+  let filteredPersonas = $derived.by(() => {
+    const needle = query.trim().toLocaleLowerCase();
+    return personas.filter(
+      (persona) =>
+        persona.display_name.toLocaleLowerCase().includes(needle) ||
+        persona.id.toLocaleLowerCase().includes(needle)
+    );
+  });
 
   function choose(persona: PersonaView | null): void {
     open = false;
@@ -28,9 +34,17 @@
   }
 </script>
 
-{#snippet content()}
-  <h2>{$i18n.t('timeline.reproxyTitle')}</h2>
-  <ul class="reproxy-options" class:dialog={desktop}>
+{#snippet content(desktop: boolean)}
+  <h2>{i18n.t('timeline.reproxyMessage')}</h2>
+  <TextInput
+    bind:value={query}
+    class="reproxy-search"
+    type="search"
+    autocomplete="off"
+    placeholder={i18n.t('personas.search')}
+    aria-label={i18n.t('personas.search')}
+  />
+  <ul class={['reproxy-options', { dialog: desktop }]} {@attach scrollHint}>
     <li>
       <button
         type="button"
@@ -40,11 +54,11 @@
         }}
       >
         <Avatar size="small"><ProhibitIcon /></Avatar>
-        <span class="reproxy-option-name">{$i18n.t('personas.pickerOffGlobal')}</span>
+        <span class="reproxy-option-name">{i18n.t('personas.pickerOffGlobal')}</span>
         {#if !current}<CheckIcon aria-hidden="true" />{/if}
       </button>
     </li>
-    {#each personas as persona (persona.id)}
+    {#each filteredPersonas as persona (persona.id)}
       <li>
         <button
           type="button"
@@ -65,27 +79,27 @@
       </li>
     {/each}
   </ul>
+  {#if filteredPersonas.length === 0 && query.trim()}
+    <p class="reproxy-empty">{i18n.t('personas.noMatches')}</p>
+  {/if}
 {/snippet}
 
-{#if desktop}
-  <DialogFrame bind:open variant="verification" label={$i18n.t('timeline.reproxyTitle')}>
-    {@render content()}
-  </DialogFrame>
-{:else}
-  <BottomSheet
-    bind:open
-    label={$i18n.t('timeline.reproxyTitle')}
-    closeLabel={$i18n.t('timeline.closeMenu')}
-  >
-    {@render content()}
-  </BottomSheet>
-{/if}
+<ResponsiveDialog
+  bind:open
+  label={i18n.t('timeline.reproxyMessage')}
+  closeLabel={i18n.t('timeline.closeMenu')}
+  children={content}
+/>
 
 <style>
   h2 {
     font-size: var(--font-size-heading);
     line-height: var(--line-height-heading);
     margin: 0 0 var(--space-200);
+  }
+
+  :global(.reproxy-search) {
+    margin-bottom: var(--space-200);
   }
 
   .reproxy-options {
@@ -127,5 +141,12 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .reproxy-empty {
+    color: var(--surface-var-on-container);
+    font-size: var(--font-size-small);
+    margin: 0;
+    padding: var(--space-200) var(--space-300);
   }
 </style>

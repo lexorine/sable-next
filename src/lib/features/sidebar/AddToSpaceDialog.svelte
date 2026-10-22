@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { RoomSummary } from '#src/generated/protocol';
+  import type { RoomListItemView } from '#src/generated/protocol';
   import { i18n } from '#lib/i18n.js';
   import Avatar from '#lib/ui/primitives/Avatar.svelte';
   import Button from '#lib/ui/primitives/Button.svelte';
@@ -7,11 +7,12 @@
   import TextInput from '#lib/ui/primitives/TextInput.svelte';
   import { SvelteSet } from 'svelte/reactivity';
   import '#lib/ui/primitives/menu.css';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
 
   interface Props {
     open: boolean;
-    room: RoomSummary;
-    spaces: readonly RoomSummary[];
+    room: RoomListItemView;
+    spaces: readonly RoomListItemView[];
     onOpenChange: (open: boolean) => void;
     onApply: (spaceIds: string[]) => void;
   }
@@ -51,19 +52,19 @@
     if (!next) close();
   }}
   variant="verification"
-  label={$i18n.t('room.addToSpaceTitle', { name: room.name ?? room.room_id })}
+  label={i18n.t('room.addToSpaceTitle', { name: room.name ?? room.room_id })}
 >
-  <h2>{$i18n.t('room.addToSpaceTitle', { name: room.name ?? room.room_id })}</h2>
+  <h2>{i18n.t('room.addToSpaceTitle', { name: room.name ?? room.room_id })}</h2>
   <TextInput
     id={fieldId}
     bind:value={search}
-    placeholder={$i18n.t('room.addToSpaceSearch')}
-    aria-label={$i18n.t('room.addToSpaceSearch')}
+    placeholder={i18n.t('room.addToSpaceSearch')}
+    aria-label={i18n.t('room.addToSpaceSearch')}
   />
   {#if targets.length === 0}
-    <p class="empty">{$i18n.t('room.addToSpaceEmpty')}</p>
+    <p class="empty">{i18n.t('room.addToSpaceEmpty')}</p>
   {:else}
-    <ul class="targets">
+    <ul class="targets" {@attach scrollHint}>
       {#each targets as space (space.room_id)}
         <li>
           <label class="menu-item target">
@@ -82,9 +83,9 @@
     </ul>
   {/if}
   <div class="actions">
-    <Button variant="ghost" onclick={close}>{$i18n.t('room.leaveCancel')}</Button>
+    <Button variant="ghost" onclick={close}>{i18n.t('common.cancel')}</Button>
     <Button variant="primary" disabled={selected.size === 0} onclick={apply}>
-      {$i18n.t('room.addToSpaceApply', { count: selected.size })}
+      {i18n.t('room.addToSpaceApply', { count: selected.size })}
     </Button>
   </div>
 </DialogFrame>

@@ -11,7 +11,7 @@
   import { pickFiles, saveBytes } from '#lib/platform/files.js';
   import { importPersonaAvatar } from '#lib/platform/persona-avatar.js';
   import { i18n } from '#lib/i18n.js';
-  import { backupFileName, backupJson, CATALOG_EVENT, parseBackup } from '#lib/personas/backup.js';
+  import { backupFileName } from '#lib/personas/backup.js';
   import { usePersonaStore } from '#lib/personas/personas.svelte.js';
   import {
     fetchPluralkitMembers,
@@ -19,6 +19,7 @@
     parsePluralkitExport,
     personaFromPluralkit,
     systemIdFromInput,
+    type PluralkitImportOptions,
     type PluralkitMember,
   } from '#lib/personas/pluralkit.js';
   import { triggerLabel } from '#lib/personas/persona.js';
@@ -31,6 +32,7 @@
   import SettingsSection from '#lib/ui/primitives/SettingsSection.svelte';
   import Spinner from '#lib/ui/primitives/Spinner.svelte';
   import TextInput from '#lib/ui/primitives/TextInput.svelte';
+  import Switch from '#lib/ui/primitives/Switch.svelte';
   import '#lib/ui/primitives/settings-row.css';
 
   import PersonaEditor from './PersonaEditor.svelte';
@@ -42,17 +44,20 @@
   let editing = $state<PersonaView | null>(null);
   let removing = $state<string | null>(null);
   let personaToRemove = $state<PersonaView | null>(null);
+  let confirmingRemoveAll = $state(false);
+  let removingAll = $state(false);
   let error = $state<string | null>(null);
 
   let systemInput = $state('');
   let token = $state('');
+  let pkExtractPronouns = $state(true);
   let importing = $state(false);
   let importNotice = $state<string | null>(null);
   let exportInput = $state<HTMLInputElement>();
 
   let backingUp = $state(false);
   let backupInput = $state<HTMLInputElement>();
-  let restoreContent = $state.raw<Record<string, unknown> | null>(null);
+  let restoreContent = $state.raw<string | null>(null);
   let restoring = $state(false);
 
   $effect(() => {
@@ -76,7 +81,7 @@
       await personas.remove(persona.id);
     } catch (cause) {
       console.warn('[sable personas] deleting failed', cause);
-      error = $i18n.t('personas.removeFailed');
+      error = i18n.t('personas.removeFailed');
     } finally {
       removing = null;
     }
@@ -89,6 +94,20 @@
     personaToRemove = null;
   }
 
+  async function confirmRemoveAll(): Promise<void> {
+    removingAll = true;
+    error = null;
+    try {
+      await personas.removeAll();
+    } catch (cause) {
+      console.warn('[sable personas] deleting every profile failed', cause);
+      error = i18n.t('personas.removeFailed');
+    } finally {
+      removingAll = false;
+      confirmingRemoveAll = false;
+    }
+  }
+
   async function avatarFor(member: PluralkitMember, existing: PersonaView | undefined) {
     if (!member.avatar_url) return { url: existing?.avatar_url ?? null, failed: false };
     if (existing?.pluralkit?.avatar_url === member.avatar_url && existing.avatar_url) {
@@ -96,7 +115,7 @@
     }
 
     try {
-      return { url: await importPersonaAvatar(member.avatar_url, core.commands), failed: false };
+      return { url: await importPersonaAvatar(member.avatar_url, core.media), failed: false };
     } catch (cause) {
       console.warn('[sable personas] fetching a PluralKit picture failed', cause);
       return { url: existing?.avatar_url ?? null, failed: true };
@@ -105,7 +124,8 @@
 
   async function importMembers(
     load: () => Promise<PluralkitMember[]>,
-    failure: string
+    failure: string,
+    options: PluralkitImportOptions = {}
   ): Promise<boolean> {
     importing = true;
     error = null;
@@ -118,17 +138,20 @@
         const existing = matchImported(personas.personas, member);
         const avatar = await avatarFor(member, existing);
         if (avatar.failed) pictures += 1;
-        await personas.save(personaFromPluralkit(member, avatar.url), existing?.id ?? null);
+        await personas.save(
+          personaFromPluralkit(member, avatar.url, options),
+          existing?.id ?? null
+        );
       }
 
       importNotice =
         pictures === 0
-          ? $i18n.t('personas.importDone', { count: members.length })
-          : $i18n.t('personas.importAvatarFailed', { count: pictures });
+          ? i18n.t('personas.importDone', { count: members.length })
+          : i18n.t('personas.importAvatarFailed', { count: pictures });
       return true;
     } catch (cause) {
       console.warn('[sable personas] the PluralKit import failed', cause);
-      error = $i18n.t(failure);
+      error = i18n.t(failure);
       return false;
     } finally {
       importing = false;
@@ -142,7 +165,8 @@
 
     const imported = await importMembers(
       () => fetchPluralkitMembers(systemId, token.trim() || null),
-      'personas.importFailed'
+      'personas.importFailed',
+      { extractPronouns: pkExtractPronouns }
     );
     if (imported) token = '';
   }
@@ -152,7 +176,8 @@
     if (!file || importing) return;
     await importMembers(
       async () => parsePluralkitExport(await file.text()),
-      'personas.importFileFailed'
+      'personas.importFileFailed',
+      { extractPronouns: pkExtractPronouns }
     );
   }
 
@@ -166,14 +191,13 @@
     backingUp = true;
     error = null;
     try {
-      const content = await core.commands.accountData(CATALOG_EVENT);
-      const bytes = new TextEncoder().encode(backupJson(content));
+      const bytes = new TextEncoder().encode(await core.rpc.personas.backup());
       if ((await saveBytes(bytes, backupFileName(), 'application/json')) === 'failed') {
-        error = $i18n.t('personas.backupFailed');
+        error = i18n.t('personas.backupFailed');
       }
     } catch (cause) {
       console.warn('[sable personas] the backup failed', cause);
-      error = $i18n.t('personas.backupFailed');
+      error = i18n.t('personas.backupFailed');
     } finally {
       backingUp = false;
     }
@@ -184,10 +208,12 @@
     if (!file) return;
     error = null;
     try {
-      restoreContent = parseBackup(await file.text());
+      const backup = await file.text();
+      await core.rpc.personas.checkBackup({ backup });
+      restoreContent = backup;
     } catch (cause) {
       console.warn('[sable personas] the backup file could not be read', cause);
-      error = $i18n.t('personas.restoreInvalid');
+      error = i18n.t('personas.restoreInvalid');
     }
   }
 
@@ -198,15 +224,15 @@
   }
 
   async function confirmRestore(): Promise<void> {
-    const content = restoreContent;
-    if (!content) return;
+    const backup = restoreContent;
+    if (backup === null) return;
     restoring = true;
     try {
-      await core.commands.setAccountData(CATALOG_EVENT, content);
+      await core.rpc.personas.restoreBackup({ backup });
       await personas.load(true);
     } catch (cause) {
       console.warn('[sable personas] the restore failed', cause);
-      error = $i18n.t('personas.restoreFailed');
+      error = i18n.t('personas.restoreFailed');
     } finally {
       restoring = false;
       restoreContent = null;
@@ -216,18 +242,18 @@
 
 <div class="persona-stack">
   {#if error}<Alert variant="critical" aria-live="polite">{error}</Alert>{/if}
-  {#if personas.error}<Alert variant="critical">{$i18n.t(personas.error)}</Alert>{/if}
+  {#if personas.error}<Alert variant="critical">{i18n.t(personas.error)}</Alert>{/if}
 
   <SettingsSection
-    title={$i18n.t('personas.manageTitle')}
-    description={$i18n.t('personas.manageDescription')}
+    title={i18n.t('personas.manageTitle')}
+    description={i18n.t('personas.manageDescription')}
     headingId="settings-personas"
   >
     <div class="settings-form">
       {#if personas.loading && personas.personas.length === 0}
-        <p class="persona-empty"><Spinner small label={$i18n.t('a11y.loading')} /></p>
+        <p class="persona-empty"><Spinner small label={i18n.t('a11y.loading')} /></p>
       {:else if personas.personas.length === 0}
-        <p class="persona-empty">{$i18n.t('personas.empty')}</p>
+        <p class="persona-empty">{i18n.t('personas.empty')}</p>
       {:else}
         <ul class="persona-list">
           {#each personas.personas as persona (persona.id)}
@@ -253,7 +279,7 @@
               <IconButton
                 variant="subtle"
                 size="small"
-                label={$i18n.t('personas.edit', { name: persona.display_name })}
+                label={i18n.t('personas.edit', { name: persona.display_name })}
                 onclick={() => {
                   openEditor(persona);
                 }}
@@ -264,7 +290,7 @@
                 variant="subtle"
                 size="small"
                 disabled={index === 0}
-                label={$i18n.t('personas.moveUp', { name: persona.display_name })}
+                label={i18n.t('personas.moveUp', { name: persona.display_name })}
                 onclick={() => void personas.reorder(index, index - 1)}
               >
                 <ArrowUpIcon />
@@ -273,7 +299,7 @@
                 variant="subtle"
                 size="small"
                 disabled={index === personas.personas.length - 1}
-                label={$i18n.t('personas.moveDown', { name: persona.display_name })}
+                label={i18n.t('personas.moveDown', { name: persona.display_name })}
                 onclick={() => void personas.reorder(index, index + 1)}
               >
                 <ArrowDownIcon />
@@ -282,7 +308,7 @@
                 variant="subtle"
                 size="small"
                 disabled={removing === persona.id}
-                label={$i18n.t('personas.remove', { name: persona.display_name })}
+                label={i18n.t('personas.remove', { name: persona.display_name })}
                 onclick={() => {
                   personaToRemove = persona;
                 }}
@@ -298,36 +324,53 @@
         <Button
           variant="secondary"
           size="small"
+          disabled={personas.personas.length === 0 || importing || restoring}
+          onclick={() => {
+            confirmingRemoveAll = true;
+          }}
+        >
+          <TrashIcon />
+          {i18n.t('personas.removeAll')}
+        </Button>
+        <Button
+          variant="secondary"
+          size="small"
           onclick={() => {
             openEditor(null);
           }}
         >
           <PlusIcon />
-          {$i18n.t('personas.add')}
+          {i18n.t('personas.add')}
         </Button>
       </div>
     </div>
   </SettingsSection>
 
   <SettingsSection
-    title={$i18n.t('personas.importTitle')}
-    description={$i18n.t('personas.importDescription')}
+    title={i18n.t('personas.importTitle')}
+    description={i18n.t('personas.importDescription')}
     headingId="settings-personas-pluralkit"
   >
     <form class="settings-form import-form" onsubmit={(event) => void runImport(event)}>
       {#if importNotice}<Alert variant="info" aria-live="polite">{importNotice}</Alert>{/if}
       <label class="field">
-        <span>{$i18n.t('personas.importSystem')}</span>
+        <span>{i18n.t('personas.importSystem')}</span>
         <TextInput
           bind:value={systemInput}
           required
-          placeholder={$i18n.t('personas.importSystemPlaceholder')}
+          placeholder={i18n.t('personas.importSystemPlaceholder')}
         />
       </label>
       <label class="field">
-        <span>{$i18n.t('personas.importToken')}</span>
+        <span>{i18n.t('personas.importToken')}</span>
         <TextInput bind:value={token} type="password" autocomplete="off" />
-        <small>{$i18n.t('personas.importTokenHint')}</small>
+        <small>{i18n.t('personas.importTokenHint')}</small>
+      </label>
+      <label class="field">
+        <div>
+          <span>{i18n.t('personas.importPronouns')}</span>
+          <Switch label={i18n.t('personas.importPronouns')} bind:checked={pkExtractPronouns} />
+        </div>
       </label>
       <div class="persona-actions">
         <Button
@@ -336,10 +379,10 @@
           disabled={importing}
           onclick={() => void chooseExport()}
         >
-          {$i18n.t('personas.importFile')}
+          {i18n.t('personas.importFile')}
         </Button>
         <Button type="submit" size="small" loading={importing}>
-          {$i18n.t('personas.importAction')}
+          {i18n.t('common.import')}
         </Button>
       </div>
       <input
@@ -359,8 +402,8 @@
   </SettingsSection>
 
   <SettingsSection
-    title={$i18n.t('personas.backupTitle')}
-    description={$i18n.t('personas.backupDescription')}
+    title={i18n.t('personas.backupTitle')}
+    description={i18n.t('personas.backupDescription')}
     headingId="settings-personas-backup"
   >
     <div class="settings-form">
@@ -371,7 +414,7 @@
           disabled={importing || restoring}
           onclick={() => void chooseBackup()}
         >
-          {$i18n.t('personas.restore')}
+          {i18n.t('common.restore')}
         </Button>
         <Button
           variant="secondary"
@@ -380,7 +423,7 @@
           disabled={personas.personas.length === 0}
           onclick={() => void backUp()}
         >
-          {$i18n.t('personas.backup')}
+          {i18n.t('personas.backup')}
         </Button>
       </div>
       <input
@@ -415,11 +458,23 @@
   onOpenChange={(next: boolean) => {
     if (!next && removing === null) personaToRemove = null;
   }}
-  title={$i18n.t('personas.removeTitle', { name: personaToRemove?.display_name ?? '' })}
-  description={$i18n.t('personas.removeConfirm')}
-  confirmLabel={$i18n.t('personas.remove', { name: personaToRemove?.display_name ?? '' })}
+  title={i18n.t('personas.removeTitle', { name: personaToRemove?.display_name ?? '' })}
+  description={i18n.t('personas.removeConfirm')}
+  confirmLabel={i18n.t('personas.remove', { name: personaToRemove?.display_name ?? '' })}
   busy={removing !== null}
   onConfirm={() => void confirmRemoval()}
+/>
+
+<ConfirmDialog
+  open={confirmingRemoveAll}
+  onOpenChange={(next: boolean) => {
+    if (!next && !removingAll) confirmingRemoveAll = false;
+  }}
+  title={i18n.t('personas.removeAllTitle')}
+  description={i18n.t('personas.removeAllConfirm')}
+  confirmLabel={i18n.t('personas.removeAll')}
+  busy={removingAll}
+  onConfirm={() => void confirmRemoveAll()}
 />
 
 <ConfirmDialog
@@ -427,9 +482,9 @@
   onOpenChange={(next: boolean) => {
     if (!next && !restoring) restoreContent = null;
   }}
-  title={$i18n.t('personas.restoreTitle')}
-  description={$i18n.t('personas.restoreConfirm')}
-  confirmLabel={$i18n.t('personas.restore')}
+  title={i18n.t('personas.restoreTitle')}
+  description={i18n.t('personas.restoreConfirm')}
+  confirmLabel={i18n.t('common.restore')}
   busy={restoring}
   onConfirm={() => void confirmRestore()}
 />
@@ -503,5 +558,12 @@
   .field small {
     color: var(--surface-var-on-container);
     font-size: var(--font-size-small);
+  }
+
+  .field div {
+    align-items: center;
+    display: flex;
+    flex-flow: row wrap;
+    justify-content: space-between;
   }
 </style>

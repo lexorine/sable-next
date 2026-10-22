@@ -187,7 +187,7 @@ describe('attachVia', () => {
     const doc = editor.doc();
 
     expect(doc && serializeComposer(doc).formatted).toBe(
-      '<a href="https://matrix.to/#/!abc:example.org?via=sable.moe">#Sable</a> '
+      '<a href="https://matrix.to/#/!abc:example.org?via=sable.moe">#Sable</a>'
     );
   });
 
@@ -230,6 +230,17 @@ test('clear empties the document and setText refills it', () => {
   expect(editor.isEmpty()).toBe(true);
 });
 
+test('setLines keeps a blank line as a line the caret can reach', () => {
+  const editor = open();
+  editor.setLines('1\n\n2\r\n3');
+
+  const doc = editor.doc();
+  if (!doc) throw new Error('no document');
+  expect(doc.childCount).toBe(1);
+  expect(doc.firstChild?.childCount).toBe(6);
+  expect(serializeComposer(doc).body).toBe('1\n\n2\n3');
+});
+
 describe('document replacement', () => {
   test.each(['one', 'one\ntwo'])('places the selection at the end of %j', (text) => {
     const editor = open();
@@ -264,6 +275,19 @@ describe('document replacement', () => {
     expect(handled).toBe(true);
     expect(editor.doc()?.textContent).toBe('short');
   });
+});
+
+test('typing $…$ in the rich composer inserts inline math, but prices stay text', () => {
+  const sent = (text: string): string | null => {
+    const editor = open();
+    typeAfterBreak(editor, text);
+    const doc = editor.doc();
+    if (!doc) throw new Error('no document');
+    return serializeComposer(doc).formatted;
+  };
+
+  expect(sent('so $x^2$ ok')).toBe('so <span data-mx-maths="x^2"><code>x^2</code></span> ok');
+  expect(sent('costs $5 and $6')).toBeNull();
 });
 
 describe('history reset', () => {
@@ -1304,6 +1328,20 @@ describe('pasting', () => {
     });
     expect(hrefs).toEqual(['https://example.org']);
   });
+
+  test('an address pasted over a selection in the plain composer is written as markdown', () => {
+    preferences.richTextComposer = false;
+    const editor = open();
+    type(editor, 'the docs');
+    const editorView = view(editor);
+    editorView.dispatch(
+      editorView.state.tr.setSelection(TextSelection.create(editorView.state.doc, 5, 9))
+    );
+    editorView.pasteText('https://example.org');
+
+    expect(editor.doc()?.textContent).toBe('the [docs](https://example.org)');
+    preferences.richTextComposer = true;
+  });
 });
 
 describe('the placeholder', () => {
@@ -1686,6 +1724,18 @@ describe('arrow keys at the edge of the document', () => {
 
     expect(pressSurface('ArrowRight').defaultPrevented).toBe(true);
     expect(pressSurface('ArrowLeft').defaultPrevented).toBe(false);
+  });
+
+  test('right at the very end leaves inline code', () => {
+    const editor = open();
+    editor.setText('ab');
+    const editorView = view(editor);
+    editorView.dispatch(editorView.state.tr.addMark(1, 3, composerSchema.marks.code.create()));
+    caretAt(editor, 'end');
+
+    expect(pressSurface('ArrowRight').defaultPrevented).toBe(true);
+    editorView.dispatch(editorView.state.tr.insertText('c'));
+    expect(editorView.state.doc.nodeAt(3)?.marks).toEqual([]);
   });
 
   test('left and right in the middle of the text are left to the browser', () => {
@@ -2337,5 +2387,50 @@ describe('a pasted user id becomes a mention', () => {
     paste('mail me at ana@example.org or see `@ana:example.org`');
 
     expect(mentions(editor)).toEqual([]);
+  });
+});
+
+test('blurring the editor leaves no DOM selection inside it', () => {
+  const editor = open();
+  editor.focus();
+  const surface = view(editor).dom;
+  const range = document.createRange();
+  range.selectNodeContents(surface);
+  getSelection()?.removeAllRanges();
+  getSelection()?.addRange(range);
+
+  surface.dispatchEvent(new FocusEvent('blur'));
+
+  expect(getSelection()?.rangeCount).toBe(0);
+});
+
+describe('pasting what select-all copied', () => {
+  test.each(['start', 'end'])('at the %s of a paragraph adds no paragraph', (where) => {
+    const editor = open();
+    const editorView = view(editor);
+    const emote = composerSchema.nodes.emoticon.create({
+      url: 'mxc://a/b',
+      body: 'x',
+      shortcode: 'emote',
+    });
+    editorView.dispatch(editorView.state.tr.replaceSelectionWith(emote));
+    editorView.dispatch(editorView.state.tr.setSelection(new AllSelection(editorView.state.doc)));
+    const copied = editorView.serializeForClipboard(editorView.state.selection.content());
+
+    const size = editorView.state.doc.content.size;
+    editorView.dispatch(
+      editorView.state.tr.setSelection(
+        TextSelection.create(editorView.state.doc, where === 'end' ? size - 1 : 1)
+      )
+    );
+    const data = new DataTransfer();
+    data.setData('text/plain', copied.text);
+    data.setData('text/html', copied.dom.innerHTML);
+    const event = new Event('paste', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'clipboardData', { value: data });
+    surface().dispatchEvent(event);
+
+    expect(editorView.state.doc.childCount).toBe(1);
+    expect(editorView.state.doc.firstChild?.childCount).toBe(2);
   });
 });

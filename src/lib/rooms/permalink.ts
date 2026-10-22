@@ -1,6 +1,7 @@
+import { copyText } from '#lib/platform/clipboard.js';
 import { resolve } from '$app/paths';
 
-import type { RoomSummary } from '#src/generated/protocol';
+import type { RoomListItemView } from '#src/generated/protocol';
 
 import type { CoreClient } from '#lib/core/client.svelte.js';
 
@@ -9,16 +10,23 @@ import { parseMatrixLink } from '#lib/rooms/matrix-link.js';
 
 import { findRoomByPathId, roomPathParam, roomPathParamFromId } from './room-list.svelte';
 
-function parentSpaceOf(rooms: readonly RoomSummary[], roomId: string): RoomSummary | undefined {
+function parentSpaceOf(
+  rooms: readonly RoomListItemView[],
+  roomId: string
+): RoomListItemView | undefined {
   return rooms.find(
     (space) =>
-      space.is_space &&
+      space.room_kind === 'space' &&
       space.state === 'joined' &&
+      !space.is_tombstoned &&
       space.space_children.some((child) => child.room_id === roomId)
   );
 }
 
-function rootSpaceOf(rooms: readonly RoomSummary[], roomId: string): RoomSummary | undefined {
+function rootSpaceOf(
+  rooms: readonly RoomListItemView[],
+  roomId: string
+): RoomListItemView | undefined {
   const seen = new Set<string>([roomId]);
   let space = parentSpaceOf(rooms, roomId);
 
@@ -34,17 +42,18 @@ function rootSpaceOf(rooms: readonly RoomSummary[], roomId: string): RoomSummary
 
 /** Mirrors RoomNav's sectioning, so a permalink lands where the sidebar links. */
 function sectionPath(
-  rooms: readonly RoomSummary[],
-  room: RoomSummary | undefined,
+  rooms: readonly RoomListItemView[],
+  room: RoomListItemView | undefined,
   roomParam: string
 ): string {
-  if (room?.is_space) return resolve('/(app)/space/[spaceId]/lobby', { spaceId: roomParam });
+  if (room?.room_kind === 'space')
+    return resolve('/(app)/space/[spaceId]/lobby', { spaceId: roomParam });
   if (room?.is_direct) return resolve('/(app)/direct/[roomId]', { roomId: roomParam });
 
   const parentSpace = room ? rootSpaceOf(rooms, room.room_id) : undefined;
   if (parentSpace) {
     return resolve('/(app)/space/[spaceId]/[roomId]', {
-      spaceId: roomPathParam(parentSpace),
+      spaceId: roomPathParam(parentSpace, rooms),
       roomId: roomParam,
     });
   }
@@ -55,7 +64,7 @@ function sectionPath(
 }
 
 export function roomSectionPath(
-  rooms: readonly RoomSummary[],
+  rooms: readonly RoomListItemView[],
   roomIdOrAlias: string,
   eventId?: string | null,
   via: readonly string[] = []
@@ -64,12 +73,12 @@ export function roomSectionPath(
   const base = sectionPath(
     rooms,
     room,
-    room ? roomPathParam(room) : roomPathParamFromId(roomIdOrAlias)
+    room ? roomPathParam(room, rooms) : roomPathParamFromId(roomIdOrAlias)
   );
 
   const query = new URLSearchParams();
   // A space has no timeline to focus an event in.
-  if (eventId && !room?.is_space) query.set('event', eventId);
+  if (eventId && room?.room_kind !== 'space') query.set('event', eventId);
   // `via` only helps a join, so it rides along solely for a room the client has
   // never seen. Carrying it further would pin it in the URL of a room already open.
   if (room === undefined) for (const server of via) query.append('via', server);
@@ -84,8 +93,7 @@ export function viaFor(address: string, via: readonly string[]): string[] {
 }
 
 /**
- * A matrix.to link others can follow. A room id is not routable without `via`,
- * which is why it is not optional for that form.
+ * A matrix.to link others can follow; a room id needs `via` to be routable.
  */
 export function matrixToUrl(
   address: string,
@@ -104,15 +112,15 @@ export function matrixToUrl(
 }
 
 export async function copyRoomLink(
-  core: Pick<CoreClient, 'commands'>,
-  room: Pick<RoomSummary, 'room_id' | 'canonical_alias'>,
+  core: Pick<CoreClient, 'rpc'>,
+  room: Pick<RoomListItemView, 'room_id' | 'canonical_alias'>,
   eventId?: string | null
 ): Promise<boolean> {
   try {
-    const via = room.canonical_alias ? [] : await core.commands.roomViaServers(room.room_id);
-    await navigator.clipboard.writeText(
-      matrixToUrl(room.canonical_alias ?? room.room_id, via, eventId)
-    );
+    const via = room.canonical_alias
+      ? []
+      : await core.rpc.rooms.viaServers({ room_id: room.room_id });
+    await copyText(matrixToUrl(room.canonical_alias ?? room.room_id, via, eventId));
     return true;
   } catch (error) {
     console.debug('[sable room] copy link failed', error);
@@ -124,12 +132,10 @@ export async function copyRoomLink(
 export type PermalinkTarget = { kind: 'room'; path: string } | { kind: 'user'; userId: string };
 
 /**
- * Resolves the tail of a `/to/...` URL, which mirrors a matrix.to fragment.
- * Takes it still percent-encoded so the matrix.to parser decodes each segment
- * itself, as it does for a pasted link.
+ * Resolves the tail of a `/to/...` URL, still percent-encoded so the matrix.to parser decodes it.
  */
 export function permalinkTarget(
-  rooms: readonly RoomSummary[],
+  rooms: readonly RoomListItemView[],
   encodedFragment: string
 ): PermalinkTarget | null {
   // `?via=` sits inside the fragment, where it would otherwise be parsed as
@@ -137,10 +143,10 @@ export function permalinkTarget(
   const { href, via } = splitVia(`https://matrix.to/#/${encodedFragment}`);
   const link = parseMatrixLink(href);
   if (link === null) return null;
-  if (link.kind === 'user') return { kind: 'user', userId: link.userId };
+  if (link.kind === 'user') return { kind: 'user', userId: link.user_id };
 
   return {
     kind: 'room',
-    path: roomSectionPath(rooms, link.roomId, link.kind === 'event' ? link.eventId : null, via),
+    path: roomSectionPath(rooms, link.room_id, link.kind === 'event' ? link.event_id : null, via),
   };
 }

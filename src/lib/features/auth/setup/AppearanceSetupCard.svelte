@@ -1,15 +1,13 @@
 <script lang="ts">
-  import { MediaQuery } from 'svelte/reactivity';
-
   import CustomThemes from '#lib/features/settings/CustomThemes.svelte';
   import { i18n } from '#lib/i18n.js';
+  import { systemDark } from '#lib/platform/system-theme.js';
   import { preferences, setPreference } from '#lib/settings/preferences.svelte.js';
   import { resolveTheme } from '#lib/settings/theme.js';
   import Button from '#lib/ui/primitives/Button.svelte';
   import AuthField from '../shared/AuthField.svelte';
 
   let { onComplete }: { onComplete: () => void } = $props();
-  const systemDark = new MediaQuery('(prefers-color-scheme: dark)');
   const systemTheme = $derived(resolveTheme('system', systemDark.current));
 
   function choose(kind: 'light' | 'dark'): void {
@@ -18,13 +16,13 @@
 </script>
 
 <div class="appearance-setup-card auth-card-surface">
-  <AuthField labelId="appearance-setup-title" label={$i18n.t('setup.appearanceTitle')}>
+  <AuthField labelId="appearance-setup-title" label={i18n.t('setup.appearanceTitle')}>
     <p class="hint">
-      {$i18n.t(
+      {i18n.t(
         preferences.theme === 'system' ? 'setup.appearanceSystem' : 'setup.appearancePinned',
         {
-          mode: $i18n
-            .t(preferences.theme === 'light' ? 'settings.themeLight' : 'settings.themeDark')
+          mode: i18n
+            .t(preferences.theme === 'light' ? 'common.light' : 'common.dark')
             .toLowerCase(),
         }
       )}
@@ -32,7 +30,7 @@
   </AuthField>
 
   <CustomThemes onboarding onThemeChosen={choose} />
-  <Button variant="primary" block onclick={onComplete}>{$i18n.t('auth.continue')}</Button>
+  <Button variant="primary" block onclick={onComplete}>{i18n.t('auth.continue')}</Button>
 </div>
 
 <style>

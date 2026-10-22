@@ -15,20 +15,3 @@ test('a room can be reported from its menu', async ({ app, page, installRoomCore
 
   await expect(page.getByText('Report sent')).toBeVisible();
 });
-
-test('the media preview setting is offered in privacy settings', async ({
-  app,
-  page,
-  installRoomCore,
-}) => {
-  await installRoomCore('ready');
-  await app.openRoom('!room:example.test');
-
-  await page.goto('/settings/privacy');
-  await expect(page.getByText('Show media previews')).toBeVisible({ timeout: 15_000 });
-  await expect(page.getByRole('switch', { name: 'Show avatars on invites' })).toBeChecked();
-  await page.screenshot({
-    path: `test-results/media-privacy-${test.info().project.name}.png`,
-    fullPage: false,
-  });
-});

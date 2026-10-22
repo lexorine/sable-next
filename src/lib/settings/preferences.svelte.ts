@@ -1,8 +1,10 @@
 import { untrack } from 'svelte';
 import { SvelteSet } from 'svelte/reactivity';
 import type { PresenceView, ProfilePropagationView } from '#src/generated/protocol';
-import type { GifProviderSetting } from '#lib/features/gif/providers.js';
-import type { MemberSort } from '#lib/features/room/members/member-listing.js';
+import type { GifProviderSetting } from '#lib/gif/providers.js';
+import type { MemberSort } from '#lib/rooms/member-listing.js';
+import type { RoomSort } from '#lib/rooms/room-sort.js';
+import { SYSTEM_TIME_ZONE, timeZoneValues } from '#lib/ui/time-zones.js';
 import { languageValues, SYSTEM_LANGUAGE } from '#lib/locales.js';
 import { readJson, writeJson } from '#lib/platform/local-json.js';
 import { customTitleBarDefault } from '#lib/platform/window-decorations.js';
@@ -14,14 +16,17 @@ export type { BadgeNotificationMode };
 
 export type ThreadPresentation = 'timeline' | 'panel';
 export type TimelineLayout = 'modern' | 'compact' | 'bubble';
-export type MessageSpacing = 'compact' | 'cozy' | 'roomy';
+export type MessageSpacing = 'none' | 'compact' | 'cozy' | 'roomy';
 export type MediaAutoLoad = 'on' | 'private' | 'off';
+export type ImageMetadata = 'location' | 'all' | 'keep';
 export type TimelineEmoteSize = 'default' | '20' | '24' | '32' | '48' | '64';
 export type DateFormat = 'auto' | 'dmy' | 'mdy' | 'ymd';
 export type WeekStart = 'sunday' | 'monday' | 'saturday';
 export type ThemeMode = 'system' | 'dark' | 'light';
 export type ShowRoomIcon = 'always' | 'sometimes' | 'collapsed' | 'never';
 export type SearchIndexLimit = '128' | '256' | '512' | '1024' | '2048' | '4096';
+export type PersonaPickerSortOrder = 'manual' | 'alphabetical-asc' | 'alphabetical-desc' | 'recent';
+
 export const SEARCH_INDEX_LIMITS: readonly SearchIndexLimit[] = [
   '128',
   '256',
@@ -30,6 +35,7 @@ export const SEARCH_INDEX_LIMITS: readonly SearchIndexLimit[] = [
   '2048',
   '4096',
 ];
+export const CORE_LOG_LEVELS = ['default', 'debug'] as const;
 export const SEARCH_CRAWL_PAUSES = ['1', '2', '3', '5', '10', '30'] as const;
 export const SEARCH_TRICKLE_PAUSES = ['5', '10', '30', '60'] as const;
 export const SEARCH_FLUSH_INTERVALS = ['20', '60', '120', '300'] as const;
@@ -57,7 +63,8 @@ export type LatchScope = 'off' | 'room' | 'account';
 export type ReplyPreviewStyle = 'connected' | 'compact' | 'expanded';
 export type CaptionPosition = 'above' | 'below' | 'inline' | 'hidden';
 export type UsernameClick = 'mention' | 'profile';
-export type CallRingtoneVolume = 'quiet' | 'normal' | 'loud';
+export const CALL_MODES = ['auto', 'legacy', 'compatibility', 'matrix_2'] as const;
+export type CallModePreference = (typeof CALL_MODES)[number];
 export const CALL_VIDEO_RESOLUTIONS = [
   'auto',
   '360',
@@ -78,6 +85,17 @@ export const CALL_VIDEO_BITRATES = [
   '16000',
 ] as const;
 export const CALL_VIDEO_CODECS = ['auto', 'vp8', 'h264', 'vp9', 'av1'] as const;
+export const CALL_SCREEN_FRAMERATES = ['auto', '15', '30', '60'] as const;
+export const WEBRTC_IP_POLICIES = [
+  'default',
+  'default_public_and_private_interfaces',
+  'default_public_interface_only',
+  'disable_non_proxied_udp',
+] as const;
+export const UPDATE_CHANNELS = ['stable', 'nightly'] as const;
+export type UpdateChannel = (typeof UPDATE_CHANNELS)[number];
+export type WebRtcIpPolicy = (typeof WEBRTC_IP_POLICIES)[number];
+export type CallScreenFramerate = (typeof CALL_SCREEN_FRAMERATES)[number];
 export type CallVideoResolution = (typeof CALL_VIDEO_RESOLUTIONS)[number];
 export type CallVideoBitrate = (typeof CALL_VIDEO_BITRATES)[number];
 export type CallVideoCodec = (typeof CALL_VIDEO_CODECS)[number];
@@ -85,6 +103,10 @@ export type ComposerForm = 'short' | 'adaptive' | 'tall';
 export type EnterKey = 'adaptive' | 'newline' | 'send';
 export const COMPOSER_ACTIONS = ['gif', 'sticker', 'emoticon', 'persona', 'format'] as const;
 export type ComposerAction = (typeof COMPOSER_ACTIONS)[number];
+export const DEARROW_THUMBNAIL_FALLBACKS = ['random', 'original', 'youtube_autogen'] as const;
+export type DearrowThumbnailFallback = (typeof DEARROW_THUMBNAIL_FALLBACKS)[number];
+export const YOUTUBE_THUMBNAIL_POSITIONS = ['start', 'middle', 'end'] as const;
+export type YoutubeThumbnailPosition = (typeof YOUTUBE_THUMBNAIL_POSITIONS)[number];
 
 export const COMPOSER_SEPARATOR_MAX = 9;
 export type ComposerSeparatorId = `separator:${number}`;
@@ -172,14 +194,20 @@ export interface Preferences {
   layout: TimelineLayout;
   threadPresentation: ThreadPresentation;
   alignOwnMessages: boolean;
+  avatarsInMessageHeaders: boolean;
   messageSpacing: MessageSpacing;
   timelineEmoteSize: TimelineEmoteSize;
   theme: ThemeMode;
   quickCss: string;
+  fontFamily: string;
+  fontFamilyMono: string;
+  codeLigatures: boolean;
   underlineLinks: boolean;
   renderRoomColors: boolean;
+  renderProfileColors: boolean;
   reducedMotion: boolean;
   pageZoom: number;
+  zoomShortcuts: boolean;
   textScale: number;
   highContrast: boolean;
   alwaysShowAltText: boolean;
@@ -188,9 +216,11 @@ export interface Preferences {
   nameColorCorrection: NameColorCorrection;
   showRoomIcon: ShowRoomIcon;
   showRoomBanners: boolean;
+  showDmTopics: boolean;
   roomBannerHeight: number;
   subspaceHierarchyLimit: SubspaceDepth;
   searchIndexLimit: SearchIndexLimit;
+  coreLogLevel: (typeof CORE_LOG_LEVELS)[number];
   searchCrawlPause: (typeof SEARCH_CRAWL_PAUSES)[number];
   searchTricklePause: (typeof SEARCH_TRICKLE_PAUSES)[number];
   searchFlushInterval: (typeof SEARCH_FLUSH_INTERVALS)[number];
@@ -201,9 +231,11 @@ export interface Preferences {
   searchUnmeteredOnly: boolean;
   serverSearch: boolean;
   showHome: boolean;
+  restoreLastRoom: boolean;
   showSearch: boolean;
   showUnreadCounts: boolean;
   badgeCountDMsOnly: boolean;
+  showEasterEggs: boolean;
   showPingCounts: boolean;
   showUnreadDots: boolean;
   uniformIcons: boolean;
@@ -212,12 +244,15 @@ export interface Preferences {
 
   hour24Clock: boolean;
   dateFormat: DateFormat;
+  timeZone: string;
   weekStart: WeekStart;
 
   hideMembershipEvents: boolean;
   hideProfileChanges: boolean;
+  hideTopicChanges: boolean;
   hideMemberInReadOnly: boolean;
   showTombstoneEvents: boolean;
+  openRoomsAtUnread: boolean;
   hideReadReceipts: boolean;
   readReceiptPlacement: ReadReceiptPlacement;
   replyPreviewStyle: ReplyPreviewStyle;
@@ -225,9 +260,12 @@ export interface Preferences {
   usernameClick: UsernameClick;
   doubleTapReact: boolean;
   showRoleTooltip: boolean;
+  autoRevealRedacted: boolean;
   doubleTapReaction: string;
   hideTypingIndicators: boolean;
   memberSort: MemberSort;
+  roomSort: RoomSort;
+  directSort: RoomSort;
   groupMembersByPresence: boolean;
   filterPronounsByLanguage: boolean;
   showPronouns: boolean;
@@ -236,11 +274,16 @@ export interface Preferences {
   pronounPillLength: PronounPillLength;
 
   composerForm: ComposerForm;
+  alwaysInlineEditor: boolean;
   enterForNewline: EnterKey;
+  sedEdits: boolean;
+  inlineEditing: boolean;
   mentionInReplies: boolean;
   formattingToolbar: boolean;
   composerFormatButton: boolean;
   richTextComposer: boolean;
+  composerSpellcheck: boolean;
+  composerAutocapitalize: boolean;
   composerGifButton: boolean;
   composerStickerButton: boolean;
   composerEmoteButton: boolean;
@@ -249,11 +292,16 @@ export interface Preferences {
   scheduleInEncryptedRooms: boolean;
   sendAttachmentAsCaption: boolean;
   sendAttachmentsAsGallery: boolean;
+  imageMetadata: ImageMetadata;
 
   personaPicker: boolean;
+  personaPickerSortOrder: PersonaPickerSortOrder;
+  personaPickerLeftSide: boolean;
   personaProxying: boolean;
   personaLatching: LatchScope;
   personaFallback: boolean;
+  personaGrid: boolean;
+  personaAlternateAvatar: boolean;
 
   sendTypingNotifications: boolean;
   sendReadReceipts: boolean;
@@ -276,14 +324,17 @@ export interface Preferences {
   clientEmbeds: boolean;
   encryptedClientEmbeds: boolean;
   youtubeEmbeds: boolean;
+  useDearrow: boolean;
+  dearrowThumbnailFallback: DearrowThumbnailFallback;
+  youtubeThumbnailPosition: YoutubeThumbnailPosition;
   tiktokEmbeds: boolean;
   instagramEmbeds: boolean;
+  blueskyEmbeds: boolean;
 
   systemNotifications: boolean;
   badgeDefaultDirect: BadgeNotificationMode;
   badgeDefaultGroup: BadgeNotificationMode;
   notificationSounds: boolean;
-  notificationSoundVolume: number;
   notifyOnce: boolean;
   backgroundNotificationSounds: boolean;
   notificationContent: boolean;
@@ -295,9 +346,10 @@ export interface Preferences {
   ringForGroupCalls: boolean;
   alwaysShowCallButton: boolean;
   callScreenPreview: boolean;
+  callMode: CallModePreference;
   incomingCallSound: boolean;
   outgoingRingback: boolean;
-  callRingtoneVolume: CallRingtoneVolume;
+  callMicrophoneMuted: boolean;
   noiseSuppression: boolean;
   voiceIsolation: boolean;
   incomingVoiceIsolation: boolean;
@@ -311,6 +363,7 @@ export interface Preferences {
   callCameraCodec: CallVideoCodec;
   callScreenResolution: CallVideoResolution;
   callScreenBitrate: CallVideoBitrate;
+  callScreenFramerate: CallScreenFramerate;
   callScreenCodec: CallVideoCodec;
   callSimulcast: boolean;
 
@@ -324,21 +377,46 @@ export interface Preferences {
   /** Distinguishes a declined prompt from one that was never shown. */
   telemetryAsked: boolean;
 
+  soundsNotificationVolume: number;
+  soundsCameraOnVolume: number;
+  soundsCameraOffVolume: number;
+  soundsMicOnVolume: number;
+  soundsMicOffVolume: number;
+  soundsDeafenOnVolume: number;
+  soundsDeafenOffVolume: number;
+  soundsScreenshareStartVolume: number;
+  soundsScreenshareStopVolume: number;
+  soundsCallJoinVolume: number;
+  soundsCallLeaveVolume: number;
+  soundsIncomingCallVolume: number;
+  soundsOutgoingCallVolume: number;
+
   autoUpdateCheck: boolean;
+  updateChannel: UpdateChannel;
   closeToTray: boolean;
+  askDownloadLocation: boolean;
+  minimizeToTray: boolean;
   showSystemTrayIcon: boolean;
   useCustomTitleBar: boolean;
+  hardwareAcceleration: boolean;
+  hardwareVideoAcceleration: boolean;
+  smoothScrolling: boolean;
+  webRtcIpPolicy: WebRtcIpPolicy;
 
   settingsSync: boolean;
   syncDrafts: boolean;
   profileChangePropagation: ProfilePropagationView;
 
   developerTools: boolean;
+  callStatsOverlay: boolean;
+  callDebugOverlay: boolean;
   showHiddenEvents: boolean;
+  hiddenEventsHeaderToggle: boolean;
   hiddenEventEdits: boolean;
   hiddenEventReactions: boolean;
   hiddenEventRedactions: boolean;
   hiddenEventOther: boolean;
+  showTranslationStrings: boolean;
 }
 
 /** The subset the timeline reads when deciding which events to render. */
@@ -347,6 +425,7 @@ export type TimelinePreferences = Pick<
   | 'layout'
   | 'hideMembershipEvents'
   | 'hideProfileChanges'
+  | 'hideTopicChanges'
   | 'hideMemberInReadOnly'
   | 'showTombstoneEvents'
   | 'showHiddenEvents'
@@ -367,13 +446,15 @@ type EnumPreference = Exclude<
 
 const ENUMS = {
   mediaAutoLoad: ['on', 'private', 'off'],
+  imageMetadata: ['location', 'all', 'keep'],
   language: languageValues,
   layout: ['modern', 'compact', 'bubble'],
   threadPresentation: ['timeline', 'panel'],
-  messageSpacing: ['compact', 'cozy', 'roomy'],
+  messageSpacing: ['none', 'compact', 'cozy', 'roomy'],
   timelineEmoteSize: ['default', '20', '24', '32', '48', '64'],
   theme: ['system', 'dark', 'light'],
   dateFormat: ['auto', 'dmy', 'mdy', 'ymd'],
+  timeZone: timeZoneValues(),
   enterForNewline: ['adaptive', 'newline', 'send'],
   composerForm: ['short', 'adaptive', 'tall'],
   weekStart: ['sunday', 'monday', 'saturday'],
@@ -381,6 +462,7 @@ const ENUMS = {
   showRoomIcon: ['always', 'sometimes', 'collapsed', 'never'],
   subspaceHierarchyLimit: SUBSPACE_DEPTHS,
   searchIndexLimit: SEARCH_INDEX_LIMITS,
+  coreLogLevel: CORE_LOG_LEVELS,
   searchCrawlPause: SEARCH_CRAWL_PAUSES,
   searchTricklePause: SEARCH_TRICKLE_PAUSES,
   searchFlushInterval: SEARCH_FLUSH_INTERVALS,
@@ -395,17 +477,25 @@ const ENUMS = {
   replyPreviewStyle: ['connected', 'compact', 'expanded'],
   captionPosition: ['above', 'below', 'inline', 'hidden'],
   usernameClick: ['mention', 'profile'],
-  callRingtoneVolume: ['quiet', 'normal', 'loud'],
+  callMode: CALL_MODES,
   callCameraResolution: CALL_VIDEO_RESOLUTIONS,
   callCameraBitrate: CALL_VIDEO_BITRATES,
   callCameraCodec: CALL_VIDEO_CODECS,
   callScreenResolution: CALL_VIDEO_RESOLUTIONS,
   callScreenBitrate: CALL_VIDEO_BITRATES,
+  callScreenFramerate: CALL_SCREEN_FRAMERATES,
   callScreenCodec: CALL_VIDEO_CODECS,
+  webRtcIpPolicy: WEBRTC_IP_POLICIES,
+  updateChannel: UPDATE_CHANNELS,
+  dearrowThumbnailFallback: DEARROW_THUMBNAIL_FALLBACKS,
+  youtubeThumbnailPosition: YOUTUBE_THUMBNAIL_POSITIONS,
   badgeDefaultDirect: ['all', 'mentions', 'quiet'],
   badgeDefaultGroup: ['all', 'mentions', 'quiet'],
   memberSort: ['name-asc', 'name-desc', 'newest', 'oldest'],
+  roomSort: ['recent', 'name-asc', 'name-desc'],
+  directSort: ['recent', 'name-asc', 'name-desc'],
   personaLatching: ['off', 'room', 'account'],
+  personaPickerSortOrder: ['manual', 'alphabetical-asc', 'alphabetical-desc', 'recent'],
   presence: ['online', 'unavailable', 'offline'],
   profileChangePropagation: ['all', 'unchanged', 'none'],
 } as const satisfies { [K in EnumPreference]?: readonly Preferences[K][] };
@@ -414,6 +504,8 @@ const ENUMS = {
     `SelectPreference` would otherwise claim. */
 const FREE_TEXT = [
   'quickCss',
+  'fontFamily',
+  'fontFamilyMono',
   'audioInputDevice',
   'audioOutputDevice',
   'videoInputDevice',
@@ -428,7 +520,19 @@ const FREE_TEXT = [
 export type FreeTextPreference = (typeof FREE_TEXT)[number];
 
 export const PREFERENCE_RANGES = {
-  notificationSoundVolume: { min: 0, max: 1 },
+  soundsNotificationVolume: { min: 0, max: 2.0 },
+  soundsCameraOnVolume: { min: 0, max: 2.0 },
+  soundsCameraOffVolume: { min: 0, max: 2.0 },
+  soundsMicOnVolume: { min: 0, max: 2.0 },
+  soundsMicOffVolume: { min: 0, max: 2.0 },
+  soundsDeafenOnVolume: { min: 0, max: 2.0 },
+  soundsDeafenOffVolume: { min: 0, max: 2.0 },
+  soundsScreenshareStartVolume: { min: 0, max: 2.0 },
+  soundsScreenshareStopVolume: { min: 0, max: 2.0 },
+  soundsCallJoinVolume: { min: 0, max: 2.0 },
+  soundsCallLeaveVolume: { min: 0, max: 2.0 },
+  soundsIncomingCallVolume: { min: 0, max: 2.0 },
+  soundsOutgoingCallVolume: { min: 0, max: 2.0 },
   pageZoom: { min: 0.75, max: 1.5 },
   textScale: { min: 0.75, max: 1.5 },
   roomBannerHeight: { min: 56, max: 500 },
@@ -441,14 +545,20 @@ const DEFAULTS: Preferences = {
   layout: 'modern',
   threadPresentation: 'timeline',
   alignOwnMessages: true,
+  avatarsInMessageHeaders: true,
   messageSpacing: 'cozy',
   timelineEmoteSize: 'default',
   theme: 'system',
   quickCss: '',
+  fontFamily: '',
+  fontFamilyMono: '',
+  codeLigatures: true,
   underlineLinks: true,
   renderRoomColors: true,
+  renderProfileColors: true,
   reducedMotion: prefersReducedMotion(),
   pageZoom: 1,
+  zoomShortcuts: true,
   textScale: 1,
   highContrast: false,
   alwaysShowAltText: false,
@@ -457,9 +567,11 @@ const DEFAULTS: Preferences = {
   nameColorCorrection: 'strong',
   showRoomIcon: 'always',
   showRoomBanners: true,
+  showDmTopics: true,
   roomBannerHeight: 190,
   subspaceHierarchyLimit: '3',
   searchIndexLimit: '512',
+  coreLogLevel: 'default',
   searchCrawlPause: '3',
   searchTricklePause: '10',
   searchFlushInterval: '60',
@@ -470,9 +582,11 @@ const DEFAULTS: Preferences = {
   searchUnmeteredOnly: true,
   serverSearch: true,
   showHome: false,
+  restoreLastRoom: true,
   showSearch: false,
   showUnreadCounts: false,
   badgeCountDMsOnly: true,
+  showEasterEggs: true,
   showPingCounts: true,
   showUnreadDots: true,
   uniformIcons: false,
@@ -481,12 +595,15 @@ const DEFAULTS: Preferences = {
 
   hour24Clock: false,
   dateFormat: 'auto',
+  timeZone: SYSTEM_TIME_ZONE,
   weekStart: 'sunday',
 
   hideMembershipEvents: false,
   hideProfileChanges: true,
+  hideTopicChanges: false,
   hideMemberInReadOnly: true,
   showTombstoneEvents: true,
+  openRoomsAtUnread: true,
   hideReadReceipts: false,
   readReceiptPlacement: 'message',
   replyPreviewStyle: 'connected',
@@ -494,9 +611,12 @@ const DEFAULTS: Preferences = {
   usernameClick: 'mention',
   doubleTapReact: true,
   showRoleTooltip: false,
+  autoRevealRedacted: false,
   doubleTapReaction: '❤️',
   hideTypingIndicators: false,
   memberSort: 'name-asc',
+  roomSort: 'recent',
+  directSort: 'recent',
   groupMembersByPresence: true,
   filterPronounsByLanguage: true,
   showPronouns: true,
@@ -505,11 +625,16 @@ const DEFAULTS: Preferences = {
   pronounPillLength: 'all',
 
   composerForm: 'tall',
+  alwaysInlineEditor: false,
   enterForNewline: 'adaptive',
+  sedEdits: false,
+  inlineEditing: false,
   mentionInReplies: true,
   formattingToolbar: false,
   composerFormatButton: true,
   richTextComposer: false,
+  composerSpellcheck: true,
+  composerAutocapitalize: true,
   composerGifButton: true,
   composerStickerButton: true,
   composerEmoteButton: true,
@@ -517,12 +642,17 @@ const DEFAULTS: Preferences = {
   composerButtonOrder: [...COMPOSER_BUTTONS],
   scheduleInEncryptedRooms: true,
   sendAttachmentAsCaption: true,
-  sendAttachmentsAsGallery: true,
+  sendAttachmentsAsGallery: false,
+  imageMetadata: 'location',
 
   personaPicker: true,
+  personaPickerSortOrder: 'recent',
+  personaPickerLeftSide: false,
   personaProxying: false,
   personaLatching: 'off',
   personaFallback: true,
+  personaGrid: true,
+  personaAlternateAvatar: false,
 
   sendTypingNotifications: true,
   sendReadReceipts: true,
@@ -545,14 +675,17 @@ const DEFAULTS: Preferences = {
   clientEmbeds: false,
   encryptedClientEmbeds: false,
   youtubeEmbeds: false,
+  useDearrow: false,
+  dearrowThumbnailFallback: 'youtube_autogen',
+  youtubeThumbnailPosition: 'middle',
   tiktokEmbeds: false,
   instagramEmbeds: false,
+  blueskyEmbeds: false,
 
   systemNotifications: true,
   badgeDefaultDirect: 'all',
   badgeDefaultGroup: 'mentions',
   notificationSounds: true,
-  notificationSoundVolume: 1,
   notifyOnce: true,
   backgroundNotificationSounds: true,
   notificationContent: false,
@@ -564,9 +697,10 @@ const DEFAULTS: Preferences = {
   ringForGroupCalls: false,
   alwaysShowCallButton: false,
   callScreenPreview: true,
+  callMode: 'auto',
   incomingCallSound: true,
   outgoingRingback: true,
-  callRingtoneVolume: 'normal',
+  callMicrophoneMuted: false,
   noiseSuppression: true,
   voiceIsolation: false,
   incomingVoiceIsolation: false,
@@ -578,8 +712,9 @@ const DEFAULTS: Preferences = {
   callCameraResolution: 'auto',
   callCameraBitrate: 'auto',
   callCameraCodec: 'auto',
-  callScreenResolution: 'auto',
+  callScreenResolution: '720',
   callScreenBitrate: 'auto',
+  callScreenFramerate: '30',
   callScreenCodec: 'auto',
   callSimulcast: true,
 
@@ -587,25 +722,50 @@ const DEFAULTS: Preferences = {
   pushVapidKey: '',
   pushAppId: '',
 
+  soundsNotificationVolume: 1,
+  soundsCameraOnVolume: 1,
+  soundsCameraOffVolume: 1,
+  soundsMicOnVolume: 1,
+  soundsMicOffVolume: 1,
+  soundsDeafenOnVolume: 1,
+  soundsDeafenOffVolume: 1,
+  soundsScreenshareStartVolume: 1,
+  soundsScreenshareStopVolume: 1,
+  soundsCallJoinVolume: 1,
+  soundsCallLeaveVolume: 1,
+  soundsIncomingCallVolume: 1,
+  soundsOutgoingCallVolume: 1,
+
   errorReporting: false,
   sessionReplay: false,
   telemetryAsked: false,
 
   autoUpdateCheck: true,
+  updateChannel: import.meta.env.VITE_APP_VERSION?.includes('-nightly.') ? 'nightly' : 'stable',
   closeToTray: false,
+  askDownloadLocation: true,
+  minimizeToTray: false,
   showSystemTrayIcon: true,
   useCustomTitleBar: customTitleBarDefault(),
+  hardwareAcceleration: true,
+  hardwareVideoAcceleration: true,
+  smoothScrolling: true,
+  webRtcIpPolicy: 'default',
 
   settingsSync: false,
   syncDrafts: true,
   profileChangePropagation: 'unchanged',
 
   developerTools: false,
+  callStatsOverlay: false,
+  callDebugOverlay: true,
   showHiddenEvents: false,
+  hiddenEventsHeaderToggle: false,
   hiddenEventEdits: true,
   hiddenEventReactions: true,
   hiddenEventRedactions: true,
   hiddenEventOther: true,
+  showTranslationStrings: false,
 };
 
 function prefersReducedMotion(): boolean {
@@ -632,6 +792,9 @@ export function sanitize(stored: Record<string, unknown>, base: Preferences): Pr
   for (const key of PREFERENCE_KEYS) {
     let value = key === 'enterForNewline' ? legacyEnterKey(stored[key]) : stored[key];
     if (key === 'mediaAutoLoad' && typeof value === 'boolean') value = value ? 'on' : 'off';
+    if (key === 'callMode' && value === undefined && stored.forceLegacyCalls === true) {
+      value = 'legacy';
+    }
     const allowed: readonly string[] | undefined =
       key in ENUMS ? ENUMS[key as keyof typeof ENUMS] : undefined;
     if (allowed) {

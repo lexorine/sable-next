@@ -2,6 +2,8 @@
   import type { PDFDocumentProxy, RenderTask } from 'pdfjs-dist';
   import pdfWorkerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
+  import { devicePixelRatio } from 'svelte/reactivity/window';
+
   import { i18n } from '#lib/i18n.js';
   import Button from '#lib/ui/primitives/Button.svelte';
   import Spinner from '#lib/ui/primitives/Spinner.svelte';
@@ -17,17 +19,17 @@
 
   let { src, name, page = 1, zoom = 1, onPages }: Props = $props();
 
-  let container = $state<HTMLDivElement>();
   let canvas = $state<HTMLCanvasElement>();
   let doc = $state<PDFDocumentProxy | null>(null);
   let numPages = $state(0);
-  let containerWidth = $state(0);
-  let containerHeight = $state(0);
+  let contentRect = $state<DOMRectReadOnly>();
+  let containerWidth = $derived(contentRect?.width ?? 0);
+  let containerHeight = $derived(contentRect?.height ?? 0);
   let loading = $state(true);
   let failed = $state(false);
   let attempt = $state(0);
 
-  let canvasLabel = $derived($i18n.t('pdf.documentLabel', { name, page, pages: numPages }));
+  let canvasLabel = $derived(i18n.t('pdf.documentLabel', { name, page, pages: numPages }));
 
   $effect(() => {
     void attempt;
@@ -66,27 +68,13 @@
   });
 
   $effect(() => {
-    const element = container;
-    if (!element) return;
-    const observer = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      if (!entry) return;
-      containerWidth = entry.contentRect.width;
-      containerHeight = entry.contentRect.height;
-    });
-    observer.observe(element);
-    return () => {
-      observer.disconnect();
-    };
-  });
-
-  $effect(() => {
     const activeDoc = doc;
     const target = canvas;
     const width = containerWidth;
     const height = containerHeight;
     const magnification = zoom;
     const pageIndex = page;
+    const outputScale = devicePixelRatio.current || 1;
     if (!activeDoc || !target || width <= 0) return;
 
     let cancelled = false;
@@ -104,7 +92,6 @@
       const context = target.getContext('2d');
       if (!context) return;
 
-      const outputScale = window.devicePixelRatio || 1;
       target.width = Math.floor(viewport.width * outputScale);
       target.height = Math.floor(viewport.height * outputScale);
       target.style.width = `${String(viewport.width)}px`;
@@ -130,15 +117,15 @@
   }
 </script>
 
-<div class="pdf-viewer" bind:this={container}>
+<div class="pdf-viewer" bind:contentRect>
   <div class="pdf-page-frame">
     {#if loading}
-      <Spinner label={$i18n.t('a11y.loading')} />
+      <Spinner label={i18n.t('a11y.loading')} />
     {:else if failed}
       <div class="pdf-error">
         <WarningIcon />
-        <p>{$i18n.t('pdf.loadFailed')}</p>
-        <Button size="small" onclick={retry}>{$i18n.t('pdf.retry')}</Button>
+        <p>{i18n.t('pdf.loadFailed')}</p>
+        <Button size="small" onclick={retry}>{i18n.t('common.retry')}</Button>
       </div>
     {:else}
       <div class="pdf-canvas-frame" role="img" aria-label={canvasLabel}>

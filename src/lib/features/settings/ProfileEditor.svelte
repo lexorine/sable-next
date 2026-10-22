@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, untrack } from 'svelte';
+  import { onMount, onDestroy, untrack } from 'svelte';
 
   import type { BrightnessView, ProfileFieldView, ProfileView } from '#src/generated/protocol';
   import { useCoreClient } from '#lib/core/context.js';
@@ -9,10 +9,14 @@
     BIO_FIELD,
     LEGACY_BIO_FIELDS,
     LEGACY_STATUS_FIELDS,
+    MAX_DISPLAY_NAME_LENGTH,
+    MAX_STATUS_TEXT_BYTES,
     NAME_COLOR_FIELD,
     PRONOUNS_FIELD,
     STATUS_FIELD,
     legacyDeletes,
+    statusContent,
+    truncateUtf8,
   } from '#lib/profile/fields.js';
   import { MAX_PRONOUN_INPUT, pronounSets, pronounText } from '#lib/profile/pronouns.js';
   import { preferences } from '#lib/settings/preferences.svelte.js';
@@ -33,6 +37,7 @@
   import SettingsSection from '#lib/ui/primitives/SettingsSection.svelte';
   import TextArea from '#lib/ui/primitives/TextArea.svelte';
   import TextInput from '#lib/ui/primitives/TextInput.svelte';
+  import { nativeFilePicker } from '#lib/platform/native-file-picker.js';
   import { toasts } from '#lib/ui/toasts.svelte.js';
   import { uprightJpeg } from '#lib/ui/upright-jpeg.js';
   import '#lib/ui/primitives/settings-row.css';
@@ -40,7 +45,25 @@
   import SpaceProfileEditor from './SpaceProfileEditor.svelte';
   import { isActiveSpace } from '#lib/features/sidebar/nav-rooms.js';
   import { bioHtml, bioMarkdown, bioTexts } from './bio-markdown.js';
-  import ColorSetting from './ColorSetting.svelte';
+  import ColorSetting from '#lib/ui/ColorSetting.svelte';
+  import { hexColorOrEmpty } from '#lib/ui/hex-color.js';
+  import { type SenderCosmetics } from '#lib/rooms/room-cosmetics.svelte.js';
+
+  import {
+    MessageDialogs,
+    provideMessageDialogs,
+  } from '#lib/features/room/messages/message-dialogs.svelte.js';
+  import {
+    OpenMessageMenu,
+    provideMessageMenu,
+  } from '#lib/features/room/messages/message-menu-open.svelte.js';
+  import {
+    PinnedEvents,
+    providePinnedEvents,
+  } from '#lib/features/room/timeline/pinned-events.svelte.js';
+  import TimelineItem from '#lib/features/room/timeline/TimelineItem.svelte';
+  import { previewMessage } from '#lib/features/room/timeline/preview-message.js';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
 
   interface Props {
     profile: ProfileView;
@@ -68,6 +91,9 @@
 
   let { profile, userId, onSaved }: Props = $props();
   const core = useCoreClient();
+  providePinnedEvents(new PinnedEvents(core.rpc.timeline));
+  provideMessageDialogs(new MessageDialogs());
+  provideMessageMenu(new OpenMessageMenu());
 
   const supportedZones =
     typeof Intl.supportedValuesOf === 'function' ? Intl.supportedValuesOf('timeZone') : [];
@@ -95,6 +121,7 @@
 
   let draft = $state(untrack(() => read(profile)));
   let base = $state.raw(untrack(() => read(profile)));
+  let avatarInput = $state<HTMLInputElement | null>(null);
   let avatarFile = $state<File | null>(null);
   let avatarPreview = $state<string | null>(null);
   let uploadingBanner = $state(false);
@@ -142,6 +169,22 @@
     name_color_dark: draft.dark || null,
   });
 
+  const previewCosmetics = $derived<SenderCosmetics>({
+    colorOnLight: previewProfile.name_color_light,
+    colorOnDark: previewProfile.name_color_dark,
+    pronouns: previewProfile.pronouns,
+  });
+
+  const previewItem = $derived(
+    previewMessage('profile-message-preview', 'See you at six?', {
+      sender: profile.user_id,
+      sender_name: draft.name.trim() || null,
+      sender_avatar: avatarPreview ?? (draft.avatarRemoved ? null : profile.avatar_url),
+      timestamp: Date.now(),
+      is_own: true,
+    })
+  );
+
   $effect(() => {
     const next = profile;
     untrack(() => {
@@ -150,6 +193,17 @@
       setAvatar(null);
       editKey = undefined;
     });
+  });
+
+  onMount(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('editStatus') !== null) {
+      const accountStatusInput = document.getElementById('account-status');
+      if (accountStatusInput && accountStatusInput instanceof HTMLInputElement) {
+        accountStatusInput.focus();
+        accountStatusInput.select();
+      }
+    }
   });
 
   onDestroy(() => {
@@ -176,7 +230,7 @@
     uploadingBanner = true;
     error = null;
     try {
-      draft.banner = await core.commands.uploadMedia(
+      draft.banner = await core.media.uploadMedia(
         file.type || 'image/*',
         new Uint8Array(await file.arrayBuffer())
       );
@@ -212,21 +266,22 @@
     const out: Array<[string, unknown]> = [];
     if (changed('status')) {
       out.push(
-        [STATUS_FIELD, draft.status ? { text: draft.status } : null],
+        [STATUS_FIELD, statusContent(draft.status, profile.status?.emoji)],
         ...legacyDeletes(profile.legacy_fields, LEGACY_STATUS_FIELDS)
       );
     }
     if (changed('light', 'dark', 'hero', 'brightness')) {
+      const light = hexColorOrEmpty(draft.light);
+      const dark = hexColorOrEmpty(draft.dark);
+      const hero = hexColorOrEmpty(draft.hero);
       out.push(
         [
           NAME_COLOR_FIELD,
-          draft.light || draft.dark
-            ? { on_light: draft.light || null, on_dark: draft.dark || null }
-            : null,
+          light || dark ? { on_light: light || null, on_dark: dark || null } : null,
         ],
         [
           'chat.commet.profile_color_scheme',
-          draft.hero ? { color: draft.hero, brightness: draft.brightness } : null,
+          hero ? { color: hero, brightness: draft.brightness } : null,
         ]
       );
     }
@@ -268,7 +323,10 @@
     try {
       const name = draft.name.trim();
       if (name !== base.name.trim()) {
-        await core.commands.setDisplayName(name || null, preferences.profileChangePropagation);
+        await core.rpc.account.setDisplayName({
+          name: name || null,
+          propagate_to: preferences.profileChangePropagation,
+        });
       }
       if (avatarFile) {
         const upright = await uprightJpeg(avatarFile);
@@ -278,8 +336,12 @@
           preferences.profileChangePropagation
         );
       } else if (draft.avatarRemoved) {
-        await core.commands.setAvatarUrl(null, preferences.profileChangePropagation);
+        await core.rpc.account.setAvatarUrl({
+          url: null,
+          propagate_to: preferences.profileChangePropagation,
+        });
       }
+      draft.status = truncateUtf8(draft.status, MAX_STATUS_TEXT_BYTES);
       for (const [field, value] of fields()) await core.setProfileField(field, value);
       base = $state.snapshot(draft);
       setAvatar(null);
@@ -348,7 +410,7 @@
 <svelte:window onkeydown={saveShortcut} />
 
 <SettingsSection
-  title={$i18n.t('settings.profile')}
+  title={i18n.t('settings.profile')}
   headingId="account-profile"
   class="profile-section"
 >
@@ -356,11 +418,11 @@
     <Select
       bind:value={scope}
       items={scopeItems}
-      aria-label={$i18n.t('settings.profileScope')}
+      aria-label={i18n.t('settings.profileScope')}
       class="scope-select"
     />
   {/snippet}
-  <div class="tabs" role="tablist" aria-label={$i18n.t('settings.profile')}>
+  <div class="tabs" role="tablist" aria-label={i18n.t('settings.profile')}>
     {#each ['edit', 'preview'] as const as id (id)}
       <button
         type="button"
@@ -379,7 +441,7 @@
           document.getElementById(`profile-tab-${tab}`)?.focus();
         }}
       >
-        {$i18n.t(id === 'edit' ? 'settings.profileEdit' : 'settings.profilePreviewTab')}
+        {i18n.t(id === 'edit' ? 'common.edit' : 'settings.profilePreviewTab')}
       </button>
     {/each}
   </div>
@@ -393,6 +455,13 @@
       aria-labelledby="profile-tab-preview"
     >
       <MentionProfileCard {userId} member={null} roomId="" profile={previewProfile} />
+      <TimelineItem
+        item={previewItem}
+        collapsed={false}
+        layout={preferences.layout}
+        overrideCosmetics={previewCosmetics}
+        preview
+      />
     </div>
   {/if}
   <div
@@ -409,12 +478,14 @@
         void save();
       }}
     >
-      <div class="profile-hero" aria-label={$i18n.t('settings.profilePreview')}>
+      <div class="profile-hero" aria-label={i18n.t('settings.profilePreview')}>
         <ProfileCard
           {userId}
           displayName={draft.name.trim() || userId}
           avatarUrl={avatarPreview ?? (draft.avatarRemoved ? null : profile.avatar_url)}
           bannerUrl={draft.banner}
+          avatarLabel={i18n.t(hasAvatar ? 'common.changeAvatar' : 'settings.uploadAvatar')}
+          onAvatarEdit={() => avatarInput?.click()}
           color={draft.hero || senderColor(userId)}
           heroColor={draft.hero || null}
           heroBrightness={draft.hero ? draft.brightness : null}
@@ -426,59 +497,59 @@
               id="account-status"
               class="inline-edit"
               bind:value={draft.status}
-              aria-label={$i18n.t('settings.status')}
-              placeholder={$i18n.t('settings.statusPlaceholder')}
-              maxlength={256}
+              aria-label={i18n.t('settings.status')}
+              placeholder={i18n.t('common.statusPlaceholder')}
+              maxlength={MAX_STATUS_TEXT_BYTES}
             />
           {/snippet}
           {#snippet nameField()}
             <div class="caption-field">
               <label class="caption" for="account-display-name"
-                >{$i18n.t('settings.displayName')}</label
+                >{i18n.t('common.displayName')}</label
               >
               <TextInput
                 id="account-display-name"
                 class="inline-edit hero-name"
                 bind:value={draft.name}
-                placeholder={$i18n.t('settings.displayName')}
+                placeholder={i18n.t('common.displayName')}
                 autocomplete="nickname"
-                maxlength={255}
+                maxlength={MAX_DISPLAY_NAME_LENGTH}
               />
             </div>
           {/snippet}
           {#snippet pronouns()}
             <div class="caption-field">
-              <label class="caption" for="account-pronouns">{$i18n.t('settings.pronouns')}</label>
+              <label class="caption" for="account-pronouns">{i18n.t('settings.pronouns')}</label>
               <TextInput
                 id="account-pronouns"
                 class="inline-edit hero-pronouns"
                 bind:value={draft.pronouns}
                 aria-describedby="account-pronouns-hint"
-                placeholder={$i18n.t('settings.pronounsAdd')}
+                placeholder={i18n.t('settings.pronounsAdd')}
                 maxlength={MAX_PRONOUN_INPUT}
               />
               <span id="account-pronouns-hint" class="sr-only"
-                >{$i18n.t('settings.pronounsHint')}</span
+                >{i18n.t('settings.pronounsHint')}</span
               >
             </div>
           {/snippet}
           {#snippet meta()}
             <div class="caption-field">
-              <label class="caption" for="account-timezone">{$i18n.t('settings.timezone')}</label>
+              <label class="caption" for="account-timezone">{i18n.t('settings.timezone')}</label>
               <div class="timezone-row">
                 <Select
                   id="account-timezone"
                   class="inline-edit timezone-select"
                   items={zoneItems}
                   bind:value={draft.timezone}
-                  placeholder={$i18n.t('settings.timezoneNotSet')}
+                  placeholder={i18n.t('settings.timezoneNotSet')}
                 />
                 {#if draft.timezone}<Button
                     variant="ghost"
                     size="small"
                     onclick={() => {
                       draft.timezone = '';
-                    }}>{$i18n.t('settings.removeTimezone')}</Button
+                    }}>{i18n.t('settings.removeTimezone')}</Button
                   >{/if}
               </div>
             </div>
@@ -486,6 +557,8 @@
           {#snippet actions()}
             <label class="file-button btn btn-secondary btn-small">
               <input
+                bind:this={avatarInput}
+                use:nativeFilePicker
                 type="file"
                 accept="image/*"
                 onchange={(event: Event & { currentTarget: HTMLInputElement }) => {
@@ -494,13 +567,14 @@
                   if (file) stageAvatar(file);
                 }}
               />
-              {$i18n.t(hasAvatar ? 'settings.changeAvatar' : 'settings.uploadAvatar')}
+              {i18n.t(hasAvatar ? 'common.changeAvatar' : 'settings.uploadAvatar')}
             </label>
             {#if hasAvatar}<Button variant="secondary" size="small" onclick={removeAvatar}
-                >{$i18n.t('settings.removeAvatar')}</Button
+                >{i18n.t('common.removeAvatar')}</Button
               >{/if}
             <label class="file-button btn btn-secondary btn-small">
               <input
+                use:nativeFilePicker
                 type="file"
                 accept="image/*"
                 disabled={uploadingBanner}
@@ -510,7 +584,7 @@
                   if (file) void stageBanner(file);
                 }}
               />
-              {draft.banner ? $i18n.t('settings.changeBanner') : $i18n.t('settings.saveBanner')}
+              {draft.banner ? i18n.t('common.changeBanner') : i18n.t('settings.saveBanner')}
             </label>
             {#if draft.banner}<Button
                 variant="secondary"
@@ -518,16 +592,16 @@
                 loading={uploadingBanner}
                 onclick={() => {
                   draft.banner = null;
-                }}>{$i18n.t('settings.removeBanner')}</Button
+                }}>{i18n.t('common.removeBanner')}</Button
               >{/if}
           {/snippet}
           {#snippet footer()}
             <div class="card-fields">
               <fieldset class="group">
-                <legend>{$i18n.t('settings.profileColors')}</legend>
+                <legend>{i18n.t('settings.profileColors')}</legend>
                 <div class="field-grid">
                   <ColorSetting
-                    label={$i18n.t('settings.profileColorsBackground')}
+                    label={i18n.t('settings.profileColorsBackground')}
                     bind:value={draft.hero}
                     onCommit={() => {}}
                     onReset={() => {
@@ -536,20 +610,20 @@
                   />
                   <div class="caption-field">
                     <label class="caption" for="account-brightness"
-                      >{$i18n.t('settings.profileColorsBrightness')}</label
+                      >{i18n.t('settings.profileColorsBrightness')}</label
                     >
                     <Select
                       id="account-brightness"
                       class="inline-edit"
                       bind:value={draft.brightness}
                       items={[
-                        { value: 'light', label: $i18n.t('settings.profileColorsBrightnessLight') },
-                        { value: 'dark', label: $i18n.t('settings.profileColorsBrightnessDark') },
+                        { value: 'light', label: i18n.t('common.light') },
+                        { value: 'dark', label: i18n.t('common.dark') },
                       ]}
                     />
                   </div>
                   <ColorSetting
-                    label={$i18n.t('settings.profileColorsOnDark')}
+                    label={i18n.t('settings.profileColorsOnDark')}
                     bind:value={draft.dark}
                     onCommit={() => {}}
                     onReset={() => {
@@ -557,7 +631,7 @@
                     }}
                   />
                   <ColorSetting
-                    label={$i18n.t('settings.profileColorsOnLight')}
+                    label={i18n.t('settings.profileColorsOnLight')}
                     bind:value={draft.light}
                     onCommit={() => {}}
                     onReset={() => {
@@ -567,39 +641,39 @@
                 </div>
               </fieldset>
               <fieldset class="group">
-                <legend>{$i18n.t('settings.animalIdentity')}</legend>
+                <legend>{i18n.t('settings.animalIdentity')}</legend>
                 <div class="field-grid">
                   <div class="caption-field">
                     <label class="caption" for="account-animal-is"
-                      >{$i18n.t('settings.animalIdentityWhatIs')}</label
+                      >{i18n.t('settings.animalIdentityWhatIs')}</label
                     >
                     <TextInput
                       id="account-animal-is"
                       class="inline-edit"
                       bind:value={draft.isAnimal}
-                      placeholder={$i18n.t('settings.animalIdentityWhatIsPlaceholder')}
+                      placeholder={i18n.t('settings.animalIdentityWhatIsPlaceholder')}
                     />
                   </div>
                   <div class="caption-field">
                     <label class="caption" for="account-animal-has"
-                      >{$i18n.t('settings.animalIdentityWhatHas')}</label
+                      >{i18n.t('settings.animalIdentityWhatHas')}</label
                     >
                     <TextInput
                       id="account-animal-has"
                       class="inline-edit"
                       bind:value={draft.hasAnimal}
-                      placeholder={$i18n.t('settings.animalIdentityWhatHasPlaceholder')}
+                      placeholder={i18n.t('settings.animalIdentityWhatHasPlaceholder')}
                     />
                   </div>
                   <div class="caption-field">
                     <label class="caption" for="account-animal-needs"
-                      >{$i18n.t('settings.animalIdentityWhatNeeds')}</label
+                      >{i18n.t('settings.animalIdentityWhatNeeds')}</label
                     >
                     <TextInput
                       id="account-animal-needs"
                       class="inline-edit"
                       bind:value={draft.animalNeed}
-                      placeholder={$i18n.t('settings.animalIdentityWhatNeedsPlaceholder')}
+                      placeholder={i18n.t('settings.animalIdentityWhatNeedsPlaceholder')}
                     />
                   </div>
                 </div>
@@ -608,13 +682,13 @@
           {/snippet}
 
           <div class="caption-field">
-            <label class="caption" for="account-bio">{$i18n.t('settings.biography')}</label>
-            <div class="bio-toolbar" role="toolbar" aria-label={$i18n.t('settings.bioFormatting')}>
+            <label class="caption" for="account-bio">{i18n.t('settings.biography')}</label>
+            <div class="bio-toolbar" role="toolbar" aria-label={i18n.t('settings.bioFormatting')}>
               {#each bioFormats as format (format.id)}
                 <IconButton
                   variant="ghost"
                   size="small"
-                  label={$i18n.t(`settings.bioFormat.${format.id}`)}
+                  label={i18n.t(`settings.bioFormat.${format.id}`)}
                   onclick={() => formatBio(format)}
                 >
                   <format.icon />
@@ -627,22 +701,22 @@
               bind:value={draft.bio}
               rows={4}
               maxlength={5000}
-              placeholder={$i18n.t('settings.biographyHint')}
+              placeholder={i18n.t('settings.biographyHint')}
             />
           </div>
         </ProfileCard>
       </div>
       <div class="settings-form">
         <fieldset class="group">
-          <legend>{$i18n.t('settings.otherProfileFields')}</legend>
+          <legend>{i18n.t('settings.otherProfileFields')}</legend>
           <p class="settings-note">
-            {$i18n.t('settings.otherProfileFieldsDescription')}
-            <span aria-label={$i18n.t('settings.otherProfileFieldsKaomojiTranslation')}
-              >{$i18n.t('settings.otherProfileFieldsKaomoji')}</span
+            {i18n.t('settings.otherProfileFieldsDescription')}
+            <span aria-label={i18n.t('settings.otherProfileFieldsKaomojiTranslation')}
+              >{i18n.t('settings.otherProfileFieldsKaomoji')}</span
             >
           </p>
           {#if draft.extra.length}
-            <div class="extra-list">
+            <div class="extra-list" {@attach scrollHint}>
               {#each draft.extra as field (field.key)}
                 <Button
                   variant={editKey?.original === field.key ? 'primary' : 'ghost'}
@@ -664,8 +738,8 @@
               <TextInput
                 bind:value={editKey.key}
                 maxlength={256}
-                aria-label={$i18n.t('settings.otherProfileFieldsKeyPlaceholder')}
-                placeholder={$i18n.t('settings.otherProfileFieldsKeyPlaceholder')}
+                aria-label={i18n.t('settings.otherProfileFieldsKeyPlaceholder')}
+                placeholder={i18n.t('settings.otherProfileFieldsKeyPlaceholder')}
                 onkeydown={(event) => {
                   if (event.key !== 'Enter') return;
                   event.preventDefault();
@@ -676,25 +750,25 @@
                 bind:value={editKey.value}
                 rows={5}
                 maxlength={5000}
-                aria-label={$i18n.t('settings.otherProfileFieldsValuePlaceholder')}
-                placeholder={$i18n.t('settings.otherProfileFieldsValuePlaceholder')}
+                aria-label={i18n.t('settings.otherProfileFieldsValuePlaceholder')}
+                placeholder={i18n.t('settings.otherProfileFieldsValuePlaceholder')}
               />
               <div class="extra-buttons">
                 <Button size="small" onclick={commitExtra}
-                  >{$i18n.t('settings.otherProfileFieldsDone')}</Button
+                  >{i18n.t('settings.otherProfileFieldsDone')}</Button
                 >
                 <Button
                   variant="danger"
                   size="small"
-                  aria-label={$i18n.t('settings.otherProfileFieldsRemove')}
-                  onclick={removeExtra}>{$i18n.t('settings.removeButton')}</Button
+                  aria-label={i18n.t('settings.otherProfileFieldsRemove')}
+                  onclick={removeExtra}>{i18n.t('common.remove')}</Button
                 >
                 <Button
                   size="small"
-                  aria-label={$i18n.t('settings.otherProfileFieldsCancel')}
+                  aria-label={i18n.t('settings.otherProfileFieldsCancel')}
                   onclick={() => (editKey = undefined)}
                 >
-                  {$i18n.t('settings.cancel')}
+                  {i18n.t('common.cancel')}
                 </Button>
               </div>
             </div>
@@ -704,7 +778,7 @@
                 size="small"
                 onclick={() => {
                   editKey = { key: '', value: '', original: '' };
-                }}>{$i18n.t('settings.addButton')}</Button
+                }}>{i18n.t('common.add')}</Button
               >
             </div>
           {/if}
@@ -713,15 +787,15 @@
       <div class="actions">
         {#if error}<p class="actions-note critical" role="alert">{error}</p>
         {:else if dirty}<p class="actions-note" role="status">
-            {$i18n.t('settings.unsavedChanges')}
+            {i18n.t('settings.unsavedChanges')}
           </p>{/if}
         <Button
           type="submit"
           variant="primary"
           disabled={!dirty || uploadingBanner}
-          loading={saving}>{$i18n.t('settings.saveButton')}</Button
+          loading={saving}>{i18n.t('common.save')}</Button
         >
-        <Button disabled={!dirty || saving} onclick={cancel}>{$i18n.t('settings.cancel')}</Button>
+        <Button disabled={!dirty || saving} onclick={cancel}>{i18n.t('common.cancel')}</Button>
       </div>
     </form>
   </div>
@@ -757,7 +831,14 @@
   }
 
   .preview-panel {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-400);
     padding: var(--space-400);
+  }
+
+  .preview-panel > :global(.message) {
+    border-radius: var(--radius);
   }
 
   .extra-list {

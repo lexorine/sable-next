@@ -6,15 +6,13 @@
   import type { EditVersionView } from '#src/generated/protocol';
 
   import { i18n } from '#lib/i18n.js';
-  import { BREAKPOINTS } from '#lib/ui/breakpoints.js';
-  import { createMediaQuery } from '#lib/ui/media-query.svelte.js';
-  import BottomSheet from '#lib/ui/primitives/BottomSheet.svelte';
-  import DialogFrame from '#lib/ui/primitives/DialogFrame.svelte';
+  import ResponsiveDialog from '#lib/ui/primitives/ResponsiveDialog.svelte';
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
 
   import FormattedBody from './FormattedBody.svelte';
   import type { MatrixLink } from '#lib/rooms/matrix-link.js';
   import { formatMessageTimestamp } from '#lib/ui/date-time.js';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
 
   interface Props {
     open?: boolean;
@@ -35,8 +33,6 @@
     onThread,
     onDelete,
   }: Props = $props();
-  const appLayout = createMediaQuery(BREAKPOINTS.appLayout);
-  let desktop = $derived(appLayout.matches);
 
   function act(version: EditVersionView, action?: (version: EditVersionView) => void): void {
     open = false;
@@ -44,10 +40,10 @@
   }
 </script>
 
-{#snippet content()}
-  <div class="edit-history" class:sheet={!desktop}>
-    <h2>{$i18n.t('timeline.editHistoryTitle')}</h2>
-    <ol class="edit-history-versions">
+{#snippet content(desktop: boolean)}
+  <div class={['edit-history', { sheet: !desktop }]}>
+    <h2>{i18n.t('timeline.editHistoryTitle')}</h2>
+    <ol class="edit-history-versions" {@attach scrollHint}>
       {#each versions as version, index (version.event_id)}
         <li class="edit-history-version">
           <div class="edit-history-meta">
@@ -55,7 +51,7 @@
               {formatMessageTimestamp(version.timestamp)}
             </time>
             {#if index === 0}
-              <span class="edit-history-original">{$i18n.t('timeline.editHistoryOriginal')}</span>
+              <span class="edit-history-original">{i18n.t('timeline.editHistoryOriginal')}</span>
             {/if}
             <span class="edit-history-actions">
               {#if onReply}
@@ -63,7 +59,7 @@
                   class="edit-history-reply"
                   size="small"
                   variant="ghost"
-                  label={$i18n.t('timeline.reply')}
+                  label={i18n.t('timeline.reply')}
                   onclick={() => {
                     act(version, onReply);
                   }}
@@ -76,7 +72,7 @@
                   class="edit-history-thread"
                   size="small"
                   variant="ghost"
-                  label={$i18n.t('timeline.replyInThread')}
+                  label={i18n.t('timeline.replyInThread')}
                   onclick={() => {
                     act(version, onThread);
                   }}
@@ -89,7 +85,7 @@
                   class="edit-history-delete"
                   size="small"
                   variant="ghost"
-                  label={$i18n.t('timeline.deleteMessage')}
+                  label={i18n.t('timeline.deleteMessage')}
                   onclick={() => {
                     act(version, onDelete);
                   }}
@@ -106,19 +102,12 @@
   </div>
 {/snippet}
 
-{#if desktop}
-  <DialogFrame bind:open variant="verification" label={$i18n.t('timeline.editHistoryTitle')}>
-    {@render content()}
-  </DialogFrame>
-{:else}
-  <BottomSheet
-    bind:open
-    label={$i18n.t('timeline.editHistoryTitle')}
-    closeLabel={$i18n.t('timeline.closeEditHistory')}
-  >
-    {@render content()}
-  </BottomSheet>
-{/if}
+<ResponsiveDialog
+  bind:open
+  label={i18n.t('timeline.editHistoryTitle')}
+  closeLabel={i18n.t('timeline.closeEditHistory')}
+  children={content}
+/>
 
 <style>
   .edit-history {

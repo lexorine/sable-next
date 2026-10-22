@@ -6,55 +6,64 @@ import { expect, test, vi } from 'vitest';
 
 import type { RoomJoinRuleView } from '#src/generated/protocol';
 
-import type { HierarchyRoomView, HierarchySection } from './space-hierarchy';
+import { buildHierarchySections, type HierarchyRoomView } from './space-hierarchy';
 import SpaceLobbySection from './SpaceLobbySection.svelte';
 
-function subspace(joinRule: RoomJoinRuleView): HierarchyRoomView {
+function space(roomId: string, joinRule: RoomJoinRuleView, children: string[]): HierarchyRoomView {
   return {
-    room_id: '!sub:example.org',
+    room_id: roomId,
     canonical_alias: null,
     name: 'Sub',
     topic: null,
     avatar_url: null,
     is_space: true,
-    is_voice: false,
     num_joined_members: 3,
     join_rule: joinRule,
     allowed_room_ids: [],
     guest_can_join: false,
-    children: [],
+    children: children.map((child) => ({
+      room_id: child,
+      via: [],
+      order: null,
+      origin_server_ts: 0,
+      suggested: false,
+    })),
   };
 }
 
-function mount(joinRule: RoomJoinRuleView, joinedIds: string[]) {
+function mount(
+  joinRule: RoomJoinRuleView,
+  joinedIds: string[],
+  rights: { canManage?: boolean; canManageOwner?: boolean } = {},
+  room: HierarchyRoomView | null = null
+) {
   const onJoin = vi.fn();
-  const section: HierarchySection = {
-    space: subspace(joinRule),
-    suggested: false,
-    depth: 1,
-    key: '!sub:example.org',
-    rooms: [],
-    parentId: '!sub:example.org',
-    ownerId: '!root:example.org',
-    siblings: [],
-    loaded: true,
-    failed: false,
-    pending: 0,
-  };
+  const onTopic = vi.fn();
+  const rooms = [
+    space('!root:example.org', 'public', room ? [room.room_id] : ['!sub:example.org']),
+    room ?? space('!sub:example.org', joinRule, []),
+  ];
+  const [section] = buildHierarchySections(rooms, '!root:example.org', {
+    joined: joinedIds,
+    keepEmpty: ['!sub:example.org'],
+  });
   const noop = vi.fn();
   render(SpaceLobbySection, {
     section,
-    closed: true,
+    closed: room === null,
     joinedIds: new Set(joinedIds),
-    invitedIds: new Set<string>(),
     joining: new Set<string>(),
     knocked: new Set<string>(),
     joinErrors: new Map<string, string>(),
-    canManage: false,
+    canManage: rights.canManage ?? false,
+    canManageOwner: rights.canManageOwner ?? false,
+    canLeaveParent: () => true,
+    canDropInto: () => true,
     label: (child: HierarchyRoomView) => child.name ?? child.room_id,
     onToggle: noop,
     onVisible: noop,
     onOpen: noop,
+    onTopic,
     onJoin,
     onCopyLink: noop,
     onRemove: noop,
@@ -73,8 +82,23 @@ function mount(joinRule: RoomJoinRuleView, joinedIds: string[]) {
     onRemoveSubspace: noop,
     onMoveTo: noop,
   });
-  return { onJoin, user: userEvent.setup() };
+  return { onJoin, onTopic, user: userEvent.setup() };
 }
+
+test('a room topic opens its full description', async () => {
+  const room = {
+    ...space('!room:example.org', 'public', []),
+    is_space: false,
+    name: 'Room',
+    topic: 'A long description',
+  };
+  const { onJoin, onTopic, user } = mount('public', ['!root:example.org'], {}, room);
+
+  await user.click(screen.getByRole('button', { name: 'A long description' }));
+
+  expect(onTopic).toHaveBeenCalledWith(expect.objectContaining({ room_id: '!room:example.org' }));
+  expect(onJoin).not.toHaveBeenCalled();
+});
 
 test('a subspace members of its parent can join offers a join', async () => {
   const { onJoin, user } = mount('restricted', ['!root:example.org']);
@@ -84,7 +108,8 @@ test('a subspace members of its parent can join offers a join', async () => {
   expect(onJoin).toHaveBeenCalledWith(
     expect.objectContaining({ room_id: '!sub:example.org' }),
     [],
-    '!root:example.org'
+    '!root:example.org',
+    'join'
   );
 });
 
@@ -99,3 +124,22 @@ test('a joined subspace offers no join', () => {
 
   expect(screen.queryByRole('button', { name: 'Join' })).not.toBeInTheDocument();
 });
+
+test.each([
+  [{ canManage: true }, true, false],
+  [{ canManageOwner: true }, false, true],
+])(
+  'a subspace header offers what its own and its parent space let you change (%o)',
+  async (rights, creates, arranges) => {
+    const { user } = mount('public', ['!root:example.org', '!sub:example.org'], rights);
+
+    await user.click(screen.getByRole('button', { name: 'Room options' }));
+
+    expect(
+      (await screen.findAllByRole('menuitem')).some((item) =>
+        item.textContent.includes('Create room in space')
+      )
+    ).toBe(creates);
+    expect(screen.queryByRole('menuitem', { name: 'Move up' }) !== null).toBe(arranges);
+  }
+);

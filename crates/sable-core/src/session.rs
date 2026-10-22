@@ -45,6 +45,7 @@ pub fn current_session(client: &Client, homeserver: String) -> Option<PersistedS
     if let Some(full) = client.oauth().full_session() {
         return Some(PersistedSession {
             oauth_issuer: None,
+            oauth_redirect_uri: None,
             resolved_homeserver: Some(client.homeserver()),
             homeserver,
             credentials: Credentials::oauth(full),
@@ -56,6 +57,7 @@ pub fn current_session(client: &Client, homeserver: String) -> Option<PersistedS
         .session()
         .map(|matrix| PersistedSession {
             oauth_issuer: None,
+            oauth_redirect_uri: None,
             resolved_homeserver: Some(client.homeserver()),
             homeserver,
             credentials: Credentials::Password(matrix),
@@ -78,6 +80,8 @@ pub enum Credentials {
 pub struct PersistedSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_issuer: Option<Url>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_redirect_uri: Option<Url>,
     #[serde(default)]
     pub resolved_homeserver: Option<Url>,
     pub homeserver: String,
@@ -88,6 +92,10 @@ impl PersistedSession {
     #[must_use]
     pub fn keeping_endpoint_of(mut self, previous: &Self) -> Self {
         self.oauth_issuer.clone_from(&previous.oauth_issuer);
+        if self.oauth_redirect_uri.is_none() {
+            self.oauth_redirect_uri
+                .clone_from(&previous.oauth_redirect_uri);
+        }
         if previous.resolved_homeserver.is_some() {
             self.resolved_homeserver
                 .clone_from(&previous.resolved_homeserver);
@@ -226,6 +234,14 @@ impl Credentials {
             Self::OAuth { user, .. } => user.tokens.clone(),
         }
     }
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn set_tokens(&mut self, tokens: matrix_sdk::SessionTokens) {
+        match self {
+            Self::Password(session) => session.tokens = tokens,
+            Self::OAuth { user, .. } => user.tokens = tokens,
+        }
+    }
+
     pub(crate) fn discard_tokens(&mut self) {
         let tokens = match self {
             Self::Password(session) => &mut session.tokens,
@@ -273,7 +289,7 @@ pub async fn build_client(
     build_account_client(
         apply_server(Client::builder(), homeserver),
         store_id,
-        true,
+        ClientRole::Account,
         persistent_event_cache,
     )
     .await
@@ -289,7 +305,13 @@ pub async fn build_client_at(
 ) -> Result<Client, matrix_sdk::ClientBuildError> {
     let builder = crate::tls::apply_sdk(Client::builder()).homeserver_url(homeserver_url.as_str());
 
-    build_account_client(builder, store_id, true, persistent_event_cache).await
+    build_account_client(
+        builder,
+        store_id,
+        ClientRole::Account,
+        persistent_event_cache,
+    )
+    .await
 }
 
 /// # Errors
@@ -328,6 +350,8 @@ pub async fn restore_authenticated_client(
 pub(crate) async fn restore_notification_client(
     store_id: &str,
     persisted: &PersistedSession,
+    room_load: matrix_sdk::store::RoomLoadSettings,
+    before_restore: impl FnOnce(&Client),
 ) -> Result<Client, CoreError> {
     validate_saved_crypto_store(store_id, persisted)
         .await
@@ -339,16 +363,30 @@ pub(crate) async fn restore_notification_client(
         || apply_server(Client::builder(), &persisted.homeserver),
         |url| crate::tls::apply_sdk(Client::builder()).homeserver_url(url.as_str()),
     );
-    let client = build_account_client(builder, store_id, false, true)
+    let client = build_account_client(builder, store_id, ClientRole::Notification, true)
         .await
         .map_err(CoreError::backend)?;
-    restore_credentials(&client, persisted).await?;
+    before_restore(&client);
+    restore_credentials_with(&client, persisted, room_load).await?;
     Ok(client)
 }
 
 pub(crate) async fn restore_credentials(
     client: &Client,
     persisted: &PersistedSession,
+) -> Result<(), CoreError> {
+    restore_credentials_with(
+        client,
+        persisted,
+        matrix_sdk::store::RoomLoadSettings::default(),
+    )
+    .await
+}
+
+async fn restore_credentials_with(
+    client: &Client,
+    persisted: &PersistedSession,
+    room_load: matrix_sdk::store::RoomLoadSettings,
 ) -> Result<(), CoreError> {
     if let Some(expected) = &persisted.oauth_issuer {
         let metadata = client
@@ -362,15 +400,12 @@ pub(crate) async fn restore_credentials(
     }
     match persisted.credentials.clone() {
         Credentials::Password(matrix) => client
-            .restore_session(matrix)
+            .restore_session_with(matrix, room_load)
             .await
             .map_err(CoreError::backend)?,
         Credentials::OAuth { client_id, user } => client
             .oauth()
-            .restore_session(
-                oauth_session(client_id, user),
-                matrix_sdk::store::RoomLoadSettings::default(),
-            )
+            .restore_session(oauth_session(client_id, user), room_load)
             .await
             .map_err(CoreError::backend)?,
     }
@@ -441,13 +476,67 @@ pub(crate) async fn repair_room_key_sharing(client: &Client) -> Result<(), CoreE
         .map_err(CoreError::backend)
 }
 
+#[derive(Clone, Copy)]
+enum ClientRole {
+    Account,
+    /// Opened beside the account's own client, possibly in another process, so
+    /// it leaves keys, backups and cross-signing to that one.
+    #[cfg(not(target_family = "wasm"))]
+    Notification,
+}
+
+impl ClientRole {
+    const fn is_account(self) -> bool {
+        matches!(self, Self::Account)
+    }
+
+    /// A notification service extension is held to a few dozen megabytes.
+    #[cfg(not(target_family = "wasm"))]
+    fn store_config(self, path: std::path::PathBuf) -> matrix_sdk::SqliteStoreConfig {
+        if self.is_account() {
+            matrix_sdk::SqliteStoreConfig::new(path)
+        } else {
+            matrix_sdk::SqliteStoreConfig::with_low_memory_config(path)
+        }
+    }
+
+    const fn encryption_settings(self) -> EncryptionSettings {
+        let account = self.is_account();
+        EncryptionSettings {
+            backup_download_strategy: if account {
+                BackupDownloadStrategy::AfterDecryptionFailure
+            } else {
+                BackupDownloadStrategy::Manual
+            },
+            auto_enable_cross_signing: account,
+            auto_enable_backups: account,
+        }
+    }
+}
+
+/// Also names the client in the OAuth refresh lock, so no two clients share a holder.
+#[cfg(not(target_family = "wasm"))]
+fn lock_holder() -> String {
+    static NEXT_CLIENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    format!(
+        "sable-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        NEXT_CLIENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 async fn build_account_client(
     builder: ClientBuilder,
     store_id: &str,
-    refresh_tokens: bool,
+    role: ClientRole,
     persistent_event_cache: bool,
 ) -> Result<Client, matrix_sdk::ClientBuildError> {
-    let builder = if refresh_tokens {
+    let builder = if role.is_account() {
         builder.handle_refresh_tokens()
     } else {
         builder
@@ -457,35 +546,20 @@ async fn build_account_client(
             RequestConfig::new().timeout(session_timeout(crate::tls::proxy_configured())),
         )
         .with_threading_support(THREADING_SUPPORT)
-        .with_encryption_settings(EncryptionSettings {
-            backup_download_strategy: BackupDownloadStrategy::AfterDecryptionFailure,
-            auto_enable_cross_signing: true,
-            auto_enable_backups: true,
-        });
+        .with_encryption_settings(role.encryption_settings());
 
     #[cfg(not(target_family = "wasm"))]
     {
         let _ = persistent_event_cache;
+        let holder = lock_holder();
         #[cfg(any(target_os = "android", target_os = "ios"))]
-        let lock = {
-            static NEXT_CLIENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-            let holder = format!(
-                "sable-{}-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos(),
-                NEXT_CLIENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            );
-            matrix_sdk_common::cross_process_lock::CrossProcessLockConfig::multi_process(holder)
-        };
+        let lock = matrix_sdk_common::cross_process_lock::CrossProcessLockConfig::multi_process(
+            holder.clone(),
+        );
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let lock = matrix_sdk_common::cross_process_lock::CrossProcessLockConfig::SingleProcess;
 
-        let store =
-            matrix_sdk::SqliteStoreConfig::new(std::path::Path::new(store_id).join("store"));
+        let store = role.store_config(std::path::Path::new(store_id).join("store"));
         let cache = store
             .clone()
             .path(std::path::Path::new(store_id).join("cache"));
@@ -510,7 +584,17 @@ async fn build_account_client(
             .base_client((*base).clone())
             .build()
             .await?;
-        register_base_client(store_id, base, &client);
+        // Before any restore or login, which is when the SDK sets the lock up.
+        if let Err(error) = client
+            .oauth()
+            .enable_cross_process_refresh_lock(holder)
+            .await
+        {
+            tracing::error!("could not enable the OAuth refresh lock: {error}");
+        }
+        if role.is_account() {
+            register_base_client(store_id, base, &client);
+        }
         Ok(client)
     }
 
@@ -629,9 +713,39 @@ pub(crate) fn base_client(store_id: &str) -> Option<SharedBaseClient> {
         .upgrade()
 }
 
-/// For dynamic client registration. The redirect URI must match the one handed
-/// to `OAuth::login`, and a private-use scheme must be the reverse-DNS of
-/// `client_uri`'s host or MAS rejects it with `invalid_redirect_uri`.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) type StoreLease = tokio::sync::OwnedMutexGuard<()>;
+
+/// The `SharedWorker` is the only owner of a web store.
+#[cfg(target_family = "wasm")]
+pub(crate) type StoreLease = ();
+
+#[cfg(target_family = "wasm")]
+pub(crate) fn store_lease(_store_id: &str) -> std::future::Ready<StoreLease> {
+    std::future::ready(())
+}
+
+/// Two clients on one crypto store overwrite each other's Olm sessions.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) async fn store_lease(store_id: &str) -> StoreLease {
+    static LEASES: std::sync::LazyLock<
+        std::sync::Mutex<
+            std::collections::HashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>>,
+        >,
+    > = std::sync::LazyLock::new(std::sync::Mutex::default);
+
+    let store = std::fs::canonicalize(store_id).unwrap_or_else(|_| store_id.into());
+    let lease = LEASES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(store)
+        .or_default()
+        .clone();
+    lease.lock_owned().await
+}
+
+/// For dynamic client registration. The redirect URI must match `OAuth::login`'s, and a private-use
+/// scheme must be the reverse-DNS of `client_uri`'s host.
 /// # Panics
 ///
 /// This function relies on `ClientMetadata` being serializable because all
@@ -641,9 +755,7 @@ pub fn client_metadata(redirect_uri: &Url) -> Raw<ClientMetadata> {
     metadata_with(redirect_uri, false)
 }
 
-/// The device authorization grant is what a QR login signs in with. It is
-/// registered only for that flow, so an ordinary login never asks a server
-/// for a grant type it may not support.
+/// Registered only for QR login, so an ordinary login never asks for a grant type the server may lack.
 #[must_use]
 pub fn qr_client_metadata(redirect_uri: &Url) -> Raw<ClientMetadata> {
     metadata_with(redirect_uri, true)
@@ -667,9 +779,7 @@ fn metadata_with(redirect_uri: &Url, device_code: bool) -> Raw<ClientMetadata> {
         scheme => (ApplicationType::Native, reverse_dns_url(scheme)),
     };
 
-    // RFC 8252 §7.3: a loopback redirect registers without a port, and sending
-    // one is rejected (continuwuity answers `invalid_client_metadata`).
-    // Authorization still uses the real URI.
+    // RFC 8252 §7.3: a loopback redirect registers without its port; authorization uses the real URI.
     let mut registered_uri = redirect_uri.clone();
     if redirect_uri.scheme() == "http"
         && loopback
@@ -694,17 +804,33 @@ fn metadata_with(redirect_uri: &Url, device_code: bool) -> Raw<ClientMetadata> {
     Raw::new(&metadata).expect("client metadata serializes")
 }
 
+#[must_use]
+pub fn registered_redirect_uri(session: &PersistedSession, requested: &Url) -> Url {
+    if let Some(uri) = &session.oauth_redirect_uri {
+        return uri.clone();
+    }
+    if matches!(requested.scheme(), "http" | "https") {
+        return requested.clone();
+    }
+    let legacy = if session.oauth_issuer.is_some() {
+        "moe.sable.app:/login"
+    } else {
+        "moe.sable.next:/login"
+    };
+    Url::parse(legacy).unwrap_or_else(|_| requested.clone())
+}
+
 fn canonical_client_uri() -> Url {
     #[expect(
         clippy::expect_used,
         reason = "this compile-time URL is part of the OAuth protocol contract"
     )]
     {
-        Url::parse("https://next.sable.moe").expect("static URL is valid")
+        Url::parse("https://app.sable.moe").expect("static URL is valid")
     }
 }
 
-/// `moe.sable.next` -> `https://next.sable.moe`
+/// `moe.sable.app` -> `https://app.sable.moe`
 fn reverse_dns_url(scheme: &str) -> Url {
     let host = scheme.split('.').rev().collect::<Vec<_>>().join(".");
     Url::parse(&format!("https://{host}")).unwrap_or_else(|_| canonical_client_uri())
@@ -789,8 +915,33 @@ mod tests {
 
     use super::{
         AccountRegistry, PROXIED_SESSION_TIMEOUT, SESSION_TIMEOUT, account_store_id,
-        build_account_client, removable_account_store, repair_room_key_sharing, session_timeout,
+        build_account_client, registered_redirect_uri, removable_account_store,
+        repair_room_key_sharing, session_timeout,
     };
+
+    #[test]
+    fn re_authentication_reuses_the_redirect_the_client_was_registered_with() {
+        let (mut registry, _) =
+            AccountRegistry::from_bytes(&registry_json("unused"), "unused").unwrap();
+        let mut session = registry.accounts.remove(0).session;
+        let app = url::Url::parse("moe.sable.app:/login").unwrap();
+        let next = url::Url::parse("moe.sable.next:/login").unwrap();
+        let web = url::Url::parse("https://app.sable.moe/login").unwrap();
+
+        assert_eq!(registered_redirect_uri(&session, &app), next);
+        assert_eq!(registered_redirect_uri(&session, &web), web);
+        session.oauth_issuer = Some(url::Url::parse("https://issuer.example.org").unwrap());
+        assert_eq!(registered_redirect_uri(&session, &next), app);
+        session.oauth_redirect_uri = Some(next.clone());
+        assert_eq!(registered_redirect_uri(&session, &app), next);
+
+        let mut refreshed = session.clone();
+        refreshed.oauth_redirect_uri = None;
+        assert_eq!(
+            refreshed.keeping_endpoint_of(&session).oauth_redirect_uri,
+            Some(next)
+        );
+    }
 
     #[test]
     fn a_proxy_allows_slow_session_requests() {
@@ -877,7 +1028,7 @@ mod tests {
         let client = build_account_client(
             matrix_sdk::Client::builder().homeserver_url("https://example.org"),
             store.path().to_str().unwrap(),
-            false,
+            super::ClientRole::Notification,
             true,
         )
         .await

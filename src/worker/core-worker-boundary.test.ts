@@ -1,4 +1,4 @@
-import { expect, test, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
 import { createCoreWorkerBoundary, type WorkerCore, type WorkerPort } from './core-worker-boundary';
 import type { WorkerMessage, WorkerRequest } from './protocol';
@@ -20,21 +20,59 @@ class FakePort implements WorkerPort {
   }
 }
 
-function fakeCore(submitCommand: WorkerCore['submitCommand']): WorkerCore {
+function fakeCore(call: WorkerCore['call'] = () => Promise.resolve('null')): WorkerCore {
   return {
-    submitCommand,
+    call,
     fetchMedia: () => Promise.resolve(new Uint8Array(new ArrayBuffer())),
     forgetMedia: () => Promise.resolve(),
     sendAttachment: () => Promise.resolve(),
     sendGallery: () => Promise.resolve(),
     uploadMedia: () => Promise.resolve(''),
+    setActive: () => Promise.resolve(),
   };
 }
+
+test('a core rejecting with a bare payload keeps the protocol error', async () => {
+  const boundary = createCoreWorkerBoundary(
+    // oxlint-disable-next-line typescript/prefer-promise-reject-errors -- the wasm core rejects with the bare payload
+    Promise.resolve(fakeCore(() => Promise.reject('{"code":"unknown_room"}')))
+  );
+  const port = new FakePort();
+  boundary.connect(port);
+
+  await port.send({ id: 1, call: { method: 'session.restore', params: {} } });
+
+  expect(port.messages).toEqual([{ id: 1, err: { code: 'unknown_room' } }]);
+});
+
+test('a core rejecting with an Error carrying the payload keeps the protocol error', async () => {
+  const boundary = createCoreWorkerBoundary(
+    Promise.resolve(fakeCore(() => Promise.reject(new Error('{"code":"unknown_room"}'))))
+  );
+  const port = new FakePort();
+  boundary.connect(port);
+
+  await port.send({ id: 1, call: { method: 'session.restore', params: {} } });
+
+  expect(port.messages).toEqual([{ id: 1, err: { code: 'unknown_room' } }]);
+});
+
+test('a core rejecting with a plain message fails the command', async () => {
+  const boundary = createCoreWorkerBoundary(
+    Promise.resolve(fakeCore(() => Promise.reject(new Error('the media is gone'))))
+  );
+  const port = new FakePort();
+  boundary.connect(port);
+
+  await port.send({ id: 1, call: { method: 'session.restore', params: {} } });
+
+  expect(port.messages).toEqual([{ id: 1, err: { code: 'failed', log_id: 'the media is gone' } }]);
+});
 
 test.each([undefined, false, true])(
   'passes background=%s through to WASM media downloads',
   async (background) => {
-    const core = fakeCore(() => Promise.resolve(''));
+    const core = fakeCore();
     const bytes = new Uint8Array([7]);
     const fetchMedia = vi.fn(() => Promise.resolve(bytes));
     core.fetchMedia = fetchMedia;
@@ -51,7 +89,7 @@ test.each([undefined, false, true])(
 );
 
 test('passes rich attachment captions and mentions to the WASM core', async () => {
-  const core = fakeCore(() => Promise.resolve(''));
+  const core = fakeCore();
   const sendAttachment = vi.fn(() => Promise.resolve());
   core.sendAttachment = sendAttachment;
   const boundary = createCoreWorkerBoundary(Promise.resolve(core));
@@ -102,7 +140,7 @@ test('passes rich attachment captions and mentions to the WASM core', async () =
 });
 
 test('asks the WASM core to forget a media source', async () => {
-  const core = fakeCore(() => Promise.resolve(''));
+  const core = fakeCore();
   const forgetMedia = vi.fn(() => Promise.resolve());
   core.forgetMedia = forgetMedia;
   const boundary = createCoreWorkerBoundary(Promise.resolve(core));
@@ -116,7 +154,7 @@ test('asks the WASM core to forget a media source', async () => {
 });
 
 test('passes gallery items and shared metadata to the WASM core', async () => {
-  const core = fakeCore(() => Promise.resolve(''));
+  const core = fakeCore();
   const sendGallery = vi.fn(() => Promise.resolve());
   core.sendGallery = sendGallery;
   const boundary = createCoreWorkerBoundary(Promise.resolve(core));
@@ -174,26 +212,30 @@ test('passes gallery items and shared metadata to the WASM core', async () => {
 });
 
 test('answers a health probe while a core command is pending', async () => {
-  const boundary = createCoreWorkerBoundary(
-    Promise.resolve(fakeCore(() => new Promise<string>(() => {})))
-  );
+  const core = fakeCore();
+  core.call = () => new Promise<string>(() => {});
+  const boundary = createCoreWorkerBoundary(Promise.resolve(core));
   const port = new FakePort();
   boundary.connect(port);
 
   void port.send({
     id: 1,
-    command: { type: 'room_members', room_id: '!room', memberships: [] },
+    call: { method: 'members.list', params: { room_id: '!room', memberships: [] } },
   });
   await port.send({ id: 2, ping: true });
 
   expect(port.messages).toEqual([{ id: 2, pong: true }]);
 });
 
+const subscribeTimeline = (roomId: string) => ({
+  method: 'timeline.subscribe',
+  params: { room_id: roomId, focus: { kind: 'live' as const }, hidden_events: false },
+});
+
 test('sends the subscription snapshot before startup events buffered for its port', async () => {
   let emit = (() => {}) as (json: string) => void;
-  const core = fakeCore((command) => {
-    const request = JSON.parse(command) as { type: string };
-    if (request.type === 'subscribe_timeline') {
+  const core = fakeCore((method) => {
+    if (method === 'timeline.subscribe') {
       emit(
         JSON.stringify([
           {
@@ -204,11 +246,9 @@ test('sends the subscription snapshot before startup events buffered for its por
           },
         ])
       );
-      return Promise.resolve(
-        JSON.stringify({ type: 'subscribe_timeline', subscription: 7, items: [] })
-      );
+      return Promise.resolve(JSON.stringify({ subscription: 7, items: [] }));
     }
-    return Promise.resolve(JSON.stringify({ type: request.type }));
+    return Promise.resolve('null');
   });
   const boundary = createCoreWorkerBoundary(Promise.resolve(core));
   emit = boundary.handleEvent;
@@ -217,18 +257,10 @@ test('sends the subscription snapshot before startup events buffered for its por
   boundary.connect(first);
   boundary.connect(second);
 
-  await first.send({
-    id: 1,
-    command: {
-      type: 'subscribe_timeline',
-      room_id: '!room',
-      focus: { kind: 'live' as const },
-      hidden_events: false,
-    },
-  });
+  await first.send({ id: 1, call: subscribeTimeline('!room') });
 
   expect(first.messages).toEqual([
-    { id: 1, ok: { type: 'subscribe_timeline', subscription: 7, items: [] } },
+    { id: 1, ok: { subscription: 7, items: [] } },
     {
       events: [
         { type: 'timeline_pagination', subscription: 7, loading: true, reached_start: false },
@@ -240,23 +272,11 @@ test('sends the subscription snapshot before startup events buffered for its por
 
 test('forwards a core batch as one message per port', async () => {
   const boundary = createCoreWorkerBoundary(
-    Promise.resolve(
-      fakeCore(() =>
-        Promise.resolve(JSON.stringify({ type: 'subscribe_timeline', subscription: 7, items: [] }))
-      )
-    )
+    Promise.resolve(fakeCore(() => Promise.resolve(JSON.stringify({ subscription: 7, items: [] }))))
   );
   const owner = new FakePort();
   boundary.connect(owner);
-  await owner.send({
-    id: 1,
-    command: {
-      type: 'subscribe_timeline',
-      room_id: '!room',
-      focus: { kind: 'live' as const },
-      hidden_events: false,
-    },
-  });
+  await owner.send({ id: 1, call: subscribeTimeline('!room') });
   owner.messages.length = 0;
 
   boundary.handleEvent(
@@ -286,12 +306,12 @@ test.each([false, true])(
     let emit = (() => {}) as (json: string) => void;
     let subscriptions = 0;
     const released: number[] = [];
-    const core = fakeCore((command) => {
-      const request = JSON.parse(command) as { type: string; subscription?: number };
-      if (request.type === 'unsubscribe') {
-        if (request.subscription === undefined) throw new Error('Missing subscription');
-        released.push(request.subscription);
-        return Promise.resolve(JSON.stringify({ type: 'unsubscribe' }));
+    const core = fakeCore((method, params) => {
+      if (method === 'timeline.unsubscribe') {
+        const { subscription } = JSON.parse(params) as { subscription?: number };
+        if (subscription === undefined) throw new Error('Missing subscription');
+        released.push(subscription);
+        return Promise.resolve('null');
       }
       subscriptions += 1;
       const subscription = subscriptions;
@@ -305,23 +325,13 @@ test.each([false, true])(
           }))
         )
       );
-      return Promise.resolve(
-        JSON.stringify({ type: 'subscribe_timeline', subscription, items: [] })
-      );
+      return Promise.resolve(JSON.stringify({ subscription, items: [] }));
     });
     const boundary = createCoreWorkerBoundary(Promise.resolve(core));
     emit = boundary.handleEvent;
     const port = new FakePort();
     boundary.connect(port);
-    await port.send({
-      id: 1,
-      command: {
-        type: 'subscribe_timeline',
-        room_id: '!room',
-        focus: { kind: 'live' },
-        hidden_events: false,
-      },
-    });
+    await port.send({ id: 1, call: subscribeTimeline('!room') });
     expect(subscriptions).toBe(repeated ? 3 : 2);
     expect(released).toEqual(repeated ? [1, 2, 3] : [1]);
     if (repeated) {
@@ -330,7 +340,7 @@ test.each([false, true])(
       expect(port.messages[0]).toHaveProperty('err.code', 'failed');
     } else {
       expect(port.messages).toEqual([
-        { id: 1, ok: { type: 'subscribe_timeline', subscription: 2, items: [] } },
+        { id: 1, ok: { subscription: 2, items: [] } },
         { events: [{ type: 'timeline_diff', subscription: 2, diffs: [{ op: 'clear' }] }] },
       ]);
     }
@@ -338,14 +348,12 @@ test.each([false, true])(
 );
 
 test('denies cross-port pagination and unsubscribe without calling the core', async () => {
-  const commands: string[] = [];
+  const calls: string[] = [];
   const boundary = createCoreWorkerBoundary(
     Promise.resolve(
-      fakeCore((command) => {
-        commands.push(command);
-        return Promise.resolve(
-          JSON.stringify({ type: 'subscribe_timeline', subscription: 7, items: [] })
-        );
+      fakeCore((method) => {
+        calls.push(method);
+        return Promise.resolve(JSON.stringify({ subscription: 7, items: [] }));
       })
     )
   );
@@ -353,23 +361,21 @@ test('denies cross-port pagination and unsubscribe without calling the core', as
   const other = new FakePort();
   boundary.connect(owner);
   boundary.connect(other);
-  await owner.send({
-    id: 1,
-    command: {
-      type: 'subscribe_timeline',
-      room_id: '!room',
-      focus: { kind: 'live' as const },
-      hidden_events: false,
-    },
-  });
+  await owner.send({ id: 1, call: subscribeTimeline('!room') });
 
   await other.send({
     id: 2,
-    command: { type: 'paginate', subscription: 7, direction: 'backward', count: 20 },
+    call: {
+      method: 'timeline.paginate',
+      params: { subscription: 7, direction: 'backward', count: 20 },
+    },
   });
-  await other.send({ id: 3, command: { type: 'unsubscribe', subscription: 7 } });
+  await other.send({
+    id: 3,
+    call: { method: 'timeline.unsubscribe', params: { subscription: 7 } },
+  });
 
-  expect(commands).toHaveLength(1);
+  expect(calls).toHaveLength(1);
   expect(other.messages).toEqual([
     { id: 2, err: { code: 'denied' } },
     { id: 3, err: { code: 'denied' } },
@@ -378,17 +384,15 @@ test('denies cross-port pagination and unsubscribe without calling the core', as
 
 test('cleans up active and pending subscriptions when their ports close', async () => {
   let resolveSubscribe: ((value: string) => void) | undefined;
-  const commands: string[] = [];
+  const calls: { method: string; params: unknown }[] = [];
   const boundary = createCoreWorkerBoundary(
     Promise.resolve(
-      fakeCore((command) => {
-        commands.push(command);
-        if (commands.length === 1)
-          return Promise.resolve(
-            JSON.stringify({ type: 'subscribe_timeline', subscription: 7, items: [] })
-          );
-        if (commands.length === 2) return new Promise((resolve) => (resolveSubscribe = resolve));
-        return Promise.resolve(JSON.stringify({ type: 'unsubscribe' }));
+      fakeCore((method, params) => {
+        calls.push({ method, params: JSON.parse(params) });
+        if (calls.length === 1)
+          return Promise.resolve(JSON.stringify({ subscription: 7, items: [] }));
+        if (calls.length === 2) return new Promise((resolve) => (resolveSubscribe = resolve));
+        return Promise.resolve('null');
       })
     )
   );
@@ -396,47 +400,19 @@ test('cleans up active and pending subscriptions when their ports close', async 
   const pending = new FakePort();
   boundary.connect(active);
   boundary.connect(pending);
-  await active.send({
-    id: 1,
-    command: {
-      type: 'subscribe_timeline',
-      room_id: '!active',
-      focus: { kind: 'live' as const },
-      hidden_events: false,
-    },
-  });
-  await pending.send({
-    id: 2,
-    command: {
-      type: 'subscribe_timeline',
-      room_id: '!pending',
-      focus: { kind: 'live' as const },
-      hidden_events: false,
-    },
-  });
+  await active.send({ id: 1, call: subscribeTimeline('!active') });
+  await pending.send({ id: 2, call: subscribeTimeline('!pending') });
 
   active.onmessageerror?.({} as MessageEvent);
   pending.onmessageerror?.({} as MessageEvent);
-  resolveSubscribe?.(JSON.stringify({ type: 'subscribe_timeline', subscription: 8, items: [] }));
+  resolveSubscribe?.(JSON.stringify({ subscription: 8, items: [] }));
   await new Promise((resolve) => setTimeout(resolve));
 
-  expect(
-    commands.map((command) => JSON.parse(command) as { type: string; subscription?: number })
-  ).toEqual([
-    {
-      type: 'subscribe_timeline',
-      room_id: '!active',
-      focus: { kind: 'live' as const },
-      hidden_events: false,
-    },
-    {
-      type: 'subscribe_timeline',
-      room_id: '!pending',
-      focus: { kind: 'live' as const },
-      hidden_events: false,
-    },
-    { type: 'unsubscribe', subscription: 7 },
-    { type: 'unsubscribe', subscription: 8 },
+  expect(calls).toEqual([
+    subscribeTimeline('!active'),
+    subscribeTimeline('!pending'),
+    { method: 'timeline.unsubscribe', params: { subscription: 7 } },
+    { method: 'timeline.unsubscribe', params: { subscription: 8 } },
   ]);
   expect(active.messages).toHaveLength(1);
   expect(pending.messages).toEqual([]);
@@ -450,7 +426,7 @@ test('a panic reaches every port and later commands fail instead of hanging', as
   boundary.connect(second);
 
   boundary.handlePanic('index out of bounds');
-  await first.send({ id: 1, command: { type: 'restore' } });
+  await first.send({ id: 1, call: { method: 'session.restore', params: {} } });
 
   expect(second.messages).toEqual([{ panic: { message: 'index out of bounds' } }]);
   expect(first.messages).toEqual([
@@ -501,6 +477,28 @@ test('WASM logs are batched to every connected port', () => {
   vi.useRealTimers();
 });
 
+test('the lines after a log entry stay attached to it', () => {
+  vi.useFakeTimers();
+  const boundary = createCoreWorkerBoundary(Promise.resolve(fakeCore(() => Promise.resolve('{}'))));
+  const port = new FakePort();
+  boundary.connect(port);
+
+  boundary.handleLog(
+    'ERROR matrix_sdk_ui::sync_service: Error while processing encryption in sync service: Some(\n    Http(\n        timeout,\n    ),\n)\nINFO sable_core: next'
+  );
+  vi.advanceTimersByTime(250);
+
+  expect(port.messages).toEqual([
+    {
+      logs: [
+        'ERROR matrix_sdk_ui::sync_service: Error while processing encryption in sync service: Some(\n    Http(\n        timeout,\n    ),\n)',
+        'INFO sable_core: next',
+      ],
+    },
+  ]);
+  vi.useRealTimers();
+});
+
 test('overflowing the log buffer drops and reports the excess', () => {
   const setLogCapture = vi.fn();
   vi.useFakeTimers();
@@ -521,18 +519,27 @@ test('overflowing the log buffer drops and reports the excess', () => {
   vi.useRealTimers();
 });
 
-test('a reset request terminates the worker after answering', () => {
+test('a reset request stops the core before answering, then terminates the worker', async () => {
   const terminate = vi.fn();
+  let answeredBeforeStop = false;
+  const port = new FakePort();
+  const stop = vi.fn(() => {
+    answeredBeforeStop = port.messages.length > 0;
+    return Promise.resolve();
+  });
   const boundary = createCoreWorkerBoundary(
     Promise.resolve(fakeCore(() => Promise.resolve('{}'))),
     undefined,
-    terminate
+    terminate,
+    undefined,
+    stop
   );
-  const port = new FakePort();
   boundary.connect(port);
 
-  port.onmessage?.({ data: { id: 1, reset: true } } as MessageEvent<WorkerRequest>);
+  await port.onmessage?.({ data: { id: 1, reset: true } } as MessageEvent<WorkerRequest>);
 
+  expect(stop).toHaveBeenCalledOnce();
+  expect(answeredBeforeStop).toBe(false);
   expect(terminate).toHaveBeenCalledTimes(1);
   expect(port.messages).toEqual([{ id: 1, uri: null }]);
 });
@@ -575,4 +582,90 @@ test('a debugLogs request toggles WASM capture and clears buffered logs', () => 
   expect(setLogCapture).toHaveBeenCalledWith(false);
   expect(port.messages).toEqual([]);
   vi.useRealTimers();
+});
+
+test('a logFilter request reaches the core', () => {
+  const setLogFilter = vi.fn();
+  const boundary = createCoreWorkerBoundary(
+    Promise.resolve(fakeCore(() => Promise.resolve('{}'))),
+    undefined,
+    undefined,
+    setLogFilter
+  );
+  const port = new FakePort();
+  boundary.connect(port);
+
+  port.onmessage?.({ data: { logFilter: 'debug' } } as MessageEvent<WorkerRequest>);
+
+  expect(setLogFilter).toHaveBeenCalledWith('debug');
+  expect(port.messages).toEqual([]);
+});
+
+test('a superseded worker tells every page', () => {
+  const boundary = createCoreWorkerBoundary(Promise.resolve(fakeCore(() => Promise.resolve('{}'))));
+  const first = new FakePort();
+  const second = new FakePort();
+  boundary.connect(first);
+  boundary.connect(second);
+
+  boundary.handleSuperseded();
+
+  expect(first.messages).toEqual([{ superseded: true }]);
+  expect(second.messages).toEqual([{ superseded: true }]);
+});
+
+describe('sync activity', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function setup() {
+    const core = fakeCore();
+    const setActive = vi.fn(() => Promise.resolve());
+    core.setActive = setActive;
+    const boundary = createCoreWorkerBoundary(Promise.resolve(core));
+    const first = new FakePort();
+    const second = new FakePort();
+    boundary.connect(first);
+    boundary.connect(second);
+    return { boundary, first, second, setActive };
+  }
+
+  const send = (port: FakePort, request: WorkerRequest) =>
+    port.onmessage?.({ data: request } as MessageEvent<WorkerRequest>);
+
+  test('keeps syncing while every tab is hidden or closed', async () => {
+    const { first, second, setActive } = setup();
+
+    send(first, { visible: false });
+    send(second, { visible: false });
+    send(second, { disconnect: true });
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(setActive).not.toHaveBeenCalled();
+  });
+
+  test('a tab becoming visible retries sync at once', async () => {
+    const { second, setActive } = setup();
+
+    send(second, { visible: true });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(setActive).toHaveBeenCalledExactlyOnceWith(true);
+  });
+
+  test('a returning network retries sync even with every tab hidden', async () => {
+    const { boundary, first, second, setActive } = setup();
+    send(first, { visible: false });
+    send(second, { visible: false });
+
+    boundary.handleOnline();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(setActive).toHaveBeenCalledExactlyOnceWith(true);
+  });
 });

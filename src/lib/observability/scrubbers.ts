@@ -14,22 +14,23 @@ if (appLocation) {
 }
 
 export function scrubExternalHosts(value: string): string {
-  return value.replace(/\bhttps?:\/\/[^/?#\s]+/gi, (match) => {
+  return value.replace(/\b(?:https?|wss?):\/\/[^/?#\s"'<>(){},]+/gi, (match) => {
     const schemeEnd = match.indexOf('://') + 3;
     const hostname = (match.slice(schemeEnd).split(':')[0] ?? '').toLowerCase();
     if (LOCAL_HOSTS.has(hostname)) return match;
-    return `${match.slice(0, schemeEnd)}[HOMESERVER]`;
+    return `${match.slice(0, schemeEnd)}${/^wss?:/i.test(match) ? '[SERVER]' : '[HOMESERVER]'}`;
   });
 }
 
 export function scrubMatrixIds(value: string): string {
   return scrubMatrixUrl(value)
     .replace(
-      /(access_token|password|token|refresh_token|session_id|sync_token|next_batch)([=:\s]+)([^\s&]+)/gi,
+      /\b(access_token|password|token|refresh_token|session_id|sync_token|next_batch|join_request|joinRequest|jwt)(["']?[=:\s]+["']?)([^\s&"'<>()[\]{},]+)/gi,
       '$1$2[REDACTED]'
     )
     .replace(/@[^\s:@]+:[^\s,'"(){}[\]]+/g, '@[USER_ID]')
     .replace(/![^\s:]+:[^\s,'"(){}[\]]+/g, '![ROOM_ID]')
+    .replace(/![A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/g, '![ROOM_ID]')
     .replace(/#[^\s:@]+:[^\s,'"(){}[\]]+/g, '#[ROOM_ALIAS]')
     .replace(/\$[A-Za-z0-9_+/-]{10,}/g, '$[EVENT_ID]');
 }
@@ -71,6 +72,8 @@ const IDENTIFIER_KEYS = new Set(
     'sessionId',
     'syncToken',
     'nextBatch',
+    'joinRequest',
+    'jwt',
   ].map(identifierKey)
 );
 
@@ -111,6 +114,7 @@ export function scrubMatrixUrl(url: string): string {
       // Browsers decode %21 and %40 for display but often leave %3A encoded,
       // so both the literal colon and the encoding have to match.
       .replace(/\/![^/?#\s:%]+(?:%3A|:)[^/?#\s]*/gi, '/![ROOM_ID]')
+      .replace(/\/![A-Za-z0-9_-]{43}(?=[/?#\s]|$)/g, '/![ROOM_ID]')
       .replace(/\/@[^/?#\s:%]+(?:%3A|:)[^/?#\s]*/gi, '/@[USER_ID]')
       .replace(/\/#[^/?#\s:%]+(?:%3A|:)[^/?#\s]*/gi, '/[ROOM_ALIAS]')
       .replace(/\/%40[^/?#\s]*/gi, '/[USER_ID]')

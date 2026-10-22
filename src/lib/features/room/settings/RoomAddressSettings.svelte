@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { RoomPowerLevelsView, RoomSummary } from '#src/generated/protocol';
+  import type { RoomPowerLevelsView, RoomListItemView } from '#src/generated/protocol';
   import TrashIcon from 'phosphor-svelte/lib/TrashIcon';
   import XIcon from 'phosphor-svelte/lib/XIcon';
 
@@ -21,7 +21,7 @@
   const CANONICAL_EVENT_TYPE = 'm.room.canonical_alias';
 
   interface Props {
-    room: RoomSummary | null;
+    room: RoomListItemView | null;
     levels: RoomPowerLevelsView | null;
     ownPowerLevel: number;
   }
@@ -34,7 +34,10 @@
   let alternatives = $state.raw<string[]>([]);
   let draft = $state('');
   let busy = $state(false);
-  let selected = $state.raw<ReadonlySet<string>>(new Set());
+  let selected = $derived.by<ReadonlySet<string>>(() => {
+    void roomId;
+    return new Set();
+  });
   let pendingRemoval = $state.raw<readonly string[]>([]);
   let outcome = $state<'invalid' | 'failed' | null>(null);
   let run = 0;
@@ -51,7 +54,6 @@
 
   $effect(() => {
     void roomId;
-    selected = new Set();
     void load();
   });
 
@@ -61,23 +63,19 @@
 
     const current = ++run;
     try {
-      const [local, canonicalContent] = await Promise.all([
-        core.commands.roomAliases(target).catch(() => [] as string[]),
-        core.commands.roomStateEvent(target, CANONICAL_EVENT_TYPE),
+      const [local, published] = await Promise.all([
+        core.rpc.rooms.aliases({ room_id: target }).catch((error: unknown): string[] => {
+          console.debug('[sable room] local aliases unavailable', error);
+          return [];
+        }),
+        core.rpc.rooms.canonicalAlias({ room_id: target }),
       ]);
       if (current !== run) return;
 
       aliases = local;
       selected = new Set([...selected].filter((alias) => local.includes(alias)));
-      const content = canonicalContent as { alias?: unknown; alt_aliases?: unknown } | null;
-      canonical = typeof content?.alias === 'string' ? content.alias : null;
-      alternatives = Array.isArray(content?.alt_aliases)
-        ? [
-            ...new Set(
-              content.alt_aliases.filter((entry): entry is string => typeof entry === 'string')
-            ),
-          ]
-        : [];
+      canonical = published.alias;
+      alternatives = published.alt_aliases;
     } catch (error) {
       console.debug('[sable room] addresses unavailable', error);
     }
@@ -110,13 +108,13 @@
     const target = roomId;
     if (!target) return;
 
-    const rest = [...new Set(alt)].filter((entry) => entry !== alias);
-    await core.commands.sendStateEvent(target, CANONICAL_EVENT_TYPE, '', {
-      ...(alias === null ? {} : { alias }),
-      ...(rest.length > 0 ? { alt_aliases: rest } : {}),
+    const written = await core.rpc.rooms.setCanonicalAlias({
+      room_id: target,
+      alias,
+      alt_aliases: [...alt],
     });
-    canonical = alias;
-    alternatives = rest;
+    canonical = written.alias;
+    alternatives = written.alt_aliases;
   }
 
   function add(): void {
@@ -129,7 +127,7 @@
     }
 
     void change(async () => {
-      await core.commands.createRoomAlias(target, alias);
+      await core.rpc.rooms.createAlias({ room_id: target, alias });
       draft = '';
     }, 'alias creation');
   }
@@ -167,7 +165,7 @@
           alternatives.filter((alias) => !targets.includes(alias))
         );
       }
-      for (const alias of targets) await core.commands.deleteRoomAlias(alias);
+      for (const alias of targets) await core.rpc.rooms.deleteAlias({ alias });
       selected = new Set();
     }, 'alias removal');
     pendingRemoval = [];
@@ -186,18 +184,18 @@
 
 <SettingsSection
   headingId="room-settings-published-addresses"
-  title={$i18n.t('room.addressesPublishedTitle')}
-  description={$i18n.t('room.addressesPublishedHint')}
+  title={i18n.t('room.addressesPublishedTitle')}
+  description={i18n.t('room.addressesPublishedHint')}
 >
   {#if published.length > 0}
     <ul class="settings-rows">
       {#each published as alias (alias)}
         <SettingsRow title={alias}>
           {#if alias === canonical}
-            <StatusBadge variant="primary" label={$i18n.t('room.addressesMain')} />
+            <StatusBadge variant="primary" label={i18n.t('room.addressesMain')} />
             {#if canEdit}
               <Button size="small" variant="ghost" disabled={busy} onclick={unsetMain}>
-                {$i18n.t('room.addressesUnsetMain')}
+                {i18n.t('room.addressesUnsetMain')}
               </Button>
             {/if}
           {:else if canEdit}
@@ -209,14 +207,14 @@
                 setMain(alias);
               }}
             >
-              {$i18n.t('room.addressesSetMain')}
+              {i18n.t('room.addressesSetMain')}
             </Button>
           {/if}
           {#if canEdit}
             <IconButton
               variant="subtle"
               size="small"
-              label={$i18n.t('room.addressesUnpublish', { alias })}
+              label={i18n.t('room.addressesUnpublish', { alias })}
               disabled={busy}
               onclick={() => {
                 unpublish([alias]);
@@ -229,24 +227,24 @@
       {/each}
     </ul>
   {:else}
-    <p class="settings-note settings-form">{$i18n.t('room.addressesPublishedEmpty')}</p>
+    <p class="settings-note settings-form">{i18n.t('room.addressesPublishedEmpty')}</p>
   {/if}
 </SettingsSection>
 
 <SettingsSection
   headingId="room-settings-addresses"
-  title={$i18n.t('room.addressesTitle')}
-  description={$i18n.t('room.addressesHint')}
+  title={i18n.t('room.addressesTitle')}
+  description={i18n.t('room.addressesHint')}
 >
   {#if canEdit && aliases.length > 0}
     <div class="bulk-bar">
       <label class="bulk-select-all">
         <input type="checkbox" checked={allSelected} disabled={busy} onchange={toggleAll} />
-        {$i18n.t('room.addressesSelectAll')}
+        {i18n.t('common.selectAll')}
       </label>
       {#if chosen.length > 0}
         <span class="bulk-count">
-          {$i18n.t('room.addressesSelectedCount', { count: chosen.length })}
+          {i18n.t('room.addressesSelectedCount', { count: chosen.length })}
         </span>
         <div class="bulk-actions">
           <Button
@@ -257,7 +255,7 @@
               publish(chosen);
             }}
           >
-            {$i18n.t('room.addressesPublish')}
+            {i18n.t('room.addressesPublish')}
           </Button>
           <Button
             size="small"
@@ -267,7 +265,7 @@
               unpublish(chosen);
             }}
           >
-            {$i18n.t('room.addressesUnpublishSelected')}
+            {i18n.t('room.addressesUnpublishSelected')}
           </Button>
           <Button
             size="small"
@@ -277,7 +275,7 @@
               pendingRemoval = chosen;
             }}
           >
-            {$i18n.t('room.addressesDeleteSelected')}
+            {i18n.t('common.delete')}
           </Button>
         </div>
       {/if}
@@ -295,7 +293,7 @@
                   type="checkbox"
                   checked={selected.has(alias)}
                   disabled={busy}
-                  aria-label={$i18n.t('room.addressesSelect', { alias })}
+                  aria-label={i18n.t('room.addressesSelect', { alias })}
                   onchange={() => {
                     toggle(alias);
                   }}
@@ -304,15 +302,15 @@
             {/if}
           {/snippet}
           {#if alias === canonical}
-            <StatusBadge variant="primary" label={$i18n.t('room.addressesMain')} />
+            <StatusBadge variant="primary" label={i18n.t('room.addressesMain')} />
           {:else if published.includes(alias)}
-            <StatusBadge label={$i18n.t('room.addressesPublished')} />
+            <StatusBadge label={i18n.t('room.addressesPublished')} />
           {/if}
           {#if canEdit}
             <IconButton
               variant="subtle"
               size="small"
-              label={$i18n.t('room.addressesRemove', { alias })}
+              label={i18n.t('room.addressesRemove', { alias })}
               disabled={busy}
               onclick={() => {
                 pendingRemoval = [alias];
@@ -325,21 +323,21 @@
       {/each}
     </ul>
   {:else}
-    <p class="settings-note settings-form">{$i18n.t('room.addressesEmpty')}</p>
+    <p class="settings-note settings-form">{i18n.t('room.addressesEmpty')}</p>
   {/if}
 
   {#if canEdit}
     <div class="settings-form">
       {#if outcome === 'invalid'}
-        <Alert variant="critical" role="alert">{$i18n.t('room.addressesInvalid')}</Alert>
+        <Alert variant="critical" role="alert">{i18n.t('room.addressesInvalid')}</Alert>
       {:else if outcome === 'failed'}
-        <Alert variant="critical" role="alert">{$i18n.t('room.addressesFailed')}</Alert>
+        <Alert variant="critical" role="alert">{i18n.t('room.addressesFailed')}</Alert>
       {/if}
       <div class="inline">
         <TextInput
           bind:value={draft}
-          placeholder={$i18n.t('room.addressesPlaceholder')}
-          aria-label={$i18n.t('room.addressesAdd')}
+          placeholder={i18n.t('room.addressesPlaceholder')}
+          aria-label={i18n.t('common.add')}
           onkeydown={(event: KeyboardEvent) => {
             if (event.key !== 'Enter') return;
             event.preventDefault();
@@ -347,7 +345,7 @@
           }}
         />
         <Button disabled={draft.trim() === '' || busy} onclick={add}>
-          {$i18n.t('room.addressesAdd')}
+          {i18n.t('common.add')}
         </Button>
       </div>
     </div>
@@ -360,9 +358,9 @@
     if (!next && busy === false) pendingRemoval = [];
   }}
   title={pendingRemoval.length === 1
-    ? $i18n.t('room.addressesRemoveConfirm', { alias: pendingRemoval[0] })
-    : $i18n.t('room.addressesRemoveManyConfirm', { count: pendingRemoval.length })}
-  confirmLabel={$i18n.t('room.remove')}
+    ? i18n.t('room.addressesRemoveConfirm', { alias: pendingRemoval[0] })
+    : i18n.t('room.addressesRemoveManyConfirm', { count: pendingRemoval.length })}
+  confirmLabel={i18n.t('common.remove')}
   {busy}
   onConfirm={() => void confirmRemoval()}
 />

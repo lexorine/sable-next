@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
+};
 
 use base64::Engine as _;
 use matrix_sdk::{
@@ -9,10 +12,31 @@ use matrix_sdk_ui::sync_service::SyncService;
 use tokio::sync::Mutex;
 
 use super::{
-    CallMember, CallMode, CallSessionId, Core, State, backend_id, content, member_service,
+    CallMember, CallMode, CallSessionId, Core, State, backend_id, member_service, mode_reason,
     own_is_present, refresh, select_mode,
 };
-use crate::{protocol::CallBackendView, session::Session, store::MemorySessionStore};
+use crate::{
+    protocol::{CallBackendView, CallIntent},
+    session::Session,
+    store::MemorySessionStore,
+};
+
+fn content(
+    room_id: &matrix_sdk::ruma::OwnedRoomId,
+    own: &CallMember,
+    intent: Option<CallIntent>,
+) -> serde_json::Value {
+    serde_json::to_value(super::content(room_id, own, intent)).unwrap()
+}
+
+fn content_at(
+    room_id: &matrix_sdk::ruma::OwnedRoomId,
+    own: &CallMember,
+    intent: Option<CallIntent>,
+    now_ms: u64,
+) -> serde_json::Value {
+    serde_json::to_value(super::content_at(room_id, own, intent, now_ms)).unwrap()
+}
 
 fn member(mode: CallMode, created_ts: u64, foci: &[&str]) -> CallMember {
     CallMember {
@@ -25,6 +49,7 @@ fn member(mode: CallMode, created_ts: u64, foci: &[&str]) -> CallMember {
         joined_ts: created_ts,
         expires_at_ms: None,
         foci: foci.iter().map(ToString::to_string).collect(),
+        screen_sharing: false,
     }
 }
 
@@ -46,7 +71,12 @@ async fn discover_with_peers(
         .ok()
         .mount()
         .await;
-    let client = server.client_builder().no_server_versions().build().await;
+    let client = server
+        .client_builder()
+        .no_server_versions()
+        .on_builder(|builder| builder.disable_well_known_lookup(true))
+        .build()
+        .await;
     let room_id = owned_room_id!("!call:example.org");
     let now = super::keys::now_ms();
     let mut builder = JoinedRoomBuilder::new(&room_id);
@@ -64,7 +94,7 @@ async fn discover_with_peers(
             },
             "event_id": format!("$peer-{age}"), "sender": peer.user_id,
             "origin_server_ts": peer.created_ts,
-            "content": super::content_at(&room_id, &peer, None, now),
+            "content": content_at(&room_id, &peer, None, now),
         });
         if mode == CallMode::Matrix2 {
             event["msc4354_sticky"] = json!({"duration_ms": 3_600_000});
@@ -78,6 +108,7 @@ async fn discover_with_peers(
             );
         }
     }
+    server.mock_room_state_encryption().plain().mount().await;
     let room = server.sync_room(&client, builder).await;
     if mode == CallMode::Matrix2 {
         Mock::given(method("POST"))
@@ -174,12 +205,28 @@ fn mode_selection_preserves_legacy_and_selects_sticky_only_when_available() {
     ));
     assert!(matches!(
         select_mode(Some(CallMode::Matrix2), &[], false),
-        Err(crate::protocol::CommandErr::Unsupported)
+        Err(crate::protocol::RpcError::Unsupported)
     ));
     assert!(matches!(
         select_mode(None, &[member(CallMode::Matrix2, 1, &[])], true),
         Ok(CallMode::Matrix2)
     ));
+}
+
+#[test]
+fn mode_reason_names_what_pinned_the_mode() {
+    use crate::protocol::CallModeReason::{Fresh, LegacyPeer, Requested, StickyOnly, StickyPeer};
+    let legacy = [member(CallMode::Legacy, 1, &[])];
+    let sticky = [member(CallMode::Matrix2, 1, &[])];
+    assert_eq!(mode_reason(None, true, &[], true), StickyOnly);
+    assert_eq!(
+        mode_reason(Some(CallMode::Legacy), false, &legacy, true),
+        Requested
+    );
+    assert_eq!(mode_reason(None, false, &legacy, true), LegacyPeer);
+    assert_eq!(mode_reason(None, false, &sticky, true), StickyPeer);
+    assert_eq!(mode_reason(None, false, &sticky, false), Fresh);
+    assert_eq!(mode_reason(None, false, &[], true), Fresh);
 }
 
 #[test]
@@ -249,6 +296,10 @@ fn own_liveness_requires_the_current_generation() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one sequential flow kept in a single function"
+)]
 async fn pending_key_with_a_custom_membership_id_is_emitted() {
     use matrix_sdk::ruma::{events::AnySyncStateEvent, serde::Raw};
     use matrix_sdk_test::JoinedRoomBuilder;
@@ -291,19 +342,22 @@ async fn pending_key_with_a_custom_membership_id_is_emitted() {
         sender: owned_user_id!("@user:example.org"),
         device: owned_device_id!("DEVICE"),
         content: super::keys::ToDeviceCallEncryptionKeysEventContent {
-            keys: super::keys::KeyPayload {
+            media_key: None,
+            keys: Some(super::keys::KeyPayload {
                 index,
                 key: base64::engine::general_purpose::STANDARD.encode([index; 16]),
-            },
+            }),
             room_id: room_id.clone(),
-            member: super::keys::MemberRef {
+            member_id: None,
+            member: Some(super::keys::MemberRef {
                 claimed_device_id: "DEVICE".to_owned(),
                 id: id.map(str::to_owned),
-            },
+            }),
             session: super::keys::SessionRef::default(),
-            sent_ts: 1,
+            sent_ts: Some(1),
         },
         received: super::keys::now_ms(),
+        reported: false,
     };
     let mut state = State::new(
         member(CallMode::Compatibility, 1, &[]),
@@ -413,18 +467,25 @@ async fn an_element_call_peers_key_is_emitted_on_the_oldest_members_focus() {
         own: member(CallMode::Compatibility, now, &["https://sfu.example.org"]),
         sticky: super::StickyMemberships::default(),
         members,
+        emitted_members: None,
         backends: BTreeMap::new(),
+        latest_keys: HashMap::new(),
+        member_first_seen: HashMap::new(),
+        silent_reported: HashSet::new(),
+        rotation_due_ms: None,
         pending_keys: vec![super::PendingKey {
             sender: owned_user_id!("@genchu:federated.nexus"),
             device: owned_device_id!("spDmuPm52O"),
             content,
             received: now,
+            reported: false,
         }],
         distributor: None,
         own_observed: false,
         revision: 0,
         intent: None,
         slot_closed: false,
+        slot_closed_midcall: false,
         slot_checked_ms: 0,
         publisher_attempt_ms: 0,
     };
@@ -438,6 +499,52 @@ async fn an_element_call_peers_key_is_emitted_on_the_oldest_members_focus() {
             if identity == "@genchu:federated.nexus:spDmuPm52O" && id == expected
     ));
     assert!(state.pending_keys.is_empty());
+}
+
+#[tokio::test]
+async fn a_key_whose_member_has_not_resolved_waits_for_the_roster() {
+    use serde_json::json;
+
+    let (core, mut events) = Core::new("test", Box::new(MemorySessionStore::default()));
+    let room_id = owned_room_id!("!call:example.org");
+    let content: super::keys::ToDeviceCallEncryptionKeysEventContent =
+        serde_json::from_value(json!({
+            "keys": {"index": 1, "key": "ag8zYq5ohmf0xrnZrzJ2Bw=="},
+            "room_id": room_id,
+            "member": {"claimed_device_id": "DEVICE"},
+            "session": {"call_id": "", "application": "m.call", "scope": "m.room"},
+            "sent_ts": 1
+        }))
+        .unwrap();
+    let mut state = State::new(
+        member(CallMode::Compatibility, 1, &[]),
+        Vec::new(),
+        super::StickyMemberships::default(),
+        &room_id,
+        false,
+        None,
+        false,
+    );
+    state.pending_keys = vec![super::PendingKey {
+        sender: owned_user_id!("@user:example.org"),
+        device: owned_device_id!("DEVICE"),
+        content,
+        received: super::keys::now_ms() - super::UNRESOLVED_KEY_REPORT_MS,
+        reported: false,
+    }];
+
+    super::emit_pending(&core, 1, CallSessionId(1), &room_id, &mut state);
+
+    assert_eq!(state.pending_keys.len(), 1);
+    assert!(state.pending_keys[0].reported);
+    assert_eq!(
+        super::unresolved_reason(&state.pending_keys[0], &state.members),
+        "no membership for the sending device"
+    );
+    assert_eq!(
+        events.try_recv().unwrap_err(),
+        tokio::sync::mpsc::error::TryRecvError::Empty
+    );
 }
 
 #[tokio::test]
@@ -484,14 +591,19 @@ async fn an_element_call_focus_without_an_alias_still_counts() {
 async fn refresh_fixture(
     created_ts: u64,
     observed: bool,
-) -> (Arc<Core>, matrix_sdk::Room, Mutex<State>) {
+) -> (
+    Arc<Core>,
+    tokio::sync::mpsc::UnboundedReceiver<crate::protocol::CoreEvent>,
+    matrix_sdk::Room,
+    Mutex<State>,
+) {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
     let room_id = owned_room_id!("!call:example.org");
     server.sync_joined_room(&client, &room_id).await;
     let room = client.get_room(&room_id).unwrap();
     let sync_service = Arc::new(SyncService::builder(client.clone()).build().await.unwrap());
-    let (core, _events) = Core::new("test", Box::new(MemorySessionStore::default()));
+    let (core, events) = Core::new("test", Box::new(MemorySessionStore::default()));
     *core.session.write().await = Some(Session {
         account_id: "test".to_owned(),
         client,
@@ -538,18 +650,25 @@ async fn refresh_fixture(
     );
     (
         core,
+        events,
         room,
         Mutex::new(State {
             own,
             sticky: super::StickyMemberships::default(),
             members: Vec::new(),
+            emitted_members: None,
             backends,
             pending_keys: Vec::new(),
+            latest_keys: HashMap::new(),
+            member_first_seen: HashMap::new(),
+            silent_reported: HashSet::new(),
+            rotation_due_ms: None,
             distributor: None,
             own_observed: observed,
             revision: 0,
             intent: None,
             slot_closed: false,
+            slot_closed_midcall: false,
             slot_checked_ms: 0,
             publisher_attempt_ms: 0,
         }),
@@ -558,19 +677,33 @@ async fn refresh_fixture(
 
 #[tokio::test]
 async fn refresh_stops_when_an_observed_membership_disappears() {
-    let (core, room, state) = refresh_fixture(super::keys::now_ms(), true).await;
+    let (core, _events, room, state) = refresh_fixture(super::keys::now_ms(), true).await;
     assert!(!refresh(&core, 0, CallSessionId(1), &room, &state).await);
 }
 
 #[tokio::test]
 async fn refresh_allows_a_recent_unobserved_membership() {
-    let (core, room, state) = refresh_fixture(super::keys::now_ms(), false).await;
+    let (core, _events, room, state) = refresh_fixture(super::keys::now_ms(), false).await;
     assert!(refresh(&core, 0, CallSessionId(1), &room, &state).await);
 }
 
 #[tokio::test]
+async fn an_unchanged_roster_is_emitted_once() {
+    let (core, mut events, room, state) = refresh_fixture(super::keys::now_ms(), false).await;
+    assert!(refresh(&core, 1, CallSessionId(1), &room, &state).await);
+    assert!(refresh(&core, 1, CallSessionId(1), &room, &state).await);
+    let mut rosters = 0;
+    while let Ok(event) = events.try_recv() {
+        if matches!(event, crate::protocol::CoreEvent::CallMembers { .. }) {
+            rosters += 1;
+        }
+    }
+    assert_eq!(rosters, 1);
+}
+
+#[tokio::test]
 async fn refresh_stops_when_an_unobserved_membership_is_old() {
-    let (core, room, state) =
+    let (core, _events, room, state) =
         refresh_fixture(super::keys::now_ms().saturating_sub(30_001), false).await;
     assert!(!refresh(&core, 0, CallSessionId(1), &room, &state).await);
 }
@@ -615,12 +748,54 @@ async fn schedule_hangup_does_not_write_when_delayed_events_are_unsupported() {
 }
 
 #[test]
+fn matrix2_and_legacy_membership_content_differ_in_shape() {
+    let room_id = owned_room_id!("!room:example.org");
+    let mut own = member(CallMode::Matrix2, 1_000, &["https://sfu.example.org"]);
+    own.member_id = Some("m1".to_owned());
+    own.screen_sharing = true;
+    assert_eq!(
+        content_at(&room_id, &own, Some(CallIntent::Video), 2_000),
+        serde_json::json!({
+            "application": {"type": "m.call", "m.call.intent": "video"},
+            "slot_id": "m.call#ROOM",
+            "member": {"user_id": "@user:example.org", "device_id": "DEVICE", "id": "m1"},
+            "transports": {
+                "published": [{"type": "livekit", "livekit_service_url": "https://sfu.example.org"}],
+                "can_subscribe": ["livekit"],
+            },
+            "versions": [],
+            "msc4354_sticky_key": "m1",
+            "org.sable.screen_sharing": true,
+        })
+    );
+    own.mode = CallMode::Compatibility;
+    own.screen_sharing = false;
+    assert_eq!(
+        content_at(&room_id, &own, Some(CallIntent::Audio), 2_000),
+        serde_json::json!({
+            "application": "m.call", "call_id": "", "scope": "m.room",
+            "device_id": "DEVICE",
+            "membershipID": "@user:example.org:DEVICE",
+            "created_ts": 1_000,
+            "expires": 14_401_000,
+            "focus_active": {"type": "livekit", "focus_selection": "multi_sfu"},
+            "foci_preferred": [{
+                "type": "livekit",
+                "livekit_service_url": "https://sfu.example.org",
+                "livekit_alias": "!room:example.org",
+            }],
+            "m.call.intent": "audio",
+        })
+    );
+}
+
+#[test]
 fn renewal_extends_membership_beyond_four_hours_without_changing_session_identity() {
     let created = 1_000;
     let now = created + 5 * 60 * 60 * 1000;
     for mode in [CallMode::Legacy, CallMode::Compatibility] {
         let member = member(mode, created, &["https://sfu.example.org"]);
-        let body = super::content_at(&owned_room_id!("!room:example.org"), &member, None, now);
+        let body = content_at(&owned_room_id!("!room:example.org"), &member, None, now);
         assert_eq!(body["created_ts"], created);
         assert_eq!(body["membershipID"], member.identity);
         assert_eq!(
@@ -653,6 +828,38 @@ fn the_call_intent_rides_where_each_membership_format_reads_it() {
     assert!(sticky.get("m.call.intent").is_none());
 }
 
+#[test]
+fn a_screen_share_flag_is_top_level_and_leaves_the_membership_untouched() {
+    let room_id = owned_room_id!("!room:example.org");
+    for mode in [CallMode::Compatibility, CallMode::Matrix2] {
+        let mut own = member(mode, 7, &["https://sfu.example.org"]);
+        own.member_id = Some("member".to_owned());
+        let quiet = content(&room_id, &own, None);
+        assert!(quiet.get("org.sable.screen_sharing").is_none());
+
+        own.screen_sharing = true;
+        let sharing = content(&room_id, &own, None);
+        assert_eq!(sharing["org.sable.screen_sharing"], true);
+
+        let mut stripped = sharing.clone();
+        stripped
+            .as_object_mut()
+            .unwrap()
+            .remove("org.sable.screen_sharing");
+        assert_eq!(stripped, quiet);
+    }
+}
+
+#[test]
+fn a_republish_while_sharing_keeps_created_ts() {
+    let room_id = owned_room_id!("!room:example.org");
+    let mut own = member(CallMode::Compatibility, 4_000, &["https://sfu.example.org"]);
+    own.screen_sharing = true;
+    let body = content_at(&room_id, &own, None, 9_000);
+    assert_eq!(body["created_ts"], 4_000);
+    assert_eq!(body["org.sable.screen_sharing"], true);
+}
+
 async fn legacy_move_fixture(
     can_publish: bool,
 ) -> (
@@ -667,7 +874,11 @@ async fn legacy_move_fixture(
     use wiremock::{Mock, ResponseTemplate};
 
     let server = MatrixMockServer::new().await;
-    let client = server.client_builder().build().await;
+    let client = server
+        .client_builder()
+        .on_builder(|builder| builder.disable_well_known_lookup(true))
+        .build()
+        .await;
     let room_id = owned_room_id!("!call:example.org");
     server.sync_joined_room(&client, &room_id).await;
     let room = client.get_room(&room_id).unwrap();
@@ -841,4 +1052,203 @@ async fn a_legacy_call_subscribes_to_another_focus_under_its_publishing_identity
     .unwrap();
 
     assert_eq!(provisioned.identity, own.identity);
+}
+
+#[tokio::test]
+async fn a_key_without_a_sent_timestamp_is_accepted() {
+    let (core, mut events) = Core::new("test", Box::new(MemorySessionStore::default()));
+    let room_id = owned_room_id!("!call:example.org");
+    let content = serde_json::from_value(serde_json::json!({
+        "room_id": room_id,
+        "member_id": "member",
+        "media_key": {
+            "index": 4,
+            "key": base64::engine::general_purpose::STANDARD.encode([7u8; 16])
+        },
+        "member": { "claimed_device_id": "DEVICE" }
+    }))
+    .unwrap();
+    let mut state = State::new(
+        member(CallMode::Compatibility, 1, &[]),
+        vec![member(
+            CallMode::Compatibility,
+            1,
+            &["https://sfu.example.org"],
+        )],
+        super::StickyMemberships::default(),
+        &room_id,
+        false,
+        None,
+        false,
+    );
+    state.pending_keys = vec![super::PendingKey {
+        sender: owned_user_id!("@user:example.org"),
+        device: owned_device_id!("DEVICE"),
+        content,
+        received: super::keys::now_ms(),
+        reported: false,
+    }];
+
+    super::emit_pending(&core, 1, CallSessionId(1), &room_id, &mut state);
+
+    assert!(matches!(
+        events.try_recv(),
+        Ok(crate::protocol::CoreEvent::CallEncryptionKey { key_index: 4, .. })
+    ));
+}
+
+#[test]
+fn a_member_that_sends_no_key_is_reported_once_after_a_wait() {
+    let room_id = owned_room_id!("!call:example.org");
+    let mut peer = member(CallMode::Compatibility, 1, &["https://sfu.example.org"]);
+    peer.user_id = owned_user_id!("@peer:example.org");
+    peer.device_id = owned_device_id!("PEER");
+    peer.identity = "@peer:example.org:PEER".to_owned();
+    let mut state = State::new(
+        member(CallMode::Compatibility, 1, &[]),
+        vec![peer.clone()],
+        super::StickyMemberships::default(),
+        &room_id,
+        true,
+        None,
+        false,
+    );
+
+    super::report_silent_members(&mut state, 1_000);
+    assert!(state.silent_reported.is_empty(), "it only just arrived");
+
+    super::report_silent_members(&mut state, 1_000 + super::SILENT_MEMBER_REPORT_MS);
+    assert!(state.silent_reported.contains(&peer.identity));
+
+    state.silent_reported.clear();
+    state
+        .latest_keys
+        .insert((peer.identity, 0), (1, vec![0; 16]));
+    super::report_silent_members(&mut state, 1_000 + 2 * super::SILENT_MEMBER_REPORT_MS);
+    assert!(state.silent_reported.is_empty(), "its key arrived");
+}
+
+#[tokio::test]
+async fn a_key_sent_again_unchanged_is_not_applied_twice() {
+    let (core, mut events) = Core::new("test", Box::new(MemorySessionStore::default()));
+    let room_id = owned_room_id!("!call:example.org");
+    let pending = |sent_ts, fill: u8| super::PendingKey {
+        sender: owned_user_id!("@user:example.org"),
+        device: owned_device_id!("DEVICE"),
+        content: super::keys::ToDeviceCallEncryptionKeysEventContent {
+            media_key: Some(super::keys::KeyPayload {
+                index: 3,
+                key: base64::engine::general_purpose::STANDARD_NO_PAD.encode([fill; 16]),
+            }),
+            keys: None,
+            room_id: room_id.clone(),
+            member_id: None,
+            member: None,
+            session: super::keys::SessionRef::default(),
+            sent_ts: Some(sent_ts),
+        },
+        received: super::keys::now_ms(),
+        reported: false,
+    };
+    let mut state = State::new(
+        member(CallMode::Compatibility, 1, &[]),
+        vec![member(
+            CallMode::Compatibility,
+            1,
+            &["https://sfu.example.org"],
+        )],
+        super::StickyMemberships::default(),
+        &room_id,
+        false,
+        None,
+        false,
+    );
+
+    state.pending_keys = vec![pending(100, 1)];
+    super::emit_pending(&core, 1, CallSessionId(1), &room_id, &mut state);
+    assert!(matches!(
+        events.try_recv(),
+        Ok(crate::protocol::CoreEvent::CallEncryptionKey { .. })
+    ));
+
+    state.pending_keys = vec![pending(200, 1)];
+    super::emit_pending(&core, 1, CallSessionId(1), &room_id, &mut state);
+    assert_eq!(
+        events.try_recv().unwrap_err(),
+        tokio::sync::mpsc::error::TryRecvError::Empty,
+        "the same key at the same index changes nothing"
+    );
+
+    state.pending_keys = vec![pending(300, 2)];
+    super::emit_pending(&core, 1, CallSessionId(1), &room_id, &mut state);
+    assert!(
+        matches!(
+            events.try_recv(),
+            Ok(crate::protocol::CoreEvent::CallEncryptionKey { .. })
+        ),
+        "a different key at the same index is applied"
+    );
+}
+
+#[tokio::test]
+async fn a_key_older_than_one_already_emitted_for_the_same_index_is_dropped() {
+    let (core, mut events) = Core::new("test", Box::new(MemorySessionStore::default()));
+    let room_id = owned_room_id!("!call:example.org");
+    let pending = |sent_ts, fill: u8| super::PendingKey {
+        sender: owned_user_id!("@user:example.org"),
+        device: owned_device_id!("DEVICE"),
+        content: super::keys::ToDeviceCallEncryptionKeysEventContent {
+            media_key: None,
+            keys: Some(super::keys::KeyPayload {
+                index: 0,
+                key: base64::engine::general_purpose::STANDARD.encode([fill; 16]),
+            }),
+            room_id: room_id.clone(),
+            member_id: None,
+            member: Some(super::keys::MemberRef {
+                claimed_device_id: "DEVICE".to_owned(),
+                id: None,
+            }),
+            session: super::keys::SessionRef::default(),
+            sent_ts: Some(sent_ts),
+        },
+        received: super::keys::now_ms(),
+        reported: false,
+    };
+    let mut state = State::new(
+        member(CallMode::Compatibility, 1, &[]),
+        vec![member(
+            CallMode::Compatibility,
+            1,
+            &["https://sfu.example.org"],
+        )],
+        super::StickyMemberships::default(),
+        &room_id,
+        false,
+        None,
+        false,
+    );
+
+    state.pending_keys = vec![pending(200, 2), pending(100, 1)];
+    super::emit_pending(&core, 1, CallSessionId(1), &room_id, &mut state);
+
+    let Ok(crate::protocol::CoreEvent::CallEncryptionKey { key, .. }) = events.try_recv() else {
+        panic!("the newer key is emitted");
+    };
+    assert_eq!(
+        key,
+        base64::engine::general_purpose::STANDARD.encode([2u8; 16])
+    );
+    assert_eq!(
+        events.try_recv().unwrap_err(),
+        tokio::sync::mpsc::error::TryRecvError::Empty,
+        "the older key for the same index is dropped"
+    );
+
+    state.pending_keys.push(pending(300, 3));
+    super::emit_pending(&core, 1, CallSessionId(1), &room_id, &mut state);
+    assert!(matches!(
+        events.try_recv(),
+        Ok(crate::protocol::CoreEvent::CallEncryptionKey { .. })
+    ));
 }

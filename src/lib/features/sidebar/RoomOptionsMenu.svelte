@@ -1,6 +1,7 @@
 <script lang="ts">
+  import { copyText } from '#lib/platform/clipboard.js';
   import { goto } from '$app/navigation';
-  import type { RoomSummary, RoomTag } from '#src/generated/protocol';
+  import type { RoomListItemView, RoomTag } from '#src/generated/protocol';
   import ArrowLineUpIcon from 'phosphor-svelte/lib/ArrowLineUpIcon';
   import ArrowUpIcon from 'phosphor-svelte/lib/ArrowUpIcon';
   import ArrowDownIcon from 'phosphor-svelte/lib/ArrowDownIcon';
@@ -27,6 +28,7 @@
   import { spaceTimelinePath } from '#lib/features/room/event-timeline.js';
 
   import { useCoreClient } from '#lib/core/context.js';
+  import { joinRoom } from '#lib/core/api/rooms.js';
   import { i18n } from '#lib/i18n.js';
   import { copyRoomLink } from '#lib/rooms/permalink.js';
   import { isQuiet, setQuiet } from '#lib/rooms/quiet-rooms.svelte.js';
@@ -47,15 +49,15 @@
   import { markRoomUnread, markRoomsRead, spaceDescendantRooms } from './nav-rooms.js';
 
   interface Props {
-    room: RoomSummary;
+    room: RoomListItemView;
     parentSpaceId?: string | null;
     open?: boolean;
     anchor?: HTMLElement | CursorAnchor | null;
     align?: 'start' | 'end';
     side?: 'bottom' | 'right';
-    onSettings: (room: RoomSummary) => void;
-    onLeave: (room: RoomSummary) => void;
-    onLobby?: (room: RoomSummary) => void;
+    onSettings: (room: RoomListItemView) => void;
+    onLeave: (room: RoomListItemView) => void;
+    onLobby?: (room: RoomListItemView) => void;
     onMoveUp?: () => void;
     onMoveDown?: () => void;
     onUnpin?: () => void;
@@ -89,7 +91,7 @@
   let addableSpaces = $derived(
     roomList.rooms.filter(
       (candidate) =>
-        candidate.is_space &&
+        candidate.room_kind === 'space' &&
         candidate.state === 'joined' &&
         candidate.room_id !== room.room_id &&
         !candidate.space_children.some((child) => child.room_id === room.room_id) &&
@@ -98,7 +100,7 @@
   );
 
   let readable = $derived(
-    room.is_space ? spaceDescendantRooms(roomList.rooms, room.room_id) : [room]
+    room.room_kind === 'space' ? spaceDescendantRooms(roomList.rooms, room.room_id) : [room]
   );
   let unread = $derived(
     readable.some((entry) => entry.unread > 0 || entry.highlight > 0 || entry.marked_unread)
@@ -117,8 +119,8 @@
     const run = ++manageableRun;
     manageable.clear();
     for (const spaceId of candidates) {
-      void core.commands
-        .roomPermissions(spaceId)
+      void core.rpc.members
+        .permissions({ room_id: spaceId })
         .then((permissions) => {
           if (run !== manageableRun || !permissions.can_manage_children) return;
           manageable.add(spaceId);
@@ -132,8 +134,8 @@
   function readInvitePermission(): void {
     const run = ++inviteRun;
     canInvite = false;
-    void core.commands
-      .roomPermissions(room.room_id)
+    void core.rpc.members
+      .permissions({ room_id: room.room_id })
       .then((permissions) => {
         if (run !== inviteRun) return;
         canInvite = permissions.can_invite;
@@ -148,20 +150,20 @@
     parentSpace !== null && manageable.has(parentSpace.room_id) ? parentSpace : null
   );
 
-  let joinableParents = $state<{ room_id: string; via: string[]; name: string | null }[]>([]);
+  let joinableParents = $state.raw<{ room_id: string; via: string[]; name: string | null }[]>([]);
   let parentsRun = 0;
 
   function readParents(): void {
     const run = ++parentsRun;
     joinableParents = [];
-    void core.commands
-      .unjoinedSpaceParents(room.room_id)
+    void core.rpc.spaces
+      .unjoinedSpaceParents({ room_id: room.room_id })
       .then((parents) => {
         if (run !== parentsRun) return;
         joinableParents = parents.map((parent) => ({ ...parent, name: null }));
         for (const parent of parents) {
-          void core.commands
-            .roomPreview(parent.room_id, parent.via)
+          void core.rpc.rooms
+            .preview({ address: parent.room_id, via: parent.via })
             .then((preview) => {
               if (run !== parentsRun) return;
               joinableParents = joinableParents.map((entry) =>
@@ -179,7 +181,7 @@
   }
 
   function joinParent(parent: { room_id: string; via: string[] }): void {
-    void core.commands.joinRoom(parent.room_id, parent.via).catch(report);
+    void joinRoom(core.rpc, parent.room_id, parent.via).catch(report);
   }
 
   let opened = $state(false);
@@ -198,51 +200,57 @@
 
   function report(error: unknown): void {
     console.warn('[sable room] room action failed', error);
-    toasts.error($i18n.t('errors.actionFailed'));
+    toasts.error(i18n.t('errors.actionFailed'));
   }
 
   function toggleTag(tag: RoomTag, current: boolean): void {
     const next = !current;
     pendingTags.set(tag, next);
-    void core.commands.setRoomTag(room.room_id, tag, next).catch((error: unknown) => {
-      pendingTags.delete(tag);
-      report(error);
-    });
+    void core.rpc.rooms
+      .setTag({ room_id: room.room_id, tag, set: next })
+      .catch((error: unknown) => {
+        pendingTags.delete(tag);
+        report(error);
+      });
   }
 
   /** One-directional, like v1: a DM becomes a group. */
   function convertToGroup(): void {
-    void core.commands.setDirect(room.room_id, false).catch(report);
+    void core.rpc.account
+      .setDirect({ room_id: room.room_id, direct: false, user_id: null })
+      .catch(report);
   }
 
   function addToSpaces(spaceIds: string[]): void {
     for (const spaceId of spaceIds) {
-      void core.commands.addToSpace(spaceId, room.room_id).catch(report);
+      void core.rpc.spaces
+        .add({ space_id: spaceId, room_id: room.room_id, suggested: null })
+        .catch(report);
     }
   }
 
   function removeFromSpace(spaceId: string): void {
-    void core.commands.removeFromSpace(spaceId, room.room_id).catch(report);
+    void core.rpc.spaces.remove({ space_id: spaceId, room_id: room.room_id }).catch(report);
   }
 
   function markRead(): void {
-    markRoomsRead(readable, core.commands, readReceiptIsPrivate());
+    markRoomsRead(readable, core.rpc.timeline, readReceiptIsPrivate());
   }
 
   function markUnread(): void {
-    markRoomUnread(room.room_id, core.commands);
+    markRoomUnread(room.room_id, core.rpc.timeline);
   }
 
   async function copyLink(): Promise<void> {
-    if (!(await copyRoomLink(core, room))) toasts.error($i18n.t('errors.copyFailed'));
+    if (!(await copyRoomLink(core, room))) toasts.error(i18n.t('errors.copyFailed'));
   }
 
   async function copyId(): Promise<void> {
     try {
-      await navigator.clipboard.writeText(room.room_id);
+      await copyText(room.room_id);
     } catch (error) {
       console.debug('[sable room] copy id failed', error);
-      toasts.error($i18n.t('errors.copyFailed'));
+      toasts.error(i18n.t('errors.copyFailed'));
     }
   }
 </script>
@@ -252,15 +260,15 @@
     {...props}
     type="button"
     class="room-options-trigger selection-open"
-    aria-label={$i18n.t('room.menuLabel')}
+    aria-label={i18n.t('room.menuLabel')}
   >
-    <DotsThreeVerticalIcon weight={open ? 'fill' : 'regular'} />
+    <DotsThreeVerticalIcon />
   </button>
 {/snippet}
 
 <ActionMenu
   bind:open
-  label={$i18n.t('room.menuLabel')}
+  label={i18n.t('room.menuLabel')}
   class="room-options-menu"
   {anchor}
   {side}
@@ -269,15 +277,15 @@
   trigger={anchor ? undefined : optionsTrigger}
 >
   <IconContext values={{ 'aria-hidden': 'true' }}>
-    {#if room.is_space || unread}
+    {#if room.room_kind === 'space' || unread}
       <ActionMenuItem disabled={!unread} onSelect={markRead}>
         <ChecksIcon />
-        {$i18n.t('room.menuMarkRead')}
+        {i18n.t('common.markAsRead')}
       </ActionMenuItem>
     {:else}
       <ActionMenuItem onSelect={markUnread}>
         <CircleDashedIcon />
-        {$i18n.t('room.menuMarkUnread')}
+        {i18n.t('room.menuMarkUnread')}
       </ActionMenuItem>
     {/if}
     <ActionMenuSeparator />
@@ -287,7 +295,7 @@
       }}
     >
       <StarIcon weight={favourite ? 'fill' : 'regular'} />
-      {$i18n.t('room.menuFavourite')}
+      {i18n.t('room.menuFavourite')}
     </ActionMenuItem>
     <ActionMenuItem
       disabled={quietBySpace}
@@ -301,16 +309,16 @@
         <EyeSlashIcon />
       {/if}
       {quietBySpace
-        ? $i18n.t('room.menuUnreadHiddenBySpace')
+        ? i18n.t('room.menuUnreadHiddenBySpace')
         : quiet
-          ? $i18n.t('room.menuShowUnread')
-          : $i18n.t('room.menuHideUnread')}
+          ? i18n.t('room.menuShowUnread')
+          : i18n.t('room.menuHideUnread')}
     </ActionMenuItem>
 
     {#if room.is_direct}
       <ActionMenuItem onSelect={convertToGroup}>
         <ChatCircleIcon />
-        {$i18n.t('room.menuConvertToGroup')}
+        {i18n.t('room.menuConvertToGroup')}
       </ActionMenuItem>
     {/if}
 
@@ -323,36 +331,37 @@
       }}
     >
       <UserPlusIcon />
-      {$i18n.t('room.menuInvite')}
+      {i18n.t('room.menuInvite')}
     </ActionMenuItem>
-    {#if room.is_space && onLobby}
+    {#if room.room_kind === 'space' && onLobby}
       <ActionMenuItem
         onSelect={() => {
           onLobby(room);
         }}
       >
         <FlagIcon />
-        {$i18n.t('nav.lobby')}
+        {i18n.t('nav.lobby')}
       </ActionMenuItem>
     {/if}
-    {#if room.is_space}
+    {#if room.room_kind === 'space'}
       <ActionMenuItem
         onSelect={() => {
-          void goto(spaceTimelinePath(room));
+          // eslint-disable-next-line svelte/no-navigation-without-resolve -- spaceTimelinePath() resolves the route itself
+          void goto(spaceTimelinePath(room, roomList.rooms));
         }}
       >
         <ListBulletsIcon />
-        {$i18n.t('room.menuShowSpaceTimeline')}
+        {i18n.t('room.menuShowSpaceTimeline')}
       </ActionMenuItem>
     {/if}
     <ActionMenuItem onSelect={copyLink}>
       <LinkIcon />
-      {$i18n.t('room.menuCopyLink')}
+      {i18n.t('room.menuCopyLink')}
     </ActionMenuItem>
     {#if preferences.developerTools}
       <ActionMenuItem onSelect={copyId}>
         <FingerprintIcon />
-        {$i18n.t('room.menuCopyId')}
+        {i18n.t('room.menuCopyId')}
       </ActionMenuItem>
     {/if}
     <ActionMenuItem
@@ -361,37 +370,35 @@
       }}
     >
       <GearIcon />
-      {$i18n.t('room.menuSettings')}
+      {i18n.t('room.menuSettings')}
     </ActionMenuItem>
 
     {#if onMoveUp}
       <ActionMenuItem onSelect={onMoveUp}>
         <ArrowUpIcon />
-        {$i18n.t('room.menuMoveUp')}
+        {i18n.t('room.menuMoveUp')}
       </ActionMenuItem>
     {/if}
     {#if onMoveDown}
       <ActionMenuItem onSelect={onMoveDown}>
         <ArrowDownIcon />
-        {$i18n.t('room.menuMoveDown')}
+        {i18n.t('room.menuMoveDown')}
       </ActionMenuItem>
     {/if}
     {#if onUnpin}
       <ActionMenuItem onSelect={onUnpin}>
         <PushPinSlashIcon />
-        {$i18n.t('nav.unpinFromSidebar')}
+        {i18n.t('nav.unpinFromSidebar')}
       </ActionMenuItem>
     {/if}
     {#if onRemoveFromFolder}
       <ActionMenuItem onSelect={onRemoveFromFolder}>
         <ArrowLineUpIcon />
-        {$i18n.t('nav.folderRemoveSpace')}
+        {i18n.t('nav.folderRemoveSpace')}
       </ActionMenuItem>
     {/if}
 
-    {#if !room.is_space}
-      <RoomNotificationSubmenu roomId={room.room_id} active={opened} />
-    {/if}
+    <RoomNotificationSubmenu roomId={room.room_id} active={opened} />
 
     {#if offeredSpaces.length > 0}
       <ActionMenuItem
@@ -400,7 +407,7 @@
         }}
       >
         <UsersThreeIcon />
-        {$i18n.t('room.menuAddToSpace')}
+        {i18n.t('room.createParentLabel')}
       </ActionMenuItem>
     {/if}
 
@@ -411,18 +418,18 @@
         }}
       >
         <SignInIcon />
-        {$i18n.t('room.menuJoinParentSpace', { space: parent.name ?? parent.room_id })}
+        {i18n.t('room.menuJoinParentSpace', { space: parent.name ?? parent.room_id })}
       </ActionMenuItem>
     {/each}
 
-    {#if !room.is_space && removableParent}
+    {#if room.room_kind !== 'space' && removableParent}
       <ActionMenuItem
         onSelect={() => {
           removeFromSpace(removableParent.room_id);
         }}
       >
         <UsersThreeIcon />
-        {$i18n.t('room.menuRemoveFromSpace', {
+        {i18n.t('room.menuRemoveFromSpace', {
           space: removableParent.name ?? removableParent.room_id,
         })}
       </ActionMenuItem>
@@ -435,7 +442,7 @@
       }}
     >
       <SignOutIcon />
-      {room.is_space ? $i18n.t('room.menuLeaveSpace') : $i18n.t('room.menuLeave')}
+      {room.room_kind === 'space' ? i18n.t('room.menuLeaveSpace') : i18n.t('room.menuLeave')}
     </ActionMenuItem>
   </IconContext>
 </ActionMenu>
@@ -461,7 +468,7 @@
 <style>
   :global(.room-options-menu) {
     --menu-min-width: 12rem;
-    --menu-max-height: 20rem;
+    --menu-max-height: var(--bits-floating-available-height, 100dvh);
   }
 
   :global(.room-options-trigger) {

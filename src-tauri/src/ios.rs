@@ -1,8 +1,8 @@
 use std::{
     ffi::{CString, OsStr},
     sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -81,9 +81,10 @@ pub fn write_push_policy(
     encrypted_content: bool,
     sounds: bool,
     notify_once: bool,
+    clear_on_read: bool,
 ) -> Result<(), String> {
     let root = shared_store_dir()?;
-    let value = serde_json::json!({"enabled":enabled,"content":content,"encrypted_content":encrypted_content,"sounds":sounds,"notify_once":notify_once});
+    let value = serde_json::json!({"enabled":enabled,"content":content,"encrypted_content":encrypted_content,"sounds":sounds,"notify_once":notify_once,"clear_on_read":clear_on_read});
     let temporary = root.join("push-policy.json.tmp");
     std::fs::write(&temporary, value.to_string()).map_err(|error| error.to_string())?;
     std::fs::rename(temporary, root.join("push-policy.json")).map_err(|error| error.to_string())
@@ -187,10 +188,7 @@ pub async fn save_media_to_photos(request: tauri::ipc::Request<'_>) -> Result<()
         .map_err(|error| error.to_string())?
 }
 
-// iOS shows a form accessory bar (prev/next arrows and Done) above the keyboard
-// for web inputs. WKWebView exposes no API to turn it off, so swap the private
-// WKContentView's class for a runtime subclass whose inputAccessoryView is nil,
-// the same approach as Capacitor's hideFormAccessoryBar.
+// WKWebView cannot hide the form accessory bar, so swap WKContentView's class for a subclass whose inputAccessoryView is nil.
 extern "C-unwind" fn input_accessory_view_nil(_this: &AnyObject, _cmd: Sel) -> *mut AnyObject {
     std::ptr::null_mut()
 }
@@ -240,6 +238,103 @@ pub fn set_system_bars_hidden(window: tauri::WebviewWindow, hidden: bool) -> Res
             let _: () = msg_send![&*controller, setPrefersHomeIndicatorAutoHidden: hidden];
         })
         .map_err(|error| error.to_string())
+}
+
+#[link(name = "UIKit", kind = "framework")]
+unsafe extern "C" {
+    static UIBackgroundTaskInvalid: usize;
+    static UIApplicationWillResignActiveNotification: &'static NSString;
+    static UIApplicationDidEnterBackgroundNotification: &'static NSString;
+    static UIApplicationDidBecomeActiveNotification: &'static NSString;
+}
+
+const UI_APPLICATION_STATE_BACKGROUND: isize = 2;
+
+/// A push or call wake launches the app here without it ever resigning active.
+pub(crate) fn in_background() -> bool {
+    let state: isize = unsafe { msg_send![shared_application(), applicationState] };
+    state == UI_APPLICATION_STATE_BACKGROUND
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Lifecycle {
+    ResignActive,
+    EnterBackground,
+    BecomeActive,
+}
+
+/// tao's `Focused` follows the key window, which also changes in the background.
+pub(crate) fn observe_lifecycle(handler: impl Fn(Lifecycle) + 'static) {
+    let handler = std::rc::Rc::new(handler);
+    let center: &AnyObject =
+        unsafe { msg_send![objc2::class!(NSNotificationCenter), defaultCenter] };
+    let queue: &AnyObject = unsafe { msg_send![objc2::class!(NSOperationQueue), mainQueue] };
+    let observed = unsafe {
+        [
+            (
+                UIApplicationWillResignActiveNotification,
+                Lifecycle::ResignActive,
+            ),
+            (
+                UIApplicationDidEnterBackgroundNotification,
+                Lifecycle::EnterBackground,
+            ),
+            (
+                UIApplicationDidBecomeActiveNotification,
+                Lifecycle::BecomeActive,
+            ),
+        ]
+    };
+    for (name, change) in observed {
+        let handler = handler.clone();
+        let block = RcBlock::new(move |_: *mut AnyObject| (*handler)(change));
+        let _: objc2::rc::Retained<AnyObject> = unsafe {
+            msg_send![center,
+                addObserverForName: name,
+                object: std::ptr::null::<AnyObject>(),
+                queue: queue,
+                usingBlock: &*block
+            ]
+        };
+    }
+}
+
+/// iOS kills a process suspended mid-write to the App Group stores.
+pub(crate) struct BackgroundTask(Arc<AtomicUsize>);
+
+impl BackgroundTask {
+    /// Call on the main thread so the expiration handler cannot run before the identifier is stored.
+    pub(crate) fn begin(name: &str) -> Self {
+        let task = Arc::new(AtomicUsize::new(unsafe { UIBackgroundTaskInvalid }));
+        let expired = task.clone();
+        let handler = RcBlock::new(move || end_background_task(&expired));
+        let name = NSString::from_str(name);
+        let identifier: usize = unsafe {
+            msg_send![shared_application(), beginBackgroundTaskWithName: &*name, expirationHandler: &*handler]
+        };
+        task.store(identifier, Ordering::SeqCst);
+        Self(task)
+    }
+}
+
+impl Drop for BackgroundTask {
+    fn drop(&mut self) {
+        end_background_task(&self.0);
+    }
+}
+
+fn shared_application() -> &'static AnyObject {
+    unsafe { msg_send![objc2::class!(UIApplication), sharedApplication] }
+}
+
+fn end_background_task(task: &AtomicUsize) {
+    let invalid = unsafe { UIBackgroundTaskInvalid };
+    let identifier = task.swap(invalid, Ordering::SeqCst);
+    if identifier != invalid {
+        unsafe {
+            let _: () = msg_send![shared_application(), endBackgroundTask: identifier];
+        }
+    }
 }
 
 #[tauri::command]

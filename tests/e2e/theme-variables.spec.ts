@@ -62,6 +62,21 @@ for (const theme of ['light', 'dark'] as const) {
   }) => {
     await installRoomCore('ready');
     await installTheme(page, theme);
+    // A role colour outranks the theme's name colours, so Alice must have none.
+    await page.addInitScript(() => {
+      window.__e2eMembers = [
+        {
+          user_id: '@alice:example.test',
+          display_name: 'Alice',
+          avatar_url: null,
+          power_level: 0,
+          membership: 'join',
+          member_ts: null,
+          kicked: false,
+          service: false,
+        },
+      ];
+    });
     await page.goto('/settings/appearance');
     await expect(page.locator('body')).toHaveCSS('background-color', 'rgb(16, 16, 32)');
     expect(
@@ -89,11 +104,19 @@ for (const theme of ['light', 'dark'] as const) {
       input.removeAttribute('aria-invalid');
     });
     const mode = page.getByLabel('Light or dark', { exact: true });
-    await expect(mode).toHaveCSS('background-color', 'rgb(16, 16, 32)');
-    await expect(mode).toHaveCSS('color', 'rgb(221, 221, 221)');
+    const switcherTint = await page.evaluate(() => {
+      const probe = document.createElement('div');
+      probe.style.background = 'color-mix(in oklab, rgb(238, 238, 238) 12%, transparent)';
+      document.body.append(probe);
+      const tint = getComputedStyle(probe).backgroundColor;
+      probe.remove();
+      return tint;
+    });
+    await expect(mode).toHaveCSS('background-color', switcherTint);
+    await expect(mode).toHaveCSS('color', 'rgb(238, 238, 238)');
     await expect
       .soft(page.locator('.settings-section-content').first())
-      .toHaveCSS('color', 'rgb(255, 255, 255)');
+      .toHaveCSS('color', 'rgb(238, 238, 238)');
     await expect
       .soft(page.locator('.dialog-content-settings'))
       .toHaveCSS('box-shadow', 'rgb(18, 52, 86) 0px 4px 26px -6px');
@@ -194,6 +217,10 @@ for (const theme of ['light', 'dark'] as const) {
       'rgb(221, 221, 221)'
     );
     await page.goto('/profile');
-    await expect(page.locator('.profile-card')).toHaveCSS('color', 'rgb(238, 238, 238)');
+    await expect(page.locator('.profile-card')).toHaveCSS('background-color', 'rgb(32, 48, 64)');
+    await expect(page.locator('.profile-card')).toHaveCSS(
+      'color',
+      theme === 'light' ? 'rgb(0, 0, 0)' : 'rgb(255, 255, 255)'
+    );
   });
 }

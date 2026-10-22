@@ -1,17 +1,26 @@
 use matrix_sdk::ruma::OwnedUserId;
 use matrix_sdk::ruma::api::client::profile::{AvatarUrl, DisplayName};
 
+use sable_model::non_blank::NonBlank;
+use sable_model::truncate::truncate_graphemes;
+use serde::Deserialize as _;
+use serde_with::serde_as;
+
 use crate::protocol::{
     AnimalIdentityView, BrightnessView, ProfileFieldView, ProfileView, PronounView, StatusView,
 };
 
 type ProfileResponse = matrix_sdk::ruma::api::client::profile::get_profile::v3::Response;
 
+const STATUS_FIELD: &str = "org.matrix.msc4426.status";
+const STABLE_STATUS_FIELD: &str = "m.status";
+const COMMET_STATUS_FIELD: &str = "chat.commet.profile_status";
+
 const LEGACY_PROFILE_FIELDS: [&str; 4] = [
     "moe.sable.app.bio",
     "chat.commet.profile_bio",
-    "chat.commet.profile_status",
-    "org.matrix.msc4426.status",
+    COMMET_STATUS_FIELD,
+    STABLE_STATUS_FIELD,
 ];
 
 const SUPPORTER_FIELD: &str = "moe.sable.app.supporter_awards";
@@ -26,9 +35,9 @@ const RENDERED_PROFILE_FIELDS: [&str; 24] = [
     "chat.commet.profile_bio",
     "chat.commet.profile_color_scheme",
     "chat.commet.profile_banner",
-    "chat.commet.profile_status",
-    "m.status",
-    "org.matrix.msc4426.status",
+    COMMET_STATUS_FIELD,
+    STABLE_STATUS_FIELD,
+    STATUS_FIELD,
     "io.fsky.nyx.pronouns",
     "us.cloke.msc4175.tz",
     "m.tz",
@@ -60,10 +69,54 @@ fn profile_text(value: Option<&serde_json::Value>) -> Option<String> {
 }
 
 pub(crate) fn profile_hex_color(value: Option<&serde_json::Value>) -> Option<String> {
-    profile_text(value).filter(|color| {
-        let digits = color.strip_prefix('#').unwrap_or_default();
-        matches!(digits.len(), 3 | 6) && digits.bytes().all(|digit| digit.is_ascii_hexdigit())
-    })
+    profile_text(value).and_then(hex_color)
+}
+
+fn hex_color(color: String) -> Option<String> {
+    let digits = color.strip_prefix('#').unwrap_or_default();
+    (matches!(digits.len(), 3 | 6) && digits.bytes().all(|digit| digit.is_ascii_hexdigit()))
+        .then_some(color)
+}
+
+/// A structured field reads as its default unless it is an object.
+fn profile_object<T: serde::de::DeserializeOwned + Default>(
+    response: &ProfileResponse,
+    name: &str,
+) -> T {
+    profile_field(response, name)
+        .filter(|value| value.is_object())
+        .and_then(|value| T::deserialize(value).ok())
+        .unwrap_or_default()
+}
+
+#[serde_as]
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct ColorScheme {
+    #[serde_as(as = "NonBlank")]
+    brightness: Option<String>,
+    #[serde_as(as = "NonBlank")]
+    color: Option<String>,
+}
+
+#[serde_as]
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct StructuredStatus {
+    #[serde_as(as = "NonBlank")]
+    text: Option<String>,
+    #[serde_as(as = "NonBlank")]
+    emoji: Option<String>,
+}
+
+#[serde_as]
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct PronounSet {
+    #[serde_as(as = "NonBlank")]
+    summary: Option<String>,
+    #[serde_as(as = "NonBlank")]
+    language: Option<String>,
 }
 
 use crate::matrix_html::display_html;
@@ -103,11 +156,9 @@ fn profile_bio(response: &ProfileResponse) -> Option<String> {
 }
 
 fn profile_hero_brightness(response: &ProfileResponse) -> Option<BrightnessView> {
-    match profile_text(
-        profile_field(response, "chat.commet.profile_color_scheme")
-            .and_then(|scheme| scheme.get("brightness")),
-    )?
-    .as_str()
+    match profile_object::<ColorScheme>(response, "chat.commet.profile_color_scheme")
+        .brightness?
+        .as_str()
     {
         "light" => Some(BrightnessView::Light),
         "dark" => Some(BrightnessView::Dark),
@@ -116,35 +167,32 @@ fn profile_hero_brightness(response: &ProfileResponse) -> Option<BrightnessView>
 }
 
 fn profile_hero_color(response: &ProfileResponse) -> Option<String> {
-    profile_hex_color(
-        profile_field(response, "chat.commet.profile_color_scheme")
-            .and_then(|value| value.get("color")),
-    )
+    profile_object::<ColorScheme>(response, "chat.commet.profile_color_scheme")
+        .color
+        .and_then(hex_color)
 }
 
-/// MSC4426 first, then its unstable prefix, then the older single-string field.
+/// The MSC4426 unstable key first: `m.status` is not a spec identifier yet, so
+/// only older builds wrote it and it must not shadow the current status.
 fn profile_status(response: &ProfileResponse) -> Option<StatusView> {
-    const MAX_TEXT_CHARS: usize = 256;
-    const MAX_EMOJI_CHARS: usize = 32;
+    const MAX_TEXT_BYTES: usize = 256;
+    const MAX_EMOJI_BYTES: usize = 32;
 
+    let truncate = |text: String, max: usize| truncate_graphemes(&text, max).to_owned();
     let structured = |name| {
-        let field = profile_field(response, name);
-        let text = profile_text(field.and_then(|status| status.get("text")))?;
+        let status = profile_object::<StructuredStatus>(response, name);
         Some(StatusView {
-            text: text.chars().take(MAX_TEXT_CHARS).collect(),
-            emoji: profile_text(field.and_then(|status| status.get("emoji")))
-                .map(|emoji| emoji.chars().take(MAX_EMOJI_CHARS).collect()),
+            text: truncate(status.text?, MAX_TEXT_BYTES),
+            emoji: status.emoji.map(|emoji| truncate(emoji, MAX_EMOJI_BYTES)),
         })
     };
 
-    structured("m.status")
-        .or_else(|| structured("org.matrix.msc4426.status"))
+    structured(STATUS_FIELD)
+        .or_else(|| structured(STABLE_STATUS_FIELD))
         .or_else(|| {
-            profile_text(profile_field(response, "chat.commet.profile_status")).map(|text| {
-                StatusView {
-                    text: text.chars().take(MAX_TEXT_CHARS).collect(),
-                    emoji: None,
-                }
+            profile_text(profile_field(response, COMMET_STATUS_FIELD)).map(|text| StatusView {
+                text: truncate(text, MAX_TEXT_BYTES),
+                emoji: None,
             })
         })
 }
@@ -157,14 +205,12 @@ pub(crate) fn pronoun_sets(value: Option<&serde_json::Value>) -> Vec<PronounView
         .and_then(serde_json::Value::as_array)
         .map(|sets| {
             sets.iter()
+                .filter(|set| set.is_object())
                 .filter_map(|set| {
+                    let set = PronounSet::deserialize(set).ok()?;
                     Some(PronounView {
-                        summary: profile_text(set.get("summary"))?
-                            .chars()
-                            .take(MAX_SUMMARY_CHARS)
-                            .collect(),
-                        language: profile_text(set.get("language"))
-                            .map(|language| language.to_lowercase()),
+                        summary: set.summary?.chars().take(MAX_SUMMARY_CHARS).collect(),
+                        language: set.language.map(|language| language.to_lowercase()),
                     })
                 })
                 .collect()
@@ -177,8 +223,8 @@ fn profile_pronouns(response: &ProfileResponse) -> Vec<PronounView> {
 }
 
 fn profile_timezone(response: &ProfileResponse) -> Option<String> {
-    profile_text(profile_field(response, "us.cloke.msc4175.tz"))
-        .or_else(|| profile_text(profile_field(response, "m.tz")))
+    profile_text(profile_field(response, "m.tz"))
+        .or_else(|| profile_text(profile_field(response, "us.cloke.msc4175.tz")))
         // Some clients store the zone with its JSON quotes still attached.
         .map(|zone| zone.trim_matches(['"', '\'']).to_owned())
         .filter(|zone| !zone.is_empty())
@@ -212,10 +258,9 @@ fn profile_animal(response: &ProfileResponse) -> Option<AnimalIdentityView> {
             .or_else(|| legacy_cat("kitty.meow.is_cat", "cat")),
         has_animal: profile_text(profile_field(response, "pet.plz.my"))
             .or_else(|| legacy_cat("kitty.meow.has_cats", "cats")),
-        animal_need: profile_field(response, "pet.plz.gib").map_or_else(
-            || Some("headpats".to_owned()),
-            |need| profile_text(Some(need)),
-        ),
+        animal_need: profile_field(response, "pet.plz.gib")
+            .and_then(serde_json::Value::as_str)
+            .map(|need| need.trim().to_owned()),
     };
 
     // The need alone says nothing without an animal to attach it to.
@@ -322,27 +367,52 @@ mod tests {
     #[test]
     fn legacy_status_fields_are_reported() {
         let profile = view(&json!({
-            "m.status": { "text": "here" },
+            "org.matrix.msc4426.status": { "text": "here", "emoji": "🌴" },
             "chat.commet.profile_status": "old",
-            "org.matrix.msc4426.status": { "text": "older" },
+            "m.status": { "text": "older" },
         }));
         assert_eq!(profile.status.unwrap().text, "here");
         assert_eq!(
             profile.legacy_fields,
-            ["chat.commet.profile_status", "org.matrix.msc4426.status"]
+            ["chat.commet.profile_status", "m.status"]
         );
+
+        let stable_only = view(&json!({ "m.status": { "text": "pre-fix" } }));
+        assert_eq!(stable_only.status.unwrap().text, "pre-fix");
     }
 
     #[test]
-    fn an_absent_animal_need_defaults_to_headpats() {
+    fn the_stable_timezone_wins_over_the_unstable_one() {
+        let both = view(&json!({ "m.tz": "Europe/Paris", "us.cloke.msc4175.tz": "Asia/Tokyo" }));
+        assert_eq!(both.timezone.as_deref(), Some("Europe/Paris"));
+
+        let unstable = view(&json!({ "us.cloke.msc4175.tz": "Asia/Tokyo" }));
+        assert_eq!(unstable.timezone.as_deref(), Some("Asia/Tokyo"));
+    }
+
+    #[test]
+    fn status_limits_count_utf8_bytes_on_char_boundaries() {
+        let profile = view(&json!({
+            "org.matrix.msc4426.status": { "text": "語".repeat(100), "emoji": "🌴".repeat(10) },
+        }));
+        let status = profile.status.unwrap();
+        assert_eq!(status.text, "語".repeat(85));
+        assert_eq!(status.emoji.as_deref(), Some("🌴".repeat(8).as_str()));
+
+        let legacy = view(&json!({ "chat.commet.profile_status": "é".repeat(200) }));
+        assert_eq!(legacy.status.unwrap().text, "é".repeat(128));
+    }
+
+    #[test]
+    fn a_cleared_animal_need_is_distinct_from_an_unset_one() {
         let unset = view(&json!({ "kitty.meow.is_cat": true })).animal.unwrap();
         assert_eq!(unset.is_animal.as_deref(), Some("cat"));
-        assert_eq!(unset.animal_need.as_deref(), Some("headpats"));
+        assert_eq!(unset.animal_need, None);
 
         let cleared = view(&json!({ "pet.plz.me": "cat", "pet.plz.gib": "" }))
             .animal
             .unwrap();
-        assert_eq!(cleared.animal_need, None);
+        assert_eq!(cleared.animal_need.as_deref(), Some(""));
     }
 
     #[test]
@@ -382,5 +452,27 @@ mod tests {
 
         let huge = view(&json!({ "moe.sable.app.supporter_awards": ["x".repeat(20_000)] }));
         assert_eq!(huge.supporter_awards, None);
+    }
+
+    #[test]
+    fn structured_fields_skip_wrong_typed_members() {
+        let profile = view(&json!({
+            "m.status": { "text": " busy ", "emoji": 4 },
+            "chat.commet.profile_color_scheme": { "brightness": "dark", "color": 1 },
+            "io.fsky.nyx.pronouns": [{ "summary": " she ", "language": "EN" }, { "summary": 2 }, "x"],
+        }));
+        let status = profile.status.unwrap();
+        assert_eq!(status.text, "busy");
+        assert_eq!(status.emoji, None);
+        assert!(matches!(
+            profile.hero_brightness,
+            Some(BrightnessView::Dark)
+        ));
+        assert_eq!(profile.hero_color, None);
+        assert_eq!(profile.pronouns.len(), 1);
+        assert_eq!(profile.pronouns[0].language.as_deref(), Some("en"));
+
+        let arrays = view(&json!({ "m.status": ["busy"] }));
+        assert!(arrays.status.is_none());
     }
 }

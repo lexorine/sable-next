@@ -5,11 +5,13 @@
   import ArrowRightIcon from 'phosphor-svelte/lib/ArrowRightIcon';
   import EyeSlashIcon from 'phosphor-svelte/lib/EyeSlashIcon';
   import ImageBrokenIcon from 'phosphor-svelte/lib/ImageBrokenIcon';
+  import SlidersHorizontalIcon from 'phosphor-svelte/lib/SlidersHorizontalIcon';
   import TrashIcon from 'phosphor-svelte/lib/TrashIcon';
   import XIcon from 'phosphor-svelte/lib/XIcon';
 
   import { i18n } from '#lib/i18n.js';
   import { holdOverlayBack } from '#lib/platform/overlay-back.svelte.js';
+  import { preferences, type ImageMetadata } from '#lib/settings/preferences.svelte.js';
   import { formatByteSize } from '#lib/ui/byte-size.js';
   import { overlayLayer } from '#lib/ui/overlay-layer.js';
   import Button from '#lib/ui/primitives/Button.svelte';
@@ -20,7 +22,9 @@
     VELOCITY_THRESHOLD,
   } from '#lib/ui/swipe-gesture.js';
 
-  import { objectSource, previewKind, type StagedFile } from './composer-files';
+  import { objectSource, previewKind, type StagedFile } from '#lib/composer/composer-files.js';
+  import StagedImageOptions from './StagedImageOptions.svelte';
+  import { canStrip } from './strip-metadata';
 
   interface Props {
     files: readonly StagedFile[];
@@ -28,9 +32,10 @@
     onClose: () => void;
     onRemove: (id: number) => void;
     onToggleSpoiler: (id: number) => void;
+    onSetMetadata: (id: number, metadata: ImageMetadata) => void;
   }
 
-  let { files, selectedId, onClose, onRemove, onToggleSpoiler }: Props = $props();
+  let { files, selectedId, onClose, onRemove, onToggleSpoiler, onSetMetadata }: Props = $props();
 
   let currentId = $state(untrack(() => selectedId));
   let index = $derived(
@@ -149,18 +154,18 @@
         class="staged-viewer"
         {...overlayLayer()}
         style={`opacity: ${String(1 - Math.min(0.6, swipeY / 400))}`}
-        aria-label={$i18n.t('composer.previewTitle')}
+        aria-label={i18n.t('composer.previewTitle')}
         onkeydown={handleKeydown}
       >
         <header class="staged-viewer-bar">
-          <IconButton label={$i18n.t('viewer.close')} variant="ghost" onclick={onClose}>
+          <IconButton label={i18n.t('common.close')} variant="ghost" onclick={onClose}>
             <XIcon />
           </IconButton>
           <div class="staged-viewer-title">
             <strong>{item.file.name}</strong>
             <span>
               {#if files.length > 1}
-                {$i18n.t('viewer.position', { index: index + 1, total: files.length })} ·
+                {i18n.t('viewer.position', { index: index + 1, total: files.length })} ·
               {/if}
               {formatByteSize(item.file.size)}
             </span>
@@ -170,8 +175,7 @@
         <!-- Swipes duplicate the arrow keys, the close button and the nav buttons. -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
-          class="staged-viewer-stage"
-          class:has-nav={files.length > 1}
+          class={['staged-viewer-stage', { 'has-nav': files.length > 1 }]}
           onpointerdown={startSwipe}
           onpointermove={trackSwipe}
           onpointerup={endSwipe}
@@ -180,7 +184,7 @@
           {#if index > 0}
             <IconButton
               class="staged-viewer-nav staged-viewer-previous"
-              label={$i18n.t('viewer.previous')}
+              label={i18n.t('viewer.previous')}
               size="large"
               onclick={() => go(-1)}><ArrowLeftIcon /></IconButton
             >
@@ -188,19 +192,18 @@
           {#if item.spoiler}
             <span class="staged-viewer-spoiler-chip">
               <EyeSlashIcon aria-hidden="true" />
-              {$i18n.t('composer.markedSpoiler')}
+              {i18n.t('composer.markedSpoiler')}
             </span>
           {/if}
           {#key item.id}
             {#if failedId === item.id}
               <p class="staged-viewer-failed">
                 <ImageBrokenIcon aria-hidden="true" />
-                {$i18n.t('composer.previewUnavailable')}
+                {i18n.t('composer.previewUnavailable')}
               </p>
             {:else if kind === 'video'}
               <video
-                class="staged-viewer-media"
-                class:swiping={swipeX !== 0 || swipeY !== 0}
+                class={['staged-viewer-media', { swiping: swipeX !== 0 || swipeY !== 0 }]}
                 style:translate={`${String(swipeX)}px ${String(swipeY)}px`}
                 controls
                 playsinline
@@ -213,8 +216,7 @@
               ></video>
             {:else}
               <img
-                class="staged-viewer-media"
-                class:swiping={swipeX !== 0 || swipeY !== 0}
+                class={['staged-viewer-media', { swiping: swipeX !== 0 || swipeY !== 0 }]}
                 style:translate={`${String(swipeX)}px ${String(swipeY)}px`}
                 alt={item.file.name}
                 draggable="false"
@@ -228,7 +230,7 @@
           {#if index < files.length - 1}
             <IconButton
               class="staged-viewer-nav staged-viewer-next"
-              label={$i18n.t('viewer.next')}
+              label={i18n.t('viewer.next')}
               size="large"
               onclick={() => go(1)}><ArrowRightIcon /></IconButton
             >
@@ -240,21 +242,38 @@
             variant="ghost"
             class={['staged-viewer-spoiler', item.spoiler && 'staged-viewer-spoiler-on']}
             aria-pressed={item.spoiler}
-            aria-label={$i18n.t('composer.spoilerAttachment', { name: item.file.name })}
+            aria-label={i18n.t('composer.spoilerAttachment', { name: item.file.name })}
             onclick={() => {
               if (item) onToggleSpoiler(item.id);
             }}
           >
             <EyeSlashIcon aria-hidden="true" />
-            {$i18n.t('composer.spoiler')}
+            {i18n.t('composer.spoiler')}
           </Button>
+          {#if kind === 'image' && canStrip(item.file)}
+            <StagedImageOptions {item} {onSetMetadata}>
+              {#snippet trigger({ props })}
+                <Button
+                  {...props}
+                  variant="ghost"
+                  class={[
+                    item.metadata !== preferences.imageMetadata && 'staged-viewer-spoiler-on',
+                  ]}
+                  aria-label={i18n.t('composer.imageOptions', { name: item.file.name })}
+                >
+                  <SlidersHorizontalIcon aria-hidden="true" />
+                  {i18n.t('composer.options')}
+                </Button>
+              {/snippet}
+            </StagedImageOptions>
+          {/if}
           <Button
             variant="ghost"
-            aria-label={$i18n.t('composer.removeAttachment', { name: item.file.name })}
+            aria-label={i18n.t('composer.removeAttachment', { name: item.file.name })}
             onclick={remove}
           >
             <TrashIcon aria-hidden="true" />
-            {$i18n.t('composer.remove')}
+            {i18n.t('common.remove')}
           </Button>
         </footer>
       </Dialog.Content>

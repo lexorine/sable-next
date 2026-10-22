@@ -1,3 +1,5 @@
+use crate::api::calls::RtcLivekitEndpoint;
+use crate::api::widgets::RestartDelayedEventParams;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -10,9 +12,7 @@ use matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState;
 use matrix_sdk::executor::{JoinHandleExt, spawn};
 use matrix_sdk::ruma::api::Direction;
 use matrix_sdk::ruma::api::client::account::request_openid_token;
-use matrix_sdk::ruma::api::client::delayed_events::{
-    DelayParameters, delayed_message_event, delayed_state_event, update_delayed_event,
-};
+use matrix_sdk::ruma::api::client::delayed_events::update_delayed_event::UpdateAction;
 use matrix_sdk::ruma::api::client::relations::{
     get_relating_events, get_relating_events_with_rel_type,
 };
@@ -22,20 +22,23 @@ use matrix_sdk::ruma::api::client::voip::get_turn_server_info;
 use matrix_sdk::ruma::events::GlobalAccountDataEventType;
 use matrix_sdk::ruma::events::relation::RelationType;
 use matrix_sdk::ruma::events::{
-    AnySyncStateEvent, AnySyncTimelineEvent, AnyTimelineEvent, MessageLikeEventType,
-    StateEventType, ToDeviceEventType,
+    AnySyncStateEvent, AnySyncTimelineEvent, AnyTimelineEvent, ToDeviceEventType,
 };
 use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::ruma::to_device::DeviceIdOrAllDevices;
 use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, TransactionId, UInt};
 use matrix_sdk_base::crypto::CollectStrategy;
+use serde::{Deserialize as _, Serialize};
 use serde_json::Value;
+use serde_with::{DefaultOnError, serde_as};
 
 use crate::calls::{is_rtc_member_type, sticky};
+use crate::delayed_events::{self, DelayedEvent};
 use crate::protocol::{
-    CommandErr, CoreEvent, OpenIdTokenView, PaginationDirection, RelationsView, RtcLivekitEndpoint,
+    CoreEvent, OpenIdTokenView, PaginationDirection, RelationsView, RpcError, TermsPolicyView,
     TurnServerView, UserDirectoryEntryView,
 };
+use crate::view::ObjectOnly;
 use crate::{Core, ResultExt};
 
 const MAX_TIMELINE_EVENTS: usize = 500;
@@ -129,28 +132,78 @@ struct IntegrationManager {
     ui_url: String,
 }
 
+#[serde_as]
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct WellKnownIn {
+    #[serde_as(as = "ObjectOnly")]
+    #[serde(rename = "m.integrations")]
+    integrations: Option<IntegrationsIn>,
+}
+
+#[serde_as]
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct IntegrationsIn {
+    #[serde_as(deserialize_as = "DefaultOnError<Vec<ObjectOnly>>")]
+    managers: Vec<Option<ManagerIn>>,
+}
+
+#[derive(serde::Deserialize)]
+struct ManagerIn {
+    api_url: String,
+    ui_url: String,
+}
+
 fn managers_from_well_known(well_known: &Value) -> Vec<IntegrationManager> {
-    well_known
-        .get("m.integrations")
-        .and_then(|integrations| integrations.get("managers"))
-        .and_then(Value::as_array)
+    if !well_known.is_object() {
+        return Vec::new();
+    }
+    WellKnownIn::deserialize(well_known)
+        .unwrap_or_default()
+        .integrations
+        .unwrap_or_default()
+        .managers
         .into_iter()
         .flatten()
-        .filter_map(|manager| {
-            Some(IntegrationManager {
-                api_url: manager.get("api_url")?.as_str()?.to_owned(),
-                ui_url: manager.get("ui_url")?.as_str()?.to_owned(),
-            })
+        .map(|manager| IntegrationManager {
+            api_url: manager.api_url,
+            ui_url: manager.ui_url,
         })
         .collect()
 }
 
+#[serde_as]
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct AccountWidgetIn {
+    #[serde_as(deserialize_as = "DefaultOnError")]
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    #[serde_as(deserialize_as = "DefaultOnError")]
+    url: Option<String>,
+    #[serde_as(as = "ObjectOnly")]
+    data: Option<AccountWidgetDataIn>,
+}
+
+#[serde_as]
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct AccountWidgetDataIn {
+    #[serde_as(deserialize_as = "DefaultOnError")]
+    api_url: Option<String>,
+}
+
 fn managers_from_account_data(widgets: &Value, known: &mut Vec<IntegrationManager>) {
     for widget in widgets.as_object().into_iter().flat_map(|map| map.values()) {
-        if widget.get("type").and_then(Value::as_str) != Some("m.integration_manager") {
+        if !widget.is_object() {
             continue;
         }
-        let Some(url) = widget.get("url").and_then(Value::as_str) else {
+        let widget = AccountWidgetIn::deserialize(widget).unwrap_or_default();
+        if widget.kind.as_deref() != Some("m.integration_manager") {
+            continue;
+        }
+        let Some(url) = widget.url else {
             continue;
         };
         if known.iter().any(|manager| manager.ui_url == url) {
@@ -158,12 +211,10 @@ fn managers_from_account_data(widgets: &Value, known: &mut Vec<IntegrationManage
         }
         known.push(IntegrationManager {
             api_url: widget
-                .get("data")
-                .and_then(|data| data.get("api_url"))
-                .and_then(Value::as_str)
-                .unwrap_or(url)
-                .to_owned(),
-            ui_url: url.to_owned(),
+                .data
+                .and_then(|data| data.api_url)
+                .unwrap_or_else(|| url.clone()),
+            ui_url: url,
         });
     }
 }
@@ -185,6 +236,50 @@ fn integration_manager_page(
     Some(url.to_string())
 }
 
+fn terms_url(api_url: &str) -> String {
+    format!(
+        "{}/_matrix/integrations/v1/terms",
+        api_url.trim_end_matches('/')
+    )
+}
+
+fn pending_policies(terms: &Value, accepted: &[String]) -> Vec<TermsPolicyView> {
+    let Some(policies) = terms.get("policies").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    policies
+        .values()
+        .filter_map(|policy| {
+            let translations = policy.as_object()?;
+            let translation = translations.get("en").or_else(|| {
+                translations
+                    .values()
+                    .find(|value| value.get("url").is_some())
+            })?;
+            let url = translation.get("url")?.as_str()?;
+            if accepted.iter().any(|accepted| accepted == url) {
+                return None;
+            }
+            Some(TermsPolicyView {
+                url: url.to_owned(),
+                name: translation
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(url)
+                    .to_owned(),
+            })
+        })
+        .collect()
+}
+
+#[derive(Serialize)]
+struct ScalarRegisterOut {
+    access_token: String,
+    token_type: String,
+    matrix_server_name: String,
+    expires_in: u64,
+}
+
 impl Core {
     pub(crate) async fn room_timeline_events(
         &self,
@@ -194,7 +289,7 @@ impl Core {
         state_key: Option<&str>,
         limit: u32,
         since: Option<&OwnedEventId>,
-    ) -> Result<Vec<serde_json::Value>, CommandErr> {
+    ) -> Result<Vec<serde_json::Value>, RpcError> {
         let client = self.client().await?;
         let Ok((cache, _drop_handles)) = client.event_cache().room(room_id).await else {
             return Ok(Vec::new());
@@ -254,7 +349,7 @@ impl Core {
         room_id: &OwnedRoomId,
         event_type: &str,
         state_key: Option<&str>,
-    ) -> Result<Vec<serde_json::Value>, CommandErr> {
+    ) -> Result<Vec<serde_json::Value>, RpcError> {
         let room = self.room(room_id).await?;
         let events = room
             .get_state_events(event_type.into())
@@ -283,7 +378,7 @@ impl Core {
         &self,
         term: &str,
         limit: Option<u32>,
-    ) -> Result<(bool, Vec<UserDirectoryEntryView>), CommandErr> {
+    ) -> Result<(bool, Vec<UserDirectoryEntryView>), RpcError> {
         let mut request = search_users::v3::Request::new(term.to_owned());
         if let Some(limit) = limit {
             request.limit = UInt::from(limit);
@@ -318,56 +413,53 @@ impl Core {
         content: Value,
         delay_ms: u64,
         sticky_duration_ms: Option<u32>,
-    ) -> Result<String, CommandErr> {
+    ) -> Result<String, RpcError> {
         const LABEL: &str = "widget_send_delayed_event";
-        if !self.delayed_events_supported().await? {
-            return Err(CommandErr::DelayedEventsUnsupported);
+        let support = self.delayed_events_support().await?;
+        if !support.any() {
+            return Err(RpcError::DelayedEventsUnsupported);
         }
         let room = self.room(room_id).await?;
         let client = self.client().await?;
         let delay = Duration::from_millis(delay_ms);
-        let parameters = DelayParameters::Timeout { timeout: delay };
-        let raw = Raw::new(&content).or_failed(self, LABEL)?;
 
-        if let Some(state_key) = state_key {
-            let request = delayed_state_event::unstable::Request::new_raw(
-                room_id.clone(),
+        if state_key.is_some() {
+            let event = DelayedEvent {
+                room_id: room_id.clone(),
+                event_type: event_type.to_owned(),
                 state_key,
-                StateEventType::from(event_type),
-                parameters,
-                raw.cast_unchecked(),
-            );
-            let response = client
-                .send(request)
+                content: serde_json::value::to_raw_value(&content).or_failed(self, LABEL)?,
+                delay,
+                sticky_duration_ms: None,
+            };
+            return delayed_events::send(&client, support, event)
                 .await
-                .map_err(|error| self.homeserver_http_error(LABEL, error))?;
-            return Ok(response.delay_id);
+                .map_err(|error| self.homeserver_http_error(LABEL, error));
         }
         if let Some(duration) = sticky_duration_ms {
             if !is_rtc_member_type(event_type) && self.room_is_encrypted(&room).await? {
-                return Err(CommandErr::EncryptedScheduleUnsupported);
+                return Err(RpcError::EncryptedScheduleUnsupported);
             }
             return sticky::send_delayed_event(
-                &client, &room, event_type, content, delay, duration,
+                &client, support, &room, event_type, content, delay, duration,
             )
             .await
             .or_failed(self, LABEL);
         }
         if self.room_is_encrypted(&room).await? {
-            return Err(CommandErr::EncryptedScheduleUnsupported);
+            return Err(RpcError::EncryptedScheduleUnsupported);
         }
-        let request = delayed_message_event::unstable::Request::new_raw(
-            room_id.clone(),
-            TransactionId::new(),
-            MessageLikeEventType::from(event_type),
-            parameters,
-            raw.cast_unchecked(),
-        );
-        let response = client
-            .send(request)
+        let event = DelayedEvent {
+            room_id: room_id.clone(),
+            event_type: event_type.to_owned(),
+            state_key: None,
+            content: serde_json::value::to_raw_value(&content).or_failed(self, LABEL)?,
+            delay,
+            sticky_duration_ms: None,
+        };
+        delayed_events::send(&client, support, event)
             .await
-            .map_err(|error| self.homeserver_http_error(LABEL, error))?;
-        Ok(response.delay_id)
+            .map_err(|error| self.homeserver_http_error(LABEL, error))
     }
 
     pub(crate) async fn widget_send_sticky_event(
@@ -376,7 +468,7 @@ impl Core {
         event_type: &str,
         content: Value,
         sticky_duration_ms: u32,
-    ) -> Result<OwnedEventId, CommandErr> {
+    ) -> Result<OwnedEventId, RpcError> {
         let response = self
             .room(room_id)
             .await?
@@ -387,14 +479,11 @@ impl Core {
         Ok(response.response.event_id)
     }
 
-    pub(crate) async fn restart_delayed_event(&self, delay_id: String) -> Result<(), CommandErr> {
-        let request = update_delayed_event::unstable_v1::Request::new(
-            delay_id,
-            update_delayed_event::UpdateAction::Restart,
-        );
-        self.client()
-            .await?
-            .send(request)
+    pub(crate) async fn restart_delayed_event(
+        &self,
+        RestartDelayedEventParams { delay_id }: RestartDelayedEventParams,
+    ) -> Result<(), RpcError> {
+        delayed_events::update(&self.client().await?, delay_id, UpdateAction::Restart)
             .await
             .map_err(|error| self.homeserver_http_error("restart_delayed_event", error))?;
         Ok(())
@@ -405,7 +494,7 @@ impl Core {
         event_type: &str,
         encrypted: bool,
         messages: Value,
-    ) -> Result<(), CommandErr> {
+    ) -> Result<(), RpcError> {
         const LABEL: &str = "widget_send_to_device";
         if is_internal_to_device_type(event_type) {
             tracing::warn!(
@@ -495,7 +584,7 @@ impl Core {
         &self,
         room_id: &OwnedRoomId,
         event_type: &str,
-    ) -> Result<Option<Value>, CommandErr> {
+    ) -> Result<Option<Value>, RpcError> {
         let event = self
             .room(room_id)
             .await?
@@ -513,7 +602,7 @@ impl Core {
     pub(crate) async fn room_sticky_events(
         &self,
         room_id: &OwnedRoomId,
-    ) -> Result<Vec<Value>, CommandErr> {
+    ) -> Result<Vec<Value>, RpcError> {
         let room = self.room(room_id).await?;
         Ok(sticky::live_events(&room)
             .into_iter()
@@ -526,7 +615,7 @@ impl Core {
         room_id: &OwnedRoomId,
         event_id: &OwnedEventId,
         filter: RelationsFilter<'_>,
-    ) -> Result<RelationsView, CommandErr> {
+    ) -> Result<RelationsView, RpcError> {
         const LABEL: &str = "room_event_relations";
         let room = self.room(room_id).await?;
         let client = room.client();
@@ -602,7 +691,7 @@ impl Core {
         })
     }
 
-    pub(crate) async fn turn_server(&self) -> Result<TurnServerView, CommandErr> {
+    pub(crate) async fn turn_server(&self) -> Result<TurnServerView, RpcError> {
         let response = self
             .client()
             .await?
@@ -617,7 +706,7 @@ impl Core {
         })
     }
 
-    pub(crate) async fn rtc_transports(&self) -> Result<Value, CommandErr> {
+    pub(crate) async fn rtc_transports(&self) -> Result<Value, RpcError> {
         let transports = self
             .client()
             .await?
@@ -634,7 +723,7 @@ impl Core {
         &self,
         endpoint: RtcLivekitEndpoint,
         body: &Value,
-    ) -> Result<Value, CommandErr> {
+    ) -> Result<Value, RpcError> {
         const LABEL: &str = "rtc_livekit";
         let client = self.client().await?;
         let content_type = "application/json".to_owned();
@@ -656,8 +745,16 @@ impl Core {
     pub(crate) async fn integration_manager_url(
         &self,
         room_id: &OwnedRoomId,
-    ) -> Result<String, CommandErr> {
+    ) -> Result<String, RpcError> {
         const LABEL: &str = "integration_manager_url";
+        let manager = self.integration_manager(LABEL).await?;
+
+        let scalar_token = self.scalar_token(&manager.api_url).await;
+        integration_manager_page(&manager.ui_url, scalar_token.as_deref(), room_id)
+            .ok_or_else(|| self.failed(LABEL, "the integration manager URL is invalid"))
+    }
+
+    async fn integration_manager(&self, label: &str) -> Result<IntegrationManager, RpcError> {
         let client = self.client().await?;
 
         let mut managers = Vec::new();
@@ -666,7 +763,7 @@ impl Core {
                 .http_client()
                 .get(
                     base.join("/.well-known/matrix/client")
-                        .or_failed(self, LABEL)?,
+                        .or_failed(self, label)?,
                 )
                 .send()
                 .await
@@ -677,20 +774,120 @@ impl Core {
             managers = managers_from_well_known(&well_known);
         }
         if let Some(widgets) = self
-            .global_account_data(GlobalAccountDataEventType::from("m.widgets"), LABEL)
+            .global_account_data(GlobalAccountDataEventType::from("m.widgets"), label)
             .await?
             .and_then(|raw| serde_json::from_str::<Value>(raw.json().get()).ok())
         {
             managers_from_account_data(&widgets, &mut managers);
         }
-        let manager = managers.into_iter().next().unwrap_or(IntegrationManager {
+        Ok(managers.into_iter().next().unwrap_or(IntegrationManager {
             api_url: DEFAULT_INTEGRATION_MANAGER.0.to_owned(),
             ui_url: DEFAULT_INTEGRATION_MANAGER.1.to_owned(),
-        });
+        }))
+    }
 
-        let scalar_token = self.scalar_token(&manager.api_url).await;
-        integration_manager_page(&manager.ui_url, scalar_token.as_deref(), room_id)
-            .ok_or_else(|| self.failed(LABEL, "the integration manager URL is invalid"))
+    pub(crate) async fn integration_manager_terms(&self) -> Result<Vec<TermsPolicyView>, RpcError> {
+        const LABEL: &str = "integration_manager_terms";
+        let manager = self.integration_manager(LABEL).await?;
+        let response = self
+            .client()
+            .await?
+            .http_client()
+            .get(terms_url(&manager.api_url))
+            .send()
+            .await
+            .or_failed(self, LABEL)?;
+        if !response.status().is_success() {
+            return Ok(Vec::new());
+        }
+        let terms: Value = serde_json::from_str(&response.text().await.or_failed(self, LABEL)?)
+            .or_failed(self, LABEL)?;
+
+        let accepted = self.accepted_terms(LABEL).await?;
+        let pending = pending_policies(&terms, &accepted);
+        if pending.is_empty() && self.terms_unsigned(&manager.api_url).await {
+            let urls = pending_policies(&terms, &[])
+                .into_iter()
+                .map(|policy| policy.url)
+                .collect();
+            self.accept_integration_manager_terms(urls).await?;
+        }
+        Ok(pending)
+    }
+
+    async fn terms_unsigned(&self, api_url: &str) -> bool {
+        let Some(token) = self.scalar_token(api_url).await else {
+            return false;
+        };
+        let Ok(client) = self.client().await else {
+            return false;
+        };
+        let Ok(mut url) = url::Url::parse(&format!("{}/account", api_url.trim_end_matches('/')))
+        else {
+            return false;
+        };
+        url.query_pairs_mut().append_pair("scalar_token", &token);
+        let Ok(response) = client.http_client().get(url).send().await else {
+            return false;
+        };
+        response.status() == reqwest::StatusCode::FORBIDDEN
+            && response
+                .text()
+                .await
+                .is_ok_and(|text| text.contains("M_TERMS_NOT_SIGNED"))
+    }
+
+    pub(crate) async fn accept_integration_manager_terms(
+        &self,
+        urls: Vec<String>,
+    ) -> Result<(), RpcError> {
+        const LABEL: &str = "accept_integration_manager_terms";
+        let manager = self.integration_manager(LABEL).await?;
+        let token = self
+            .scalar_token(&manager.api_url)
+            .await
+            .ok_or_else(|| self.failed(LABEL, "the integration manager did not issue a token"))?;
+
+        self.client()
+            .await?
+            .http_client()
+            .post(terms_url(&manager.api_url))
+            .bearer_auth(token)
+            .header("Content-Type", "application/json")
+            .body(serde_json::json!({ "user_accepts": urls }).to_string())
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .or_failed(self, LABEL)?;
+
+        let mut accepted = self.accepted_terms(LABEL).await?;
+        for url in urls {
+            if !accepted.contains(&url) {
+                accepted.push(url);
+            }
+        }
+        self.put_global_account_data(
+            GlobalAccountDataEventType::from("m.accepted_terms"),
+            &serde_json::json!({ "accepted": accepted }),
+            LABEL,
+        )
+        .await
+    }
+
+    async fn accepted_terms(&self, label: &str) -> Result<Vec<String>, RpcError> {
+        Ok(self
+            .global_account_data(GlobalAccountDataEventType::from("m.accepted_terms"), label)
+            .await?
+            .and_then(|raw| serde_json::from_str::<Value>(raw.json().get()).ok())
+            .and_then(|content| {
+                content.get("accepted")?.as_array().map(|urls| {
+                    urls.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+            })
+            .unwrap_or_default())
     }
 
     async fn scalar_token(&self, api_url: &str) -> Option<String> {
@@ -703,13 +900,13 @@ impl Core {
             .post(format!("{}/register", api_url.trim_end_matches('/')))
             .header("Content-Type", "application/json")
             .body(
-                serde_json::json!({
-                    "access_token": token.access_token,
-                    "token_type": token.token_type,
-                    "matrix_server_name": token.matrix_server_name,
-                    "expires_in": token.expires_in_ms / 1000,
+                serde_json::to_string(&ScalarRegisterOut {
+                    access_token: token.access_token,
+                    token_type: token.token_type,
+                    matrix_server_name: token.matrix_server_name,
+                    expires_in: token.expires_in_ms / 1000,
                 })
-                .to_string(),
+                .ok()?,
             )
             .send()
             .await
@@ -724,7 +921,7 @@ impl Core {
             .map(str::to_owned)
     }
 
-    pub(crate) async fn known_room_ids(&self) -> Result<Vec<OwnedRoomId>, CommandErr> {
+    pub(crate) async fn known_room_ids(&self) -> Result<Vec<OwnedRoomId>, RpcError> {
         Ok(self
             .client()
             .await?
@@ -819,9 +1016,9 @@ impl Core {
         );
     }
 
-    pub(crate) async fn openid_token(&self) -> Result<OpenIdTokenView, CommandErr> {
+    pub(crate) async fn openid_token(&self) -> Result<OpenIdTokenView, RpcError> {
         let client = self.client().await?;
-        let user_id = client.user_id().ok_or(CommandErr::NotLoggedIn)?.to_owned();
+        let user_id = client.user_id().ok_or(RpcError::NotLoggedIn)?.to_owned();
 
         let response = client
             .send(request_openid_token::v3::Request::new(user_id))
@@ -839,10 +1036,12 @@ impl Core {
 
 #[cfg(test)]
 mod tests {
-    use super::RelationsFilter;
+    use super::{RelationsFilter, managers_from_account_data, managers_from_well_known};
     use crate::{
         Core,
-        protocol::{Command, CommandErr, CoreEvent, RtcLivekitEndpoint},
+        api::calls::RtcLivekitEndpoint,
+        api::room_state::SendEventParams,
+        protocol::{CoreEvent, RpcError},
         session::Session,
         store::MemorySessionStore,
     };
@@ -853,7 +1052,7 @@ mod tests {
     use std::{sync::Arc, time::Duration};
     use wiremock::{
         Mock, ResponseTemplate,
-        matchers::{body_json, method, path, path_regex, query_param},
+        matchers::{body_json, header, method, path, path_regex, query_param},
     };
 
     #[tokio::test]
@@ -879,28 +1078,32 @@ mod tests {
             sync_service: Arc::new(SyncService::builder(client.clone()).build().await.unwrap()),
             client,
         });
-        for command in [
-            Command::SendRawEvent {
-                room_id: room_id.to_owned(),
-                event_type: "com.example.message".to_owned(),
-                content: json!({}),
-            },
-            Command::SendStateEvent {
+        let sent = Box::pin(core.run(crate::api::messages::SendRawEventParams {
+            room_id: room_id.to_owned(),
+            event_type: "com.example.message".to_owned(),
+            content: json!({}),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(sent, "$created");
+        let redaction = Box::pin(core.run(crate::api::messages::SendRedactionParams {
+            room_id: room_id.to_owned(),
+            event_id: "$target".try_into().unwrap(),
+            reason: None,
+        }))
+        .await
+        .unwrap();
+        assert_eq!(redaction, "$created");
+        let event_id = core
+            .run(SendEventParams {
                 room_id: room_id.to_owned(),
                 event_type: "com.example.state".to_owned(),
                 state_key: String::new(),
                 content: json!({}),
-            },
-            Command::SendRedaction {
-                room_id: room_id.to_owned(),
-                event_id: "$target".try_into().unwrap(),
-                reason: None,
-            },
-        ] {
-            let response =
-                serde_json::to_value(Box::pin(core.dispatch(command)).await.unwrap()).unwrap();
-            assert_eq!(response["event_id"], "$created");
-        }
+            })
+            .await
+            .unwrap();
+        assert_eq!(event_id, "$created");
     }
 
     async fn core_with(server: &MatrixMockServer, client: matrix_sdk::Client) -> Arc<Core> {
@@ -926,6 +1129,37 @@ mod tests {
             .mount(server.server())
             .await;
         (server, client)
+    }
+
+    #[tokio::test]
+    async fn a_stable_only_server_offers_no_user_scheduling_because_it_cannot_list() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().no_server_versions().build().await;
+        Mock::given(method("GET"))
+            .and(path("/_matrix/client/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "versions": ["v1.13"],
+                "unstable_features": {"org.matrix.msc4140.stable": true}
+            })))
+            .mount(server.server())
+            .await;
+        let room_id = room_id!("!stable:example.org");
+        server.sync_joined_room(&client, room_id).await;
+        let core = core_with(&server, client).await;
+
+        assert!(!core.scheduling_supported().await.unwrap());
+        assert!(matches!(
+            core.schedule_message(
+                &room_id.to_owned(),
+                matrix_sdk::ruma::events::room::message::RoomMessageEventContent::text_plain(
+                    "later"
+                ),
+                5000,
+            )
+            .await,
+            Err(RpcError::DelayedEventsUnsupported)
+        ));
+        assert!(core.delayed_events_support().await.unwrap().any());
     }
 
     #[tokio::test]
@@ -1009,7 +1243,7 @@ mod tests {
             .await;
         assert!(matches!(
             refused,
-            Err(CommandErr::EncryptedScheduleUnsupported)
+            Err(RpcError::EncryptedScheduleUnsupported)
         ));
         let refused = core
             .widget_send_delayed_event(
@@ -1023,7 +1257,7 @@ mod tests {
             .await;
         assert!(matches!(
             refused,
-            Err(CommandErr::EncryptedScheduleUnsupported)
+            Err(RpcError::EncryptedScheduleUnsupported)
         ));
     }
 
@@ -1071,7 +1305,11 @@ mod tests {
             .await;
         let core = core_with(&server, client).await;
 
-        core.restart_delayed_event("d3".to_owned()).await.unwrap();
+        core.restart_delayed_event(crate::api::widgets::RestartDelayedEventParams {
+            delay_id: "d3".to_owned(),
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1213,7 +1451,7 @@ mod tests {
             .rtc_livekit(RtcLivekitEndpoint::GetToken, &json!({}))
             .await;
 
-        assert!(matches!(result, Err(CommandErr::Unsupported)));
+        assert!(matches!(result, Err(RpcError::Unsupported)));
     }
 
     #[tokio::test]
@@ -1444,6 +1682,175 @@ mod tests {
     }
 
     #[test]
+    fn pending_policies_skip_accepted_urls_and_prefer_english() {
+        let terms = json!({"policies": {
+            "privacy": {
+                "version": "1",
+                "en": {"name": "Privacy", "url": "https://im/privacy-en"},
+                "fr": {"name": "Confidentialité", "url": "https://im/privacy-fr"}
+            },
+            "tos": {"version": "2", "fr": {"name": "Conditions", "url": "https://im/tos-fr"}},
+            "old": {"version": "1", "en": {"name": "Old", "url": "https://im/old"}}
+        }});
+
+        let pending = super::pending_policies(&terms, &["https://im/old".to_owned()]);
+
+        let mut urls: Vec<_> = pending.iter().map(|policy| policy.url.as_str()).collect();
+        urls.sort_unstable();
+        assert_eq!(urls, ["https://im/privacy-en", "https://im/tos-fr"]);
+        assert!(pending.iter().any(|policy| policy.name == "Privacy"));
+    }
+
+    #[tokio::test]
+    async fn accepting_integration_manager_terms_signs_with_the_scalar_token_and_remembers_it() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let uri = server.server().uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/matrix/client"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "m.integrations": {"managers": [
+                    {"api_url": format!("{uri}/scalar/api"), "ui_url": format!("{uri}/scalar")}
+                ]}
+            })))
+            .mount(server.server())
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/_matrix/client/v3/user/.*/account_data/m.(widgets|accepted_terms)",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(json!({"errcode": "M_NOT_FOUND", "error": "Not found"})),
+            )
+            .mount(server.server())
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(
+                "/_matrix/client/v3/user/.*/openid/request_token",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "openid", "token_type": "Bearer",
+                "matrix_server_name": "example.org", "expires_in": 3600
+            })))
+            .mount(server.server())
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/scalar/api/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"scalar_token": "s3"})))
+            .mount(server.server())
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/scalar/api/_matrix/integrations/v1/terms"))
+            .and(header("Authorization", "Bearer s3"))
+            .and(body_json(json!({"user_accepts": ["https://im/tos"]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(server.server())
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                "/_matrix/client/v3/user/.*/account_data/m.accepted_terms",
+            ))
+            .and(body_json(json!({"accepted": ["https://im/tos"]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(server.server())
+            .await;
+        let core = core_with(&server, client).await;
+
+        core.accept_integration_manager_terms(vec!["https://im/tos".to_owned()])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn terms_the_account_lists_are_signed_with_a_manager_that_never_saw_them() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let uri = server.server().uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/matrix/client"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "m.integrations": {"managers": [
+                    {"api_url": format!("{uri}/scalar/api"), "ui_url": format!("{uri}/scalar")}
+                ]}
+            })))
+            .mount(server.server())
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/_matrix/client/v3/user/.*/account_data/m.widgets",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(json!({"errcode": "M_NOT_FOUND", "error": "Not found"})),
+            )
+            .mount(server.server())
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                "/_matrix/client/v3/user/.*/account_data/m.accepted_terms",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"accepted": ["https://im/tos"]})),
+            )
+            .mount(server.server())
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(
+                "/_matrix/client/v3/user/.*/openid/request_token",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "openid", "token_type": "Bearer",
+                "matrix_server_name": "example.org", "expires_in": 3600
+            })))
+            .mount(server.server())
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/scalar/api/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"scalar_token": "s3"})))
+            .mount(server.server())
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/scalar/api/_matrix/integrations/v1/terms"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"policies": {
+                    "tos": {"version": "1", "en": {"name": "Terms", "url": "https://im/tos"}}
+                }})),
+            )
+            .mount(server.server())
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/scalar/api/account"))
+            .and(query_param("scalar_token", "s3"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+                "errcode": "M_TERMS_NOT_SIGNED", "error": "Terms not signed"
+            })))
+            .mount(server.server())
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/scalar/api/_matrix/integrations/v1/terms"))
+            .and(body_json(json!({"user_accepts": ["https://im/tos"]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(server.server())
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                "/_matrix/client/v3/user/.*/account_data/m.accepted_terms",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(server.server())
+            .await;
+        let core = core_with(&server, client).await;
+
+        let pending = core.integration_manager_terms().await.unwrap();
+
+        assert_eq!(pending, Vec::new());
+    }
+
+    #[test]
     fn integration_managers_come_from_well_known_then_account_data_without_duplicates() {
         let mut managers = super::managers_from_well_known(&json!({
             "m.integrations": {"managers": [
@@ -1482,5 +1889,41 @@ mod tests {
         let core = core_with(&server, client).await;
 
         assert_eq!(core.known_room_ids().await.unwrap(), [room_id.to_owned()]);
+    }
+
+    #[test]
+    fn well_known_managers_skip_malformed_entries() {
+        let managers = managers_from_well_known(&json!({ "m.integrations": { "managers": [
+            { "api_url": "https://a/api", "ui_url": "https://a/ui" },
+            { "api_url": "https://b/api" },
+            "junk",
+            { "api_url": 1, "ui_url": "https://c" },
+        ] } }));
+        assert_eq!(managers.len(), 1);
+        assert_eq!(managers[0].ui_url, "https://a/ui");
+        assert!(managers_from_well_known(&json!({ "m.integrations": ["x"] })).is_empty());
+    }
+
+    #[test]
+    fn account_data_managers_fall_back_to_the_widget_url() {
+        let mut known = Vec::new();
+        managers_from_account_data(
+            &json!({
+                "a": { "type": "m.integration_manager", "url": "https://a/ui",
+                       "data": { "api_url": "https://a/api" } },
+                "b": { "type": "m.integration_manager", "url": "https://b/ui", "data": 5 },
+                "c": { "type": "other", "url": "https://c" },
+                "d": "junk",
+            }),
+            &mut known,
+        );
+        let pairs: Vec<_> = known.iter().map(|m| (&*m.api_url, &*m.ui_url)).collect();
+        assert_eq!(
+            pairs,
+            [
+                ("https://a/api", "https://a/ui"),
+                ("https://b/ui", "https://b/ui")
+            ]
+        );
     }
 }

@@ -11,6 +11,7 @@
   import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
 
   import CallControls from './CallControls.svelte';
+  import CallTileGrid from './CallTileGrid.svelte';
   import LobbyTile from './LobbyTile.svelte';
   import { bestGrid, GRID_GAP_PX, NARROW_STAGE_PX } from './call-layout';
   import { DEVICE_PREFERENCE } from './devices';
@@ -20,6 +21,7 @@
 
   interface Props {
     participants: readonly string[];
+    screenSharers?: readonly string[];
     members: readonly MemberView[];
     media: CallMedia;
     joining: boolean;
@@ -35,6 +37,7 @@
 
   let {
     participants,
+    screenSharers = [],
     members,
     media,
     joining,
@@ -93,8 +96,9 @@
         stream = next;
         cameraFailed = false;
       })
-      .catch(() => {
+      .catch((error: unknown) => {
         if (cancelled) return;
+        console.debug('[sable call] lobby camera preview failed', error);
         stream = undefined;
         cameraFailed = true;
       });
@@ -150,13 +154,13 @@
         if (media.microphone) testing = !testing;
       }}
     >
-      {testing && media.microphone ? $i18n.t('call.stopMicTest') : $i18n.t('call.testMic')}
+      {testing && media.microphone ? i18n.t('common.stopTest') : i18n.t('call.testMic')}
     </Button>
   {/snippet}
   {#if media.microphone}
     {@render testButton({})}
   {:else}
-    <Tooltip label={$i18n.t('call.testMicNeedsMic')}>
+    <Tooltip label={i18n.t('call.testMicNeedsMic')}>
       {#snippet trigger({ props })}{@render testButton(props)}{/snippet}
     </Tooltip>
   {/if}
@@ -165,36 +169,37 @@
 {#snippet joinAction()}
   <Button variant="primary" disabled={joining} loading={joining} onclick={onJoin}>
     <PhoneIcon aria-hidden="true" weight="fill" />
-    {joining ? $i18n.t('call.joining') : $i18n.t('call.joinVoice')}
+    {joining ? i18n.t('call.joining') : i18n.t('call.joinVoice')}
   </Button>
 {/snippet}
 
-<section class="lobby" aria-label={$i18n.t('call.title')}>
+<section class="lobby" aria-label={i18n.t('call.title')}>
   <header class="top">
     <p class="status">
-      <span class="live-dot" class:idle={alone}></span>
+      <span class={['live-dot', { idle: alone }]}></span>
       {#if roomName}<span class="room">{roomName}</span>{/if}
       {#if !alone}
-        <span class="meta" title={$i18n.t('call.lobbyInCall', { count: others.length })}>
-          <UsersIcon aria-hidden="true" weight="bold" />
-          {others.length}
-          <span class="screen-reader-only">
-            {$i18n.t('call.lobbyInCall', { count: others.length })}
-          </span>
-        </span>
+        {@const lobbyLabel = i18n.t('call.lobbyInCall', { count: others.length })}
+        <Tooltip label={lobbyLabel}>
+          {#snippet trigger({ props })}
+            <span {...props} class="meta">
+              <UsersIcon aria-hidden="true" weight="bold" />
+              {others.length}
+              <span class="screen-reader-only">{lobbyLabel}</span>
+            </span>
+          {/snippet}
+        </Tooltip>
       {/if}
     </p>
   </header>
 
   <div class="media" style:--tile-aspect={aspect}>
     {#if canJoin}
-      <ul
-        class="grid"
-        class:alone
-        bind:clientWidth={mediaWidth}
-        bind:clientHeight={mediaHeight}
-        style:--tile-width="{Math.floor(grid.width)}px"
-        style:--grid-gap="{GRID_GAP_PX}px"
+      <CallTileGrid
+        {alone}
+        tileWidth={grid.width}
+        bind:width={mediaWidth}
+        bind:height={mediaHeight}
       >
         {#if self}
           <LobbyTile
@@ -205,8 +210,8 @@
             speaking={testing && meterReady && level > SPEAKING_LEVEL}
             stream={wantsCamera ? stream : undefined}
             note={cameraFailed
-              ? $i18n.t('call.cameraUnavailable')
-              : $i18n.t('call.prescreenNoCamera')}
+              ? i18n.t('call.cameraUnavailable')
+              : i18n.t('call.prescreenNoCamera')}
           />
         {/if}
         {#each others as person, index (otherKeys[index])}
@@ -214,19 +219,20 @@
             name={numberedName(person.name, otherKeys[index] ?? person.userId)}
             userId={person.userId}
             avatar={person.avatar}
+            live={screenSharers.includes(person.userId)}
           />
         {/each}
         {#if alone}
-          <li class="waiting"><p>{$i18n.t('call.lobbyEmpty')}</p></li>
+          <li class="waiting"><p>{i18n.t('call.lobbyEmpty')}</p></li>
         {/if}
-      </ul>
+      </CallTileGrid>
     {:else if !hasPermission}
-      <Alert variant="warning" class="closed" title={$i18n.t('call.lobbyNoPermission')}>
-        <p>{$i18n.t('call.lobbyNoPermissionHint')}</p>
+      <Alert variant="warning" class="closed" title={i18n.t('call.lobbyNoPermission')}>
+        <p>{i18n.t('call.lobbyNoPermissionHint')}</p>
       </Alert>
     {:else if !hasFocus}
-      <Alert variant="warning" class="closed" title={$i18n.t('call.lobbyNoFocus')}>
-        <p>{$i18n.t('call.lobbyNoFocusHint')}</p>
+      <Alert variant="warning" class="closed" title={i18n.t('call.lobbyNoFocus')}>
+        <p>{i18n.t('call.lobbyNoFocusHint')}</p>
       </Alert>
     {/if}
   </div>
@@ -331,33 +337,6 @@
     text-align: center;
   }
 
-  .grid {
-    display: flex;
-    flex: 1;
-    flex-wrap: wrap;
-    gap: var(--grid-gap);
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    place-content: center;
-  }
-
-  .grid > :global(.tile) {
-    aspect-ratio: var(--tile-aspect);
-    inline-size: var(--tile-width);
-  }
-
-  .grid.alone {
-    align-content: center;
-    flex-flow: column nowrap;
-    gap: var(--space-400);
-  }
-
-  .grid.alone > :global(.tile) {
-    align-self: center;
-    inline-size: min(var(--tile-width), 26rem);
-  }
-
   .waiting {
     align-items: center;
     display: flex;
@@ -378,6 +357,8 @@
   }
 
   .dock :global(.btn.test-mic) {
+    --button-height: var(--control-height-500);
+
     border-radius: var(--radius-inner);
     border-width: var(--border-width);
   }

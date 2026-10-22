@@ -97,10 +97,6 @@
     if (userId) void untrack(() => profile.load());
   });
 
-  function stepRoute(step: SetupStep): string {
-    return resolve('/(auth)/setup/[step]', { step });
-  }
-
   function stateFor(base: Pick<SetupRecord, 'registering'>, encryption: EncryptionStatusView) {
     return {
       registering: base.registering,
@@ -120,8 +116,8 @@
     try {
       const parsed = JSON.parse(marker ?? 'null') as { homeserver?: unknown } | null;
       if (typeof parsed?.homeserver === 'string') homeserver = parsed.homeserver;
-    } catch {
-      homeserver = '';
+    } catch (error) {
+      console.debug('[sable setup] onboarding marker unreadable', error);
     }
     const registering = marker !== null;
     return {
@@ -159,15 +155,16 @@
     }
     writeSetupRecord({ setItem: writeText }, key, next);
     record = next;
-    const target = stepRoute(upcoming);
+    const target = resolve('/(auth)/setup/[step]', { step: upcoming });
     if (reload) location.assign(target);
     else if (page.url.pathname !== target)
-      void goto(target, { replaceState: requestedIndex < 0, reset: false });
+      void goto(target, { replace: requestedIndex < 0, reset: false });
   }
 
   function leave(target: string, reload: boolean): void {
     leaving = true;
     if (reload) location.assign(target);
+    // eslint-disable-next-line svelte/no-navigation-without-resolve -- callers pass a resolved path
     else void goto(target);
   }
 
@@ -186,11 +183,13 @@
   function activate(index: number): void {
     const step = steps.at(index);
     if (!step) return;
-    if (index <= pendingIndex) void goto(stepRoute(step), { reset: false });
+    if (index <= pendingIndex)
+      void goto(resolve('/(auth)/setup/[step]', { step }), { reset: false });
     else if (index === pendingIndex + 1 && canSkipAhead && pending) advance(pending);
   }
 
   function skipChecking(): void {
+    // eslint-disable-next-line svelte/no-navigation-without-resolve -- takeAfterLogin() returns a resolved path
     void goto(takeAfterLogin(resolve('/(app)/rooms')));
   }
 
@@ -211,16 +210,21 @@
   $effect(() => {
     if (!record || !pending || leaving) return;
     if (requestedIndex >= 0 && requestedIndex <= pendingIndex) return;
-    void goto(stepRoute(pending), { replaceState: true, reset: false });
+    void goto(resolve('/(auth)/setup/[step]', { step: pending }), {
+      replace: true,
+      reset: false,
+    });
   });
 </script>
 
-{#if !record}
-  <div class="setup-checking" role="status">
+<div class="setup-checking" role="status" aria-atomic="true">
+  {#if !record}
     <Spinner />
-    <p>{$i18n.t('setup.checking')}</p>
-  </div>
-  <AuthSecondaryAction label={$i18n.t('auth.skipForNow')} onclick={skipChecking} />
+    <p>{i18n.t('setup.checking')}</p>
+  {/if}
+</div>
+{#if !record}
+  <AuthSecondaryAction label={i18n.t('auth.skipForNow')} onclick={skipChecking} />
 {:else}
   <AuthRail
     {activeIndex}
@@ -228,7 +232,7 @@
     canBack={activeIndex > 0}
     canForward={activeIndex < pendingIndex || (activeIndex === pendingIndex && canSkipAhead)}
     progress={steps.length > 1
-      ? $i18n.t('setup.progress', { current: activeIndex + 1, total: steps.length })
+      ? i18n.t('setup.progress', { current: activeIndex + 1, total: steps.length })
       : undefined}
     onBack={() => {
       activate(activeIndex - 1);
@@ -243,8 +247,8 @@
         reachable={index <= pendingIndex || (index === pendingIndex + 1 && canSkipAhead)}
         before={index < activeIndex}
         after={index > activeIndex}
-        accessibilityLabel={$i18n.t(STAGE_LABELS[step])}
-        unavailableLabel={$i18n.t('setup.finishCurrentStep')}
+        accessibilityLabel={i18n.t(STAGE_LABELS[step])}
+        unavailableLabel={i18n.t('setup.finishCurrentStep')}
         onActivate={() => {
           activate(index);
         }}

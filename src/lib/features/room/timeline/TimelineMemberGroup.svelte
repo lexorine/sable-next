@@ -1,13 +1,15 @@
 <script lang="ts">
-  import UsersIcon from 'phosphor-svelte/lib/UsersIcon';
+  import type { Snippet } from 'svelte';
+  import { cubicOut } from 'svelte/easing';
+  import { slide } from 'svelte/transition';
+  import CaretDownIcon from 'phosphor-svelte/lib/CaretDownIcon';
 
   import type { MemberView, TimelineItemView } from '#src/generated/protocol';
 
   import { currentLocale, i18n } from '#lib/i18n.js';
-  import { BREAKPOINTS } from '#lib/ui/breakpoints.js';
-  import { createMediaQuery } from '#lib/ui/media-query.svelte.js';
-  import BottomSheet from '#lib/ui/primitives/BottomSheet.svelte';
-  import DialogFrame from '#lib/ui/primitives/DialogFrame.svelte';
+  import { motionMs, MOTION_MS } from '#lib/ui/motion.js';
+  import ResponsiveDialog from '#lib/ui/primitives/ResponsiveDialog.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
 
   import { memberGroupSegments, memberGroupSummary } from '../members/member-groups';
   import MemberUserList from '../members/MemberUserList.svelte';
@@ -15,27 +17,31 @@
 
   interface Props {
     items: readonly TimelineItemView[];
+    renderItem: Snippet<[TimelineItemView]>;
     members?: readonly MemberView[];
     onSenderProfile?: (userId: string, anchor: HTMLElement) => void;
   }
 
-  let { items, members = [], onSenderProfile }: Props = $props();
-  const appLayout = createMediaQuery(BREAKPOINTS.appLayout);
-  let desktop = $derived(appLayout.matches);
+  let { items, renderItem, members = [], onSenderProfile }: Props = $props();
+  const eventsId = $props.id();
+  let expanded = $state(false);
+  let toggleLabel = $derived(
+    i18n.t(`timeline.memberGroup.${expanded ? 'hideEvents' : 'showEvents'}`, {
+      count: items.length,
+    })
+  );
   let segments = $derived(memberGroupSegments(items));
-  let tokens = $derived(memberGroupSummary(segments, $i18n.t, currentLocale()));
+  let tokens = $derived(memberGroupSummary(segments, i18n.t, currentLocale()));
   let open = $state(false);
   let openSegment = $state(0);
   let listed = $derived(segments.at(openSegment));
   let title = $derived(
-    listed
-      ? $i18n.t(`timeline.memberGroup.heading.${listed.category}`)
-      : $i18n.t('timeline.members')
+    listed ? i18n.t(`timeline.memberGroup.heading.${listed.category}`) : i18n.t('timeline.members')
   );
 </script>
 
-{#snippet list()}
-  <div class="member-group-dialog" class:sheet={!desktop}>
+{#snippet list(desktop: boolean)}
+  <div class={['member-group-dialog', { sheet: !desktop }]}>
     <h2>{title}</h2>
     <MemberUserList
       {title}
@@ -48,7 +54,23 @@
 {/snippet}
 
 <p class="member-group">
-  <span class="state-icon" aria-hidden="true"><UsersIcon /></span>
+  <Tooltip label={toggleLabel}>
+    {#snippet trigger({ props })}
+      <button
+        {...props}
+        class="state-icon expand-events"
+        type="button"
+        aria-label={toggleLabel}
+        aria-expanded={expanded}
+        aria-controls={eventsId}
+        onclick={() => {
+          expanded = !expanded;
+        }}
+      >
+        <CaretDownIcon aria-hidden="true" />
+      </button>
+    {/snippet}
+  </Tooltip>
   <span
     >{#each tokens as token, index (index)}{#if token.kind === 'text'}{token.text}{:else if token.kind === 'user'}{#if onSenderProfile}<StateEventSubjectName
             userId={token.userId}
@@ -60,21 +82,31 @@
           onclick={() => {
             openSegment = token.segment;
             open = true;
-          }}>{$i18n.t('timeline.memberGroup.others', { count: token.count })}</button
+          }}>{i18n.t('timeline.memberGroup.others', { count: token.count })}</button
         >{/if}{/each}</span
   >
 </p>
 
-{#if open}
-  {#if desktop}
-    <DialogFrame bind:open variant="verification" label={title}>
-      {@render list()}
-    </DialogFrame>
-  {:else}
-    <BottomSheet bind:open label={title} closeLabel={$i18n.t('timeline.closeMembers')}>
-      {@render list()}
-    </BottomSheet>
+<div id={eventsId} inert={!expanded}>
+  {#if expanded}
+    <div
+      class="member-group-events"
+      transition:slide={{ duration: motionMs(MOTION_MS.fast), easing: cubicOut }}
+    >
+      {#each items as item (item.id)}
+        {@render renderItem(item)}
+      {/each}
+    </div>
   {/if}
+</div>
+
+{#if open}
+  <ResponsiveDialog
+    bind:open
+    label={title}
+    closeLabel={i18n.t('timeline.closeMembers')}
+    children={list}
+  />
 {/if}
 
 <style>
@@ -99,6 +131,41 @@
   .state-icon :global(svg) {
     height: var(--icon-size-small);
     width: var(--icon-size-small);
+  }
+
+  .expand-events {
+    background: none;
+    border: 0;
+    color: inherit;
+    cursor: pointer;
+    min-height: var(--space-600);
+    padding: 0;
+  }
+
+  .expand-events[aria-expanded='false'] :global(svg) {
+    transform: rotate(-90deg);
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .expand-events :global(svg) {
+      transition: transform var(--duration-fast) var(--ease-smooth-out);
+    }
+  }
+
+  .expand-events:is(:hover, :focus-visible) {
+    background: var(--surface-var-container-hover);
+    border-radius: var(--radii-200);
+  }
+
+  .expand-events:focus-visible {
+    outline: var(--focus-ring-width) solid var(--focus-ring);
+    outline-offset: var(--space-050);
+  }
+
+  .member-group-events {
+    display: grid;
+    gap: var(--space-100);
+    margin-block-start: var(--space-100);
   }
 
   .others {

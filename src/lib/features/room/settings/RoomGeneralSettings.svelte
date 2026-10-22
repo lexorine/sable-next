@@ -4,7 +4,7 @@
     JoinRuleView,
     RoomPermissionsView,
     RoomPowerLevelsView,
-    RoomSummary,
+    RoomListItemView,
   } from '#src/generated/protocol';
   import DoorOpenIcon from 'phosphor-svelte/lib/DoorOpenIcon';
   import GlobeIcon from 'phosphor-svelte/lib/GlobeIcon';
@@ -14,6 +14,7 @@
 
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
+  import { nativeFilePicker } from '#lib/platform/native-file-picker.js';
   import Alert from '#lib/ui/primitives/Alert.svelte';
   import Avatar from '#lib/ui/primitives/Avatar.svelte';
   import MediaImage from '#lib/ui/MediaImage.svelte';
@@ -43,7 +44,7 @@
   import { canSendState } from './permission-groups';
 
   interface Props {
-    room: RoomSummary | null;
+    room: RoomListItemView | null;
     permissions: RoomPermissionsView | null;
     levels: RoomPowerLevelsView | null;
     onClose: () => void;
@@ -52,41 +53,41 @@
   let { room, permissions, levels, onClose }: Props = $props();
   const core = useCoreClient();
 
-  let name = $state('');
-  let topicDraft = $state('');
-  let pendingRule = $state<JoinRuleView | null>(null);
+  let name = $derived.by(() => {
+    void roomId;
+    return untrack(() => room?.name ?? '');
+  });
+  let topicDraft = $derived.by(() => {
+    void roomId;
+    return untrack(() => topic);
+  });
+  let pendingRule = $derived.by<JoinRuleView | null>(() => {
+    void roomId;
+    return null;
+  });
   let saving = $state(false);
-  let saved = $state(false);
-  let failed = $state(false);
+  let saved = $derived.by(() => {
+    void roomId;
+    return false;
+  });
+  let failed = $derived.by(() => {
+    void roomId;
+    return false;
+  });
   let avatarInput = $state<HTMLInputElement | null>(null);
   let bannerInput = $state<HTMLInputElement | null>(null);
   let banner = $state<string | null>(null);
 
   let roomId = $derived(room?.room_id ?? null);
   let topic = $derived(room?.topic ?? '');
-  let hasSpaceParent = $state(false);
-
-  $effect(() => {
-    const target = roomId;
-    if (target === null) {
-      hasSpaceParent = false;
-      return;
-    }
-
-    let cancelled = false;
-    core.commands
-      .roomHasSpaceParent(target)
-      .then((value) => {
-        if (!cancelled) hasSpaceParent = value;
-      })
-      .catch(() => {
-        if (!cancelled) hasSpaceParent = false;
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  });
+  let hasSpaceParent = $derived(
+    roomId === null
+      ? false
+      : await core.rpc.spaces.roomHasSpaceParent({ room_id: roomId }).catch((error: unknown) => {
+          console.debug('[sable room] space parent check failed', error);
+          return false;
+        })
+  );
 
   let settableRules = $derived.by(() => {
     const rules: JoinRuleView[] = ['public', 'invite'];
@@ -113,17 +114,6 @@
       (pendingRule !== null && pendingRule !== savedRule)
   );
 
-  $effect(() => {
-    void roomId;
-    untrack(() => {
-      name = room?.name ?? '';
-      topicDraft = topic;
-      pendingRule = null;
-      saved = false;
-      failed = false;
-    });
-  });
-
   async function run(action: () => Promise<void>): Promise<void> {
     saving = true;
     saved = false;
@@ -144,13 +134,16 @@
     if (!target) return;
     await run(async () => {
       if (canEditName && name !== (room?.name ?? '')) {
-        await core.commands.setRoomName(target, name.trim() === '' ? null : name.trim());
+        await core.rpc.room_state.setName({
+          room_id: target,
+          name: name.trim() === '' ? null : name.trim(),
+        });
       }
       if (canEditTopic && topicDraft !== topic) {
-        await core.commands.setRoomTopic(target, topicDraft.trim());
+        await core.rpc.room_state.setTopic({ room_id: target, topic: topicDraft.trim() });
       }
       if (pendingRule !== null && pendingRule !== savedRule) {
-        await core.commands.setRoomJoinRule(target, pendingRule);
+        await core.rpc.room_state.setJoinRule({ room_id: target, rule: pendingRule });
       }
     });
   }
@@ -171,7 +164,7 @@
     const target = roomId;
     if (!target) return;
     void run(async () => {
-      await core.commands.setDirect(target, false);
+      await core.rpc.account.setDirect({ room_id: target, direct: false, user_id: null });
     });
   }
 
@@ -179,7 +172,7 @@
     const target = roomId;
     if (!target || !canEditName) return;
     void run(async () => {
-      await core.commands.setRoomName(target, null);
+      await core.rpc.room_state.setName({ room_id: target, name: null });
       name = '';
     });
   }
@@ -201,7 +194,7 @@
     const target = roomId;
     if (!target || !canEditAvatar) return;
     void run(async () => {
-      await core.commands.setRoomAvatar(target, null);
+      await core.rpc.room_state.setAvatar({ room_id: target, url: null });
     });
   }
 
@@ -230,7 +223,7 @@
 
     await run(async () => {
       const bytes = new Uint8Array(await file.arrayBuffer());
-      const uri = await core.commands.uploadMedia(file.type || 'image/*', bytes);
+      const uri = await core.media.uploadMedia(file.type || 'image/*', bytes);
       await setRoomBanner(core, target, uri);
     });
   }
@@ -253,29 +246,30 @@
 <div class="section">
   <SettingsSection
     headingId="room-settings-general"
-    title={$i18n.t('room.settingsGeneral')}
-    description={$i18n.t('room.settingsGeneralDescription')}
+    title={i18n.t('room.settingsGeneral')}
+    description={i18n.t('room.settingsGeneralDescription')}
   >
     <ul class="settings-rows">
       <SettingsRow
-        title={$i18n.t('room.settingsAvatarLabel')}
-        description={$i18n.t('room.settingsAvatarHint')}
+        title={i18n.t('room.settingsAvatarLabel')}
+        description={i18n.t('room.settingsAvatarHint')}
       >
         {#snippet before()}
           <Avatar id={roomId} src={room?.avatar_url ?? null} name={room?.name ?? ''} />
         {/snippet}
         {#if canEditAvatar}
           <Button size="small" disabled={saving} onclick={() => avatarInput?.click()}>
-            {$i18n.t('room.settingsAvatarChange')}
+            {i18n.t('common.changeAvatar')}
           </Button>
           {#if room?.avatar_url}
             <Button size="small" variant="ghost" disabled={saving} onclick={removeAvatar}>
-              {$i18n.t('room.settingsAvatarRemove')}
+              {i18n.t('common.removeAvatar')}
             </Button>
           {/if}
         {/if}
         <input
           bind:this={avatarInput}
+          use:nativeFilePicker
           class="avatar-input"
           type="file"
           accept="image/*"
@@ -285,22 +279,23 @@
         />
       </SettingsRow>
       <SettingsRow
-        title={$i18n.t('room.settingsBannerLabel')}
-        description={$i18n.t('room.settingsBannerHint')}
+        title={i18n.t('room.settingsBannerLabel')}
+        description={i18n.t('room.settingsBannerHint')}
         before={banner ? bannerPreview : undefined}
       >
         {#if canEditBanner}
           <Button size="small" disabled={saving} onclick={() => bannerInput?.click()}>
-            {$i18n.t('room.settingsBannerChange')}
+            {i18n.t('common.changeBanner')}
           </Button>
           {#if banner}
             <Button size="small" variant="ghost" disabled={saving} onclick={removeBanner}>
-              {$i18n.t('room.settingsBannerRemove')}
+              {i18n.t('common.removeBanner')}
             </Button>
           {/if}
         {/if}
         <input
           bind:this={bannerInput}
+          use:nativeFilePicker
           class="avatar-input"
           type="file"
           accept="image/*"
@@ -312,18 +307,18 @@
     </ul>
     {#if canEditGeneral}
       <div class="settings-form">
-        <FormField fieldId="room-settings-name" label={$i18n.t('room.settingsNameLabel')}>
+        <FormField fieldId="room-settings-name" label={i18n.t('room.settingsNameLabel')}>
           <TextInput id="room-settings-name" bind:value={name} readonly={!canEditName} />
         </FormField>
-        <FormField fieldId="room-settings-topic" label={$i18n.t('room.settingsTopicLabel')}>
+        <FormField fieldId="room-settings-topic" label={i18n.t('room.settingsTopicLabel')}>
           <TextArea id="room-settings-topic" bind:value={topicDraft} readonly={!canEditTopic} />
         </FormField>
       </div>
     {:else}
       <ul class="settings-rows">
-        <SettingsRow title={$i18n.t('room.settingsNameLabel')} description={room?.name ?? ''} />
+        <SettingsRow title={i18n.t('room.settingsNameLabel')} description={room?.name ?? ''} />
         {#if topic !== ''}
-          <SettingsRow title={$i18n.t('room.settingsTopicLabel')} description={topic} />
+          <SettingsRow title={i18n.t('room.settingsTopicLabel')} description={topic} />
         {/if}
       </ul>
     {/if}
@@ -331,42 +326,42 @@
 
   <SettingsSection
     headingId="room-settings-access"
-    title={$i18n.t('room.settingsAccess')}
-    description={$i18n.t('room.settingsAccessDescription')}
+    title={i18n.t('room.settingsAccess')}
+    description={i18n.t('room.settingsAccessDescription')}
   >
     <div class="settings-form">
       {#if unsettableRule && canEditAccess}
         <Alert variant="warning" role="status">
-          {$i18n.t('room.settingsJoinRuleUnsettable', {
-            rule: $i18n.t(`room.joinRule.${room?.join_rule ?? 'unknown'}`),
+          {i18n.t('room.settingsJoinRuleUnsettable', {
+            rule: i18n.t(`room.joinRule.${room?.join_rule ?? 'unknown'}`),
           })}
         </Alert>
       {/if}
       {#if canEditAccess}
         <OptionCards
-          label={$i18n.t('room.settingsAccess')}
+          label={i18n.t('room.settingsAccess')}
           value={joinRule}
           disabled={saving}
           onSelect={selectJoinRule}
           options={[
             {
               value: 'public',
-              label: $i18n.t('room.settingsJoinRulePublic'),
-              hint: $i18n.t('room.settingsJoinRulePublicHint'),
+              label: i18n.t('room.settingsJoinRulePublic'),
+              hint: i18n.t('room.settingsJoinRulePublicHint'),
               icon: GlobeIcon,
             },
             {
               value: 'invite',
-              label: $i18n.t('room.settingsJoinRuleInvite'),
-              hint: $i18n.t('room.settingsJoinRuleInviteHint'),
+              label: i18n.t('room.createJoinRuleInvite'),
+              hint: i18n.t('room.settingsJoinRuleInviteHint'),
               icon: LockIcon,
             },
             ...(room?.supports_knock
               ? [
                   {
                     value: 'knock' as const,
-                    label: $i18n.t('room.settingsJoinRuleKnock'),
-                    hint: $i18n.t('room.settingsJoinRuleKnockHint'),
+                    label: i18n.t('common.askToJoin'),
+                    hint: i18n.t('room.settingsJoinRuleKnockHint'),
                     icon: HandIcon,
                   },
                 ]
@@ -375,8 +370,8 @@
               ? [
                   {
                     value: 'restricted' as const,
-                    label: $i18n.t('room.settingsJoinRuleRestricted'),
-                    hint: $i18n.t('room.settingsJoinRuleRestrictedHint'),
+                    label: i18n.t('room.createJoinRuleRestricted'),
+                    hint: i18n.t('room.settingsJoinRuleRestrictedHint'),
                     icon: HouseIcon,
                   },
                 ]
@@ -385,8 +380,8 @@
               ? [
                   {
                     value: 'knock_restricted' as const,
-                    label: $i18n.t('room.settingsJoinRuleKnockRestricted'),
-                    hint: $i18n.t('room.settingsJoinRuleKnockRestrictedHint'),
+                    label: i18n.t('room.settingsJoinRuleKnockRestricted'),
+                    hint: i18n.t('room.settingsJoinRuleKnockRestrictedHint'),
                     icon: DoorOpenIcon,
                   },
                 ]
@@ -395,30 +390,30 @@
         />
       {:else}
         <p class="read-only-value">
-          {$i18n.t(`room.joinRule.${room?.join_rule ?? 'unknown'}`)}
+          {i18n.t(`room.joinRule.${room?.join_rule ?? 'unknown'}`)}
         </p>
       {/if}
     </div>
 
     <ul class="settings-rows">
-      {#if !room?.is_space}
+      {#if room?.room_kind !== 'space'}
         <RoomHistorySettings {room} {levels} {ownPowerLevel} />
         <RoomEncryptionSettings {room} {levels} {ownPowerLevel} />
       {/if}
       <RoomPublishSettings {room} {levels} {ownPowerLevel} />
-      <RoomSpacesSettings {room} />
+      <RoomSpacesSettings {room} {levels} {ownPowerLevel} />
       {#if room?.is_direct}
         <SettingsRow
-          title={$i18n.t('room.settingsDirectLabel')}
-          description={$i18n.t('room.settingsDirectHint')}
+          title={i18n.t('common.directMessage')}
+          description={i18n.t('room.settingsDirectHint')}
         >
           {#if canEditName && room.name}
             <Button size="small" variant="ghost" disabled={saving} onclick={resetDirectName}>
-              {$i18n.t('room.settingsDirectResetName')}
+              {i18n.t('room.settingsDirectResetName')}
             </Button>
           {/if}
           <Button size="small" disabled={saving} onclick={convertToGroup}>
-            {$i18n.t('room.menuConvertToGroup')}
+            {i18n.t('room.menuConvertToGroup')}
           </Button>
         </SettingsRow>
       {/if}
@@ -430,21 +425,21 @@
   <RoomUpgradeSettings {room} {levels} {ownPowerLevel} {onClose} />
 
   {#if canEditGeneral || canEditAccess}
-    <div class="save-bar" class:pending={dirty}>
+    <div class={['save-bar', { pending: dirty }]}>
       {#if failed}
-        <p class="save-status error" role="alert">{$i18n.t('room.settingsFailed')}</p>
+        <p class="save-status error" role="alert">{i18n.t('room.settingsFailed')}</p>
       {:else if dirty}
-        <p class="save-status" role="status">{$i18n.t('room.settingsUnsaved')}</p>
+        <p class="save-status" role="status">{i18n.t('common.unsavedChangesNotice')}</p>
       {:else if saved}
-        <p class="save-status" role="status">{$i18n.t('room.settingsSaved')}</p>
+        <p class="save-status" role="status">{i18n.t('room.settingsSaved')}</p>
       {/if}
       {#if dirty}
         <Button variant="ghost" disabled={saving} onclick={resetDraft}>
-          {$i18n.t('room.settingsReset')}
+          {i18n.t('common.reset')}
         </Button>
       {/if}
       <Button variant="primary" disabled={!dirty || saving} loading={saving} onclick={save}>
-        {$i18n.t('room.settingsSave')}
+        {i18n.t('common.save')}
       </Button>
     </div>
   {/if}

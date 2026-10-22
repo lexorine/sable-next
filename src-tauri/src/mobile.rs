@@ -1,12 +1,6 @@
-// The edge-to-edge plugin leaves the system bars transparent and the webview
-// paints under them, so the bar colour is already whatever the page draws.
-// `Window.setStatusBarColor` cannot change it either: it is a no-op under
-// enforced edge-to-edge from API 35, and this app targets 36. What is left is
-// the icon contrast, which only the window insets controller can set.
-//
-// Rust cannot reach the Activity directly, since Tauri does not populate
-// ndk-context, so MainActivity hands us the JavaVM on create and we call back
-// into a static method that owns the window.
+// The webview paints under transparent system bars, so only icon contrast is ours to set;
+// `Window.setStatusBarColor` is a no-op from API 35.
+// Tauri does not populate ndk-context, so MainActivity hands us the JavaVM on create.
 
 use std::sync::OnceLock;
 

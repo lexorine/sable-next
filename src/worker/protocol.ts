@@ -1,4 +1,4 @@
-import type { Command, CommandErr, CommandOk, CoreEvent } from '#src/generated/protocol';
+import type { RpcError, CoreEvent } from '#src/generated/protocol';
 import type { Attachment, Gallery, GalleryAttachment } from '#src/transport';
 
 export type AttachmentRequest = Required<Attachment>;
@@ -7,11 +7,13 @@ export type GalleryRequest = Required<Omit<Gallery, 'attachments'>> & {
 };
 
 export type WorkerRequest =
-  | { id: number; command: Command }
+  | { id: number; call: { method: string; params: unknown } }
   | { id: number; ping: true }
   | { disconnect: true }
   | { id: number; reset: true }
   | { debugLogs: boolean }
+  | { visible: boolean }
+  | { logFilter: string }
   | { id: number; media: { source: string; width: number; height: number; background?: boolean } }
   | { id: number; forget: { source: string } }
   | { id: number; attachment: AttachmentRequest }
@@ -20,13 +22,14 @@ export type WorkerRequest =
 
 /** Worker → page. Events carry no id because they answer nothing. */
 export type WorkerMessage =
-  | { id: number; ok: CommandOk }
+  | { id: number; ok: unknown }
   | { id: number; pong: true }
-  | { id: number; err: CommandErr }
-  // Transferred, not copied, so a thumbnail crosses once.
+  | { id: number; err: RpcError }
+  // Transferred so a thumbnail crosses once.
   | { id: number; bytes: Uint8Array<ArrayBuffer> }
   /** An `mxc:` URI from `uploadMedia`, or nothing from `sendAttachment` and `forgetMedia`. */
   | { id: number; uri: string | null }
   | { events: CoreEvent[] }
   | { logs: string[] }
-  | { panic: { message: string; stack?: string } };
+  | { panic: { message: string; stack?: string } }
+  | { superseded: true };

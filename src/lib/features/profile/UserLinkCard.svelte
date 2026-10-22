@@ -6,10 +6,11 @@
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
   import { roomSectionPath } from '#lib/rooms/permalink.js';
-  import { useRoomList } from '#lib/rooms/room-list.svelte.js';
+  import { hasDirectRoom, useRoomList } from '#lib/rooms/room-list.svelte.js';
   import MediaViewer, { type MediaItem } from '#lib/features/room/media/MediaViewer.svelte';
   import Avatar from '#lib/ui/primitives/Avatar.svelte';
   import Button from '#lib/ui/primitives/Button.svelte';
+  import ConfirmDialog from '#lib/ui/primitives/ConfirmDialog.svelte';
   import Spinner from '#lib/ui/primitives/Spinner.svelte';
 
   interface Props {
@@ -21,10 +22,11 @@
   const core = useCoreClient();
   const roomList = useRoomList();
 
-  let profile = $state<ProfileView | null>(null);
+  let profile = $state.raw<ProfileView | null>(null);
   let loaded = $state(false);
   let opening = $state(false);
   let failed = $state(false);
+  let confirming = $state(false);
 
   let name = $derived(profile?.display_name ?? userId);
   let avatarOpen = $state(false);
@@ -79,8 +81,9 @@
     opening = true;
     failed = false;
     try {
-      const roomId = await core.commands.createDm(userId);
+      const roomId = await core.rpc.rooms.createDm({ user_id: userId, encrypted: null });
       const target = roomSectionPath(roomList.rooms, roomId);
+      // eslint-disable-next-line svelte/no-navigation-without-resolve -- roomSectionPath() resolves the route itself
       await goto(target, { replace: true });
     } catch (error) {
       console.warn('[sable profile] could not open a chat', error);
@@ -88,6 +91,11 @@
     } finally {
       opening = false;
     }
+  }
+
+  function requestMessage(): void {
+    if (hasDirectRoom(roomList.rooms, userId)) void message();
+    else confirming = true;
   }
 </script>
 
@@ -112,13 +120,25 @@
     <h1 id="user-link-title">{name}</h1>
     <p class="user-link-id">{userId}</p>
     {#if failed}
-      <p role="alert">{$i18n.t('userLink.failed')}</p>
+      <p role="alert">{i18n.t('userLink.failed')}</p>
     {/if}
-    <Button onclick={() => void message()} disabled={opening}>
-      {opening ? $i18n.t('userLink.opening') : $i18n.t('userLink.action')}
+    <Button onclick={requestMessage} disabled={opening}>
+      {opening ? i18n.t('userLink.opening') : i18n.t('userLink.action')}
     </Button>
   {/if}
 </section>
+
+<ConfirmDialog
+  bind:open={confirming}
+  title={i18n.t('direct.confirmTitle', { name })}
+  description={i18n.t('direct.confirmBody')}
+  confirmLabel={i18n.t('direct.submit')}
+  confirmVariant="primary"
+  onConfirm={() => {
+    confirming = false;
+    void message();
+  }}
+/>
 
 {#if avatarOpen && avatar}
   <MediaViewer

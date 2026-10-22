@@ -63,3 +63,39 @@ test('an edit diffs against the edit before it', () => {
   expect(index.editBefore(second)).toBe(first);
   expect(index.editBefore(first)).toBeNull();
 });
+
+test('a redaction reason is found by the event it redacted', () => {
+  const index = new TimelineEventIndex(
+    [],
+    [
+      hidden('$x', 'm.room.redaction', { reason: 'spam' }, 0, '$old'),
+      hidden('$y', 'm.room.redaction', { reason: '  ' }, 0, '$blank'),
+    ]
+  );
+
+  expect(index.redactionReason('$old')).toBe('spam');
+  expect(index.redactionReason('$blank')).toBeNull();
+  expect(index.redactionReason('$other')).toBeNull();
+});
+
+function deleted(sender: string, redactedBy?: string): TimelineItemView {
+  return {
+    id: '$msg',
+    event_id: '$msg',
+    sender,
+    content: { kind: 'redacted', reason: null, redacted_by: redactedBy },
+  } as TimelineItemView;
+}
+
+test('a deletion names its redactor unless the author made it', () => {
+  const redaction = (sender: string) =>
+    ({ ...hidden('$x', 'm.room.redaction', {}, 0, '$msg'), sender }) as TimelineItemView;
+
+  const live = new TimelineEventIndex([], [redaction('@mod:x')]);
+  expect(live.redactor(deleted('@alice:x'))).toBe('@mod:x');
+  expect(live.redactor(deleted('@mod:x'))).toBeNull();
+
+  const loaded = new TimelineEventIndex([], []);
+  expect(loaded.redactor(deleted('@alice:x', '@mod:x'))).toBe('@mod:x');
+  expect(loaded.redactor(deleted('@alice:x'))).toBeNull();
+});

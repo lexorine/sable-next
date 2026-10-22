@@ -1,5 +1,7 @@
 <script module lang="ts">
   export type { MediaItem } from './media-viewer-types';
+
+  const lensSettings = $state({ zoom: 2, size: 192 });
 </script>
 
 <script lang="ts">
@@ -14,8 +16,6 @@
   import { mediaProgress } from '#lib/ui/media-progress.svelte.js';
   import MediaImage from '#lib/ui/MediaImage.svelte';
   import ImageSpoilerControl from '#lib/ui/ImageSpoilerControl.svelte';
-  import { videoStreamingSupported } from '#lib/ui/video-stream.svelte.js';
-  import { canPlayVideo } from '#lib/ui/video-support.js';
   import { clampPan, type Vector2 } from '#lib/ui/pan-clamp.js';
   import { cursorAnchor, type CursorAnchor } from '#lib/ui/cursor-anchor.js';
   import { mouseContextMenu } from '#lib/ui/long-press.svelte.js';
@@ -25,7 +25,7 @@
     SWIPE_THRESHOLD,
     VELOCITY_THRESHOLD,
   } from '#lib/ui/swipe-gesture.js';
-  import { sharesNatively, supportsPhotoLibrary } from '#lib/platform/files.js';
+  import { savesNatively, sharesNatively, supportsPhotoLibrary } from '#lib/platform/files.js';
   import { setSystemBarsHidden } from '#lib/platform/system-bars.js';
   import ActionMenu from '#lib/ui/primitives/ActionMenu.svelte';
   import ActionMenuItem from '#lib/ui/primitives/ActionMenuItem.svelte';
@@ -33,6 +33,7 @@
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
   import Spinner from '#lib/ui/primitives/Spinner.svelte';
   import Button from '#lib/ui/primitives/Button.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
   import XIcon from 'phosphor-svelte/lib/XIcon';
   import ArrowLeftIcon from 'phosphor-svelte/lib/ArrowLeftIcon';
   import ArrowRightIcon from 'phosphor-svelte/lib/ArrowRightIcon';
@@ -43,6 +44,7 @@
   import PdfViewer from '#lib/ui/PdfViewer.svelte';
   import { overlayLayer } from '#lib/ui/overlay-layer.js';
   import { MediaViewerActions } from './media-viewer-actions';
+  import { spoilerVisibility, spoilerVisibilityKey } from './spoiler-visibility.svelte.js';
   import { MediaViewerResource } from './media-viewer-resource.svelte';
   import type { MediaItem } from './media-viewer-types';
   import CaretLeftIcon from 'phosphor-svelte/lib/CaretLeftIcon';
@@ -79,9 +81,8 @@
     )
   );
   let item = $derived<MediaItem | undefined>(items[index]);
-  const spoilerVisibility = new SvelteMap<string, boolean>();
   let spoiler = $derived(item?.kind === 'image' || item?.kind === 'video' ? item.spoiler : null);
-  let spoilerKey = $derived(JSON.stringify([item?.eventId, item?.source, spoiler]));
+  let spoilerKey = $derived(spoilerVisibilityKey(item?.eventId, item?.source, spoiler));
   let spoilerHidden = $derived(spoilerVisibility.get(spoilerKey) ?? spoiler !== null);
   let source = $derived(spoilerHidden && item?.kind === 'video' ? null : (item?.source ?? null));
   let mime = $derived(item?.mime ?? null);
@@ -92,17 +93,17 @@
     item === undefined ? '' : item.kind === 'sticker' ? item.body : (item.caption ?? item.filename)
   );
   let visibleLabel = $derived(
-    spoilerHidden ? $i18n.t('composer.spoiler') : mediaLabel || $i18n.t('viewer.untitled')
+    spoilerHidden ? i18n.t('composer.spoiler') : mediaLabel || i18n.t('viewer.untitled')
   );
-  const resource = new MediaViewerResource(core, () => videoEl?.currentTime ?? 0);
+  const resource = new MediaViewerResource(core);
   let url = $derived(resource.url);
   const mediaActions = new MediaViewerActions(
     () => ({ url, item, fileName }),
     () => ({
-      copied: $i18n.t('viewer.imageCopied'),
-      copyFailed: $i18n.t('viewer.copyFailed'),
-      saved: $i18n.t('viewer.saved'),
-      saveFailed: $i18n.t('errors.actionFailed'),
+      copied: i18n.t('viewer.imageCopied'),
+      copyFailed: i18n.t('viewer.copyFailed'),
+      saved: i18n.t('viewer.saved'),
+      saveFailed: i18n.t('errors.actionFailed'),
     })
   );
   const loading = mediaProgress(core, () => (!url && !failed ? source : null));
@@ -111,23 +112,50 @@
       ? item
       : null
   );
-  let videoEl = $state<HTMLVideoElement>();
   let failed = $derived(resource.failed);
-  let zoom = $state(1);
-  let rotation = $state(0);
-  let pan = $state<Vector2>({ x: 0, y: 0 });
-  let pixelated = $state(false);
+  let zoom = $derived.by(() => {
+    void source;
+    return 1;
+  });
+  let rotation = $derived.by(() => {
+    void source;
+    return 0;
+  });
+  let pan = $derived.by<Vector2>(() => {
+    void source;
+    return { x: 0, y: 0 };
+  });
+  let pixelated = $derived.by(() => {
+    void source;
+    return untrack(() =>
+      item?.kind === 'image' || item?.kind === 'sticker'
+        ? pixelatedImage(preferences.pixelatedImages, item.width, item.height)
+        : false
+    );
+  });
   let canSaveToPhotos = $state(false);
   let stageEl: HTMLElement | null = $state(null);
   let imageEl: HTMLImageElement | null = $state(null);
-  let fitRatio = $state(1);
-  let fitsWindow = $state(true);
+  let fitRatio = $derived.by(() => {
+    void source;
+    return 1;
+  });
+  let fitsWindow = $derived.by(() => {
+    void source;
+    return true;
+  });
   let dragging = $state(false);
   let instant = $state(false);
-  let imageReady = $state(false);
+  let imageReady = $derived.by(() => {
+    void source;
+    return false;
+  });
   let imageMenuOpen = $state(false);
   let imageMenuAnchor = $state.raw<CursorAnchor | null>(null);
-  let editingZoom = $state(false);
+  let editingZoom = $derived.by(() => {
+    void source;
+    return false;
+  });
   let zoomInput = $state('100');
   let swipeX = $state(0);
   let swipeY = $state(0);
@@ -158,25 +186,22 @@
     stage: DOMRect;
     image: DOMRect;
   } | null>(null);
-  let lensZoom = $state(2);
-  let lensSize = $state(192);
   let isImage = $derived(item?.kind === 'image' || item?.kind === 'sticker');
-  let streamUnavailable = $derived(resource.streamUnavailable);
-  let transcode = $derived(
-    item?.kind === 'video' &&
-      !canPlayVideo(mime) &&
-      !streamUnavailable &&
-      videoStreamingSupported(core)
-  );
   let isPdf = $derived(item?.kind === 'file');
-  let pdfPages = $state(0);
-  let pdfPage = $state(1);
+  let pdfPages = $derived.by(() => {
+    void source;
+    return 0;
+  });
+  let pdfPage = $derived.by(() => {
+    void source;
+    return 1;
+  });
   let downloadLabel = $derived(
     item?.kind === 'video'
-      ? $i18n.t('viewer.downloadVideo')
+      ? i18n.t('viewer.downloadVideo')
       : item?.kind === 'audio'
-        ? $i18n.t('viewer.downloadAudio')
-        : $i18n.t('viewer.downloadImage')
+        ? i18n.t('viewer.downloadAudio')
+        : i18n.t('viewer.downloadImage')
   );
 
   function clampCurrentPan(next: Vector2): Vector2 {
@@ -184,28 +209,7 @@
     return clampPan(next, stageEl.getBoundingClientRect(), imageEl.getBoundingClientRect());
   }
 
-  $effect(() => {
-    void source;
-    untrack(() => {
-      zoom = 1;
-      rotation = 0;
-      pan = { x: 0, y: 0 };
-      pdfPage = 1;
-      pdfPages = 0;
-      fitRatio = 1;
-      fitsWindow = true;
-      imageReady = false;
-      editingZoom = false;
-      pixelated =
-        item?.kind === 'image' || item?.kind === 'sticker'
-          ? pixelatedImage(preferences.pixelatedImages, item.width, item.height)
-          : false;
-    });
-  });
-
-  $effect(() => {
-    const stage = stageEl;
-    if (!stage) return;
+  function refitOnResize(stage: HTMLElement): () => void {
     const observer = new ResizeObserver(() => {
       if (fitsWindow && isImage) fitToStage();
     });
@@ -213,7 +217,7 @@
     return () => {
       observer.disconnect();
     };
-  });
+  }
 
   $effect(() => {
     if (item === undefined) onClose();
@@ -228,7 +232,7 @@
   });
 
   $effect(() => {
-    return resource.load(source, mime, transcode);
+    return resource.load(source, mime);
   });
 
   onDestroy(() => {
@@ -363,9 +367,15 @@
     if (lens) {
       const factor = 1 - (event.deltaY || event.deltaX) * 0.001;
       if (event.shiftKey) {
-        lensSize = Math.min(LENS_MAX_SIZE, Math.max(LENS_MIN_SIZE, lensSize * factor));
+        lensSettings.size = Math.min(
+          LENS_MAX_SIZE,
+          Math.max(LENS_MIN_SIZE, lensSettings.size * factor)
+        );
       } else {
-        lensZoom = Math.min(LENS_MAX_ZOOM, Math.max(LENS_MIN_ZOOM, lensZoom * factor));
+        lensSettings.zoom = Math.min(
+          LENS_MAX_ZOOM,
+          Math.max(LENS_MIN_ZOOM, lensSettings.zoom * factor)
+        );
       }
       return;
     }
@@ -655,33 +665,37 @@
         class={chromeHidden ? 'viewer immersive' : 'viewer'}
         {...overlayLayer()}
         style={`height: calc(100dvh - var(--titlebar-height)); inset: var(--titlebar-height) 0 0; opacity: ${String(1 - Math.min(0.75, Math.abs(swipeY) / 400))}; position: fixed; width: 100vw;`}
-        aria-label={$i18n.t('viewer.title')}
+        aria-label={i18n.t('viewer.title')}
         onInteractOutside={(event: PointerEvent) => {
           if (event.target instanceof Element && event.target.closest('.titlebar')) {
             event.preventDefault();
           }
         }}
       >
-        <header class="toolbar" class:chrome-hidden={chromeHidden}>
+        <header class={['toolbar', { 'chrome-hidden': chromeHidden }]}>
           <div class="heading">
             <strong>{item.sender}</strong>
-            <span title={visibleLabel}
-              >{$i18n.t('viewer.position', { index: index + 1, total: items.length })} · {visibleLabel}</span
-            >
+            <Tooltip label={visibleLabel}>
+              {#snippet trigger({ props })}
+                <span {...props}
+                  >{i18n.t('viewer.position', { index: index + 1, total: items.length })} · {visibleLabel}</span
+                >
+              {/snippet}
+            </Tooltip>
           </div>
           <div class="actions">
             {#if isImage || isPdf}
               <div class="zoom-controls">
                 {#if isImage && fitRatio !== 1 && zoom !== 1}
                   <IconButton
-                    label={$i18n.t('viewer.originalSize')}
+                    label={i18n.t('viewer.originalSize')}
                     size="small"
                     variant="ghost"
                     onclick={() => setZoom(1)}><ImageSquareIcon /></IconButton
                   >
                 {/if}
                 <IconButton
-                  label={$i18n.t('viewer.zoomOut')}
+                  label={i18n.t('viewer.zoomOut')}
                   size="small"
                   variant="ghost"
                   onclick={() => setZoom(zoom / (1 + ZOOM_STEP))}><MinusIcon /></IconButton
@@ -692,7 +706,7 @@
                     <input
                       type="text"
                       inputmode="numeric"
-                      aria-label={$i18n.t('viewer.setZoom')}
+                      aria-label={i18n.t('viewer.setZoom')}
                       autofocus
                       bind:value={zoomInput}
                       onblur={commitZoomEdit}
@@ -702,15 +716,17 @@
                     />%
                   </span>
                 {:else}
-                  <button
-                    class="zoom-level"
-                    type="button"
-                    title={$i18n.t('viewer.setZoom')}
-                    onclick={beginZoomEdit}>{Math.round(zoom * 100)}%</button
-                  >
+                  {@const zoomLabel = i18n.t('viewer.setZoom')}
+                  <Tooltip label={zoomLabel}>
+                    {#snippet trigger({ props })}
+                      <button {...props} class="zoom-level" type="button" onclick={beginZoomEdit}
+                        >{Math.round(zoom * 100)}%</button
+                      >
+                    {/snippet}
+                  </Tooltip>
                 {/if}
                 <IconButton
-                  label={$i18n.t('viewer.zoomIn')}
+                  label={i18n.t('viewer.zoomIn')}
                   size="small"
                   variant="ghost"
                   onclick={() => setZoom(zoom * (1 + ZOOM_STEP))}><PlusIcon /></IconButton
@@ -719,7 +735,7 @@
             {/if}
             {#if canShare}
               <IconButton
-                label={$i18n.t('viewer.share')}
+                label={i18n.t('common.share')}
                 size="medium"
                 variant="ghost"
                 onclick={(event) => {
@@ -731,11 +747,11 @@
               <ActionMenu label={downloadLabel} trigger={saveTrigger}>
                 <ActionMenuItem onSelect={() => void mediaActions.download()}>
                   <FileArrowDownIcon />
-                  {$i18n.t('viewer.saveToFiles')}
+                  {i18n.t('viewer.saveToFiles')}
                 </ActionMenuItem>
                 <ActionMenuItem onSelect={() => void mediaActions.saveToPhotos()}>
                   <ImagesIcon />
-                  {$i18n.t('viewer.saveToPhotos')}
+                  {i18n.t('viewer.saveToPhotos')}
                 </ActionMenuItem>
               </ActionMenu>
             {:else}
@@ -747,11 +763,11 @@
               >
             {/if}
             {#if isImage || isPdf || onJump}
-              <ActionMenu label={$i18n.t('timeline.moreActions')}>
+              <ActionMenu label={i18n.t('timeline.moreActions')}>
                 {#snippet trigger({ props })}
                   <IconButton
                     {...props}
-                    label={$i18n.t('timeline.moreActions')}
+                    label={i18n.t('timeline.moreActions')}
                     size="medium"
                     variant="ghost"><DotsThreeIcon /></IconButton
                   >
@@ -759,21 +775,21 @@
                 {#if isImage}
                   <ActionMenuItem onSelect={() => void mediaActions.copyImage()}>
                     <CopyIcon />
-                    {$i18n.t('viewer.copyImage')}
+                    {i18n.t('viewer.copyImage')}
                   </ActionMenuItem>
                   <ActionMenuItem onSelect={() => rotateBy(90)}>
                     <ArrowClockwiseIcon />
-                    {$i18n.t('viewer.rotate')}
+                    {i18n.t('viewer.rotate')}
                   </ActionMenuItem>
                   <ActionMenuItem checked={pixelated} onSelect={() => (pixelated = !pixelated)}>
                     <SquaresFourIcon />
-                    {$i18n.t('viewer.pixelate')}
+                    {i18n.t('viewer.pixelate')}
                   </ActionMenuItem>
                   <ActionMenuItem
                     onSelect={() => spoilerVisibility.set(spoilerKey, !spoilerHidden)}
                   >
                     {#if spoilerHidden}<EyeIcon />{:else}<EyeSlashIcon />{/if}
-                    {$i18n.t(
+                    {i18n.t(
                       spoilerHidden ? 'timeline.revealImageUnnamed' : 'timeline.hideImageUnnamed'
                     )}
                   </ActionMenuItem>
@@ -789,7 +805,7 @@
                     }}
                   >
                     <ArrowCounterClockwiseIcon />
-                    {$i18n.t('viewer.reset')}
+                    {i18n.t('viewer.reset')}
                   </ActionMenuItem>
                 {/if}
                 {#if onJump}
@@ -800,14 +816,14 @@
                     }}
                   >
                     <ChatCenteredTextIcon />
-                    {$i18n.t('viewer.jumpToMessage')}
+                    {i18n.t('common.jumpToMessage')}
                   </ActionMenuItem>
                 {/if}
               </ActionMenu>
             {/if}
             <IconButton
               class="close-button"
-              label={$i18n.t('viewer.close')}
+              label={i18n.t('common.close')}
               size="medium"
               variant="ghost"
               onclick={onClose}><XIcon /></IconButton
@@ -816,12 +832,17 @@
         </header>
 
         <main
-          class="stage"
-          class:spoilered={spoilerHidden}
-          class:has-nav={items.length > 1}
-          class:chrome-hidden={chromeHidden}
-          class:magnifying={lens !== null}
+          class={[
+            'stage',
+            {
+              spoilered: spoilerHidden,
+              'has-nav': items.length > 1,
+              'chrome-hidden': chromeHidden,
+              magnifying: lens !== null,
+            },
+          ]}
           bind:this={stageEl}
+          {@attach refitOnResize}
           onwheel={handleWheel}
           onpointerdown={startPan}
           ondblclick={toggleFileZoom}
@@ -832,25 +853,25 @@
           {#if index > 0}
             <IconButton
               class="nav previous"
-              label={$i18n.t('viewer.previous')}
+              label={i18n.t('viewer.previous')}
               size="large"
               onclick={previous}><ArrowLeftIcon /></IconButton
             >
           {/if}
           {#if spoilerHidden && !isImage}
             <Button class="spoiler-reveal" onclick={() => spoilerVisibility.set(spoilerKey, false)}>
-              {spoiler ? `${spoiler} — ` : ''}{$i18n.t('timeline.spoilerMedia')}
+              {spoiler ? `${spoiler} — ` : ''}{i18n.t('timeline.spoilerMedia')}
             </Button>
           {:else if url}
             {#if item.kind === 'video'}
               <!-- Matrix carries no caption track for an attachment. -->
               <!-- svelte-ignore a11y_media_has_caption -->
               <video
-                bind:this={videoEl}
                 class="media-player"
                 controls
+                controlslist={savesNatively() ? 'nodownload' : undefined}
                 src={url}
-                aria-label={mediaLabel || $i18n.t('timeline.videoAttachment')}
+                aria-label={mediaLabel || i18n.t('timeline.videoAttachment')}
               >
                 {fileName}
               </video>
@@ -858,8 +879,9 @@
               <audio
                 class="media-player"
                 controls
+                controlslist={savesNatively() ? 'nodownload' : undefined}
                 src={url}
-                aria-label={mediaLabel || $i18n.t('timeline.audioAttachment')}
+                aria-label={mediaLabel || i18n.t('timeline.audioAttachment')}
               >
                 {fileName}
               </audio>
@@ -876,12 +898,9 @@
             {:else}
               <img
                 bind:this={imageEl}
-                class:pixelated
-                class:dragging
-                class:instant
-                class:spoilered={spoilerHidden}
+                class={{ pixelated, dragging, instant, spoilered: spoilerHidden }}
                 src={url}
-                alt={spoilerHidden ? '' : mediaLabel || $i18n.t('viewer.imageAlt')}
+                alt={spoilerHidden ? '' : mediaLabel || i18n.t('viewer.imageAlt')}
                 aria-hidden={spoilerHidden ? 'true' : undefined}
                 draggable="false"
                 style:opacity={imageReady ? undefined : 0}
@@ -893,25 +912,25 @@
                 <div
                   class="lens"
                   aria-hidden="true"
-                  style:left={`${String(lens.x - lens.stage.x - lensSize / 2)}px`}
-                  style:top={`${String(lens.y - lens.stage.y - lensSize / 2)}px`}
-                  style:width={`${String(lensSize)}px`}
-                  style:height={`${String(lensSize)}px`}
+                  style:left={`${String(lens.x - lens.stage.x - lensSettings.size / 2)}px`}
+                  style:top={`${String(lens.y - lens.stage.y - lensSettings.size / 2)}px`}
+                  style:width={`${String(lensSettings.size)}px`}
+                  style:height={`${String(lensSettings.size)}px`}
                 >
                   <img
-                    class:pixelated
+                    class={{ pixelated }}
                     src={url}
                     alt=""
                     draggable="false"
-                    style:width={`${String(lens.image.width * lensZoom)}px`}
-                    style:height={`${String(lens.image.height * lensZoom)}px`}
-                    style:transform={`translate(${String(lensSize / 2 - (lens.x - lens.image.x) * lensZoom)}px, ${String(lensSize / 2 - (lens.y - lens.image.y) * lensZoom)}px)`}
+                    style:width={`${String(lens.image.width * lensSettings.zoom)}px`}
+                    style:height={`${String(lens.image.height * lensSettings.zoom)}px`}
+                    style:transform={`translate(${String(lensSettings.size / 2 - (lens.x - lens.image.x) * lensSettings.zoom)}px, ${String(lensSettings.size / 2 - (lens.y - lens.image.y) * lensSettings.zoom)}px)`}
                   />
                 </div>
               {/if}
               <ActionMenu
                 bind:open={imageMenuOpen}
-                label={$i18n.t('viewer.imageMenu')}
+                label={i18n.t('viewer.imageMenu')}
                 anchor={imageMenuAnchor}
                 side="bottom"
                 align="start"
@@ -919,7 +938,7 @@
               >
                 <ActionMenuItem onSelect={() => void mediaActions.copyImage()}>
                   <CopyIcon />
-                  {$i18n.t('viewer.copyImage')}
+                  {i18n.t('viewer.copyImage')}
                 </ActionMenuItem>
                 <ActionMenuItem onSelect={() => void mediaActions.download()}>
                   <DownloadSimpleIcon />
@@ -929,8 +948,8 @@
             {/if}
           {:else if failed}
             <div class="error">
-              <strong>{$i18n.t('timeline.mediaUnavailable')}</strong>
-              <span>{$i18n.t('timeline.mediaUnavailableDetail')}</span>
+              <strong>{i18n.t('timeline.mediaUnavailable')}</strong>
+              <span>{i18n.t('timeline.mediaUnavailableDetail')}</span>
             </div>
           {:else}
             {#if preview}
@@ -952,9 +971,9 @@
               />
             {/if}
             <span class="loading">
-              <Spinner label={$i18n.t('a11y.loading')} />
+              <Spinner label={i18n.t('a11y.loading')} />
               {#if loading.percent !== null}
-                <span>{$i18n.t('timeline.downloadProgress', { percent: loading.percent })}</span>
+                <span>{i18n.t('timeline.downloadProgress', { percent: loading.percent })}</span>
               {/if}
             </span>
           {/if}
@@ -967,25 +986,25 @@
             />
           {/if}
           {#if index < items.length - 1}
-            <IconButton class="nav next" label={$i18n.t('viewer.next')} size="large" onclick={next}
+            <IconButton class="nav next" label={i18n.t('viewer.next')} size="large" onclick={next}
               ><ArrowRightIcon /></IconButton
             >
           {/if}
         </main>
 
         {#if isPdf && pdfPages > 1}
-          <footer class="bottom-bar" class:chrome-hidden={chromeHidden}>
+          <footer class={['bottom-bar', { 'chrome-hidden': chromeHidden }]}>
             <div class="zoom-controls">
               <IconButton
-                label={$i18n.t('pdf.previousPage')}
+                label={i18n.t('pdf.previousPage')}
                 size="small"
                 variant="ghost"
                 disabled={pdfPage <= 1}
                 onclick={() => (pdfPage -= 1)}><CaretLeftIcon /></IconButton
               >
-              <span>{$i18n.t('pdf.pageIndicator', { page: pdfPage, pages: pdfPages })}</span>
+              <span>{i18n.t('pdf.pageIndicator', { page: pdfPage, pages: pdfPages })}</span>
               <IconButton
-                label={$i18n.t('pdf.nextPage')}
+                label={i18n.t('pdf.nextPage')}
                 size="small"
                 variant="ghost"
                 disabled={pdfPage >= pdfPages}

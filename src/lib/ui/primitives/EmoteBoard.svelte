@@ -1,15 +1,20 @@
 <script lang="ts">
+  import { MediaQuery } from 'svelte/reactivity';
+  import { innerWidth } from 'svelte/reactivity/window';
   import type { ImagePackView, ImageUsageView, PackImageView } from '#src/generated/protocol';
   import { useCoreClient } from '#lib/core/context.js';
-  import GifGrid from '#lib/features/gif/GifGrid.svelte';
-  import type { GifProviderSetting, GifResult, GifsConfig } from '#lib/features/gif/providers.js';
+  import GifGrid from '#lib/gif/GifGrid.svelte';
+  import type { GifProviderSetting, GifResult, GifsConfig } from '#lib/gif/providers.js';
   import { i18n } from '#lib/i18n.js';
   import { shouldReduceMotion } from '#lib/ui/motion.js';
   import { isPackChange, loadPacks } from '#lib/emoji/load-packs.js';
+  import { packName } from '#lib/emoji/pack-name.js';
   import MediaImage from '#lib/ui/MediaImage.svelte';
   import VirtualList from 'svelte-tiny-virtual-list';
+  import ResizeHandle from '#lib/ui/primitives/ResizeHandle.svelte';
   import Spinner from '#lib/ui/primitives/Spinner.svelte';
   import TextInput from '#lib/ui/primitives/TextInput.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
   import { emojiGroupIcons, type BoardTab } from '#lib/ui/primitives/emote-board.js';
   import ClockCounterClockwiseIcon from 'phosphor-svelte/lib/ClockCounterClockwiseIcon';
   import {
@@ -17,8 +22,7 @@
     readBoardSize,
     trackBoardSize,
   } from '#lib/ui/primitives/board-size.svelte.js';
-  import { on } from 'svelte/events';
-  import { tick } from 'svelte';
+  import { tick, untrack } from 'svelte';
 
   import { emojiGroups, searchReactionEmoji, shortcodeFor } from '#lib/emoji/emoji.js';
   import { readRecentReactions, rememberReaction } from '#lib/emoji/recents.svelte.js';
@@ -34,9 +38,10 @@
     unicode?: boolean;
     /** A reaction key cannot be a sticker. */
     stickers?: boolean;
+    reactions?: boolean;
     gifs?: { config: GifsConfig; providerSetting: GifProviderSetting } | null;
-    onPick: (image: PackImageView, usage: ImageUsageView) => void;
-    onPickUnicode?: (emoji: string) => void;
+    onPick: (image: PackImageView, usage: ImageUsageView, keepOpen: boolean) => void;
+    onPickUnicode?: (emoji: string, keepOpen: boolean) => void;
     onPickGif?: (gif: GifResult) => void;
   }
 
@@ -48,6 +53,7 @@
     resizable = false,
     unicode = false,
     stickers = true,
+    reactions = false,
     gifs = null,
     onPick,
     onPickUnicode,
@@ -72,21 +78,10 @@
   const PACK_HEADER_HEIGHT = 52;
   const GRID_GAP = 4;
 
-  let narrowSheet = $state(false);
+  const narrowViewport = new MediaQuery('(width < 24rem)');
+  let narrowSheet = $derived(variant === 'sheet' && narrowViewport.current);
 
-  $effect(() => {
-    if (variant !== 'sheet') {
-      narrowSheet = false;
-      return;
-    }
-    const mql = window.matchMedia('(width < 24rem)');
-    narrowSheet = mql.matches;
-    return on(mql, 'change', (event) => {
-      narrowSheet = event.matches;
-    });
-  });
-
-  const emojiColumns = $derived(narrowSheet ? 6 : 8);
+  let emojiRowWidth = $state(0);
 
   let packs = $state.raw<ImagePackView[]>([]);
   let loading = $state(true);
@@ -95,8 +90,6 @@
   let recentReactions = $derived(uniqueReactions());
   let preview = $state.raw<{ image: PackImageView; pack: ImagePackView } | null>(null);
   let activeCell = $state.raw<{ section: string; index: number }>({ section: '', index: 0 });
-  let dragging = $state(false);
-  let drag: { pointerId: number; startX: number; startWidth: number } | undefined;
   let gridWidth = $state(0);
   let gridHeight = $state(0);
   let scrollToRow = $state(-1);
@@ -108,6 +101,8 @@
   let scrollAlign = $state<'start' | 'auto'>('start');
   let mounted = $state.raw({ start: 0, end: 0 });
   let pendingFocus: { section: string; index: number } | null = null;
+  let searchFocused = $state(false);
+  let chosen = $state.raw({ key: '', row: 0, col: 0 });
 
   $effect(() => {
     let cancelled = false;
@@ -117,7 +112,7 @@
     packs = [];
     const load = (): void => {
       void loadPacks(
-        core.commands,
+        core.rpc,
         roomId,
         (loaded) => {
           if (cancelled) return;
@@ -126,7 +121,8 @@
           failed = false;
         },
         accountId
-      ).catch(() => {
+      ).catch((error: unknown) => {
+        console.warn('[sable emotes] the packs could not be loaded', error);
         if (cancelled || packs.length > 0) return;
         failed = true;
         loading = false;
@@ -166,6 +162,10 @@
       .filter((section) => section.images.length > 0);
   });
 
+  let packOf = $derived(
+    new Map(sections.flatMap((section) => section.images.map((image) => [image, section.pack])))
+  );
+
   let searching = $derived(query.trim() !== '');
   /** Search is by emote, so matches arrive as one flat list across packs. */
   let matchedImages = $derived(
@@ -183,7 +183,10 @@
     if (query.trim() !== '') return [];
     const all = sections.flatMap((section) => section.images);
     return recent
-      .map((shortcode) => all.find((image) => image.shortcode === shortcode))
+      .map(
+        (key) =>
+          all.find((image) => image.url === key) ?? all.find((image) => image.shortcode === key)
+      )
       .filter((image): image is PackImageView => image !== undefined)
       .slice(0, 16);
   });
@@ -199,7 +202,14 @@
     const images = recentImages
       .filter((image) => !emojiTab || !recentReactions.includes(image.url))
       .map((image): Cell => ({ image }));
-    return emojiTab ? [...recentReactions.map((emoji): Cell => ({ emoji })), ...images] : images;
+    if (!emojiTab) return images;
+    const all = sections.flatMap((section) => section.images);
+    const recent = recentReactions.map((emoji): Cell => {
+      const image = all.find((candidate) => candidate.url === emoji);
+      return image ? { image } : { emoji };
+    });
+    const cells = reactions ? recent : recent.filter((cell) => !isUnresolvedImage(cell));
+    return [...cells, ...images];
   });
 
   let groupSections = $derived(
@@ -209,7 +219,7 @@
           .map((group) => ({
             id: group.id,
             icon: emojiGroupIcons[group.id],
-            label: $i18n.t(`emoji.${group.id}`),
+            label: i18n.t(`emoji.${group.id}`),
             cells: group.emojis.map((entry): Cell => ({ emoji: entry.emoji })),
           }))
       : []
@@ -220,18 +230,24 @@
       ? [
           {
             id: 'search',
-            label: $i18n.t('timeline.emojiResults'),
+            label: i18n.t('timeline.emojiResults'),
             cells: searchEmojis.map((emoji): Cell => ({ emoji })),
           },
         ]
       : groupSections
   );
 
-  let showFreeText = $derived(onPickUnicode !== undefined && searching);
+  let showFreeText = $derived(reactions && onPickUnicode !== undefined && searching);
   let imageCell = $derived(
     imageMeasure?.tab === tab
       ? imageMeasure
       : { width: cellSize, gap: GRID_GAP, row: cellSize + GRID_GAP }
+  );
+  const emojiColumns = $derived(
+    Math.max(
+      narrowSheet ? 6 : 8,
+      Math.floor((emojiRowWidth + imageCell.gap) / (imageCell.width + imageCell.gap))
+    )
   );
   let imageColumns = $derived(
     Math.max(1, Math.floor((gridWidth + imageCell.gap) / (imageCell.width + imageCell.gap)))
@@ -277,17 +293,22 @@
           rows.push({
             id: 'emoji-recent',
             kind: 'header',
-            label: $i18n.t('timeline.frequentlyUsed'),
+            label: i18n.t('timeline.frequentlyUsed'),
             pack: null,
           });
           addImages('recent', recentImages, null);
         }
       } else {
-        addCells('recent', $i18n.t('timeline.frequentlyUsed'), frequentCells);
+        addCells('recent', i18n.t('timeline.frequentlyUsed'), frequentCells);
       }
       for (const section of sections) {
         const id = sectionId(section.pack);
-        rows.push({ id, kind: 'header', label: packName(section.pack), pack: section.pack });
+        rows.push({
+          id,
+          kind: 'header',
+          label: packName(section.pack, i18n.t),
+          pack: section.pack,
+        });
         addImages(id, section.images, section.pack);
       }
     }
@@ -307,19 +328,70 @@
   });
   let rowIndex = $derived(new Map(pickerRows.map((row, index) => [row.id, index])));
 
-  function pickerRowKey(index: number): string | number {
-    return pickerRows[index]?.id ?? index;
-  }
-
-  let originLabels: Record<ImagePackView['origin'], string> = $derived({
-    account: $i18n.t('composer.packMine'),
-    room: $i18n.t('composer.packRoom'),
-    global: $i18n.t('composer.packGlobal'),
-    space: $i18n.t('composer.packSpace'),
+  let navRows = $derived(
+    pickerRows.filter(
+      (row): row is Extract<PickerRow, { kind: 'cells' | 'images' }> =>
+        row.kind === 'cells' || row.kind === 'images'
+    )
+  );
+  let navIndex = $derived(new Map(navRows.map((row, index) => [row.id, index])));
+  let boardKey = $derived(`${tab}:${query.trim()}`);
+  let selection = $derived.by(() => {
+    const row = chosen.key === boardKey ? Math.min(chosen.row, navRows.length - 1) : 0;
+    const length = navRows[row] ? rowCells(navRows[row]).length : 0;
+    return { row, col: chosen.key === boardKey ? Math.min(chosen.col, length - 1) : 0 };
   });
 
-  function packName(pack: ImagePackView): string {
-    return pack.name ?? (pack.id || originLabels[pack.origin]);
+  function rowCells(row: Extract<PickerRow, { kind: 'cells' | 'images' }>): Cell[] {
+    return row.kind === 'cells' ? row.cells : row.images.map((image): Cell => ({ image }));
+  }
+
+  function selectedCell(): Cell | undefined {
+    const row = navRows[selection.row];
+    return row ? rowCells(row)[selection.col] : undefined;
+  }
+
+  let enterTarget = $derived.by(() => {
+    if (!showFreeText || !searchFocused) return '';
+    const cell = chosen.key === boardKey ? selectedCell() : undefined;
+    return cell ? cellLabel(cell) : i18n.t('composer.reactWithText', { text: query.trim() });
+  });
+
+  function isSelected(id: string, column: number): boolean {
+    if (showFreeText && chosen.key !== boardKey) return false;
+    return searchFocused && selection.row === navIndex.get(id) && selection.col === column;
+  }
+
+  function moveSelection(key: string): boolean {
+    if (navRows.length === 0) return false;
+    let { row, col } = selection;
+    const lengthOf = (index: number): number => rowCells(navRows[index]).length;
+    if (key === 'ArrowLeft') {
+      if (col > 0) col -= 1;
+      else if (row > 0) col = lengthOf(--row) - 1;
+    } else if (key === 'ArrowRight') {
+      if (col < lengthOf(row) - 1) col += 1;
+      else if (row < navRows.length - 1) {
+        row += 1;
+        col = 0;
+      }
+    } else if (key === 'ArrowUp' && row > 0) {
+      row -= 1;
+      col = Math.min(col, lengthOf(row) - 1);
+    } else if (key === 'ArrowDown' && row < navRows.length - 1) {
+      row += 1;
+      col = Math.min(col, lengthOf(row) - 1);
+    } else if (!key.startsWith('Arrow')) {
+      return false;
+    }
+    chosen = { key: boardKey, row, col };
+    const target = rowIndex.get(navRows[row].id);
+    if (target !== undefined) requestScroll(target, 'auto');
+    return true;
+  }
+
+  function pickerRowKey(index: number): string | number {
+    return pickerRows[index]?.id ?? index;
   }
 
   function jumpTo(id: string): void {
@@ -345,7 +417,6 @@
 
   function trackGridSize(element: HTMLElement): () => void {
     const update = (size?: ResizeObserverSize): void => {
-      gridWidth = size?.inlineSize ?? element.clientWidth;
       gridHeight = size?.blockSize ?? element.clientHeight;
     };
     update();
@@ -359,23 +430,36 @@
   }
 
   function measureImageRow(list: HTMLElement): () => void {
-    const update = (): void => {
+    const measuredTab = tab;
+    const update = (size?: ResizeObserverSize): void => {
       const cell = list.firstElementChild;
       if (!(cell instanceof HTMLElement)) return;
       const style = getComputedStyle(list);
-      const width = cell.offsetWidth;
+      // Measure the row width after space is reserved for the scrollbar.
+      const measured = size?.inlineSize ?? Number.parseFloat(style.width);
+      if (Number.isFinite(measured)) gridWidth = measured;
+      const bounds = cell.getBoundingClientRect();
+      // Match fractional cell sizes to flex wrapping.
+      const width = bounds.width;
       const gap = Number.parseFloat(style.columnGap) || 0;
-      const row = cell.offsetHeight + (Number.parseFloat(style.marginBottom) || 0);
-      const last = imageMeasure;
-      if (last?.tab === tab && last.width === width && last.gap === gap && last.row === row) return;
-      imageMeasure = { tab, width, gap, row };
+      const row = bounds.height + (Number.parseFloat(style.marginBottom) || 0);
+      const last = untrack(() => imageMeasure);
+      if (last?.tab === measuredTab && last.width === width && last.gap === gap && last.row === row)
+        return;
+      imageMeasure = { tab: measuredTab, width, gap, row };
     };
     update();
     if (typeof ResizeObserver === 'undefined') return () => {};
 
-    const observer = new ResizeObserver(update);
+    const observer = new ResizeObserver(([entry]) => {
+      update(entry.contentBoxSize[0]);
+    });
     observer.observe(list);
     return () => observer.disconnect();
+  }
+
+  function isUnresolvedImage(cell: Cell): boolean {
+    return 'emoji' in cell && cell.emoji.startsWith('mxc://');
   }
 
   function uniqueReactions(): string[] {
@@ -386,13 +470,13 @@
     return 'image' in cell ? `:${cell.image.shortcode}:` : (shortcodeFor(cell.emoji) ?? cell.emoji);
   }
 
-  function pickCell(cell: Cell): void {
+  function pickCell(cell: Cell, keepOpen: boolean): void {
     if ('image' in cell) {
-      pick(cell.image);
+      pick(cell.image, keepOpen);
       return;
     }
     rememberReaction(cell.emoji);
-    onPickUnicode?.(cell.emoji);
+    onPickUnicode?.(cell.emoji, keepOpen);
   }
 
   function targetCell(key: string, from: number, last: number): number | null {
@@ -455,15 +539,33 @@
     if (cell !== undefined) activeCell = { section: id, index: Number(cell) };
   }
 
+  function searchKeydown(event: KeyboardEvent): void {
+    if (gifTab) return;
+    if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) {
+      if (event.key === 'Enter') submitQuery(event);
+      return;
+    }
+    if (moveSelection(event.key)) {
+      event.preventDefault();
+      return;
+    }
+    submitQuery(event);
+  }
+
   /** A reaction key is any string, so an unmatched query is still a valid one. */
   function submitQuery(event: KeyboardEvent): void {
-    if (event.key !== 'Enter' || !onPickUnicode || gifTab) return;
+    if (event.key !== 'Enter') return;
+    const cell = showFreeText && chosen.key !== boardKey ? undefined : selectedCell();
+    if (cell) {
+      event.preventDefault();
+      pickCell(cell, event.shiftKey);
+      return;
+    }
+    if (!showFreeText) return;
     const text = query.trim();
     if (text === '') return;
     event.preventDefault();
-    const best = searchEmojis.at(0);
-    if (best !== undefined) rememberReaction(best);
-    onPickUnicode(best ?? text);
+    onPickUnicode?.(text, event.shiftKey);
   }
 
   function focusSearch(element: HTMLElement): void {
@@ -475,43 +577,24 @@
     return resizable ? trackBoardSize(element) : undefined;
   }
 
-  function pick(image: PackImageView): void {
-    rememberEmote(image.shortcode, tab === 'sticker' ? 'sticker' : 'emoticon');
-    onPick(image, tab as ImageUsageView);
+  function showPreview(image: PackImageView, pack: ImagePackView | null): void {
+    const owner = pack ?? packOf.get(image);
+    if (owner) preview = { image, pack: owner };
   }
 
-  function handleResizeStart(event: PointerEvent) {
-    if (event.button !== 0) return;
-
-    const handle = event.currentTarget;
-    if (!(handle instanceof HTMLElement)) return;
-
-    const boardSize = readBoardSize();
-    const width: number = boardSize != null ? boardSize.width : 550;
-
-    drag = { pointerId: event.pointerId, startX: event.clientX, startWidth: width };
-    dragging = true;
-    handle.setPointerCapture(event.pointerId);
+  function pick(image: PackImageView, keepOpen: boolean): void {
+    rememberEmote(image.url, tab === 'sticker' ? 'sticker' : 'emoticon');
+    onPick(image, tab as ImageUsageView, keepOpen);
   }
 
-  function handleResizeMove(event: PointerEvent) {
-    if (!drag || event.pointerId !== drag.pointerId) return;
+  const MIN_BOARD_WIDTH = 250;
+  let maxBoardWidth = $derived(Math.max(MIN_BOARD_WIDTH, (innerWidth.current ?? 0) - 32));
 
-    const boardSize = readBoardSize();
-    const targetWidth = drag.startWidth - event.clientX + drag.startX;
-    if (targetWidth < 250) return;
-
-    const targetHeight: number = boardSize != null ? boardSize.height : 457;
-
-    if (Number.isFinite(targetWidth) && Number.isFinite(targetHeight))
-      writeBoardSize({ width: targetWidth, height: targetHeight });
-  }
-
-  function finishResize(event: PointerEvent) {
-    if (!drag || event.pointerId !== drag.pointerId) return;
-
-    drag = undefined;
-    dragging = false;
+  function resizeBoard(width: number): void {
+    writeBoardSize({
+      width: Math.max(MIN_BOARD_WIDTH, Math.min(maxBoardWidth, width)),
+      height: readBoardSize()?.height ?? 457,
+    });
   }
 </script>
 
@@ -520,22 +603,21 @@
   style={boardStyle}
   {@attach attachSize}
 >
-  <button
-    type="button"
-    class={resizable ? 'resize-handle' : 'resize-handle-hidden'}
-    class:dragging
-    role="slider"
-    aria-orientation="horizontal"
-    aria-valuenow={readBoardSize()?.width}
-    aria-label={$i18n.t('nav.resizeRooms')}
-    onpointerdown={handleResizeStart}
-    onpointermove={handleResizeMove}
-    onpointerup={finishResize}
-    onpointercancel={finishResize}
-  ></button>
+  {#if resizable}
+    <ResizeHandle
+      value={readBoardSize()?.width ?? 550}
+      min={MIN_BOARD_WIDTH}
+      max={maxBoardWidth}
+      label={i18n.t('composer.resizeBoard')}
+      grow="left"
+      step={16}
+      shiftStep={64}
+      onResize={resizeBoard}
+    />
+  {/if}
   <div class="board-head">
     {#if stickers || gifs}
-      <div class="tabs" role="group" aria-label={$i18n.t('composer.emotesAndStickers')}>
+      <div class="tabs" role="group" aria-label={i18n.t('composer.emotesAndStickers')}>
         <button
           type="button"
           class="choice"
@@ -544,7 +626,7 @@
             tab = 'emoticon';
           }}
         >
-          {$i18n.t('composer.emoticons')}
+          {i18n.t('composer.emoticons')}
         </button>
         {#if stickers}
           <button
@@ -555,7 +637,7 @@
               tab = 'sticker';
             }}
           >
-            {$i18n.t('composer.stickers')}
+            {i18n.t('composer.stickers')}
           </button>
         {/if}
         {#if gifs}
@@ -567,7 +649,7 @@
               tab = 'gif';
             }}
           >
-            {$i18n.t('composer.gifs')}
+            {i18n.t('composer.gifs')}
           </button>
         {/if}
       </div>
@@ -576,13 +658,20 @@
       class="board-search"
       type="search"
       bind:value={query}
-      placeholder={gifTab ? $i18n.t('composer.searchGifs') : $i18n.t('composer.searchPacks')}
-      aria-label={gifTab ? $i18n.t('composer.searchGifs') : $i18n.t('composer.searchPacks')}
-      onkeydown={submitQuery}
+      placeholder={gifTab ? i18n.t('composer.searchGifs') : i18n.t('composer.searchPacks')}
+      aria-label={gifTab ? i18n.t('composer.searchGifs') : i18n.t('composer.searchPacks')}
+      onkeydown={searchKeydown}
+      onfocus={() => {
+        searchFocused = true;
+      }}
+      onblur={() => {
+        searchFocused = false;
+      }}
       {@attach focusSearch}
     />
+    <span class="sr-only" role="status">{enterTarget}</span>
     {#if !gifTab && sections.length > 0}
-      <p class="pack-visibility">{$i18n.t('composer.packMediaVisibility')}</p>
+      <p class="pack-visibility">{i18n.t('composer.packMediaVisibility')}</p>
     {/if}
   </div>
 
@@ -596,12 +685,12 @@
       }}
     />
   {:else if loading}
-    <div class="board-note"><Spinner label={$i18n.t('a11y.loading')} /></div>
+    <div class="board-note"><Spinner label={i18n.t('a11y.loading')} /></div>
   {:else if failed}
-    <div class="board-note">{$i18n.t('composer.packsFailed')}</div>
+    <div class="board-note">{i18n.t('composer.packsFailed')}</div>
   {:else if sections.length === 0 && !unicode}
     <div class="board-note">
-      {query.trim() ? $i18n.t('composer.noMatches') : $i18n.t('composer.noPacks')}
+      {query.trim() ? i18n.t('composer.noMatches') : i18n.t('composer.noPacks')}
     </div>
   {:else}
     <div class="board-body">
@@ -637,11 +726,11 @@
                       <button
                         type="button"
                         class="free-text"
-                        onclick={() => {
-                          onPickUnicode?.(text);
+                        onclick={(event) => {
+                          onPickUnicode?.(text, event.shiftKey);
                         }}
                       >
-                        {$i18n.t('composer.reactWithText', { text })}
+                        {i18n.t('composer.reactWithText', { text })}
                       </button>
                     {/if}
                   </div>
@@ -665,67 +754,86 @@
                       class="row"
                       role="row"
                       bind:clientHeight={cellRowHeight}
-                      style={`grid-template-columns: repeat(${String(emojiColumns)}, minmax(0, 1fr))`}
+                      bind:clientWidth={emojiRowWidth}
+                      style={`grid-template-columns: repeat(${String(emojiColumns)}, minmax(0, var(--emote-cell)))`}
                     >
                       {#each row.cells as cell, column (column)}
                         {@const index = row.start + column}
                         {@const source = 'image' in cell ? cell.image.url : cell.emoji}
-                        <button
-                          type="button"
-                          role="gridcell"
-                          data-cell={index}
-                          tabindex={tabStop(row.section, index, column) ? 0 : -1}
-                          title={cellLabel(cell)}
-                          aria-label={cellLabel(cell)}
-                          onclick={() => {
-                            pickCell(cell);
-                          }}
-                          {@attach focusWhenPending(row.section, index)}
-                        >
-                          {#if source.startsWith('mxc://')}
-                            <MediaImage
-                              class="unicode-image"
-                              {source}
-                              alt=""
-                              width={64}
-                              height={64}
-                              thumbnailWidth={128}
-                              thumbnailHeight={128}
-                            />
-                          {:else}
-                            <span class="unicode-text">{source}</span>
-                          {/if}
-                        </button>
+                        {@const label = cellLabel(cell)}
+                        <Tooltip {label}>
+                          {#snippet trigger({ props })}
+                            <button
+                              {...props}
+                              type="button"
+                              role="gridcell"
+                              data-cell={index}
+                              data-selected={isSelected(row.id, column) || undefined}
+                              tabindex={tabStop(row.section, index, column) ? 0 : -1}
+                              aria-label={label}
+                              onclick={(event) => {
+                                pickCell(cell, event.shiftKey);
+                              }}
+                              onpointerenter={() => {
+                                if ('image' in cell) showPreview(cell.image, null);
+                              }}
+                              onfocus={() => {
+                                if ('image' in cell) showPreview(cell.image, null);
+                              }}
+                              {@attach focusWhenPending(row.section, index)}
+                            >
+                              {#if source.startsWith('mxc://')}
+                                <MediaImage
+                                  class="unicode-image"
+                                  {source}
+                                  alt=""
+                                  width={64}
+                                  height={64}
+                                  original
+                                  emoticon
+                                />
+                              {:else}
+                                <span class="unicode-text">{source}</span>
+                              {/if}
+                            </button>
+                          {/snippet}
+                        </Tooltip>
                       {/each}
                     </div>
                   </div>
                 {:else}
                   <ul {@attach measureImageRow}>
                     {#each row.images as image, column (column)}
+                      {@const imageLabel = `:${image.shortcode}:`}
                       <li>
-                        <button
-                          type="button"
-                          title=":{image.shortcode}:"
-                          aria-label=":{image.shortcode}:"
-                          onclick={() => {
-                            pick(image);
-                          }}
-                          onpointerenter={() => {
-                            if (row.pack) preview = { image, pack: row.pack };
-                          }}
-                          onfocus={() => {
-                            if (row.pack) preview = { image, pack: row.pack };
-                          }}
-                        >
-                          <MediaImage
-                            source={image.url}
-                            alt={image.body ?? image.shortcode}
-                            width={cellSize}
-                            height={cellSize}
-                            thumbnailWidth={cellSize * 2}
-                            thumbnailHeight={cellSize * 2}
-                          />
-                        </button>
+                        <Tooltip label={imageLabel}>
+                          {#snippet trigger({ props })}
+                            <button
+                              {...props}
+                              type="button"
+                              aria-label={imageLabel}
+                              data-selected={isSelected(row.id, column) || undefined}
+                              onclick={(event) => {
+                                pick(image, event.shiftKey);
+                              }}
+                              onpointerenter={() => {
+                                showPreview(image, row.pack);
+                              }}
+                              onfocus={() => {
+                                showPreview(image, row.pack);
+                              }}
+                            >
+                              <MediaImage
+                                source={image.url}
+                                alt={image.body ?? image.shortcode}
+                                width={cellSize}
+                                height={cellSize}
+                                original
+                                emoticon
+                              />
+                            </button>
+                          {/snippet}
+                        </Tooltip>
                       </li>
                     {/each}
                   </ul>
@@ -736,61 +844,74 @@
         {/key}
       </div>
 
-      <nav class="rail" class:hidden={searching} aria-label={$i18n.t('composer.packs')}>
+      <nav class={['rail', { hidden: searching }]} aria-label={i18n.t('composer.packs')}>
         {#if frequentCells.length > 0}
-          <button
-            type="button"
-            class="rail-pack rail-glyph"
-            title={$i18n.t('timeline.frequentlyUsed')}
-            aria-label={$i18n.t('timeline.frequentlyUsed')}
-            onclick={() => {
-              jumpTo('emoji-recent');
-            }}
-          >
-            <ClockCounterClockwiseIcon />
-          </button>
+          {@const frequentLabel = i18n.t('timeline.frequentlyUsed')}
+          <Tooltip label={frequentLabel}>
+            {#snippet trigger({ props })}
+              <button
+                {...props}
+                type="button"
+                class="rail-pack rail-glyph"
+                aria-label={frequentLabel}
+                onclick={() => {
+                  jumpTo('emoji-recent');
+                }}
+              >
+                <ClockCounterClockwiseIcon />
+              </button>
+            {/snippet}
+          </Tooltip>
         {/if}
         {#each ['account', 'global', 'room', 'space'] as const as origin (origin)}
           {@const group = sections.filter((section) => section.pack.origin === origin)}
           {#if group.length > 0}
             <hr class="rail-divider" />
             {#each group as section (sectionId(section.pack))}
-              <button
-                type="button"
-                class="rail-pack"
-                title={packName(section.pack)}
-                aria-label={packName(section.pack)}
-                onclick={() => {
-                  jumpTo(sectionId(section.pack));
-                }}
-              >
-                <MediaImage
-                  class="rail-emote"
-                  source={section.pack.avatar_url ?? section.images[0].url}
-                  alt={packName(section.pack)}
-                  width={24}
-                  height={24}
-                  thumbnailWidth={48}
-                  thumbnailHeight={48}
-                />
-              </button>
+              {@const packLabel = packName(section.pack, i18n.t)}
+              <Tooltip label={packLabel}>
+                {#snippet trigger({ props })}
+                  <button
+                    {...props}
+                    type="button"
+                    class="rail-pack"
+                    aria-label={packLabel}
+                    onclick={() => {
+                      jumpTo(sectionId(section.pack));
+                    }}
+                  >
+                    <MediaImage
+                      class="rail-emote"
+                      source={section.pack.avatar_url ?? section.images[0].url}
+                      alt={packLabel}
+                      width={24}
+                      height={24}
+                      original
+                    />
+                  </button>
+                {/snippet}
+              </Tooltip>
             {/each}
           {/if}
         {/each}
         {#if groupSections.length > 0}
           <hr class="rail-divider" />
           {#each groupSections as section (section.id)}
-            <button
-              type="button"
-              class="rail-pack rail-glyph"
-              title={section.label}
-              aria-label={section.label}
-              onclick={() => {
-                jumpTo(`emoji-${section.id}`);
-              }}
-            >
-              <section.icon />
-            </button>
+            <Tooltip label={section.label}>
+              {#snippet trigger({ props })}
+                <button
+                  {...props}
+                  type="button"
+                  class="rail-pack rail-glyph"
+                  aria-label={section.label}
+                  onclick={() => {
+                    jumpTo(`emoji-${section.id}`);
+                  }}
+                >
+                  <section.icon />
+                </button>
+              {/snippet}
+            </Tooltip>
           {/each}
         {/if}
       </nav>
@@ -807,9 +928,9 @@
           original
         />
         <code>:{preview.image.shortcode}:</code>
-        <span class="preview-pack">{packName(preview.pack)}</span>
+        <span class="preview-pack">{packName(preview.pack, i18n.t)}</span>
       {:else}
-        <span class="preview-hint">{$i18n.t('composer.previewHint')}</span>
+        <span class="preview-hint">{i18n.t('composer.previewHint')}</span>
       {/if}
     </div>
   {/if}
@@ -824,7 +945,7 @@
   }
 
   .board.sheet {
-    height: min(24rem, calc(100dvh - 7rem));
+    height: min(36rem, calc(100dvh - var(--keyboard-overlap) - 7rem));
     width: 100%;
   }
 
@@ -881,10 +1002,9 @@
     display: flex;
     flex: 0 0 3.25rem;
     flex-direction: column;
-    gap: var(--space-100);
+    gap: var(--space-200);
     overflow-y: auto;
     overscroll-behavior: contain;
-    padding: var(--space-200) var(--space-150);
     scrollbar-width: none;
   }
 
@@ -925,7 +1045,6 @@
     flex: 1;
     min-height: 0;
     min-width: 0;
-    padding: var(--space-200);
   }
 
   .grids :global(.virtual-list-wrapper) {
@@ -958,15 +1077,18 @@
   .grids ul {
     display: flex;
     flex-wrap: wrap;
-    gap: var(--space-100);
     justify-content: center;
     list-style: none;
-    margin: 0 0 var(--space-300);
+    margin: 0;
     padding: 0;
   }
 
   .grids.sticker {
     --emote-cell: 7rem;
+  }
+
+  .board.sheet .grids.sticker {
+    --emote-cell: 5rem;
   }
 
   .grids.emoji {
@@ -1024,12 +1146,23 @@
   }
 
   .grids li button:hover,
-  .grids .unicode button:hover {
+  .grids .unicode button:hover,
+  .grids li button[data-selected],
+  .grids .unicode button[data-selected] {
     background: var(--surface-container-hover);
   }
 
   .rail.hidden {
     display: none;
+  }
+
+  .sr-only {
+    clip-path: inset(50%);
+    height: 1px;
+    overflow: hidden;
+    position: absolute;
+    white-space: nowrap;
+    width: 1px;
   }
 
   .free-text {
@@ -1057,7 +1190,7 @@
   /* Rows are real elements for the grid pattern, so the wrap is laid out here. */
   .grids .unicode .row {
     display: grid;
-    gap: var(--space-100);
+    justify-content: center;
     padding-bottom: var(--space-100);
   }
 
@@ -1066,8 +1199,8 @@
   }
 
   .rail :global(.rail-emote) {
-    height: var(--avatar-size-200);
-    width: var(--avatar-size-200);
+    height: var(--avatar-size-300);
+    width: var(--avatar-size-300);
   }
 
   .rail :global(.rail-emote .media-image-content) {
@@ -1120,43 +1253,7 @@
     text-align: center;
   }
 
-  .resize-handle {
-    appearance: none;
-    background: transparent;
-    border: 0;
+  .board :global(.resize-handle) {
     border-radius: 10px;
-    cursor: col-resize;
-    height: 100%;
-    padding: 0;
-    position: absolute;
-    top: 0;
-    touch-action: none;
-    transition: background-color 0s;
-    user-select: none;
-    width: 0.5rem;
-  }
-
-  .resize-handle:hover,
-  .resize-handle.dragging,
-  .resize-handle:focus-visible {
-    background: var(--primary-main);
-  }
-
-  .resize-handle:hover {
-    transition-delay: var(--motion-normal);
-  }
-
-  .resize-handle.dragging,
-  .resize-handle:focus-visible {
-    transition: none;
-  }
-
-  .resize-handle:focus-visible {
-    outline: var(--focus-ring-width) solid var(--focus-ring);
-    outline-offset: -3px;
-  }
-
-  .resize-handle-hidden {
-    display: none;
   }
 </style>

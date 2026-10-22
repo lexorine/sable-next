@@ -1,4 +1,4 @@
-import { expect, test } from 'vitest';
+import { describe, expect, test } from 'vitest';
 
 import {
   bindingFromEvent,
@@ -8,6 +8,7 @@ import {
   isDialogOpen,
   matchesBinding,
   parseBinding,
+  toProseMirrorKey,
 } from './binding';
 
 function event(overrides: Partial<Parameters<typeof matchesBinding>[1]> = {}) {
@@ -73,6 +74,13 @@ test('a letter binding ignores shiftKey, since the reported key already reflects
 test('mod+shift+n matches the uppercase key browsers report for it', () => {
   expect(
     matchesBinding('mod+shift+n', event({ key: 'N', ctrlKey: true, shiftKey: true }), false)
+  ).toBe(true);
+});
+
+test('a shifted letter binding does not match the unshifted key', () => {
+  expect(matchesBinding('mod+shift+v', event({ key: 'v', ctrlKey: true }), false)).toBe(false);
+  expect(
+    matchesBinding('mod+shift+v', event({ key: 'V', ctrlKey: true, shiftKey: true }), false)
   ).toBe(true);
 });
 
@@ -199,4 +207,16 @@ test('reports a modifier-only event as unbindable', () => {
 
 test('keeps a mac control press distinct from the command modifier', () => {
   expect(bindingFromEvent(event({ key: 'p', ctrlKey: true }), true)).toBe('ctrl+p');
+});
+
+describe('toProseMirrorKey', () => {
+  test.each([
+    ['mod+b', 'Mod-b'],
+    ['mod+shift+8', 'Mod-Shift-8'],
+    ['alt+up', 'Alt-ArrowUp'],
+    ['ctrl+shift+escape', 'Ctrl-Shift-Escape'],
+    ['mod+space', 'Mod-Space'],
+  ])('%s -> %s', (binding, expected) => {
+    expect(toProseMirrorKey(binding)).toBe(expected);
+  });
 });

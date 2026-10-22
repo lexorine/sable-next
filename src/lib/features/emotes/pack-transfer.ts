@@ -1,6 +1,6 @@
 import { unzipSync, zipSync } from 'fflate';
 
-import type { CoreCommands } from '#lib/core/commands.svelte.js';
+import type { CoreMedia } from '#lib/core/media.svelte.js';
 import { saveBytes, mimeFromName, type SaveOutcome } from '#lib/platform/files.js';
 import { imageMime } from '#lib/ui/media-url.js';
 
@@ -17,7 +17,7 @@ import {
 import { ALL_USAGES, type PackDraft } from './pack-content.js';
 
 export type PackTransferCore = {
-  commands: Pick<CoreCommands, 'fetchMedia' | 'uploadMedia'>;
+  media: Pick<CoreMedia, 'fetchMedia' | 'uploadMedia'>;
 };
 
 const MAX_TRANSFERS = 4;
@@ -44,14 +44,14 @@ async function collect(
         wanted.set(image.url, (mime) => entryName(index, image.shortcode, mime));
       }
     }
-    if (draft.avatarUrl !== null && !wanted.has(draft.avatarUrl)) {
-      wanted.set(draft.avatarUrl, (mime) => avatarEntryName(index, mime));
+    if (draft.avatar_url !== null && !wanted.has(draft.avatar_url)) {
+      wanted.set(draft.avatar_url, (mime) => avatarEntryName(index, mime));
     }
   }
 
   const fetched = await inBatches(
     [...wanted].map(([url, nameFor]) => async () => {
-      const bytes = await core.commands.fetchMedia(url, 0, 0, true);
+      const bytes = await core.media.fetchMedia(url, 0, 0, true);
       return [url, { name: nameFor(imageMime(bytes) ?? null), bytes }] as const;
     })
   );
@@ -123,14 +123,14 @@ export async function importArchive(
         .filter(([file]) => referenced.has(file))
         .map(([file, data]) => async () => {
           const mime = declared.get(file) ?? imageMime(data) ?? mimeFromName(file);
-          return [file, await core.commands.uploadMedia(mime, data.slice())] as const;
+          return [file, await core.media.uploadMedia(mime, data.slice())] as const;
         })
     )
   );
 
   return packs.map((pack) => ({
     name: pack.pack.display_name ?? '',
-    avatarUrl:
+    avatar_url:
       pack.pack.avatar_file === undefined ? null : (uploaded.get(pack.pack.avatar_file) ?? null),
     attribution: pack.pack.attribution ?? '',
     usage: pack.pack.usage ?? ALL_USAGES,

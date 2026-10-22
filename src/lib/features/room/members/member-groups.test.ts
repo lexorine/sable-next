@@ -31,6 +31,20 @@ function member(
   } as TimelineItemView;
 }
 
+function rename(user: string, to: string): TimelineItemView {
+  return member(user, 'joined', {
+    id: `${user}-${to}`,
+    event_id: `$${user}-${to}`,
+    sender_name: to,
+    content: {
+      kind: 'profile_change',
+      user_id: `@${user}:x`,
+      display_name: { old: user, new: to },
+      avatar: null,
+    },
+  });
+}
+
 const message = {
   id: 'message',
   event_id: '$message',
@@ -42,6 +56,8 @@ const t = (key: string, values?: Record<string, unknown>): string => {
   const templates: Record<string, string> = {
     'timeline.memberGroup.joined': '{{users}} joined',
     'timeline.memberGroup.left': '{{users}} left',
+    'timeline.memberGroup.invited': '{{users}} invited',
+    'timeline.memberGroup.name': '{{users}} changed their name',
   };
   return (templates[key] ?? key).replace('{{users}}', String(values?.users));
 };
@@ -117,4 +133,23 @@ test('each kind of change gets its own clause, and a user is named once per clau
 
   expect(segments.map((segment) => segment.category)).toEqual(['joined', 'left']);
   expect(text(memberGroupSummary(segments, t, 'en'))).toBe('[A] and [B] joined and [A] left');
+});
+
+test('name changes collapse with adjacent member events', () => {
+  const items = [rename('a', 'A1'), rename('a', 'A2'), member('b', 'joined'), rename('c', 'C')];
+  const units = groupMemberEvents(items);
+
+  expect(units).toEqual([{ item: items[3], index: 3, group: items }]);
+  expect(text(memberGroupSummary(memberGroupSegments(items), t, 'en'))).toBe(
+    '[A1] and [C] changed their name and [B] joined'
+  );
+});
+
+test('an invitation collapses with the join that answers it', () => {
+  const items = [member('a', 'invited'), member('a', 'invitation_accepted'), member('b', 'left')];
+
+  expect(groupMemberEvents(items)).toEqual([{ item: items[2], index: 2, group: items }]);
+  expect(text(memberGroupSummary(memberGroupSegments(items), t, 'en'))).toBe(
+    '[A] invited, [A] joined, and [B] left'
+  );
 });

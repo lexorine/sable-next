@@ -4,9 +4,10 @@
     MemberView,
     ProfileView,
     RoomPermissionsView,
-    RoomSummary,
-    UserDirectoryEntryView,
+    RoomListItemView,
   } from '#src/generated/protocol';
+
+  import { CoreError } from '#src/transport';
 
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
@@ -15,9 +16,11 @@
   import ActionMenuItem from '#lib/ui/primitives/ActionMenuItem.svelte';
   import Alert from '#lib/ui/primitives/Alert.svelte';
   import Button from '#lib/ui/primitives/Button.svelte';
+  import ConfirmDialog from '#lib/ui/primitives/ConfirmDialog.svelte';
   import DialogFrame from '#lib/ui/primitives/DialogFrame.svelte';
   import FormField from '#lib/ui/primitives/FormField.svelte';
   import Select from '#lib/ui/primitives/Select.svelte';
+  import Switcher from '#lib/ui/primitives/Switcher.svelte';
   import MemberIdentityRow from '../members/MemberIdentityRow.svelte';
   import {
     MEMBERSHIP_FILTERS,
@@ -28,10 +31,11 @@
     matchesFilter,
     membershipFor,
     type MembershipFilter,
-  } from '../members/member-listing';
+  } from '#lib/rooms/member-listing.js';
   import MentionProfile from '../members/MentionProfile.svelte';
   import { powerTag } from '../members/power-tags';
   import RoleTagIcon from '../members/RoleTagIcon.svelte';
+  import { UserDirectoryLookup } from '../members/user-directory-lookup.svelte.js';
   import RoomInviteDialog from '../RoomInviteDialog.svelte';
   import SettingsRow from '#lib/ui/primitives/SettingsRow.svelte';
   import SettingsSection from '#lib/ui/primitives/SettingsSection.svelte';
@@ -40,14 +44,10 @@
   import '#lib/ui/primitives/settings-row.css';
   import TextInput from '#lib/ui/primitives/TextInput.svelte';
 
-  import {
-    parsePowerLevelTags,
-    POWER_LEVEL_TAGS_EVENT_TYPE,
-    type PowerLevelTagMap,
-  } from './power-level-tags';
+  import { FOUNDER_POWER_LEVEL, type PowerLevelTagMap } from './power-level-tags';
 
   interface Props {
-    room: RoomSummary | null;
+    room: RoomListItemView | null;
     permissions: RoomPermissionsView | null;
   }
 
@@ -69,25 +69,27 @@
   let members = $state.raw<MemberView[]>([]);
   let loading = $state(false);
   let failed = $state(false);
+  let denied = $state(false);
   let busy = $state<string | null>(null);
   let inviteOpen = $state(false);
-  let directory = $state.raw<UserDirectoryEntryView[]>([]);
-  let searching = $state(false);
+  const directory = new UserDirectoryLookup(core);
   let inviting = $state<string | null>(null);
   let invitedIds = $state.raw<string[]>([]);
   let inviteFailed = $state(false);
   let powerTags = $state.raw<PowerLevelTagMap>({});
   let profileUserId = $state<string | null>(null);
   let profileAnchor = $state<HTMLElement | null>(null);
-  let profile = $state<ProfileView | null>(null);
+  let profile = $state.raw<ProfileView | null>(null);
   let profileFailed = $state(false);
   let run = 0;
-  let lookup = 0;
   let profileRequest = 0;
 
   let roomId = $derived(room?.room_id ?? null);
   let ownPowerLevel = $derived(permissions?.own_power_level ?? 0);
   let canSetPower = $derived(permissions?.can_change_power_levels ?? false);
+  let selfId = $derived(core.session?.user_id ?? null);
+  let selfDemotion = $state<{ member: MemberView; level: number } | null>(null);
+  let powerResets = $state(0);
   let isDirect = $derived(room?.is_direct ?? false);
   let canInviteInline = $derived(
     (permissions?.can_invite ?? false) && !isDirect && tab !== 'ban' && tab !== 'knock'
@@ -95,10 +97,11 @@
   let inviteQuery = $derived(canInviteInline ? search.trim() : '');
   let candidates = $derived.by(() => {
     const typed =
-      userIdPattern.test(inviteQuery) && !directory.some((entry) => entry.user_id === inviteQuery)
+      userIdPattern.test(inviteQuery) &&
+      !directory.results.some((entry) => entry.user_id === inviteQuery)
         ? [{ user_id: inviteQuery, display_name: null, avatar_url: null }]
         : [];
-    return [...typed, ...directory].filter(
+    return [...typed, ...directory.results].filter(
       (entry) => !members.some((member) => member.user_id === entry.user_id)
     );
   });
@@ -125,12 +128,13 @@
     const target = roomId;
     if (!target) return;
     let current = true;
-    void core.commands
-      .roomStateEvent(target, POWER_LEVEL_TAGS_EVENT_TYPE)
-      .then((content) => {
-        if (current) powerTags = parsePowerLevelTags(content);
+    void core.rpc.members
+      .powerLevelTags({ room_id: target })
+      .then((tags) => {
+        if (current) powerTags = tags;
       })
-      .catch(() => {
+      .catch((error: unknown) => {
+        console.debug('[sable room] power level tags unavailable', error);
         if (current) powerTags = {};
       });
     return () => {
@@ -138,20 +142,19 @@
     };
   });
 
-  function openProfile(userId: string, anchor: HTMLElement): void {
+  async function openProfile(userId: string, anchor: HTMLElement): Promise<void> {
     const request = ++profileRequest;
     profileUserId = userId;
     profileAnchor = anchor;
     profile = null;
     profileFailed = false;
-    void core
-      .userProfile(userId)
-      .then((next) => {
-        if (request === profileRequest) profile = next;
-      })
-      .catch(() => {
-        if (request === profileRequest) profileFailed = true;
-      });
+    try {
+      const next = await core.userProfile(userId);
+      if (request === profileRequest) profile = next;
+    } catch (error) {
+      console.warn('[sable room] loading member profile failed', error);
+      if (request === profileRequest) profileFailed = true;
+    }
   }
 
   function closeProfile(): void {
@@ -161,32 +164,11 @@
   }
 
   $effect(() => {
-    const query = inviteQuery;
-    const current = ++lookup;
-    searching = query !== '';
-    if (!query) {
-      directory = [];
-      return;
-    }
-    const timer = setTimeout(() => {
-      void findUsers(query, current);
-    }, 300);
+    directory.search(inviteQuery);
     return () => {
-      clearTimeout(timer);
+      directory.cancel();
     };
   });
-
-  async function findUsers(query: string, current: number): Promise<void> {
-    try {
-      const { results } = await core.commands.searchUserDirectory(query, 10);
-      if (current === lookup) directory = results;
-    } catch (error) {
-      console.warn('[sable room] user directory unavailable', error);
-      if (current === lookup) directory = [];
-    } finally {
-      if (current === lookup) searching = false;
-    }
-  }
 
   async function invite(userId: string): Promise<void> {
     const target = roomId;
@@ -195,7 +177,7 @@
     inviting = userId;
     inviteFailed = false;
     try {
-      await core.commands.inviteUser(target, userId);
+      await core.rpc.rooms.invite({ room_id: target, user_id: userId });
       invitedIds = [...invitedIds, userId];
       await load();
     } catch (error) {
@@ -218,8 +200,12 @@
     const current = ++run;
     loading = true;
     failed = false;
+    denied = false;
     try {
-      const loaded = await core.commands.roomMembers(target, [membershipFor(filter)]);
+      const loaded = await core.rpc.members.list({
+        room_id: target,
+        memberships: [membershipFor(filter)],
+      });
       if (current !== run) return;
       members = loaded.filter((member) => matchesFilter(member, filter));
     } catch (error) {
@@ -232,6 +218,12 @@
 
   function outranked(member: MemberView): boolean {
     return member.power_level >= ownPowerLevel;
+  }
+
+  function canChangePower(member: MemberView): boolean {
+    if (!canSetPower) return false;
+    if (member.user_id === selfId) return ownPowerLevel < FOUNDER_POWER_LEVEL;
+    return !outranked(member);
   }
 
   async function act(
@@ -249,25 +241,28 @@
           .filter((entry) => matchesFilter(entry, tab));
     } catch (error) {
       console.warn('[sable room] member action failed', error);
+      await load();
       failed = true;
+      denied = error instanceof CoreError && error.detail.code === 'denied';
     } finally {
       busy = null;
     }
   }
 
   function powerLabel(level: number): string {
-    if (level >= 100) return $i18n.t('timeline.powerLevelAdmin');
-    if (level >= 50) return $i18n.t('timeline.powerLevelModerator');
-    if (level < 0) return $i18n.t('timeline.powerLevelMuted');
-    return $i18n.t('timeline.powerLevelMember');
+    if (level >= 100) return i18n.t('timeline.powerLevelAdmin');
+    if (level >= 50) return i18n.t('timeline.powerLevelModerator');
+    if (level < 0) return i18n.t('timeline.powerLevelMuted');
+    return i18n.t('timeline.powerLevelMember');
   }
 
   function powerOptions(member: MemberView): { value: string; label: string }[] {
     const labels: Record<string, string> = Object.fromEntries(
-      powerChoices.map((choice) => [String(choice.level), $i18n.t(choice.label)])
+      powerChoices.map((choice) => [String(choice.level), i18n.t(choice.label)])
     );
     for (const [level, tag] of Object.entries(powerTags)) labels[String(Number(level))] = tag.name;
     const known = Object.entries(labels)
+      .filter(([level]) => Number(level) <= ownPowerLevel)
       .sort(([left], [right]) => Number(right) - Number(left))
       .map(([value, label]) => ({ value, label }));
     const current = String(member.power_level);
@@ -275,12 +270,21 @@
     return [{ value: current, label: current }, ...known];
   }
 
-  function setPower(member: MemberView, level: number): void {
+  function setPower(member: MemberView, level: number, confirmed = false): void {
     const target = roomId;
     if (!target || level === member.power_level) return;
+    if (member.user_id === selfId && !confirmed) {
+      selfDemotion = { member, level };
+      return;
+    }
     void act(
       member.user_id,
-      () => core.commands.setUserPowerLevel(target, member.user_id, level),
+      () =>
+        core.rpc.members.setUserPowerLevel({
+          room_id: target,
+          user_id: member.user_id,
+          power_level: level,
+        }),
       (entry) => ({ ...entry, power_level: level })
     );
   }
@@ -318,8 +322,8 @@
     try {
       await act(target.userId, () =>
         target.action === 'kick'
-          ? core.commands.kickUser(room, target.userId, reason)
-          : core.commands.banUser(room, target.userId, reason)
+          ? core.rpc.members.kick({ room_id: room, user_id: target.userId, reason })
+          : core.rpc.members.ban({ room_id: room, user_id: target.userId, reason })
       );
     } finally {
       moderationBusy = false;
@@ -330,27 +334,25 @@
 </script>
 
 <div class="section">
-  <div class="tabs" role="tablist" aria-label={$i18n.t('room.settingsMembers')}>
-    {#each MEMBERSHIP_FILTERS as entry (entry)}
-      <button
-        type="button"
-        role="tab"
-        aria-selected={tab === entry}
-        class="choice"
-        onclick={() => {
-          tab = entry;
-          search = '';
-        }}
-      >
-        {$i18n.t(MEMBERSHIP_FILTER_LABELS[entry])}
-      </button>
-    {/each}
+  <div class="tabs">
+    <Switcher
+      label={i18n.t('room.settingsMembers')}
+      items={MEMBERSHIP_FILTERS.map((entry) => ({
+        value: entry,
+        label: i18n.t(MEMBERSHIP_FILTER_LABELS[entry]),
+      }))}
+      value={tab}
+      onValueChange={(next) => {
+        tab = next as MembershipFilter;
+        search = '';
+      }}
+    />
     <div class="sort">
-      <ActionMenu label={$i18n.t('timeline.memberSort')}>
+      <ActionMenu label={i18n.t('timeline.memberSort')}>
         {#snippet trigger({ props })}
-          <Button {...props} variant="secondary" aria-label={$i18n.t('timeline.memberSort')}>
+          <Button {...props} variant="secondary" aria-label={i18n.t('timeline.memberSort')}>
             <ArrowsDownUpIcon aria-hidden="true" />
-            {$i18n.t(MEMBER_SORT_LABELS[sort])}
+            {i18n.t(MEMBER_SORT_LABELS[sort])}
           </Button>
         {/snippet}
         {#each MEMBER_SORTS as option (option)}
@@ -360,7 +362,7 @@
               setPreference('memberSort', option);
             }}
           >
-            {$i18n.t(MEMBER_SORT_LABELS[option])}
+            {i18n.t(MEMBER_SORT_LABELS[option])}
           </ActionMenuItem>
         {/each}
       </ActionMenu>
@@ -372,11 +374,11 @@
       bind:value={search}
       type="search"
       placeholder={canInviteInline
-        ? $i18n.t('room.membersSearchOrInvite')
-        : $i18n.t('timeline.searchMembers')}
+        ? i18n.t('room.membersSearchOrInvite')
+        : i18n.t('timeline.searchMembers')}
       aria-label={canInviteInline
-        ? $i18n.t('room.membersSearchOrInvite')
-        : $i18n.t('timeline.searchMembers')}
+        ? i18n.t('room.membersSearchOrInvite')
+        : i18n.t('timeline.searchMembers')}
     />
     {#if permissions?.can_invite && isDirect}
       <Button
@@ -385,13 +387,15 @@
           inviteOpen = true;
         }}
       >
-        {$i18n.t('room.inviteTitle')}
+        {i18n.t('room.inviteTitle')}
       </Button>
     {/if}
   </div>
 
   {#if failed}
-    <Alert variant="critical" role="alert">{$i18n.t('room.membersFailed')}</Alert>
+    <Alert variant="critical" role="alert"
+      >{i18n.t(denied ? 'room.membersDenied' : 'room.membersFailed')}</Alert
+    >
   {/if}
 
   {#if loading && members.length === 0}
@@ -399,19 +403,19 @@
   {:else if shown.length === 0}
     <p class="settings-status">
       {tab === 'knock' && !search.trim()
-        ? $i18n.t('room.membersNoRequests')
-        : $i18n.t('timeline.noMembersFound')}
+        ? i18n.t('room.membersNoRequests')
+        : i18n.t('timeline.noMembersFound')}
     </p>
   {:else}
     {#each groups as group (group.key)}
-      {@const tag = powerTag(group.level ?? 0, $i18n.t, powerTags)}
+      {@const tag = powerTag(group.level ?? 0, i18n.t, powerTags)}
       {#snippet tagIcon()}
         <RoleTagIcon icon={tag.icon ?? ''} />
       {/snippet}
       <SettingsSection
         headingId={`room-settings-members-${group.key}`}
         title={tag.name}
-        description={$i18n.t('timeline.memberCount', { count: group.members.length })}
+        description={i18n.t('timeline.memberCount', { count: group.members.length })}
         icon={tag.icon ? tagIcon : undefined}
       >
         <ul class="settings-rows">
@@ -439,12 +443,12 @@
                       if (target)
                         void act(
                           member.user_id,
-                          () => core.commands.inviteUser(target, member.user_id),
+                          () => core.rpc.rooms.invite({ room_id: target, user_id: member.user_id }),
                           (entry) => ({ ...entry, membership: 'invite' })
                         );
                     }}
                   >
-                    {$i18n.t('room.membersApprove')}
+                    {i18n.t('room.membersApprove')}
                   </Button>
                 {/if}
                 {#if permissions?.can_kick && !outranked(member)}
@@ -458,14 +462,16 @@
                         void act(
                           member.user_id,
                           () =>
-                            core.commands.sendStateEvent(target, 'm.room.member', member.user_id, {
-                              membership: 'leave',
+                            core.rpc.members.kick({
+                              room_id: target,
+                              user_id: member.user_id,
+                              reason: null,
                             }),
                           (entry) => ({ ...entry, membership: 'leave' })
                         );
                     }}
                   >
-                    {$i18n.t('room.membersDeny')}
+                    {i18n.t('room.membersDeny')}
                   </Button>
                 {/if}
               {:else if tab === 'leave' || tab === 'kick'}
@@ -478,7 +484,7 @@
                       openModeration(member.user_id, 'ban');
                     }}
                   >
-                    {$i18n.t('timeline.profileBan')}
+                    {i18n.t('timeline.profileBan')}
                   </Button>
                 {/if}
               {:else if tab === 'ban'}
@@ -491,24 +497,30 @@
                       const target = roomId;
                       if (target)
                         void act(member.user_id, () =>
-                          core.commands.unbanUser(target, member.user_id)
+                          core.rpc.members.unban({
+                            room_id: target,
+                            user_id: member.user_id,
+                            reason: null,
+                          })
                         );
                     }}
                   >
-                    {$i18n.t('timeline.profileUnban')}
+                    {i18n.t('timeline.profileUnban')}
                   </Button>
                 {/if}
               {:else}
-                {#if canSetPower && !outranked(member)}
-                  <Select
-                    value={String(member.power_level)}
-                    aria-label={$i18n.t('timeline.profileChangePower')}
-                    disabled={busy === member.user_id}
-                    items={powerOptions(member)}
-                    onValueChange={(next: string) => {
-                      setPower(member, Number(next));
-                    }}
-                  />
+                {#if canChangePower(member)}
+                  {#key powerResets}
+                    <Select
+                      value={String(member.power_level)}
+                      aria-label={i18n.t('timeline.profileChangePower')}
+                      disabled={busy === member.user_id}
+                      items={powerOptions(member)}
+                      onValueChange={(next: string) => {
+                        setPower(member, Number(next));
+                      }}
+                    />
+                  {/key}
                 {:else}
                   <span class="power">{powerLabel(member.power_level)}</span>
                 {/if}
@@ -521,7 +533,7 @@
                       openModeration(member.user_id, 'kick');
                     }}
                   >
-                    {$i18n.t('timeline.profileKick')}
+                    {i18n.t('timeline.profileKick')}
                   </Button>
                 {/if}
                 {#if permissions?.can_ban && !outranked(member)}
@@ -533,7 +545,7 @@
                       openModeration(member.user_id, 'ban');
                     }}
                   >
-                    {$i18n.t('timeline.profileBan')}
+                    {i18n.t('timeline.profileBan')}
                   </Button>
                 {/if}
               {/if}
@@ -545,13 +557,10 @@
   {/if}
 
   {#if inviteQuery}
-    <SettingsSection
-      headingId="room-settings-members-invite"
-      title={$i18n.t('room.membersInviteHeading')}
-    >
+    <SettingsSection headingId="room-settings-members-invite" title={i18n.t('common.invitePeople')}>
       {#if inviteFailed}
         <div class="settings-form">
-          <Alert variant="critical" role="alert">{$i18n.t('room.inviteSendFailed')}</Alert>
+          <Alert variant="critical" role="alert">{i18n.t('room.inviteSendFailed')}</Alert>
         </div>
       {/if}
       {#if candidates.length > 0}
@@ -566,7 +575,7 @@
                 </MemberIdentityRow>
               {/snippet}
               {#if invitedIds.includes(entry.user_id)}
-                <span class="power">{$i18n.t('room.membersInvited')}</span>
+                <span class="power">{i18n.t('room.membersInvited')}</span>
               {:else}
                 <Button
                   size="small"
@@ -577,7 +586,7 @@
                     void invite(entry.user_id);
                   }}
                 >
-                  {$i18n.t('room.inviteSubmit')}
+                  {i18n.t('room.inviteSubmit')}
                 </Button>
               {/if}
             </SettingsRow>
@@ -585,10 +594,10 @@
         </ul>
       {:else}
         <div class="settings-form">
-          {#if searching}
+          {#if directory.searching}
             <p class="settings-note" role="status"><Spinner small /></p>
           {:else}
-            <p class="settings-note">{$i18n.t('room.membersInviteEmpty')}</p>
+            <p class="settings-note">{i18n.t('room.membersInviteEmpty')}</p>
           {/if}
         </div>
       {/if}
@@ -624,6 +633,27 @@
   }}
 />
 
+<ConfirmDialog
+  open={selfDemotion !== null}
+  title={i18n.t('timeline.profileDemoteSelfTitle')}
+  description={i18n.t('timeline.profileDemoteSelfBody')}
+  confirmLabel={i18n.t('timeline.profileDemoteSelfConfirm')}
+  onOpenChange={(next: boolean) => {
+    if (next || selfDemotion === null) return;
+    selfDemotion = null;
+    powerResets += 1;
+  }}
+  onCancel={() => {
+    selfDemotion = null;
+    powerResets += 1;
+  }}
+  onConfirm={() => {
+    const pending = selfDemotion;
+    selfDemotion = null;
+    if (pending) setPower(pending.member, pending.level, true);
+  }}
+/>
+
 <DialogFrame
   open={moderationTarget !== null}
   onOpenChange={(next) => {
@@ -631,32 +661,32 @@
   }}
   variant="verification"
   label={moderationTarget?.action === 'ban'
-    ? $i18n.t('timeline.profileBan')
-    : $i18n.t('timeline.profileKick')}
+    ? i18n.t('timeline.profileBan')
+    : i18n.t('timeline.profileKick')}
   onConfirm={submitModeration}
 >
   {#if moderationTarget}
     <div class="moderation">
       <h2>
         {moderationTarget.action === 'ban'
-          ? $i18n.t('timeline.profileBanConfirm', {
+          ? i18n.t('timeline.profileBanConfirm', {
               name: moderationMember ? memberName(moderationMember) : moderationTarget.userId,
             })
-          : $i18n.t('timeline.profileKickConfirm', {
+          : i18n.t('timeline.profileKickConfirm', {
               name: moderationMember ? memberName(moderationMember) : moderationTarget.userId,
             })}
       </h2>
-      <FormField fieldId="member-moderation-reason" label={$i18n.t('timeline.deleteReason')}>
+      <FormField fieldId="member-moderation-reason" label={i18n.t('timeline.deleteReason')}>
         <TextInput id="member-moderation-reason" bind:value={moderationReason} autocomplete="off" />
       </FormField>
       <div class="moderation-actions">
         <Button type="button" variant="ghost" disabled={moderationBusy} onclick={cancelModeration}>
-          {$i18n.t('timeline.cancel')}
+          {i18n.t('common.cancel')}
         </Button>
         <Button type="submit" variant="danger" loading={moderationBusy}>
           {moderationTarget.action === 'ban'
-            ? $i18n.t('timeline.profileBan')
-            : $i18n.t('timeline.profileKick')}
+            ? i18n.t('timeline.profileBan')
+            : i18n.t('timeline.profileKick')}
         </Button>
       </div>
     </div>

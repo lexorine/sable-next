@@ -1,4 +1,5 @@
-import type { SharedBatch } from '#lib/platform/share-target.js';
+import type { SharedBatch, SharedTarget } from '#lib/platform/share-target.js';
+import { withResolvedMime } from '#lib/platform/files.js';
 import {
   clearSharedBatch,
   drainSharedContent,
@@ -14,6 +15,7 @@ import {
   displayFileName,
   isShareDeepLink,
   mergeShareBatches,
+  shareTarget,
 } from './share-content.js';
 
 export class ShareInbox {
@@ -31,6 +33,11 @@ export class ShareInbox {
   get text(): string {
     const native = collectShareText(this.#batches);
     return [native, this.#webText].filter((part) => part !== '').join('\n');
+  }
+
+  get target(): SharedTarget | null {
+    if (this.#webText !== '' || this.#webFiles.length > 0) return null;
+    return shareTarget(this.#batches);
   }
 
   get fileCount(): number {
@@ -53,9 +60,11 @@ export class ShareInbox {
     const read = await Promise.all(
       refs.map(async (ref) => {
         const bytes = await readSharedFile(ref.batchId, ref.fileName);
-        return new File([bytes as BlobPart], displayFileName(ref.fileName), {
-          type: ref.mime ?? 'application/octet-stream',
-        });
+        return withResolvedMime(
+          new File([bytes as BlobPart], displayFileName(ref.fileName), {
+            type: ref.mime ?? 'application/octet-stream',
+          })
+        );
       })
     );
     return [...read, ...this.#webFiles];
@@ -104,10 +113,14 @@ export function watchSharedContent(inbox: ShareInbox): () => void {
     else stops.push(stop);
   };
 
-  void subscribeSharedContent(drain).then(collect, () => undefined);
+  const subscribeFailed = (error: unknown): void => {
+    console.debug('[sable share-target] subscribing failed', error);
+  };
+
+  void subscribeSharedContent(drain).then(collect, subscribeFailed);
   void subscribeDeepLinks((urls) => {
     if (urls.some(isShareDeepLink)) drain();
-  }).then(collect, () => undefined);
+  }).then(collect, subscribeFailed);
 
   const onVisible = (): void => {
     if (document.visibilityState === 'visible') drain();

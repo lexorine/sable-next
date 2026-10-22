@@ -13,13 +13,7 @@
     preview?: string | null;
   };
 
-  let {
-    open = $bindable(false),
-    preview = null,
-    loadImagePacks,
-    roomId,
-    ...actions
-  }: Props = $props();
+  let { open = $bindable(false), preview = null, roomId, ...actions }: Props = $props();
 
   function run(action: () => void): void {
     open = false;
@@ -34,8 +28,8 @@
 
 <BottomSheet
   bind:open
-  label={$i18n.t('timeline.moreActions')}
-  closeLabel={$i18n.t('timeline.closeMenu')}
+  label={i18n.t('timeline.moreActions')}
+  closeLabel={i18n.t('timeline.closeMenu')}
 >
   {#if preview}
     <p class="sheet-source">{preview}</p>
@@ -43,7 +37,7 @@
   {/if}
   <IconContext values={{ 'aria-hidden': 'true' }}>
     {#if actions.onReact}
-      <MessageQuickReactions count={8} {loadImagePacks} onReact={react} {roomId} roomy />
+      <MessageQuickReactions count={8} onReact={react} {roomId} roomy />
     {/if}
     <div class="sheet-list">
       {#each messageMenuRows(actions) as row (row.key)}
@@ -57,7 +51,7 @@
           }}
         >
           <RowIcon />
-          <span>{$i18n.t(row.label)}</span>
+          <span>{i18n.t(row.label)}</span>
         </button>
       {/each}
     </div>

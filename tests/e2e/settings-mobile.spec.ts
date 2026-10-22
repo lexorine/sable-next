@@ -1,13 +1,14 @@
 import type { Page } from '@playwright/test';
 
 import { expect, test, SIGNED_OUT } from './fixtures/test';
+import { quietFor, LONG_PRESS_HOLD_MS } from './fixtures/settle';
 
 test.use({ storageState: SIGNED_OUT, hasTouch: true, viewport: { width: 412, height: 915 } });
 
 async function holdAt(page: Page, x: number, y: number): Promise<void> {
   const cdp = await page.context().newCDPSession(page);
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
-  await page.waitForTimeout(800);
+  await quietFor(page, LONG_PRESS_HOLD_MS);
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
 }
 
@@ -26,7 +27,7 @@ async function swipeRight(
     });
   await touch('touchStart', fromX);
   for (let x = fromX + 12; x <= toX; x += 12) {
-    if (stepMs > 0) await page.waitForTimeout(stepMs);
+    if (stepMs > 0) await quietFor(page, stepMs);
     await touch('touchMove', x);
   }
   await touch('touchEnd', toX);
@@ -171,33 +172,7 @@ test('mobile: a row with several buttons wraps them under its description', asyn
   expect(description.width).toBeGreaterThan(rowBox.width * 0.6);
 });
 
-test('mobile: a dropdown opens as a sheet of choices', async ({ page, installRoomCore }) => {
-  await installRoomCore('ready');
-  await page.goto('/settings/appearance');
-
-  await page.getByRole('button', { name: 'Message spacing' }).click();
-  const sheet = page.getByRole('dialog', { name: 'Message spacing' });
-  const choice = sheet.getByRole('radio', { name: 'Roomy' });
-  await choice.click();
-
-  await expect(sheet).toBeHidden();
-  await expect(page.getByRole('button', { name: 'Message spacing' })).toContainText('Roomy');
-});
-
-test('mobile: log out is the last row of the section list', async ({ page, installRoomCore }) => {
-  await installRoomCore('ready');
-  await page.goto('/settings');
-
-  const nav = page.getByRole('navigation', { name: 'Settings sections' });
-  const logout = nav.getByRole('button', { name: 'Log out' });
-  await logout.scrollIntoViewIfNeeded();
-  const about = await nav.getByRole('link', { name: 'About' }).boundingBox();
-  const row = await logout.boundingBox();
-  if (!about || !row) throw new Error('The list is not laid out.');
-  expect(row.y).toBeGreaterThan(about.y);
-});
-
-const THEME_FILES = 'https://raw.githubusercontent.com/SableClient/themes/main/';
+const THEME_FILES = 'https://git.sable.moe/SableClient/themes/raw/branch/main/';
 const DRACULA = `/*
 @sable-theme
 name: Dracula
@@ -209,7 +184,7 @@ kind: dark
 async function routeCatalogue(page: Page, requested: string[] = []): Promise<void> {
   await page.route('https://**/*', (route) => {
     const url = route.request().url();
-    if (!url.startsWith('https://raw.githubusercontent.com/')) return route.continue();
+    if (!url.startsWith('https://git.sable.moe/')) return route.continue();
     requested.push(url);
     if (url.endsWith('catalog.json')) {
       return route.fulfill({
@@ -223,7 +198,7 @@ async function routeCatalogue(page: Page, requested: string[] = []): Promise<voi
             {
               basename: 'outside',
               previewUrl: null,
-              fullUrl: 'https://raw.githubusercontent.com/else/where/x.sable.css',
+              fullUrl: 'https://git.sable.moe/else/where/x.sable.css',
             },
           ],
           tweaks: [

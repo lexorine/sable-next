@@ -9,14 +9,18 @@ import android.net.NetworkCapabilities
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.util.Log
+import android.webkit.WebView
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
 import androidx.core.content.IntentCompat
+import androidx.core.content.pm.ShortcutManagerCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import java.io.File
 import java.io.FileOutputStream
 import java.util.UUID
+import moe.sable.push.ConversationShortcuts
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -24,12 +28,19 @@ class MainActivity : TauriActivity() {
   private external fun nativeInitSystemBars()
   private external fun nativeNetworkChanged(unmetered: Boolean)
   private var networkCallback: ConnectivityManager.NetworkCallback? = null
+  private var fullscreenClient: FullscreenChromeClient? = null
+  private val fullscreenBackCallback = object : OnBackPressedCallback(false) {
+    override fun handleOnBackPressed() {
+      fullscreenClient?.exitFullscreen()
+    }
+  }
 
   override fun onCreate(savedInstanceState: Bundle?) {
     NativeSentry.apply(this, getSharedPreferences("sentry", MODE_PRIVATE).getBoolean("enabled", false))
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
     instance = this
+    onBackPressedDispatcher.addCallback(this, fullscreenBackCallback)
     runCatching { nativeInitSystemBars() }
     startNetworkMonitor()
     stageShareIntent(intent)
@@ -72,6 +83,36 @@ class MainActivity : TauriActivity() {
     }
   }
 
+  override fun onWebViewCreate(webView: WebView) {
+    onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+      override fun handleOnBackPressed() {
+        webView.evaluateJavascript(
+          "(typeof window.__sableAndroidBack === 'function' && window.__sableAndroidBack() === true)"
+        ) { consumed ->
+          if (consumed != "true") moveTaskToBack(true)
+        }
+      }
+    })
+    if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.O) return
+    webView.post {
+      val inner = webView.webChromeClient ?: return@post
+      val client = FullscreenChromeClient(inner, ::setFullscreenVideo)
+      webView.webChromeClient = client
+      fullscreenClient = client
+    }
+  }
+
+  private fun setFullscreenVideo(active: Boolean) {
+    val controller = WindowCompat.getInsetsController(window, window.decorView)
+    if (active) {
+      controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+      controller.hide(WindowInsetsCompat.Type.systemBars())
+    } else {
+      controller.show(WindowInsetsCompat.Type.systemBars())
+    }
+    fullscreenBackCallback.isEnabled = active
+  }
+
   override fun onNewIntent(intent: Intent) {
     super.onNewIntent(intent)
     stageShareIntent(intent)
@@ -110,9 +151,21 @@ class MainActivity : TauriActivity() {
       JSONObject().apply {
         put("version", 1)
         put("items", items)
+        intent.getStringExtra(ShortcutManagerCompat.EXTRA_SHORTCUT_ID)
+          ?.takeIf(::isPublishedShortcut)
+          ?.let(ConversationShortcuts::parse)
+          ?.let { (userId, roomId) -> put("target", JSONObject().put("userId", userId).put("roomId", roomId)) }
       }.toString()
     )
   }
+
+  /** Any app can send this activity a shortcut id, so only trust the ones published here. */
+  private fun isPublishedShortcut(id: String): Boolean = runCatching {
+    ShortcutManagerCompat.getShortcuts(
+      this,
+      ShortcutManagerCompat.FLAG_MATCH_DYNAMIC or ShortcutManagerCompat.FLAG_MATCH_CACHED,
+    ).any { it.id == id }
+  }.getOrDefault(false)
 
   private fun addTextItem(items: JSONArray, text: String) {
     items.put(JSONObject().apply {

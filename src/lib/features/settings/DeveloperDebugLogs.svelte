@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { copyText } from '#lib/platform/clipboard.js';
   import { formatTime } from '#lib/ui/date-time.js';
   import { i18n } from '#lib/i18n.js';
   import Button from '#lib/ui/primitives/Button.svelte';
@@ -15,6 +16,7 @@
   } from '#lib/observability/debug-log.svelte.js';
   import { exportDiagnosticsBundle } from '#lib/observability/export-diagnostics.js';
   import '#lib/ui/primitives/settings-row.css';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
 
   const categories: DebugLogCategory[] = [
     'sync',
@@ -44,7 +46,7 @@
   }
 
   async function copy(entries = filtered): Promise<void> {
-    await navigator.clipboard.writeText(exportDebugLogs(entries));
+    await copyText(exportDebugLogs(entries));
   }
 </script>
 
@@ -52,11 +54,11 @@
   <ul class="settings">
     <SettingsRow
       id="debug-logs-status"
-      title={$i18n.t('settings.developerLogsStatus')}
-      description={$i18n.t('settings.developerLogsDescription')}
+      title={i18n.t('settings.developerLogsStatus')}
+      description={i18n.t('settings.developerLogsDescription')}
     >
       <Switch
-        label={$i18n.t('settings.developerLogsEnable')}
+        label={i18n.t('settings.developerLogsEnable')}
         checked={debugLog.enabled}
         onCheckedChange={setDebugLogging}
       />
@@ -66,13 +68,13 @@
   <div class="settings-form logs-body">
     <div class="filters">
       <Select
-        aria-label={$i18n.t('settings.developerLogsLevel')}
+        aria-label={i18n.t('settings.developerLogsLevel')}
         value={level}
         items={levels.map((value) => ({ value, label: value }))}
         onValueChange={(value) => (level = value as DebugLogLevel | 'all')}
       />
       <Select
-        aria-label={$i18n.t('settings.developerLogsCategory')}
+        aria-label={i18n.t('settings.developerLogsCategory')}
         value={category}
         items={[
           { value: 'all', label: 'all' },
@@ -83,21 +85,20 @@
     </div>
 
     <div class="actions">
-      <Button variant="ghost" size="small" onclick={clearDebugLogs}
-        >{$i18n.t('settings.developerLogsClear')}</Button
+      <Button variant="ghost" size="small" onclick={clearDebugLogs}>{i18n.t('common.clear')}</Button
       >
       <Button variant="secondary" size="small" onclick={() => void copy()}
-        >{$i18n.t('settings.developerLogsCopy')}</Button
+        >{i18n.t('settings.developerLogsCopy')}</Button
       >
       <Button variant="secondary" size="small" onclick={() => void download()}
-        >{$i18n.t('settings.developerLogsExport')}</Button
+        >{i18n.t('settings.developerLogsExport')}</Button
       >
     </div>
 
     {#if filtered.length === 0}
-      <p class="empty">{$i18n.t('settings.developerLogsEmpty')}</p>
+      <p class="empty">{i18n.t('settings.developerLogsEmpty')}</p>
     {:else}
-      <div class="entries" aria-live="polite">
+      <div class="entries" aria-live="polite" {@attach scrollHint}>
         {#each filtered.slice(-200).reverse() as entry (entry.id)}
           <details class={`entry level-${entry.level}`}>
             <summary>
@@ -176,6 +177,7 @@
     display: grid;
     font-family: var(--font-family-mono);
     font-size: var(--font-size-small);
+    font-variant-ligatures: none;
     gap: var(--space-200);
     grid-template-columns: auto auto auto 1fr;
   }
@@ -196,6 +198,7 @@
   pre {
     font-family: var(--font-family-mono);
     font-size: var(--font-size-small);
+    font-variant-ligatures: none;
     margin: var(--space-200) 0 0;
     overflow-wrap: anywhere;
     white-space: pre-wrap;

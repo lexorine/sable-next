@@ -15,7 +15,7 @@ inputs:
     required: false
     default: 'wasm'
   install-mise-tools:
-    description: Whether to install tools declared in mise.toml.
+    description: Whether to install tools declared in .mise/config.toml.
     required: false
     default: 'true'
 
@@ -26,15 +26,15 @@ runs:
       uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
 
     - name: Set up Node.js
-      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
       with:
         node-version: 24.21.0
         cache: pnpm
 
     - name: Set up mise
-      uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+      uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
       with:
-        version: '2026.9.13'
+        version: '2026.10.8'
         cache: true
         env: false
         install: ${{ inputs.install-mise-tools }}
@@ -56,13 +56,13 @@ runs:
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: src/generated/wasm
-        key: wasm-${{ runner.os }}-${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', 'mise.toml', 'scripts/build-wasm.mjs') }}
+        key: wasm-${{ runner.os }}-${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml', '.mise/config.toml', 'scripts/build/build-wasm.mjs') }}
 
     - name: Set up Rust
       if: ${{ inputs.rust == 'true' || (inputs.build == 'true' && steps.wasm.outputs.cache-hit != 'true') }}
       uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
       with:
-        toolchain: 1.98.1
+        toolchain: 1.99.0
         targets: wasm32-unknown-unknown
 
     - name: Cache Rust artifacts

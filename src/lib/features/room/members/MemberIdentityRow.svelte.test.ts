@@ -2,7 +2,7 @@
 
 import { render, screen, within } from '@testing-library/svelte';
 import { userEvent } from '@testing-library/user-event';
-import { afterEach, expect, test, vi } from 'vitest';
+import { afterEach, expect, test, vi, type Mock } from 'vitest';
 
 const presence = vi.hoisted(() => ({
   entry: null as {
@@ -62,6 +62,7 @@ function profileFor(userId: string) {
 afterEach(() => {
   core.userProfile.mockReset();
   core.userProfile.mockRejectedValue(new Error('profile unavailable'));
+  core.onProfileChanged.mockImplementation(() => () => {});
   presence.entry = null;
 });
 
@@ -86,13 +87,11 @@ test('tints the name from the profile and opens the profile card from the row', 
   const onProfile = vi.fn();
   render(MemberIdentityRow, { userId: '@bob:example.org', members, onProfile });
 
-  const row = screen.getByRole('button', { name: "Open Bob's profile" });
+  const row = screen.getByRole('button', { name: 'Open Bob’s profile' });
   await vi.waitFor(() => {
     expect(within(row).getByText('Bob')).toHaveClass('tinted');
   });
-  expect(within(row).getByText('he/him').closest('.sender-identity-pronouns')).toHaveClass(
-    'tinted'
-  );
+  expect(within(row).queryByText('he/him')).toBeNull();
   await user.click(row);
   expect(onProfile).toHaveBeenCalledWith('@bob:example.org', row);
 });
@@ -118,6 +117,31 @@ test('shows the profile status, emoji first', async () => {
   expect(await screen.findByText('Shipping')).toHaveTextContent('\u{1F680}Shipping');
 });
 
+test('follows profile changes for the shown user', async () => {
+  const listeners: ((userId: string) => void)[] = [];
+  (
+    core.onProfileChanged as Mock<(listener: (userId: string) => void) => () => void>
+  ).mockImplementation((listener) => {
+    listeners.push(listener);
+    return () => {};
+  });
+  core.userProfile.mockResolvedValue({
+    ...profileFor('@bob:example.org'),
+    status: { text: 'Shipping', emoji: null },
+  });
+  await mountRow({ showStatus: true });
+  expect(await screen.findByText('Shipping')).toBeInTheDocument();
+
+  core.userProfile.mockResolvedValue({
+    ...profileFor('@bob:example.org'),
+    status: { text: 'On holiday', emoji: null },
+  });
+  for (const listener of listeners) listener('@bob:example.org');
+
+  expect(await screen.findByText('On holiday')).toBeInTheDocument();
+  expect(screen.queryByText('Shipping')).not.toBeInTheDocument();
+});
+
 test('offers the whole status on hover, since the row truncates it', async () => {
   const text = 'Shipping the release candidate before the weekend, back on Monday';
   core.userProfile.mockResolvedValue({
@@ -126,7 +150,8 @@ test('offers the whole status on hover, since the row truncates it', async () =>
   });
   await mountRow({ showStatus: true });
 
-  expect(await screen.findByText(text)).toHaveAttribute('title', `\u{1F680} ${text}`);
+  await userEvent.setup().hover(await screen.findByText(text));
+  expect(await screen.findByText(`\u{1F680} ${text}`)).toBeInTheDocument();
 });
 
 test('renders a medium presence marker', async () => {

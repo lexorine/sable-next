@@ -45,7 +45,7 @@
     sending = true;
     outcome = null;
     try {
-      await core.commands.sendRawEvent(roomId, type, parsed);
+      await core.rpc.messages.sendRawEvent({ room_id: roomId, event_type: type, content: parsed });
       outcome = 'sent';
     } catch (error) {
       console.warn('[sable room] message event rejected', error);
@@ -58,11 +58,11 @@
 
 <SettingsSection
   headingId="room-developer-event"
-  title={$i18n.t('room.devEventTitle')}
-  description={$i18n.t('room.devEventDescription')}
+  title={i18n.t('room.devEventTitle')}
+  description={i18n.t('room.devEventDescription')}
 >
   <form class="settings-form" onsubmit={send}>
-    <FormField fieldId="room-dev-event-type" label={$i18n.t('room.devEventType')}>
+    <FormField fieldId="room-dev-event-type" label={i18n.t('room.devEventType')}>
       <TextInput
         id="room-dev-event-type"
         bind:value={eventType}
@@ -70,20 +70,20 @@
         spellcheck="false"
       />
     </FormField>
-    <FormField fieldId="room-dev-event-content" label={$i18n.t('room.devContent')}>
+    <FormField fieldId="room-dev-event-content" label={i18n.t('room.devContent')}>
       <TextArea id="room-dev-event-content" bind:value={content} rows={8} spellcheck="false" />
     </FormField>
     {#if outcome === 'json'}
-      <Alert variant="critical" role="alert">{$i18n.t('room.devInvalidJson')}</Alert>
+      <Alert variant="critical" role="alert">{i18n.t('room.devInvalidJson')}</Alert>
     {:else if outcome === 'failed'}
-      <Alert variant="critical" role="alert">{$i18n.t('room.devFailed')}</Alert>
+      <Alert variant="critical" role="alert">{i18n.t('common.stateEventRejected')}</Alert>
     {:else if outcome === 'sent'}
-      <Alert variant="success" role="status">{$i18n.t('room.devSent')}</Alert>
+      <Alert variant="success" role="status">{i18n.t('room.devSent')}</Alert>
     {/if}
     {#if canSend}
       <div class="actions">
         <Button type="submit" loading={sending} disabled={eventType.trim() === ''}>
-          {$i18n.t('room.devEventSend')}
+          {i18n.t('room.devEventSend')}
         </Button>
       </div>
     {/if}

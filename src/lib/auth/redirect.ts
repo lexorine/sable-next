@@ -44,8 +44,11 @@ export function createRedirectUri(
   return url.toString();
 }
 
-export function tauriRedirectUri(loginType: RedirectLoginType): string {
-  return loginType === 'oidc' ? 'moe.sable.next:/login' : 'sable://login';
+export function nativeRedirectUri(loginType: RedirectLoginType): string {
+  if (__SABLE_STABLE__) {
+    return loginType === 'oidc' ? 'moe.sable.app:/login' : 'sable://login';
+  }
+  return loginType === 'oidc' ? 'moe.sable.next:/login' : 'moe.sable.next://login';
 }
 
 export function callbackChannelName(callbackUrl: string, windowName: string): string {

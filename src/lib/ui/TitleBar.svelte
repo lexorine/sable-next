@@ -8,6 +8,7 @@
     showSnapLayouts,
     supportsSnapLayouts,
     startWindowResize,
+    supportsWindowResizeHandles,
     toggleMaximizeWindow,
     watchMaximized,
     type TitleBarKind,
@@ -91,7 +92,7 @@
     <div class="controls">
       <button
         type="button"
-        aria-label={$i18n.t('window.minimize')}
+        aria-label={i18n.t('window.minimize')}
         onclick={() => {
           dismissSnap();
           void minimizeWindow();
@@ -103,7 +104,7 @@
       </button>
       <button
         type="button"
-        aria-label={maximized ? $i18n.t('window.restore') : $i18n.t('window.maximize')}
+        aria-label={maximized ? i18n.t('common.restore') : i18n.t('window.maximize')}
         onmouseenter={hoverMaximize}
         onmouseleave={leaveMaximize}
         onclick={() => {
@@ -123,7 +124,7 @@
       <button
         type="button"
         class="close"
-        aria-label={$i18n.t('window.close')}
+        aria-label={i18n.t('common.close')}
         onclick={() => {
           dismissSnap();
           void closeWindow();
@@ -137,7 +138,7 @@
   {/if}
 </div>
 
-{#if kind === 'desktop' && !maximized}
+{#if kind === 'desktop' && !maximized && supportsWindowResizeHandles()}
   <div class="resize-handles" aria-hidden="true">
     {#each edges as edge (edge)}
       <!-- svelte-ignore a11y_no_static_element_interactions -->

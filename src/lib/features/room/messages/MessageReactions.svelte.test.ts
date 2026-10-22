@@ -9,6 +9,8 @@ vi.mock('#lib/core/context.js');
 
 import { core } from '#lib/core/__mocks__/context.js';
 
+import { invalidatePacks } from '#lib/emoji/load-packs.js';
+
 import { mediaPreviewSettings } from '#lib/settings/media-previews.svelte.js';
 import { LONG_PRESS_MS } from '#lib/ui/long-press.svelte.js';
 import { guardTouchClicks } from '#lib/ui/trailing-click.js';
@@ -22,6 +24,10 @@ const packs = [
     room_id: null,
     name: 'Cats',
     avatar_url: null,
+    declared_name: null,
+    declared_avatar_url: null,
+    stable_event: false,
+    legacy_event: false,
     attribution: null,
     usage: ['emoticon'],
     images: [
@@ -114,7 +120,7 @@ test.each(['mouse', 'keyboard'])('reaction contextmenu opens only details (%s)',
 });
 
 test('uses a custom emote shortcode rather than its Matrix media URI', async () => {
-  Object.assign(core.commands, { imagePacks: vi.fn(() => Promise.resolve(packs)) });
+  Object.assign(core.rpc.packs, { list: vi.fn(() => Promise.resolve({ packs, complete: true })) });
 
   render(MessageReactionsHarness, {
     reactions: [
@@ -126,7 +132,7 @@ test('uses a custom emote shortcode rather than its Matrix media URI', async () 
     eventId: '$event',
     currentUserId: null,
     members: [] as MemberView[],
-    roomId: '!room:example.org',
+    roomId: '!emotes:example.org',
     actionable: false,
   });
 
@@ -135,8 +141,10 @@ test('uses a custom emote shortcode rather than its Matrix media URI', async () 
 });
 
 test('names an image from a pack we cannot see by the shortcode it was sent with', async () => {
-  Object.assign(core.commands, {
-    imagePacks: vi.fn(() => Promise.resolve([])),
+  Object.assign(core.rpc.packs, {
+    list: vi.fn(() => Promise.resolve({ packs: [], complete: true })),
+  });
+  Object.assign(core.rpc.messages, {
     reactionShortcodes: vi.fn(() =>
       Promise.resolve([{ key: 'mxc://remote.example/parrot', shortcode: 'partyparrot' }])
     ),
@@ -157,8 +165,10 @@ test('names an image from a pack we cannot see by the shortcode it was sent with
 });
 
 test('shows the shortcode in place of an image that cannot load', async () => {
-  Object.assign(core.commands, {
-    imagePacks: vi.fn(() => Promise.resolve([])),
+  Object.assign(core.rpc.packs, {
+    list: vi.fn(() => Promise.resolve({ packs: [], complete: true })),
+  });
+  Object.assign(core.rpc.messages, {
     reactionShortcodes: vi.fn(() =>
       Promise.resolve([{ key: 'mxc://dead.example/parrot', shortcode: 'partyparrot' }])
     ),
@@ -180,7 +190,7 @@ test('shows the shortcode in place of an image that cannot load', async () => {
 });
 
 test('a custom emote reaction shows its shortcode where media previews are off (MSC4278)', async () => {
-  Object.assign(core.commands, { imagePacks: vi.fn(() => Promise.resolve(packs)) });
+  Object.assign(core.rpc.packs, { list: vi.fn(() => Promise.resolve({ packs, complete: true })) });
   mediaPreviewSettings.global = { media_previews: 'off' };
 
   render(MessageReactionsHarness, {
@@ -188,7 +198,7 @@ test('a custom emote reaction shows its shortcode where media previews are off (
     eventId: '$event',
     currentUserId: null,
     members: [],
-    roomId: '!room:example.org',
+    roomId: '!emotes-hidden:example.org',
     actionable: false,
     joinRule: 'invite',
   });
@@ -196,4 +206,21 @@ test('a custom emote reaction shows its shortcode where media previews are off (
   expect(await screen.findByText(':neocat:')).toHaveClass('reaction-shortcode');
   expect(document.querySelector('.reaction-image')).toBeNull();
   mediaPreviewSettings.global = {};
+});
+
+test('plain emoji reactions do not load the room packs', async () => {
+  invalidatePacks(core.rpc);
+  core.rpc.packs.list.mockClear();
+  render(MessageReactionsHarness, {
+    reactions: [{ key: '👍', senders: ['@alice:example.org'] }],
+    eventId: '$event',
+    currentUserId: null,
+    members: [],
+    roomId: '!room:example.org',
+    actionable: false,
+  });
+
+  await screen.findByRole('button', { name: /👍/ });
+  await Promise.resolve();
+  expect(core.rpc.packs.list).not.toHaveBeenCalled();
 });

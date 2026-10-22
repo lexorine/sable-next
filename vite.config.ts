@@ -4,11 +4,18 @@ import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vite';
 import { isAbsolute, relative, resolve } from 'node:path';
 
-import { fetchDeepFilterNet } from './scripts/fetch-deepfilternet.mjs';
+import { fetchDeepFilterNet } from './scripts/build/fetch-deepfilternet.mjs';
+import { emojiDataPlugin } from './scripts/build/emoji-data-plugin.mjs';
 
 const wasmOutput = process.env.SABLE_WASM_OUTPUT ?? 'src/generated/wasm';
 
 export default defineConfig({
+  define: {
+    __SABLE_STABLE__: JSON.stringify(process.env.SABLE_BUILD_FLAVOR === 'stable'),
+  },
+  build: {
+    sourcemap: process.env.VITE_SENTRY_ENVIRONMENT === 'production' ? 'hidden' : true,
+  },
   optimizeDeps: {
     exclude: ['phosphor-svelte'],
   },
@@ -43,31 +50,27 @@ export default defineConfig({
     },
   },
   plugins: [
+    emojiDataPlugin(),
     {
       name: 'deepfilternet-assets',
       buildStart: async () => {
-        if (!process.env.VITEST) await fetchDeepFilterNet();
+        if (!process.env.VITEST && !process.env.SABLE_SKIP_DEEPFILTERNET)
+          await fetchDeepFilterNet();
       },
     },
     sentrySvelteKit({
       // The plugin detects the adapter from `svelte.config.js`, which this
       // project does not have, and does not know `adapter-static` either.
       adapter: 'other',
-      autoUploadSourceMaps: Boolean(process.env.SENTRY_AUTH_TOKEN),
-      authToken: process.env.SENTRY_AUTH_TOKEN,
-      org: process.env.SENTRY_ORG,
-      project: process.env.SENTRY_PROJECT,
+      autoUploadSourceMaps: false,
       release: { name: process.env.VITE_APP_VERSION },
-      sourcemaps: {
-        // Upload discovery uses SvelteKit's output; neither copy may ship maps.
-        filesToDeleteAfterUpload: ['./.svelte-kit/output/**/*.map', './dist/**/*.map'],
-      },
     }),
     sveltekit({
       compilerOptions: {
         // Force runes mode for the project, except for libraries. Can be removed in svelte 6.
         runes: ({ filename }) =>
           filename.split(/[/\\]/).includes('node_modules') ? undefined : true,
+        experimental: { async: true },
       },
 
       // The web build is a client-side app served as Cloudflare Worker assets.
@@ -89,6 +92,7 @@ export default defineConfig({
         pages: 'dist',
         fallback: '404.html',
       }),
+      inspector: true,
     }),
   ],
 });

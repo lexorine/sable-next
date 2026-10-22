@@ -1,7 +1,9 @@
 <script lang="ts">
-  import { onDestroy, tick, untrack, type Snippet } from 'svelte';
+  import { page } from '$app/state';
+  import { onDestroy, untrack, type Snippet } from 'svelte';
   import { on } from 'svelte/events';
-  import { fade } from 'svelte/transition';
+  import { fade, fly } from 'svelte/transition';
+  import { cubicOut } from 'svelte/easing';
   import ArrowDownIcon from 'phosphor-svelte/lib/ArrowDownIcon';
   import ArrowUpIcon from 'phosphor-svelte/lib/ArrowUpIcon';
   import CheckIcon from 'phosphor-svelte/lib/CheckIcon';
@@ -13,19 +15,21 @@
   } from '#src/generated/protocol';
   import { i18n } from '#lib/i18n.js';
   import { windowActivity } from '#lib/platform/window-activity.js';
-  import type { ResumeAnchor, RoomTimeline } from '#lib/rooms/timeline.svelte.js';
+  import type { RoomTimeline } from '#lib/rooms/timeline.svelte.js';
   import { preferences } from '#lib/settings/preferences.svelte.js';
-  import { motionMs, shouldReduceMotion } from '#lib/ui/motion.js';
+  import { MOTION_MS, motionMs, shouldReduceMotion } from '#lib/ui/motion.js';
   import {
     TimelineWindow,
     type TimelineEntry,
     type TimelineRow,
     type TimelineWindowState,
   } from '#lib/timeline/timeline-window.js';
+  import { flushed } from '#lib/ui/flushed.js';
   import Alert from '#lib/ui/primitives/Alert.svelte';
   import Button from '#lib/ui/primitives/Button.svelte';
   import EmptyState from '#lib/ui/primitives/EmptyState.svelte';
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
   import Spinner from '#lib/ui/primitives/Spinner.svelte';
   import { isEditableTarget } from '#lib/ui/shortcuts/binding.js';
 
@@ -34,6 +38,7 @@
   import { useEventItems } from '../messages/event-items.svelte.js';
   import { MessageDialogs, provideMessageDialogs } from '../messages/message-dialogs.svelte.js';
   import { OpenMessageMenu, provideMessageMenu } from '../messages/message-menu-open.svelte.js';
+  import { LoadRetry } from './load-retry';
   import TimelineItem from './TimelineItem.svelte';
   import TimelineMemberGroup from './TimelineMemberGroup.svelte';
   import TimelineReadReceipt from './TimelineReadReceipt.svelte';
@@ -57,7 +62,7 @@
     withReadMarkerBefore,
     type ReplyDirection,
   } from './timeline-format';
-  import { MAX_EMPTY_REFILLS, TimelinePagination } from './timeline-pagination.svelte.js';
+  import { TimelinePagination } from './timeline-pagination.svelte.js';
   import { TimelineFocus } from './timeline-focus.svelte.js';
   import { TimelineFuture } from './timeline-future.svelte.js';
   import { TimelineHistoryController } from './timeline-history';
@@ -68,7 +73,7 @@
     estimateRowSize,
     mediaColumnPx,
     TIMELINE_LAYOUT,
-    TIMELINE_LAYOUT_STYLE,
+    timelineLayoutStyle,
   } from './timeline-layout';
 
   import type { MessageCallbacks } from '../messages/message-action-controller.svelte.js';
@@ -78,8 +83,10 @@
     focusEventId?: string | null;
     landingEventId?: string | null;
     replyEventId?: string | null;
+    editEventId?: string | null;
+    inlineEditor?: Snippet;
     onLanded?: () => void;
-    onRequestHistory: () => Promise<boolean>;
+    onRequestHistory: (count?: number) => Promise<boolean>;
     onRequestFuture: () => Promise<void>;
     onRetryLoad?: () => Promise<void>;
     threadRootId?: string | null;
@@ -88,7 +95,7 @@
     hasUnread?: boolean;
     onLoadReadMarker?: () => Promise<string | null>;
     onRequestUnread?: (eventId: string) => Promise<void>;
-    onResumeLive?: (anchor: ResumeAnchor) => Promise<void>;
+    onResumeLive?: () => Promise<void>;
     onMarkRead?: () => Promise<void>;
     onMatrixLink?: (link: MatrixLink, anchor: HTMLAnchorElement) => void;
     onSenderProfile?: (
@@ -127,6 +134,8 @@
     focusEventId = null,
     landingEventId = null,
     replyEventId = null,
+    editEventId = null,
+    inlineEditor,
     onLanded,
     onRequestHistory,
     onRequestFuture,
@@ -149,6 +158,7 @@
     currentUserId,
     onToggleReaction,
     onReply,
+    onCancelContext,
     onOpenThread,
     onEdit,
     onDelete,
@@ -167,7 +177,7 @@
     active = true,
     scrollLocked = false,
     nearLatest = $bindable(true),
-    /* eslint-disable-next-line no-useless-assignment */
+    /* eslint-disable-next-line no-useless-assignment, @typescript-eslint/no-unused-vars */
     followingLive = $bindable(false),
     typingUsers = [],
     footTrailing,
@@ -194,6 +204,7 @@
   let switchingToUnread = false;
   let resumeTask: Promise<void> | null = null;
   let resumeFailed = $state(false);
+  let reading = $derived(active && page.state.settings === undefined);
   const readRoomId = untrack(() => roomId);
   let readUpTo: string | null = null;
   let fullyReadAt: string | null = null;
@@ -205,10 +216,12 @@
   $effect(() => {
     if (!windowActivity.active) untrack(settleFullyRead);
   });
+  const loadRetry = new LoadRetry();
   onDestroy(() => {
     unreadNavigation?.abort();
     unread.destroy();
     settleFullyRead();
+    loadRetry.reset();
   });
   let followingRead = $state(false);
   let eventItems = $derived(visibleTimelineItems(timeline.items, preferences, { readOnly }));
@@ -259,11 +272,13 @@
     return entries.find(({ value }) => holdsEvent(value, eventId));
   }
   let rows = $state.raw<readonly TimelineRow<RowValue>[]>([]);
-  let windowState = $state.raw<TimelineWindowState>({
+  let windowState = $state.raw<TimelineWindowState<RowValue>>({
     start: 0,
     end: 0,
     firstVisible: null,
     lastVisible: null,
+    lastFullyVisible: null,
+    rows: [],
     pinned: true,
     scrolling: false,
   });
@@ -274,8 +289,9 @@
   let jumpToLatestVisible = $state(false);
   let opening = false;
   let filling = $state(false);
+  let opened = $state(false);
   let disposed = false;
-  let refillPending = false;
+  let refillPending = $state(false);
   const fetchedItems = useEventItems();
   let personas = $derived(
     personaLookup(timeline.items, (eventId) =>
@@ -287,7 +303,7 @@
   let menuOpen = $state(false);
   const pagination = new TimelinePagination(
     () => timeline,
-    () => onRequestHistory()
+    (count) => onRequestHistory(count)
   );
   const future = new TimelineFuture(
     () => timeline,
@@ -295,6 +311,11 @@
   );
   function requestFuture(manual = false): Promise<void> {
     return future.request(manual);
+  }
+  function loadFuture(manual = false): void {
+    void requestFuture(manual).catch((error: unknown) => {
+      console.warn('[sable timeline] loading newer messages failed', error);
+    });
   }
   const focus = new TimelineFocus<RowValue>({
     timeline: () => timeline,
@@ -312,18 +333,39 @@
     visibleItems.length === 0 && timeline.error === null && !noHistory
   );
   let emptyFailure = $derived(visibleItems.length === 0 && timeline.error !== null);
+  $effect(() => {
+    if (visibleItems.length > 0) {
+      loadRetry.reset();
+      return;
+    }
+    if (
+      !emptyFailure ||
+      timeline.loading ||
+      timeline.mode.kind === 'focused' ||
+      !windowActivity.visible ||
+      !onRetryLoad
+    ) {
+      loadRetry.cancel();
+      return;
+    }
+    loadRetry.schedule(() => void onRetryLoad());
+    return () => loadRetry.cancel();
+  });
   let readEventId = $derived.by(() => {
     if (!revealed || !viewport || unread.blocking || markingRead) return null;
     if (windowState.pinned) {
-      return latestEventId(timeline.items) ?? latestEventId(rows.map((row) => row.value.item));
+      return (
+        latestEventId(timeline.items) ??
+        latestEventId(windowState.rows.map((row) => row.value.item))
+      );
     }
-    const bottom = viewport.getBoundingClientRect().bottom;
-    let seen: string | null = null;
-    for (const row of viewport.querySelectorAll<HTMLElement>('.item[data-event-id]')) {
-      if (row.getBoundingClientRect().bottom > bottom) break;
-      seen = row.dataset.eventId ?? seen;
+    if (windowState.lastFullyVisible === null) return null;
+    for (let index = windowState.rows.length - 1; index >= 0; index -= 1) {
+      const row = windowState.rows[index];
+      if (row.index <= windowState.lastFullyVisible && row.value.item.event_id)
+        return row.value.item.event_id;
     }
-    return seen;
+    return null;
   });
   let unreadCount = $derived(unread.count(eventItems));
   let unreadInView = $derived.by(() => {
@@ -337,11 +379,23 @@
     );
   });
   $effect(() => {
+    const focused = windowActivity.active;
+    if (opened && live)
+      untrack(() => unread.trackBackground(eventItems, focused && !windowActivity.recentlyResumed));
     unread.resolve(timeline.items, oldestUnreadLoaded, eventItems);
-    if (active && revealed && unreadInView && document.visibilityState === 'visible') {
-      unread.observe(unread.firstEventId);
-    }
+    if (!reading || !revealed || !focused) return;
+    if (unreadInView) unread.observe(unread.firstEventId);
+    else if (
+      live &&
+      windowState.pinned &&
+      opened &&
+      !jumpingUnread &&
+      !unread.background &&
+      !holdAtLatest
+    )
+      unread.reachLatest();
   });
+  let holdAtLatest = $state(untrack(() => !preferences.openRoomsAtUnread));
   let hadUnread = untrack(() => hasUnread);
   $effect(() => {
     if (hadUnread && !hasUnread && unread.initialized) untrack(() => unread.dismiss());
@@ -379,8 +433,14 @@
   function fillsViewport(engine: TimelineWindow<RowValue>, node: HTMLElement): boolean {
     return engine.contentHeight >= node.clientHeight || node.scrollHeight > node.clientHeight;
   }
-  function requestHistory(): Promise<boolean> {
-    return pagination.requestHistory();
+  function requestHistory(count?: number): Promise<boolean> {
+    return pagination.requestHistory(count);
+  }
+  let fillRequested = false;
+  function requestFill(): Promise<boolean> {
+    const count = fillRequested ? TIMELINE_LAYOUT.openingFillPageItems : undefined;
+    fillRequested = true;
+    return requestHistory(count);
   }
   const historyController = new TimelineHistoryController({
     getBackwardPagination: () => timeline.backwardPagination,
@@ -391,7 +451,7 @@
     isScrolling: () => windowState.scrolling,
     requestHistory,
   });
-  function windowChanged(state: TimelineWindowState): void {
+  function windowChanged(state: TimelineWindowState<RowValue>): void {
     const wasScrolling = windowState.scrolling;
     windowState = state;
     const node = viewport;
@@ -411,6 +471,9 @@
   function readerScrolled(delta: number): void {
     historyController.clearUserScrollPending();
     if (!revealed) return;
+    if (delta < 0) holdAtLatest = false;
+    if (delta > 0 && windowState.pinned && windowActivity.active && !holdAtLatest)
+      unread.reachLatest();
     historyController.observeScroll(delta < 0, nearLatest);
     if (
       timeline.mode.kind !== 'live' &&
@@ -418,7 +481,7 @@
       windowState.lastVisible !== null &&
       windowState.lastVisible >= entries.length - TIMELINE_LAYOUT.historyPrefetchItems
     ) {
-      void requestFuture(true).catch(() => {});
+      loadFuture(true);
     }
   }
   function mountWindow(node: HTMLDivElement): () => void {
@@ -446,7 +509,7 @@
       content,
       render: async (next) => {
         rows = next;
-        await tick();
+        await flushed();
         if (!disposed) measureMediaColumn();
       },
       onChange: windowChanged,
@@ -461,7 +524,7 @@
           windowState.lastVisible !== null &&
           windowState.lastVisible >= entries.length - TIMELINE_LAYOUT.historyPrefetchItems
         ) {
-          void requestFuture(true).catch(() => {});
+          loadFuture(true);
         }
         abandonLanding();
       },
@@ -504,19 +567,12 @@
     )
       return;
     if (!future.canRefill()) return;
-    void requestFuture().catch(() => {});
+    loadFuture();
   });
-  async function awaitPagination(): Promise<void> {
-    const deadline = performance.now() + TIMELINE_LAYOUT.initialFillSettleTimeout;
-    while (!disposed && timeline.backwardPagination === 'loading' && performance.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, TIMELINE_LAYOUT.initialFillPollInterval));
-    }
-    await tick();
-  }
   async function openTimeline(engine: TimelineWindow<RowValue>): Promise<void> {
     if (opening || disposed) return;
     opening = true;
-    await tick();
+    await flushed();
     await new Promise(requestAnimationFrame);
     if (disposed) return;
     if (timeline.loading || (!timeline.hasSnapshot && !timeline.error)) {
@@ -531,9 +587,11 @@
       eventItems,
       timeline.readMarkerEventId
     );
+    const landingPending = landingEventId !== null && onRequestUnread !== undefined;
     if (
       !entries.some(({ value }) => value.item.content.kind === 'read_marker') &&
-      !entryFor(landingEventId)
+      !entryFor(landingEventId) &&
+      !landingPending
     ) {
       revealed = true;
     }
@@ -550,39 +608,35 @@
     }
     const landingEntry = () => entryFor(landingEventId);
     const unreadEntry = entries.find(({ value }) => value.item.content.kind === 'read_marker');
-    if (!unreadEntry && !landingEntry()) revealed = true;
+    if (!unreadEntry && !landingEntry() && !landingPending) revealed = true;
     filling = true;
     try {
-      while (!disposed && engine.state.pinned && timeline.backwardPagination !== 'end') {
-        const node = viewport;
-        if (!node || timeline.items.length === 0) break;
-        if (engine.contentHeight >= node.clientHeight || node.scrollHeight > node.clientHeight)
-          break;
-        if (timeline.backwardPagination === 'loading') {
-          await awaitPagination();
-          if (timeline.backwardPagination === 'loading') break;
-        } else {
-          if (!pagination.canRefill()) break;
-          pagination.exhausted = await requestHistory();
-          await awaitPagination();
-          await engine.update(entries);
-          await new Promise(requestAnimationFrame);
-          if (pagination.exhausted) break;
-        }
-      }
       const notified = landingEntry();
-      const landing = notified ?? unreadEntry;
+      const landing = notified ?? (landingPending ? undefined : unreadEntry);
       if (landing && !disposed && engine.state.pinned) {
         if (notified) markLanded(landingEventId);
         await engine.jumpTo(landing.key, landing === unreadEntry ? 'start' : 'center');
-      } else if (!notified && unread.active && unread.firstEventId !== null && !disposed) {
-        await jumpToUnread();
+      } else if (!notified && !disposed) {
+        const landed = landingPending && (await landOnUnloaded(engine, landingEventId));
+        if (
+          !landed &&
+          !holdAtLatest &&
+          unread.active &&
+          unread.firstEventId !== null &&
+          !disposed
+        ) {
+          await jumpToUnread();
+        }
       }
-    } catch {
+    } catch (error) {
+      console.warn('[sable timeline] opening the timeline failed', error);
       pagination.exhausted = false;
     } finally {
       filling = false;
-      if (!disposed) revealed = true;
+      if (!disposed) {
+        revealed = true;
+        opened = true;
+      }
     }
   }
   $effect(() => {
@@ -593,7 +647,7 @@
     if (
       timeline.loading ||
       timeline.resumingLive ||
-      timeline.mode.kind === 'focused' ||
+      (timeline.mode.kind === 'focused' && timeline.forwardPagination !== 'end') ||
       timeline.error !== null ||
       !engine ||
       !revealed ||
@@ -607,16 +661,18 @@
       return;
     if (count > 0 && !(node && windowState.start === 0 && !fillsViewport(engine, node))) return;
     if (!pagination.canRefill()) return;
-    refillPending = true;
-    void requestHistory()
-      .then((end) => {
-        pagination.exhausted = end;
-      })
-      .catch(() => {})
-      .finally(() => {
-        refillPending = false;
-      });
+    void refill();
   });
+  async function refill(): Promise<void> {
+    refillPending = true;
+    try {
+      pagination.exhausted = await requestFill();
+    } catch (error) {
+      console.warn('[sable timeline] loading older messages failed', error);
+    } finally {
+      refillPending = false;
+    }
+  }
   let sentEcho: string | null | undefined;
   $effect(() => {
     const engine = controller;
@@ -639,36 +695,27 @@
     if (nearLatest && !windowState.pinned) void controller.jumpTo(null, 'start');
   }
   let handledFocus: string | null = null;
+  let heldContext = $state<string | null>(null);
   $effect(() => {
     if (
       timeline.mode.kind !== 'unread' ||
+      timeline.mode.eventId === heldContext ||
       timeline.forwardPagination !== 'end' ||
       timeline.loading ||
       timeline.resumingLive ||
       !revealed ||
-      !onResumeLive
+      !onResumeLive ||
+      !nearLatest
     )
       return;
-    void resumeLive().catch(() => {});
+    retryLive();
   });
-  export function resumeLive(keepAnchor = true): Promise<void> {
-    if (resumeTask) {
-      if (keepAnchor) return resumeTask;
-      return resumeTask
-        .catch(() => {})
-        .then(() => (timeline.canResumeLive ? resumeLive(false) : jumpToLiveEnd()));
-    }
+  export function resumeLive(): Promise<void> {
+    if (resumeTask) return resumeTask;
     if (!onResumeLive || !timeline.canResumeLive) return Promise.resolve();
-    if (keepAnchor) controller?.holdAnchor();
-    const anchor = () => {
-      const key = keepAnchor && !disposed ? controller?.anchorKey(restorableAnchor) : null;
-      return entries.find((entry) => entry.key === key)?.value.item.event_id ?? null;
-    };
     resumeFailed = false;
-    const task = onResumeLive(anchor)
-      .then(async () => {
-        if (!keepAnchor) await jumpToLiveEnd();
-      })
+    const task = onResumeLive()
+      .then(jumpToLiveEnd)
       .catch((error: unknown) => {
         if (!disposed) resumeFailed = true;
         throw error;
@@ -679,11 +726,13 @@
     resumeTask = task;
     return task;
   }
-  function restorableAnchor({ item }: RowValue): boolean {
-    return item.thread_root === null;
+  function retryLive(): void {
+    void resumeLive().catch((error: unknown) => {
+      console.warn('[sable timeline] resuming the live timeline failed', error);
+    });
   }
   async function jumpToLiveEnd(): Promise<void> {
-    await tick();
+    await flushed();
     if (!disposed) await controller?.jumpTo(null, 'start');
   }
   $effect(() => {
@@ -708,9 +757,36 @@
     handledFocus = target;
     void focus.position(engine, target, entry.key, !shouldReduceMotion());
   });
+  async function landOnUnloaded(
+    engine: TimelineWindow<RowValue>,
+    target: string,
+    root = false
+  ): Promise<boolean> {
+    if (!onRequestUnread) return false;
+    switchingToUnread = true;
+    try {
+      await onRequestUnread(target);
+    } catch (error) {
+      console.warn('[sable timeline] loading the notified event failed', error);
+      return false;
+    } finally {
+      switchingToUnread = false;
+    }
+    if (disposed) return true;
+    await flushed();
+    await engine.update(entries);
+    const threadRoot = entryFor(target)?.value.item.thread_root ?? null;
+    const landing = threadRoot ?? target;
+    const entry = entryFor(landing);
+    if (!entry) return threadRoot !== null && !root && landOnUnloaded(engine, threadRoot, true);
+    markLanded(landing);
+    await engine.jumpTo(entry.key, 'center');
+    return true;
+  }
   let handledLanding: string | null = null;
   let landedEventId = $state<string | null>(null);
   function markLanded(eventId: string | null): void {
+    if (timeline.mode.kind === 'unread') heldContext = timeline.mode.eventId;
     handledLanding = landingEventId;
     landedEventId = eventId;
     onLanded?.();
@@ -728,7 +804,7 @@
       return;
     }
     if (!engine || !revealed || target === handledLanding) return;
-    if (focusEventId !== null || timeline.mode.kind !== 'live') {
+    if (focusEventId !== null || timeline.mode.kind === 'focused') {
       untrack(abandonLanding);
       return;
     }
@@ -778,11 +854,9 @@
     unreadNavigation?.abort();
     unreadNavigation = navigation;
     jumpingUnread = true;
+    holdAtLatest = false;
     unreadError = null;
-    let mode = timeline.mode;
-    const current = () => !disposed && !navigation.signal.aborted && timeline.mode === mode;
-    const deadline = performance.now() + 30_000;
-    let emptyPages = 0;
+    const current = () => !disposed && !navigation.signal.aborted;
     try {
       await unread.initialize(
         timeline.items,
@@ -799,43 +873,23 @@
         switchingToUnread = true;
         try {
           await onRequestUnread(unread.readEventId);
-          mode = timeline.mode;
         } finally {
           switchingToUnread = false;
         }
+        await flushed();
       }
-      while (current()) {
-        unread.resolve(timeline.items, oldestUnreadLoaded, eventItems);
-        if (!unread.active) return;
-        const target = entryFor(unread.firstEventId);
-        if (target) {
-          await engine.update(entries);
-          if (current()) await engine.jumpTo(target.key, 'start', false, navigation.signal);
-          return;
-        }
-        if (
-          emptyPages >= MAX_EMPTY_REFILLS ||
-          performance.now() >= deadline ||
-          oldestUnreadLoaded
-        ) {
-          unreadError = 'jump';
-          return;
-        }
-        const before = timeline.items;
-        if (!live && timeline.forwardPagination !== 'end') {
-          await requestFuture(true);
-          await tick();
-        } else {
-          const end = await requestHistory();
-          if (!current()) return;
-          pagination.exhausted = end;
-          await awaitPagination();
-        }
-        if (!current()) return;
-        emptyPages = timeline.items === before ? emptyPages + 1 : 0;
-        await engine.update(entries);
+      if (!current()) return;
+      unread.resolve(timeline.items, oldestUnreadLoaded, eventItems);
+      if (!unread.active) return;
+      const target = entryFor(unread.firstEventId);
+      if (!target) {
+        unreadError = 'jump';
+        return;
       }
-    } catch {
+      await engine.update(entries);
+      if (current()) await engine.jumpTo(target.key, 'start', false, navigation.signal);
+    } catch (error) {
+      console.warn('[sable timeline] jump to unread failed', error);
       if (current()) unreadError = 'jump';
     } finally {
       if (unreadNavigation === navigation) jumpingUnread = false;
@@ -852,7 +906,8 @@
         unread.clear();
         followingRead = windowState.pinned;
       }
-    } catch {
+    } catch (error) {
+      console.warn('[sable timeline] mark as read failed', error);
       if (!disposed) unreadError = 'read';
     } finally {
       if (!disposed) markingRead = false;
@@ -865,7 +920,7 @@
   let replayingEventId = $state<string | null>(null);
   async function replayHighlight(eventId: string): Promise<void> {
     replayingEventId = eventId;
-    await tick();
+    await flushed();
     await new Promise(requestAnimationFrame);
     if (replayingEventId === eventId) replayingEventId = null;
   }
@@ -898,13 +953,14 @@
     unreadNavigation?.abort();
     historyController.finishHistoryFill();
     if (timeline.canResumeLive) {
-      void resumeLive(false).catch(() => {});
+      retryLive();
       return;
     }
     if (!live) {
       onJumpToLive?.();
       return;
     }
+    unread.reachLatest();
     void controller?.jumpTo(null, 'start', !shouldReduceMotion());
   }
   function onEscape(event: KeyboardEvent): void {
@@ -924,16 +980,66 @@
     }
     event.preventDefault();
     jumpToLatest();
-    if (unread.active || hasUnread) void markAllRead();
+    if (unread.active || hasUnread) {
+      void markAllRead();
+    } else {
+      dismissUnread();
+    }
   }
 </script>
+
+{#snippet timelineItem(item: TimelineItemView, collapsed = false, unreadCount = 0)}
+  {@const edited = editEventId !== null && item.event_id === editEventId}
+  <TimelineItem
+    {item}
+    {collapsed}
+    {unreadCount}
+    replyPersona={item.in_reply_to ? personas(item.in_reply_to.event_id) : null}
+    threadPersona={item.thread_summary ? personas(item.thread_summary.latest_event_id) : null}
+    highlighted={item.event_id !== null &&
+      item.event_id !== replayingEventId &&
+      item.event_id === (focusEventId ?? landedEventId)}
+    selected={replyEventId !== null && item.event_id === replyEventId}
+    editing={edited}
+    editor={edited ? inlineEditor : undefined}
+    {onMatrixLink}
+    {onCopyLink}
+    {onMarkUnread}
+    {onSenderProfile}
+    {onMentionUser}
+    {onRetrySend}
+    {onCancelSend}
+    {currentUserId}
+    {onToggleReaction}
+    {onReply}
+    {onCancelContext}
+    {onOpenThread}
+    {onEdit}
+    {onDelete}
+    {canRedactOwn}
+    {canRedactOthers}
+    {canPin}
+    {encrypted}
+    {members}
+    layout={preferences.layout}
+    alignOwn={preferences.alignOwnMessages}
+    avatarsInHeaders={preferences.avatarsInMessageHeaders}
+    {onJumpToEvent}
+    {onOpenMedia}
+    {onVotePoll}
+    {onEndPoll}
+    {events}
+    onMenuOpenChange={setMenuOpen}
+    {roomId}
+  />
+{/snippet}
 
 <svelte:window onkeydown={onEscape} />
 
 <TimelineReadReceipt
   {timeline}
   visibleEventId={readEventId}
-  enabled={active && !unread.blocking && !markingRead && !timeline.resumingLive}
+  enabled={reading && !unread.blocking && !markingRead && !timeline.resumingLive}
   atLatest={windowState.pinned && timeline.forwardPagination === 'end'}
   onRead={markRead}
 />
@@ -959,21 +1065,19 @@
 
 {#if timeline.error && !emptyFailure}
   <Alert class="timeline-error" variant="critical" role="alert"
-    >{$i18n.t('timeline.loadFailed')}</Alert
+    >{i18n.t('timeline.loadFailed')}</Alert
   >
 {/if}
 {#if resumeFailed}
   <Alert variant="critical" role="alert">
-    {$i18n.t('timeline.loadFailed')}
-    <Button type="button" onclick={() => void resumeLive().catch(() => {})}
-      >{$i18n.t('timeline.resumeLiveRetry')}</Button
-    >
+    {i18n.t('timeline.loadFailed')}
+    <Button type="button" onclick={retryLive}>{i18n.t('common.tryAgain')}</Button>
   </Alert>
 {/if}
 
 <div
   class={['timeline-content', `spacing-${preferences.messageSpacing}`]}
-  style={TIMELINE_LAYOUT_STYLE}
+  style={timelineLayoutStyle(preferences.messageSpacing)}
 >
   {#if revealed && unread.active && !unread.loading && (!unreadInView || unreadError !== null)}
     <div class="unread-bar">
@@ -982,27 +1086,27 @@
         variant="ghost"
         loading={jumpingUnread}
         disabled={markingRead}
-        aria-label={$i18n.t('timeline.jumpToUnread')}
+        aria-label={i18n.t('timeline.jumpToUnread')}
         onclick={() => void jumpToUnread()}
       >
         <ArrowUpIcon />
         <span
           >{unreadCount > 0
-            ? $i18n.t('timeline.unreadCount', { count: unreadCount })
-            : $i18n.t('timeline.newMessages')}</span
+            ? i18n.t('timeline.unreadCount', { count: unreadCount })
+            : i18n.t('timeline.newMessagesUnknown')}</span
         >
-        <span class="unread-action">{$i18n.t('timeline.jumpToUnread')}</span>
+        <span class="unread-action">{i18n.t('timeline.jumpToUnread')}</span>
       </Button>
       {#if onMarkRead}
         <Button variant="ghost" loading={markingRead} onclick={() => void markAllRead()}>
-          <span>{$i18n.t('timeline.markRead')}</span>
+          <span>{i18n.t('common.markAsRead')}</span>
           <CheckIcon />
         </Button>
       {/if}
     </div>
     {#if unreadError !== null}
       <Alert variant="critical" role="alert"
-        >{$i18n.t(
+        >{i18n.t(
           unreadError === 'jump' ? 'timeline.unreadJumpFailed' : 'timeline.markReadFailed'
         )}</Alert
       >
@@ -1019,7 +1123,7 @@
         }}
       >
         <Spinner />
-        <span class="screen-reader-only">{$i18n.t('timeline.loadingHistory')}</span>
+        <span class="screen-reader-only">{i18n.t('timeline.loadingHistory')}</span>
       </div>
     {/if}
     {#if futureLoading}
@@ -1031,7 +1135,7 @@
         }}
       >
         <Spinner />
-        <span class="screen-reader-only">{$i18n.t('timeline.loadingNewer')}</span>
+        <span class="screen-reader-only">{i18n.t('timeline.loadingNewer')}</span>
       </div>
     {/if}
     <div class={['timeline-viewport', { initial: !revealed }]}>
@@ -1039,7 +1143,7 @@
       <div
         bind:this={viewport}
         class="viewport"
-        aria-label={$i18n.t('timeline.label')}
+        aria-label={i18n.t('timeline.label')}
         tabindex="0"
         {@attach mountWindow}
         {@attach userScrollMarker}
@@ -1059,53 +1163,19 @@
                 data-timeline-key={row.key}
               >
                 {#if threadRootId && item.event_id === threadRootId}
-                  <p class="thread-original">{$i18n.t('timeline.originalMessage')}</p>
+                  <p class="thread-original">{i18n.t('timeline.originalMessage')}</p>
                 {/if}
                 {#if timelineStart && item.content.kind === 'timeline_start'}
                   {@render timelineStart()}
                 {:else if group}
-                  <TimelineMemberGroup items={group} {members} {onSenderProfile} />
-                {:else}
-                  <TimelineItem
-                    {item}
-                    {collapsed}
-                    unreadCount={row.value.unreadCount}
-                    replyPersona={item.in_reply_to ? personas(item.in_reply_to.event_id) : null}
-                    threadPersona={item.thread_summary
-                      ? personas(item.thread_summary.latest_event_id)
-                      : null}
-                    highlighted={item.event_id !== null &&
-                      item.event_id !== replayingEventId &&
-                      item.event_id === (focusEventId ?? landedEventId)}
-                    selected={replyEventId !== null && item.event_id === replyEventId}
-                    {onMatrixLink}
-                    {onCopyLink}
-                    {onMarkUnread}
-                    {onSenderProfile}
-                    {onMentionUser}
-                    {onRetrySend}
-                    {onCancelSend}
-                    {currentUserId}
-                    {onToggleReaction}
-                    {onReply}
-                    {onOpenThread}
-                    {onEdit}
-                    {onDelete}
-                    {canRedactOwn}
-                    {canRedactOthers}
-                    {canPin}
-                    {encrypted}
+                  <TimelineMemberGroup
+                    items={group}
                     {members}
-                    layout={preferences.layout}
-                    alignOwn={preferences.alignOwnMessages}
-                    {onJumpToEvent}
-                    {onOpenMedia}
-                    {onVotePoll}
-                    {onEndPoll}
-                    {events}
-                    onMenuOpenChange={setMenuOpen}
-                    {roomId}
+                    {onSenderProfile}
+                    renderItem={timelineItem}
                   />
+                {:else}
+                  {@render timelineItem(item, collapsed, row.value.unreadCount)}
                 {/if}
               </div>
             {/each}
@@ -1119,20 +1189,20 @@
     {:else if emptyFailure && timeline.mode.kind === 'focused'}
       <EmptyState
         class="timeline-empty"
-        title={$i18n.t('timeline.focusFailed')}
-        description={$i18n.t('timeline.focusFailedHint')}
+        title={i18n.t('timeline.focusFailed')}
+        description={i18n.t('timeline.focusFailedHint')}
       >
         {#snippet actions()}
           {#if onJumpToLive}
-            <Button type="button" onclick={onJumpToLive}>{$i18n.t('timeline.jumpToLatest')}</Button>
+            <Button type="button" onclick={onJumpToLive}>{i18n.t('timeline.jumpToLatest')}</Button>
           {/if}
         {/snippet}
       </EmptyState>
     {:else if emptyFailure}
-      <EmptyState class="timeline-empty" title={$i18n.t('timeline.loadFailed')}>
+      <EmptyState class="timeline-empty" title={i18n.t('timeline.loadFailed')}>
         {#snippet actions()}
           {#if onRetryLoad}
-            <Button onclick={() => void onRetryLoad?.()}>{$i18n.t('timeline.retryLoad')}</Button>
+            <Button onclick={() => void onRetryLoad?.()}>{i18n.t('common.tryAgain')}</Button>
           {/if}
         {/snippet}
       </EmptyState>
@@ -1140,25 +1210,36 @@
       <EmptyState
         class="timeline-empty"
         title={timeline.items.length > 0
-          ? $i18n.t('timeline.allFiltered')
-          : $i18n.t('timeline.noMessages')}
-        description={timeline.items.length > 0 ? $i18n.t('timeline.allFilteredHint') : undefined}
+          ? i18n.t('timeline.allFiltered')
+          : i18n.t('timeline.noMessages')}
+        description={timeline.items.length > 0 ? i18n.t('timeline.allFilteredHint') : undefined}
       />
     {/if}
   </div>
 
   {#if revealed && visibleItems.length > 0 && (live ? jumpToLatestVisible : onJumpToLive !== undefined)}
-    <IconButton
-      type="button"
-      class="jump-to-latest"
-      variant="secondary"
-      size="medium"
-      label={$i18n.t('timeline.jumpToLatest')}
-      title={$i18n.t('timeline.jumpToLatest')}
-      onclick={jumpToLatest}
+    {@const jumpLabel = i18n.t('timeline.jumpToLatest')}
+    <div
+      class="jump-to-latest-motion"
+      in:fly={{ y: 4, duration: motionMs(200), easing: cubicOut }}
+      out:fade={{ duration: motionMs(MOTION_MS.quick) }}
     >
-      <ArrowDownIcon />
-    </IconButton>
+      <Tooltip label={jumpLabel}>
+        {#snippet trigger({ props })}
+          <IconButton
+            {...props}
+            type="button"
+            class="jump-to-latest"
+            variant="secondary"
+            size="medium"
+            label={jumpLabel}
+            onclick={jumpToLatest}
+          >
+            <ArrowDownIcon />
+          </IconButton>
+        {/snippet}
+      </Tooltip>
+    </div>
   {/if}
 
   {#if typingUsers.length > 0 || footTrailingVisible}
@@ -1186,9 +1267,7 @@
   .timeline-content {
     --timeline-foot-height: var(--size-x300);
     --timeline-indicator-size: var(--target-hit);
-    --timeline-group-gap: var(--space-200);
-    --timeline-row-gap: var(--space-300);
-    --timeline-row-padding: var(--space-100);
+    --timeline-scrollbar-size: 0.5rem;
 
     display: flex;
     flex: 1;
@@ -1197,14 +1276,6 @@
     min-height: 0;
     min-width: 0;
     position: relative;
-  }
-
-  .timeline-content.spacing-compact {
-    --timeline-row-padding: var(--space-050);
-  }
-
-  .timeline-content.spacing-roomy {
-    --timeline-row-padding: var(--space-200);
   }
 
   @media (width >= 48rem) and (any-hover: hover) and (any-pointer: fine) {
@@ -1287,8 +1358,8 @@
   }
 
   .viewport::-webkit-scrollbar {
-    height: 0.5rem;
-    width: 0.5rem;
+    height: var(--timeline-scrollbar-size);
+    width: var(--timeline-scrollbar-size);
   }
 
   .viewport::-webkit-scrollbar-thumb {
@@ -1336,6 +1407,10 @@
     padding-top: calc(var(--timeline-row-padding) + var(--timeline-group-gap));
   }
 
+  .layout-compact .item {
+    padding-top: 0;
+  }
+
   .unread-bar {
     align-items: center;
     background: var(--primary-container);
@@ -1380,7 +1455,7 @@
     gap: var(--space-200);
     height: var(--timeline-foot-height);
     inset-block-end: 0;
-    inset-inline: 0;
+    inset-inline: 0 var(--timeline-scrollbar-size);
     justify-content: space-between;
     padding: 0 var(--page-gutter);
     position: absolute;
@@ -1389,6 +1464,15 @@
 
   .foot-trailing {
     flex: none;
+  }
+
+  .jump-to-latest-motion {
+    inset-inline: 0;
+    bottom: calc(var(--timeline-foot-height) + var(--space-200));
+    margin-inline: auto;
+    position: absolute;
+    width: fit-content;
+    z-index: 4;
   }
 
   :global(button.jump-to-latest) {
@@ -1401,10 +1485,6 @@
 
     background-image: none;
     border-radius: 50%;
-    bottom: calc(var(--timeline-foot-height) + var(--space-200));
     box-shadow: var(--shadow-float);
-    inset-inline-end: var(--page-gutter);
-    position: absolute;
-    z-index: 4;
   }
 </style>

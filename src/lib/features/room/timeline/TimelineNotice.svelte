@@ -6,23 +6,28 @@
   import type { MemberView, TimelineItemView } from '#src/generated/protocol';
 
   import { i18n } from '#lib/i18n.js';
+  import { reactionKey } from '#lib/model/model.js';
   import { preferences } from '#lib/settings/preferences.svelte.js';
   import MediaImage from '#lib/ui/MediaImage.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
 
   import EditDiff from '../messages/EditDiff.svelte';
+  import EmoteCard from '../messages/EmoteCard.svelte';
   import EventTargetPreview from '../messages/EventTargetPreview.svelte';
   import { isCustomReaction } from '../messages/reaction-emote-label';
+  import { redactedLabel } from '../messages/redacted-label';
+  import { memberName } from '../members/members.js';
   import StateContentDiff from '../messages/StateContentDiff.svelte';
   import StateEventText from './StateEventText.svelte';
   import { stateEventIcon } from './state-event-icon';
-  import { reactionKey } from './state-event-text';
+  import { reactionSource } from './state-event-text';
   import {
     isEditEvent,
     redactionTarget,
     relationOf,
     type TimelineEventIndex,
   } from './timeline-event-index';
-  import { formatDate } from '#lib/ui/date-time.js';
+  import { formatDate, formatFullTimestamp, formatMessageTimestamp } from '#lib/ui/date-time.js';
   import UndecryptableNotice from './UndecryptableNotice.svelte';
 
   const MAX_PIN_PREVIEWS = 4;
@@ -49,6 +54,13 @@
     onJumpToEvent,
   }: Props = $props();
   let peekOpen = $state(false);
+  let redactedText = $derived.by(() => {
+    const redactor = events?.redactor(item) ?? null;
+    return redactedLabel(
+      redactor ? memberName(members, redactor) : null,
+      item.content.kind === 'redacted' ? item.content.reason : null
+    );
+  });
   let StateIcon = $derived(stateEventIcon(item));
   let hiddenTarget = $derived.by((): string | null => {
     const content = item.content;
@@ -59,20 +71,20 @@
     }
     return null;
   });
-  let customReaction = $derived.by((): string | null => {
-    const content = item.content;
-    if (content.kind !== 'hidden_event' || content.event_type !== 'm.reaction') return null;
-    const key = reactionKey(content.content);
-    return key !== null && isCustomReaction(key) ? key : null;
-  });
-  let redactedReaction = $derived.by((): boolean => {
-    const content = item.content;
-    return (
-      content.kind === 'hidden_event' &&
-      content.event_type === 'm.reaction' &&
-      reactionKey(content.content) === null
-    );
-  });
+  let reaction = $derived(
+    item.content.kind === 'hidden_event' && item.content.event_type === 'm.reaction'
+      ? item.content
+      : null
+  );
+  let reactionLabel = $derived(reactionKey(reaction?.content));
+  let source = $derived(reactionSource(reaction?.content));
+  let customReaction = $derived(source !== null && isCustomReaction(source) ? source : null);
+  let customReactionLabel = $derived(
+    reactionLabel !== null && !isCustomReaction(reactionLabel)
+      ? reactionLabel
+      : i18n.t('timeline.customEmote')
+  );
+  let redactedReaction = $derived(reaction !== null && reactionLabel === null);
   let targetAbove = $derived(preferences.replyPreviewStyle !== 'expanded');
   let pins = $derived.by(() => {
     const content = item.content;
@@ -83,6 +95,27 @@
     ].slice(0, MAX_PIN_PREVIEWS);
   });
 </script>
+
+{#snippet reactionImageContent()}
+  {#if customReaction}
+    <Tooltip label={customReactionLabel} variant="inline" side="top">
+      <MediaImage
+        class="state-emote"
+        source={customReaction}
+        alt={customReactionLabel}
+        width={64}
+        height={64}
+        original
+        emoticon
+      />
+      {#snippet content()}
+        <EmoteCard label={customReactionLabel}>
+          <MediaImage source={customReaction} alt="" width={64} height={64} original />
+        </EmoteCard>
+      {/snippet}
+    </Tooltip>
+  {/if}
+{/snippet}
 
 {#snippet targetDetail(target: string)}
   <div class={['state-detail', { 'target-above': targetAbove }]}>
@@ -116,10 +149,21 @@
   <span class="state-icon" aria-hidden="true"><StateIcon /></span>
 {/snippet}
 
+{#snippet stateTime()}
+  <Tooltip label={formatFullTimestamp(item.timestamp)}>
+    {#snippet trigger({ props })}
+      <time {...props} class="state-time" datetime={new Date(item.timestamp).toISOString()}>
+        {formatMessageTimestamp(item.timestamp)}
+      </time>
+    {/snippet}
+  </Tooltip>
+{/snippet}
+
 {#if item.content.kind === 'membership' || item.content.kind === 'profile_change' || (item.content.kind === 'state_event' && item.content.change !== null)}
   <p class="state">
     {@render stateGutter()}
     <StateEventText {item} {members} {onSenderProfile} />
+    {@render stateTime()}
   </p>
   {#if pins.length > 0}
     <div class="state-detail">
@@ -140,6 +184,7 @@
   <p class="state">
     {@render stateGutter()}
     <StateEventText {item} {members} {onSenderProfile} />
+    {@render stateTime()}
   </p>
   {#if item.content.content !== null}
     <div class="state-detail">
@@ -149,27 +194,22 @@
 {:else if item.content.kind === 'redacted' || redactedReaction}
   <p class="state redacted">
     {@render stateGutter()}
-    <span class="redacted-label">
-      {item.content.kind === 'redacted' && item.content.reason
-        ? $i18n.t('timeline.redactedWithReason', { reason: item.content.reason })
-        : $i18n.t('timeline.redacted')}
+    <span class="redacted-label state-text">
+      {redactedText}
     </span>
+    {@render stateTime()}
   </p>
 {:else if hiddenTarget !== null}
   {#if targetAbove}{@render targetDetail(hiddenTarget)}{/if}
   <p class="state">
     {@render stateGutter()}
-    <span
-      ><StateEventText {item} {members} {onSenderProfile} />{#if customReaction}
-        <MediaImage
-          class="state-emote"
-          source={customReaction}
-          alt={$i18n.t('timeline.customEmote')}
-          width={64}
-          height={64}
-          original
-        />{/if}</span
-    >
+    <StateEventText
+      {item}
+      {members}
+      {onSenderProfile}
+      reaction={customReaction ? reactionImageContent : undefined}
+    />
+    {@render stateTime()}
   </p>
   {#if !targetAbove}{@render targetDetail(hiddenTarget)}{/if}
 {:else if item.content.kind === 'hidden_event'}
@@ -181,7 +221,7 @@
       {#if raw !== null}
         <Collapsible.Root bind:open={peekOpen} class="debug-peek-root">
           <Collapsible.Trigger class="debug-peek-trigger">
-            {peekOpen ? $i18n.t('timeline.hidePeek') : $i18n.t('timeline.showPeek')}
+            {peekOpen ? i18n.t('timeline.hidePeek') : i18n.t('timeline.showPeek')}
           </Collapsible.Trigger>
           <Collapsible.Content class="debug-peek-content">
             <pre class="debug-peek">{JSON.stringify(raw, null, 2)}</pre>
@@ -189,6 +229,7 @@
         </Collapsible.Root>
       {/if}
     </div>
+    {@render stateTime()}
   </div>
 {:else if item.content.kind === 'unable_to_decrypt'}
   <UndecryptableNotice
@@ -199,27 +240,31 @@
     sender={item.sender}
     threadRoot={item.thread_root}
   />
-{:else if item.content.kind === 'call_invite' || item.content.kind === 'malformed'}
+{:else if item.content.kind === 'call_invite' || item.content.kind === 'verification_request' || item.content.kind === 'cute' || item.content.kind === 'malformed'}
   <p class="state">
     {@render stateGutter()}
     <StateEventText {item} {members} {onSenderProfile} />
+    {@render stateTime()}
   </p>
 {:else if item.content.kind === 'unsupported'}
   <p class="state">
     {@render stateGutter()}
-    {$i18n.t('timeline.unsupported', { description: item.content.description })}
+    <span class="state-text"
+      >{i18n.t('timeline.unsupported', { description: item.content.description })}</span
+    >
+    {@render stateTime()}
   </p>
 {:else if item.content.kind === 'date_divider'}
   <p class="date-divider"><span>{formatDate(item.content.timestamp)}</span></p>
 {:else if item.content.kind === 'timeline_start'}
-  <p class="separator">{$i18n.t('timeline.start')}</p>
+  <p class="separator">{i18n.t('timeline.start')}</p>
 {:else if item.content.kind === 'read_marker'}
   {#if unreadCount > 0}
     <p class="unread">
-      <span>{$i18n.t('timeline.unreadCount', { count: unreadCount })}</span>
+      <span>{i18n.t('timeline.unreadCount', { count: unreadCount })}</span>
     </p>
   {:else}
-    <p class="read-marker"><span>{$i18n.t('timeline.readMarker')}</span></p>
+    <p class="read-marker"><span>{i18n.t('timeline.readMarker')}</span></p>
   {/if}
 {/if}
 
@@ -246,8 +291,13 @@
     font-size: var(--font-size-body);
     gap: var(--timeline-row-gap);
     line-height: var(--line-height-body);
-    opacity: var(--opacity-p300);
     padding: 0;
+  }
+
+  .state-icon,
+  .state :global(.state-event-text),
+  .state-text {
+    opacity: var(--opacity-p300);
   }
 
   .state-icon {
@@ -262,6 +312,20 @@
   .state-icon :global(svg) {
     height: var(--icon-size-small);
     width: var(--icon-size-small);
+  }
+
+  .state-time {
+    color: var(--surface-var-on-container);
+    flex-shrink: 0;
+    font-size: var(--font-size-small);
+    margin-inline-start: auto;
+    white-space: nowrap;
+  }
+
+  .state :global(.state-event-text),
+  .state-text {
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
 
   .state-detail {
@@ -279,11 +343,11 @@
   }
 
   .state :global(.state-emote) {
+    display: inline-block;
     height: 1lh;
-    margin-inline-start: var(--space-100);
     object-fit: contain;
     vertical-align: bottom;
-    width: auto;
+    width: calc(1lh * var(--media-ratio));
   }
 
   .redacted-label {
@@ -350,6 +414,7 @@
   .debug-event code {
     flex: 0 0 18ch;
     font-family: var(--font-family-mono);
+    font-variant-ligatures: none;
     margin-inline-start: calc(var(--avatar-size-small) + var(--space-250));
     overflow-wrap: anywhere;
     text-align: end;

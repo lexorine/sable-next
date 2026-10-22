@@ -11,12 +11,9 @@
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
   import { useCoreClient } from '#lib/core/context.js';
+  import { createRoom } from '#lib/core/api/rooms.js';
   import { i18n } from '#lib/i18n.js';
-  import type {
-    CreateJoinRuleView,
-    CreateRoomKind,
-    RoomVersionsView,
-  } from '#src/generated/protocol';
+  import type { CreateJoinRuleView, RoomKind, RoomVersionsView } from '#src/generated/protocol';
   import { roomPathParamFromId, useRoomList } from '#lib/rooms/room-list.svelte.js';
   import Alert from '#lib/ui/primitives/Alert.svelte';
   import Button from '#lib/ui/primitives/Button.svelte';
@@ -45,7 +42,7 @@
 
   let name = $state('');
   let topic = $state('');
-  let kind = $state<CreateRoomKind>('text');
+  let kind = $state<RoomKind>('text');
   let access = $state<'private' | 'public'>('private');
   let encrypted = $state(true);
   // `parentSpaceId` arrives once the room list has loaded, so the field follows
@@ -60,12 +57,14 @@
   let federate = $state(true);
   let roomVersions = $state.raw<RoomVersionsView | null>(null);
   let inviteDraft = $state('');
-  let invites = $state<string[]>([]);
+  let invites = $state.raw<string[]>([]);
   let inviteInvalid = $state(false);
   let submitting = $state(false);
   let failed = $state(false);
 
-  let spaces = $derived(roomList.rooms.filter((room) => room.is_space && room.state === 'joined'));
+  let spaces = $derived(
+    roomList.rooms.filter((room) => room.room_kind === 'space' && room.state === 'joined')
+  );
   let effectiveKind = $derived(mode === 'space' ? 'space' : kind);
   let encryptable = $derived(access === 'private');
   let parentSpaceSummary = $derived(spaces.find((space) => space.room_id === parentSpace) ?? null);
@@ -91,20 +90,20 @@
     {
       value: '',
       label: roomVersions
-        ? $i18n.t('room.createVersionDefault', { version: roomVersions.default })
-        : $i18n.t('room.createVersionDefaultUnknown'),
+        ? i18n.t('room.createVersionDefault', { version: roomVersions.default })
+        : i18n.t('room.createVersionDefaultUnknown'),
     },
     ...(roomVersions?.available ?? []).map((entry) => ({
       value: entry.id,
-      label: entry.stable ? entry.id : $i18n.t('room.createVersionUnstable', { version: entry.id }),
+      label: entry.stable ? entry.id : i18n.t('room.createVersionUnstable', { version: entry.id }),
     })),
   ]);
   let canSubmit = $derived(name.trim() !== '' && aliasError === null && !submitting);
 
   $effect(() => {
     let cancelled = false;
-    core.commands
-      .roomVersions()
+    core.rpc.rooms
+      .versions()
       .then((result) => {
         if (!cancelled) roomVersions = result;
       })
@@ -131,10 +130,10 @@
 
   function joinRuleHint(keyStem: string): string {
     return parentSpaceSummary
-      ? $i18n.t(`room.${keyStem}Hint`, {
+      ? i18n.t(`room.${keyStem}Hint`, {
           space: parentSpaceSummary.name ?? parentSpaceSummary.room_id,
         })
-      : $i18n.t('room.createJoinRuleRequiresSpace');
+      : i18n.t('room.createJoinRuleRequiresSpace');
   }
 
   function addInvite(): void {
@@ -167,7 +166,7 @@
     submitting = true;
     failed = false;
     try {
-      const roomId = await core.commands.createRoom({
+      const roomId = await createRoom(core.rpc, {
         name: name.trim(),
         topic: topic.trim() === '' ? null : topic.trim(),
         kind: effectiveKind,
@@ -205,67 +204,67 @@
 </script>
 
 <form class="create-room" onsubmit={submit}>
-  <FormField fieldId="create-room-name" label={$i18n.t('room.createNameLabel')}>
+  <FormField fieldId="create-room-name" label={i18n.t('room.createNameLabel')}>
     <TextInput
       id="create-room-name"
       bind:value={name}
       required
       autocomplete="off"
-      placeholder={$i18n.t('room.createNamePlaceholder')}
+      placeholder={i18n.t('room.createNamePlaceholder')}
     />
   </FormField>
 
-  <FormField fieldId="create-room-topic" label={$i18n.t('room.createTopicLabel')}>
+  <FormField fieldId="create-room-topic" label={i18n.t('room.createTopicLabel')}>
     <TextArea
       id="create-room-topic"
       bind:value={topic}
-      placeholder={$i18n.t('room.createTopicPlaceholder')}
+      placeholder={i18n.t('room.createTopicPlaceholder')}
     />
-    <p class="hint">{$i18n.t('room.createTopicHint')}</p>
+    <p class="hint">{i18n.t('room.createTopicHint')}</p>
   </FormField>
 
   {#if mode === 'space'}
-    <p class="hint">{$i18n.t('room.createSpaceDescription')}</p>
+    <p class="hint">{i18n.t('room.createSpaceDescription')}</p>
   {:else}
     <div class="field">
-      <span class="field-label">{$i18n.t('room.createKindLabel')}</span>
+      <span class="field-label">{i18n.t('room.createKindLabel')}</span>
       <OptionCards
-        label={$i18n.t('room.createKindLabel')}
+        label={i18n.t('room.createKindLabel')}
         value={kind}
-        onSelect={(next: CreateRoomKind) => {
+        onSelect={(next: RoomKind) => {
           kind = next;
         }}
         options={[
           {
             value: 'text',
-            label: $i18n.t('room.createKindRoom'),
-            hint: $i18n.t('room.createKindRoomHint'),
+            label: i18n.t('room.createKindRoom'),
+            hint: i18n.t('room.createKindRoomHint'),
             icon: ChatsIcon,
           },
           {
             value: 'voice',
-            label: $i18n.t('room.createKindVoice'),
-            hint: $i18n.t('room.createKindVoiceHint'),
+            label: i18n.t('common.voiceRoom'),
+            hint: i18n.t('room.createKindVoiceHint'),
             icon: SpeakerHighIcon,
           },
           {
             value: 'forum',
-            label: $i18n.t('room.createKindForum'),
-            hint: $i18n.t('room.createKindForumHint'),
+            label: i18n.t('room.createKindForum'),
+            hint: i18n.t('room.createKindForumHint'),
             icon: ChatsTeardropIcon,
           },
           {
             value: 'calendar',
-            label: $i18n.t('room.createKindCalendar'),
-            hint: $i18n.t('room.createKindCalendarHint'),
+            label: i18n.t('room.createKindCalendar'),
+            hint: i18n.t('room.createKindCalendarHint'),
             icon: CalendarDotsIcon,
           },
           ...(mode === 'all'
             ? [
                 {
                   value: 'space' as const,
-                  label: $i18n.t('room.createKindSpace'),
-                  hint: $i18n.t('room.createKindSpaceHint'),
+                  label: i18n.t('room.createKindSpace'),
+                  hint: i18n.t('room.createKindSpaceHint'),
                   icon: UsersThreeIcon,
                 },
               ]
@@ -276,12 +275,12 @@
   {/if}
 
   {#if mode === 'all' && spaces.length > 0}
-    <FormField fieldId="create-room-parent" label={$i18n.t('room.createParentLabel')}>
+    <FormField fieldId="create-room-parent" label={i18n.t('room.createParentLabel')}>
       <Select
         id="create-room-parent"
         value={parentSpace}
         items={[
-          { value: '', label: $i18n.t('room.createParentNone') },
+          { value: '', label: i18n.t('room.createParentNone') },
           ...spaces.map((space) => ({ value: space.room_id, label: space.name ?? space.room_id })),
         ]}
         onValueChange={(value: string) => {
@@ -292,9 +291,9 @@
   {/if}
 
   <div class="field">
-    <span class="field-label">{$i18n.t('room.createAccessLabel')}</span>
+    <span class="field-label">{i18n.t('room.createAccessLabel')}</span>
     <OptionCards
-      label={$i18n.t('room.createAccessLabel')}
+      label={i18n.t('room.createAccessLabel')}
       value={access}
       onSelect={(next: 'private' | 'public') => {
         access = next;
@@ -302,14 +301,14 @@
       options={[
         {
           value: 'private',
-          label: $i18n.t('room.createAccessPrivate'),
-          hint: $i18n.t('room.createAccessPrivateHint'),
+          label: i18n.t('room.createAccessPrivate'),
+          hint: i18n.t('room.createAccessPrivateHint'),
           icon: LockIcon,
         },
         {
           value: 'public',
-          label: $i18n.t('room.createAccessPublic'),
-          hint: $i18n.t('room.createAccessPublicHint'),
+          label: i18n.t('room.createAccessPublic'),
+          hint: i18n.t('room.createAccessPublicHint'),
           icon: GlobeIcon,
         },
       ]}
@@ -318,9 +317,9 @@
 
   {#if access === 'private'}
     <div class="field">
-      <span class="field-label">{$i18n.t('room.createJoinRuleLabel')}</span>
+      <span class="field-label">{i18n.t('room.createJoinRuleLabel')}</span>
       <OptionCards
-        label={$i18n.t('room.createJoinRuleLabel')}
+        label={i18n.t('room.createJoinRuleLabel')}
         value={effectiveJoinRule}
         onSelect={(next: PrivateJoinRule) => {
           joinRuleChoice = next;
@@ -328,24 +327,24 @@
         options={[
           {
             value: 'invite',
-            label: $i18n.t('room.createJoinRuleInvite'),
-            hint: $i18n.t('room.createJoinRuleInviteHint'),
+            label: i18n.t('room.createJoinRuleInvite'),
+            hint: i18n.t('room.createAccessPrivateHint'),
           },
           {
             value: 'knock',
-            label: $i18n.t('room.createJoinRuleKnock'),
-            hint: $i18n.t('room.createJoinRuleKnockHint'),
+            label: i18n.t('common.askToJoin'),
+            hint: i18n.t('room.createJoinRuleKnockHint'),
             disabled: !knockSupported,
           },
           {
             value: 'restricted',
-            label: $i18n.t('room.createJoinRuleRestricted'),
+            label: i18n.t('room.createJoinRuleRestricted'),
             hint: joinRuleHint('createJoinRuleRestricted'),
             disabled: !restrictedSupported,
           },
           {
             value: 'knock_restricted',
-            label: $i18n.t('room.createJoinRuleKnockRestricted'),
+            label: i18n.t('room.createJoinRuleKnockRestricted'),
             hint: joinRuleHint('createJoinRuleKnockRestricted'),
             disabled: !knockRestrictedSupported,
           },
@@ -355,35 +354,35 @@
   {/if}
 
   {#if access === 'public'}
-    <FormField fieldId="create-room-alias" label={$i18n.t('room.createAliasLabel')}>
+    <FormField fieldId="create-room-alias" label={i18n.t('room.createAliasLabel')}>
       <TextInput
         id="create-room-alias"
         bind:value={alias}
         autocomplete="off"
-        placeholder={$i18n.t('room.createAliasPlaceholder')}
+        placeholder={i18n.t('room.createAliasPlaceholder')}
         aria-invalid={aliasError !== null}
       />
       {#if aliasError}
-        <p class="error">{$i18n.t(aliasErrorMessageKey(aliasError))}</p>
+        <p class="error">{i18n.t(aliasErrorMessageKey(aliasError))}</p>
       {:else}
-        <p class="hint">{$i18n.t('room.createAliasHint')}</p>
+        <p class="hint">{i18n.t('room.createAliasHint')}</p>
       {/if}
     </FormField>
   {/if}
 
   <div class="row">
     <div class="row-text">
-      <span class="field-label">{$i18n.t('room.createEncryptionLabel')}</span>
+      <span class="field-label">{i18n.t('common.endToEndEncryption')}</span>
       <p class="hint">
         {encryptable
-          ? $i18n.t('room.createEncryptionHint')
-          : $i18n.t('room.createEncryptionUnavailable')}
+          ? i18n.t('room.createEncryptionHint')
+          : i18n.t('room.createEncryptionUnavailable')}
       </p>
     </div>
     <Switch
       checked={encryptable && encrypted}
       disabled={!encryptable}
-      label={$i18n.t('room.createEncryptionLabel')}
+      label={i18n.t('common.endToEndEncryption')}
       onCheckedChange={(next: boolean) => {
         encrypted = next;
       }}
@@ -391,23 +390,23 @@
   </div>
 
   <details class="advanced">
-    <summary>{$i18n.t('room.createAdvancedLabel')}</summary>
+    <summary>{i18n.t('room.createAdvancedLabel')}</summary>
     <div class="advanced-content">
       <div class="row">
         <div class="row-text">
-          <span class="field-label">{$i18n.t('room.createFederationLabel')}</span>
-          <p class="hint">{$i18n.t('room.createFederationHint')}</p>
+          <span class="field-label">{i18n.t('room.createFederationLabel')}</span>
+          <p class="hint">{i18n.t('room.createFederationHint')}</p>
         </div>
         <Switch
           checked={federate}
-          label={$i18n.t('room.createFederationLabel')}
+          label={i18n.t('room.createFederationLabel')}
           onCheckedChange={(next: boolean) => {
             federate = next;
           }}
         />
       </div>
 
-      <FormField fieldId="create-room-version" label={$i18n.t('room.createVersionLabel')}>
+      <FormField fieldId="create-room-version" label={i18n.t('room.createVersionLabel')}>
         <Select
           id="create-room-version"
           value={roomVersionChoice}
@@ -420,20 +419,20 @@
     </div>
   </details>
 
-  <FormField fieldId="create-room-invite" label={$i18n.t('room.createInviteLabel')}>
+  <FormField fieldId="create-room-invite" label={i18n.t('common.invitePeople')}>
     <div class="invite-row">
       <TextInput
         id="create-room-invite"
         bind:value={inviteDraft}
         autocomplete="off"
-        placeholder={$i18n.t('room.createInvitePlaceholder')}
+        placeholder={i18n.t('room.createInvitePlaceholder')}
         aria-invalid={inviteInvalid}
         onkeydown={onInviteKeydown}
       />
-      <Button onclick={addInvite}>{$i18n.t('room.createInviteAdd')}</Button>
+      <Button onclick={addInvite}>{i18n.t('common.add')}</Button>
     </div>
     {#if inviteInvalid}
-      <p class="error">{$i18n.t('room.createInviteInvalid')}</p>
+      <p class="error">{i18n.t('common.userIdFormatHint')}</p>
     {/if}
     {#if invites.length > 0}
       <ul class="invites">
@@ -443,7 +442,7 @@
             <IconButton
               variant="ghost"
               size="small"
-              label={$i18n.t('room.createInviteRemove', { user: invite })}
+              label={i18n.t('room.createInviteRemove', { user: invite })}
               onclick={() => {
                 removeInvite(invite);
               }}
@@ -457,11 +456,11 @@
   </FormField>
 
   {#if failed}
-    <Alert variant="critical" role="alert">{$i18n.t('room.createFailed')}</Alert>
+    <Alert variant="critical" role="alert">{i18n.t('room.createFailed')}</Alert>
   {/if}
 
   <Button type="submit" variant="primary" disabled={!canSubmit} loading={submitting}>
-    {effectiveKind === 'space' ? $i18n.t('room.createSubmitSpace') : $i18n.t('room.createSubmit')}
+    {effectiveKind === 'space' ? i18n.t('common.createSpace') : i18n.t('common.createRoom')}
   </Button>
 </form>
 

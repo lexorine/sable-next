@@ -28,7 +28,7 @@
 <div class="message-actions">
   {#if actions.onReact}
     <ReactionPicker
-      label={$i18n.t('timeline.addReaction')}
+      label={i18n.t('timeline.addReaction')}
       {roomId}
       onPick={actions.onReact}
       onOpenChange={onPickerOpenChange}
@@ -42,7 +42,7 @@
       class="message-action-button"
       size="small"
       variant="ghost"
-      label={$i18n.t('timeline.reply')}
+      label={i18n.t('timeline.reply')}
       onclick={actions.onReply}
     >
       <ReplyIcon />
@@ -53,21 +53,25 @@
       class="message-action-button"
       size="small"
       variant="ghost"
-      label={$i18n.t('timeline.editMessage')}
+      label={i18n.t('timeline.editMessage')}
       onclick={actions.onEdit}
     >
       <EditIcon />
     </IconButton>
   {/if}
   {#if rows.length > 0}
-    <ActionMenu label={$i18n.t('timeline.moreActions')} onOpenChange={onOverflowOpenChange}>
+    <ActionMenu
+      class="message-menu"
+      label={i18n.t('timeline.moreActions')}
+      onOpenChange={onOverflowOpenChange}
+    >
       {#snippet trigger({ props })}
         <IconButton
           {...props}
           size="small"
           variant="ghost"
           class="message-action-button selection-open"
-          label={$i18n.t('timeline.moreActions')}
+          label={i18n.t('timeline.moreActions')}
         >
           <MoreIcon />
         </IconButton>
@@ -84,7 +88,7 @@
             onSelect={row.run}
           >
             <RowIcon />
-            <span>{$i18n.t(row.label)}</span>
+            <span>{i18n.t(row.label)}</span>
           </ActionMenuItem>
         {/each}
       </IconContext>

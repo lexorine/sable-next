@@ -18,7 +18,7 @@ function fakeCore(stored: Record<string, Uint8Array | undefined>): FakeCore {
   const uploads: { mime: string; bytes: Uint8Array }[] = [];
   return {
     uploads,
-    commands: {
+    media: {
       fetchMedia: vi.fn((source: string) => {
         const bytes = stored[source];
         return bytes === undefined
@@ -40,6 +40,10 @@ function pack(overrides: Partial<ImagePackView> = {}): ImagePackView {
     room_id: '!r:example.org',
     name: 'Blobs',
     avatar_url: 'mxc://old/av',
+    declared_name: 'Blobs',
+    declared_avatar_url: 'mxc://old/av',
+    stable_event: true,
+    legacy_event: false,
     attribution: 'CC BY 4.0',
     usage: ['emoticon', 'sticker'],
     images: [
@@ -87,7 +91,7 @@ test('the export asks for the original outside the UI download limit', async () 
   const core = fakeCore(media);
   await buildArchive(core, [packDraft(pack())]);
 
-  for (const call of vi.mocked(core.commands.fetchMedia).mock.calls) {
+  for (const call of vi.mocked(core.media.fetchMedia).mock.calls) {
     expect(call.slice(1)).toEqual([0, 0, true]);
   }
 });
@@ -108,7 +112,7 @@ test('a pack survives a round trip onto a homeserver that never saw the original
 
   expect(imported.name).toBe('Blobs');
   expect(imported.attribution).toBe('CC BY 4.0');
-  expect(imported.avatarUrl).toMatch(/^mxc:\/\/new\.example\.org\//u);
+  expect(imported.avatar_url).toMatch(/^mxc:\/\/new\.example\.org\//u);
   expect(imported.images.map((image) => image.shortcode).toSorted()).toEqual([
     'blob_party',
     'blob_wave',
@@ -134,7 +138,12 @@ test('an archive recompressed by another tool still imports', async () => {
 
 test('two packs export into one archive without colliding', async () => {
   const core = fakeCore(media);
-  const second = pack({ id: 'more', name: 'More', images: pack().images.slice(0, 1) });
+  const second = pack({
+    id: 'more',
+    name: 'More',
+    declared_name: 'More',
+    images: pack().images.slice(0, 1),
+  });
   const files = unzipSync(await buildArchive(core, [packDraft(pack()), packDraft(second)]));
 
   expect(files).toHaveProperty(['images/0-blob_wave.png']);
@@ -152,11 +161,12 @@ test('a shared image is fetched and stored once', async () => {
   const core = fakeCore(media);
   const shared = pack({
     avatar_url: 'mxc://old/wave',
+    declared_avatar_url: 'mxc://old/wave',
     images: pack().images.slice(0, 1),
   });
   const files = unzipSync(await buildArchive(core, [packDraft(shared)]));
 
-  expect(vi.mocked(core.commands.fetchMedia).mock.calls).toHaveLength(1);
+  expect(vi.mocked(core.media.fetchMedia).mock.calls).toHaveLength(1);
   expect(Object.keys(files).toSorted()).toEqual(['images/0-blob_wave.png', MANIFEST_NAME]);
 });
 

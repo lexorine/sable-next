@@ -23,9 +23,10 @@
   );
   let progressLabel = $derived(
     download?.state === 'downloading'
-      ? $i18n.t('settings.keyBackupDownloading')
-      : $i18n.t('settings.keyBackupProgress', {
+      ? i18n.t('settings.keyBackupDownloading')
+      : i18n.t('settings.keyBackupProgress', {
           processed: download?.processed ?? 0,
+          count: download?.total ?? 0,
           total: download?.total ?? 0,
         })
   );
@@ -46,7 +47,7 @@
       fetching = true;
       const updates = downloadUpdates;
       try {
-        const next = await core.commands.keyBackupStatus();
+        const next = await core.rpc.encryption.keyBackupStatus();
         if (!active) return;
         status = next;
         if (updates === downloadUpdates && !requesting) download = next.download;
@@ -95,7 +96,7 @@
       failed: 0,
     };
     try {
-      const result = await core.commands.downloadKeyBackup(requestId);
+      const result = await core.rpc.encryption.downloadKeyBackup({ request_id: requestId });
       if (core.session?.account_id !== accountId) return;
       download = result;
       await refresh();
@@ -109,12 +110,12 @@
   }
 </script>
 
-<SettingsSection headingId="key-backup-heading" title={$i18n.t('settings.keyBackupTitle')}>
+<SettingsSection headingId="key-backup-heading" title={i18n.t('settings.keyBackupTitle')}>
   {#snippet titleActions()}
     <IconButton
       variant="subtle"
       size="small"
-      label={$i18n.t('settings.refresh')}
+      label={i18n.t('common.refresh')}
       disabled={loading || busy}
       onclick={() => void refresh()}
     >
@@ -127,55 +128,55 @@
       <div class="backup-counts">
         <p>
           {status.cloud_keys === null
-            ? $i18n.t('settings.keyBackupDisabled')
-            : $i18n.t('settings.keyBackupCloudCount', { count: status.cloud_keys })}
+            ? i18n.t('settings.keyBackupDisabled')
+            : i18n.t('settings.keyBackupCloudCount', { count: status.cloud_keys })}
         </p>
         <p class="secondary">
-          {$i18n.t('settings.keyBackupLocalCount', { count: status.local_keys })}
+          {i18n.t('settings.keyBackupLocalCount', { count: status.local_keys })}
         </p>
         {#if status.cloud_keys !== null}
           <p class="secondary">
-            {$i18n.t('settings.keyBackupUploadCount', {
+            {i18n.t('settings.keyBackupUploadCount', {
               backedUp: status.backed_up_keys,
+              count: status.local_keys,
               total: status.local_keys,
             })}
           </p>
           {#if !status.can_restore}<p class="secondary">
-              {$i18n.t('settings.keyBackupLocked')}
+              {i18n.t('settings.keyBackupLocked')}
             </p>{/if}
         {/if}
       </div>
     {:else if loading}
-      <p role="status">{$i18n.t('settings.keyBackupLoading')}</p>
+      <p role="status">{i18n.t('settings.keyBackupLoading')}</p>
     {/if}
     {#if download}
       <div class="download-status">
         {#if busy}
           <p role="status">{progressLabel}</p>
-          {#if download.total !== null}
-            <Progress
-              value={download.total === 0
+          <Progress
+            value={download.total === null
+              ? null
+              : download.total === 0
                 ? 100
                 : Math.min(100, (download.processed / download.total) * 100)}
-              label={progressLabel}
-            />
-          {:else}
-            <progress aria-label={progressLabel}></progress>
-          {/if}
+            label={progressLabel}
+          />
         {:else if download.state === 'complete'}
           <p role="status">
-            {$i18n.t('settings.keyBackupRestored', {
+            {i18n.t('settings.keyBackupRestored', {
               downloaded: download.processed - download.failed,
+              count: download.total,
               total: download.total,
             })}
           </p>
           <p class="secondary">
-            {$i18n.t('settings.keyBackupImported', { count: download.imported })}
+            {i18n.t('settings.keyBackupImported', { count: download.imported })}
           </p>
         {/if}
         {#if download.failed > 0}
           <Alert variant="warning"
-            >{$i18n.t('settings.keyBackupInvalidKeys', { count: download.failed })}</Alert
+            >{i18n.t('settings.keyBackupInvalidKeys', { count: download.failed })}</Alert
           >
         {/if}
       </div>
@@ -184,11 +185,11 @@
       <div class="backup-actions">
         {#if status.can_restore}
           <Button variant="secondary" size="small" loading={busy} onclick={() => void restore()}
-            >{$i18n.t('settings.keyBackupDownload')}</Button
+            >{i18n.t('settings.keyBackupDownload')}</Button
           >
         {:else}
           <Button variant="secondary" size="small" onclick={onUnlock}
-            >{$i18n.t('settings.recoveryIncompleteAction')}</Button
+            >{i18n.t('settings.recoveryIncompleteAction')}</Button
           >
         {/if}
       </div>
@@ -222,11 +223,5 @@
 
   .backup-actions {
     display: flex;
-  }
-
-  progress {
-    accent-color: var(--primary-main);
-    block-size: var(--space-300);
-    inline-size: 100%;
   }
 </style>

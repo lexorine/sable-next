@@ -9,9 +9,13 @@ import { ProfileController } from './profile-controller.svelte';
 
 function controller(existing: Partial<ProfileView> = {}) {
   const core = {
-    commands: {
-      setDisplayName: vi.fn(() => Promise.resolve()),
-      setAvatarUrl: vi.fn(() => Promise.resolve()),
+    rpc: {
+      account: {
+        setDisplayName: vi.fn(() => Promise.resolve(null)),
+        setAvatarUrl: vi.fn(() => Promise.resolve(null)),
+      },
+    },
+    media: {
       uploadMedia: vi.fn(() => Promise.resolve('mxc://example.org/banner')),
     },
     setProfileField: vi.fn(() => Promise.resolve()),
@@ -78,8 +82,11 @@ test('the extra options go to the fields Settings edits', async () => {
     on_light: '#aa3377',
     on_dark: '#aa3377',
   });
-  expect(core.setProfileField).toHaveBeenCalledWith('m.status', { text: 'on holiday' });
-  expect(core.commands.uploadMedia).toHaveBeenCalledWith('image/png', new Uint8Array([1, 2, 3]));
+  expect(core.setProfileField).toHaveBeenCalledWith('org.matrix.msc4426.status', {
+    text: 'on holiday',
+    emoji: '',
+  });
+  expect(core.media.uploadMedia).toHaveBeenCalledWith('image/png', new Uint8Array([1, 2, 3]));
   expect(core.setProfileField).toHaveBeenCalledWith(
     'chat.commet.profile_banner',
     'mxc://example.org/banner'
@@ -108,8 +115,8 @@ test('an existing profile fills the form and saving it untouched writes nothing'
 
   await profile.save();
 
-  expect(core.commands.setDisplayName).not.toHaveBeenCalled();
-  expect(core.commands.setAvatarUrl).not.toHaveBeenCalled();
+  expect(core.rpc.account.setDisplayName).not.toHaveBeenCalled();
+  expect(core.rpc.account.setAvatarUrl).not.toHaveBeenCalled();
   expect(core.setProfileField).not.toHaveBeenCalled();
 });
 
@@ -126,9 +133,11 @@ test('clearing loaded fields removes them from the profile', async () => {
   profile.setBanner(null);
   await profile.save();
 
-  expect(core.setProfileField).toHaveBeenCalledWith('m.status', null);
+  expect(core.setProfileField).toHaveBeenCalledWith('org.matrix.msc4426.status', null);
   expect(core.setProfileField).toHaveBeenCalledWith('chat.commet.profile_banner', null);
-  expect(core.commands.setAvatarUrl).toHaveBeenCalledWith(null, expect.anything());
+  expect(core.rpc.account.setAvatarUrl).toHaveBeenCalledWith(
+    expect.objectContaining({ url: null })
+  );
 });
 
 test('a field typed before the profile arrives is kept', async () => {
@@ -142,17 +151,31 @@ test('a field typed before the profile arrives is kept', async () => {
 
 test('a status save deletes the legacy status keys the profile still carries', async () => {
   const { profile, core } = controller({
-    status: { text: 'around', emoji: null },
+    status: { text: 'around', emoji: '🌴' },
     supporter_awards: null,
-    legacy_fields: ['chat.commet.profile_status', 'moe.sable.app.bio'],
+    legacy_fields: ['chat.commet.profile_status', 'm.status', 'moe.sable.app.bio'],
   });
   await profile.load();
 
   profile.setStatus('away');
   await profile.save();
 
-  expect(core.setProfileField).toHaveBeenCalledWith('m.status', { text: 'away' });
+  expect(core.setProfileField).toHaveBeenCalledWith('org.matrix.msc4426.status', {
+    text: 'away',
+    emoji: '🌴',
+  });
   expect(core.setProfileField).toHaveBeenCalledWith('chat.commet.profile_status', null);
+  expect(core.setProfileField).toHaveBeenCalledWith('m.status', null);
   expect(core.setProfileField).not.toHaveBeenCalledWith('org.matrix.msc4426.status', null);
   expect(core.setProfileField).not.toHaveBeenCalledWith('moe.sable.app.bio', null);
+});
+
+test('a half-typed name colour is not saved', async () => {
+  const { profile, core } = controller();
+  await profile.load();
+
+  profile.setNameColor('#12');
+  await profile.save();
+
+  expect(core.setProfileField).not.toHaveBeenCalledWith('eu.she-a.color', expect.anything());
 });

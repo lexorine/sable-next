@@ -8,7 +8,7 @@ const SCRIPTED_TIMELINE_SPECS =
 
 const build = process.env.SABLE_E2E_PREBUILT
   ? ''
-  : 'SABLE_WASM_OUTPUT=src/generated/wasm-e2e pnpm run build && ';
+  : 'SABLE_SKIP_DEEPFILTERNET=1 SABLE_WASM_OUTPUT=src/generated/wasm-e2e pnpm run build && ';
 
 export default defineConfig({
   testDir: 'tests/e2e',
@@ -38,7 +38,7 @@ export default defineConfig({
     {
       name: 'chromium',
       dependencies: ['setup'],
-      testIgnore: /(?:global\.(?:setup|teardown)|v1-migration\.spec)\.ts/,
+      testIgnore: /(?:global\.(?:setup|teardown)|v1-migration\.spec|\.browser\.test)\.ts/,
       use: devices['Desktop Chrome'],
     },
     {
@@ -46,7 +46,8 @@ export default defineConfig({
       // deliberately small so it catches compatibility regressions cheaply.
       name: 'webkit',
       dependencies: ['setup'],
-      testMatch: /(?:^|\/)(?:app-shell|login|navigation|window-activity|thread-links)\.spec\.ts$/,
+      testMatch:
+        /(?:^|\/)(?:a11y-auth|app-shell|login|navigation|window-activity|thread-links|last-room)\.spec\.ts$/,
       use: devices['Desktop Safari'],
     },
     {
@@ -59,7 +60,7 @@ export default defineConfig({
       name: 'ios',
       dependencies: ['setup'],
       testMatch: SCRIPTED_TIMELINE_SPECS,
-      use: { ...devices['iPhone 13'], browserName: 'webkit' },
+      use: devices['iPhone 13'],
     },
   ],
   webServer: [
@@ -78,7 +79,7 @@ export default defineConfig({
         'SABLE_WASM_OUTPUT=src/generated/wasm pnpm exec vite dev --host 127.0.0.1 --port 4186 --strictPort',
       url: migrationOrigin,
       reuseExistingServer: !process.env.CI,
-      timeout: 120_000,
+      timeout: 600_000,
     },
   ],
 });

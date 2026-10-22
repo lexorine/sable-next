@@ -1,0 +1,9 @@
+"$schema" = "schemas/schema.json"
+[default]
+description = "Plays the notification chime and reads and clears the push history and diagnostics."
+permissions = [
+  "allow-play-chime",
+  "allow-push-history",
+  "allow-clear-push-history",
+  "allow-take-push-diagnostics",
+]

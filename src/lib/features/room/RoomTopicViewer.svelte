@@ -7,6 +7,7 @@
   import FormattedBody from './messages/FormattedBody.svelte';
   import type { MatrixLink } from '../../rooms/matrix-link';
   import { topicHtml } from './topic-html';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
 
   interface Props {
     open: boolean;
@@ -19,10 +20,10 @@
   let { open, roomName, topic, onOpenChange, onMatrixLink }: Props = $props();
 </script>
 
-<DialogFrame {open} {onOpenChange} variant="verification" label={$i18n.t('room.topicTitle')}>
+<DialogFrame {open} {onOpenChange} variant="verification" label={i18n.t('room.topicTitle')}>
   <div class="topic-dialog">
     <h2>{roomName}</h2>
-    <div class="topic-full">
+    <div class="topic-full" {@attach scrollHint}>
       <FormattedBody html={topicHtml(topic)} {onMatrixLink} />
     </div>
     <DialogActions>
@@ -30,7 +31,7 @@
         variant="ghost"
         onclick={() => {
           onOpenChange(false);
-        }}>{$i18n.t('room.topicClose')}</Button
+        }}>{i18n.t('common.close')}</Button
       >
     </DialogActions>
   </div>

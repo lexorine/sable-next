@@ -1,6 +1,7 @@
 <script lang="ts">
   import QrCodeIcon from 'phosphor-svelte/lib/QrCodeIcon';
   import { fade } from 'svelte/transition';
+  import { page } from '$app/state';
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
   import { MOTION_MS, motionMs } from '#lib/ui/motion.js';
@@ -40,6 +41,7 @@
     onLogin: () => Promise<void>;
     onQrLogin?: () => void;
     onCreateAccount?: () => void;
+    onCancel?: () => void;
     followUserServer?: boolean;
   }
 
@@ -60,6 +62,7 @@
     onQrLogin,
     onLogin,
     onCreateAccount,
+    onCancel,
     followUserServer = true,
   }: Props = $props();
 
@@ -90,7 +93,9 @@
     offeredFlows?.password === true && (showAllLoginMethods || preferredLoginMethod === 'password')
   );
   let forgotPasswordHref = $derived(
-    offeredFlows?.password && !offeredFlows.oidc ? resetPasswordHref(displayedHomeserver) : null
+    offeredFlows?.password && !offeredFlows.oidc
+      ? resetPasswordHref(displayedHomeserver, page.url.searchParams.has('addAccount'))
+      : null
   );
   let hasLoginAction = $derived(loginFlows === null || preferredLoginMethod !== null);
   let userServerError = $state<string | null>(null);
@@ -99,19 +104,20 @@
   let statusError = $derived(
     userServerError ??
       (!isPasswordLoginVisible && (fieldError || loginError || core.status === 'error')
-        ? (fieldError ?? loginError ?? $i18n.t('auth.unableToStart'))
+        ? (fieldError ?? loginError ?? i18n.t('auth.unableToStart'))
         : null)
   );
   let statusMessage = $derived(
     statusError ??
       (loginFlows && availableLoginMethodCount === 0
-        ? $i18n.t('errors.unsupportedSignIn')
+        ? i18n.t('errors.unsupportedSignIn')
         : usernameServer && sameServer(displayedHomeserver, usernameServer)
-          ? $i18n.t('auth.signingInOn', { server: usernameServer })
+          ? i18n.t('auth.signingInOn', { server: usernameServer })
           : null)
   );
 
   const methodSlotId = $props.id();
+  const titleId = `${methodSlotId}-title`;
   // A combobox pick and the blur it causes both validate, so only the latest
   // answer may release the controls.
   let latestValidation = 0;
@@ -131,7 +137,7 @@
     if (!server || server === declinedServer || sameServer(homeserver, server)) return null;
     if (!homeservers.allowCustom && !homeservers.list.includes(server)) {
       declinedServer = server;
-      userServerError = $i18n.t('auth.userServerNotFound', { server });
+      userServerError = i18n.t('auth.userServerNotFound', { server });
       return false;
     }
     const previous = homeserver;
@@ -146,7 +152,7 @@
     homeserver = previous;
     onClearHomeserverValidation();
     declinedServer = server;
-    userServerError = $i18n.t('auth.userServerNotFound', { server });
+    userServerError = i18n.t('auth.userServerNotFound', { server });
     return false;
   }
 
@@ -159,14 +165,15 @@
 <form
   class="login-form auth-card-surface"
   out:fade={{ duration: motionMs(MOTION_MS.quick) }}
-  aria-busy={isAuthenticating}
+  aria-labelledby={titleId}
   novalidate
   onsubmit={(event) => {
     event.preventDefault();
     void submit();
   }}
 >
-  <FormField dense fieldId="homeserver" label={$i18n.t('auth.accountProvider')}>
+  <h2 class="screen-reader-only" id={titleId}>{i18n.t('auth.signInTitle')}</h2>
+  <FormField dense fieldId="homeserver" label={i18n.t('auth.accountProvider')}>
     <HomeserverPicker
       id="homeserver"
       bind:value={homeserver}
@@ -189,22 +196,25 @@
   </FormField>
 
   <AuthStatusSlot
-    loading={isCheckingHomeserver}
-    loadingMessage={$i18n.t('auth.checkingProvider')}
+    loading={isCheckingHomeserver || isAuthenticating || isLaunchingLogin}
+    loadingMessage={i18n.t(isCheckingHomeserver ? 'auth.checkingProvider' : 'auth.signingIn')}
     message={statusMessage}
     tone={statusError ? 'error' : 'muted'}
   />
 
-  <div class="login-methods">
-    <div class="method-slot" class:action-slot={hasLoginAction} id={methodSlotId}>
-      {#if !loginFlows}
+  <div
+    class="login-methods"
+    aria-busy={isCheckingHomeserver || isAuthenticating || isLaunchingLogin}
+  >
+    <div class={['method-slot', { 'action-slot': hasLoginAction }]} id={methodSlotId}>
+      {#if !loginFlows && homeserver.trim() && !isCheckingHomeserver}
         <div class="actions">
           <Button
             type="submit"
             disabled={isAuthenticating || isLoginControlsDisabled}
             variant="primary"
           >
-            {isCheckingHomeserver ? $i18n.t('auth.checking') : $i18n.t('auth.continue')}
+            {isCheckingHomeserver ? i18n.t('auth.checking') : i18n.t('auth.continue')}
           </Button>
         </div>
       {/if}
@@ -213,20 +223,20 @@
         <LoginMethod>
           <div class="actions sso-actions">
             <LoginProviderButton
-              label={$i18n.t('auth.signInWithProvider', {
+              label={i18n.t('auth.signInWithProvider', {
                 name: displayedHomeserver || 'matrix.org',
               })}
               launching={isLaunchingLogin}
               disabled={isAuthenticating || isLoginControlsDisabled || isLaunchingLogin}
               onclick={() => void onLaunchRedirectLogin('oidc')}
             />
-            {#if onQrLogin}
+            {#if onQrLogin && loginFlows.qr_login}
               <Button
                 variant="ghost"
                 disabled={isAuthenticating || isLoginControlsDisabled || isLaunchingLogin}
                 onclick={onQrLogin}
               >
-                <QrCodeIcon size={18} aria-hidden="true" />{$i18n.t('qrLogin.signInWithQr')}
+                <QrCodeIcon size={18} aria-hidden="true" />{i18n.t('qrLogin.titleLogin')}
               </Button>
             {/if}
           </div>
@@ -239,7 +249,7 @@
             <div class="actions sso-actions">
               {#each loginFlows.sso_identity_providers as provider (provider.id)}
                 <LoginProviderButton
-                  label={$i18n.t('auth.signInWithProvider', { name: provider.name })}
+                  label={i18n.t('auth.signInWithProvider', { name: provider.name })}
                   launching={isLaunchingLogin}
                   disabled={isAuthenticating || isLoginControlsDisabled || isLaunchingLogin}
                   onclick={() => void onLaunchRedirectLogin('sso', provider.id)}
@@ -249,7 +259,7 @@
           {:else}
             <div class="actions">
               <LoginProviderButton
-                label={$i18n.t('auth.signInWithSso')}
+                label={i18n.t('auth.signInWithSso')}
                 launching={isLaunchingLogin}
                 disabled={isAuthenticating || isLoginControlsDisabled || isLaunchingLogin}
                 onclick={() => void onLaunchRedirectLogin('sso')}
@@ -287,8 +297,8 @@
       <AuthMethodToggle
         expanded={showAllLoginMethods}
         controls={methodSlotId}
-        showLabel={$i18n.t('auth.moreWaysToSignIn')}
-        hideLabel={$i18n.t('auth.hideOtherWaysToSignIn')}
+        showLabel={i18n.t('auth.moreWaysToSignIn')}
+        hideLabel={i18n.t('auth.hideOtherWaysToSignIn')}
         disabled={isLoginControlsDisabled}
         onToggle={() => {
           showAllLoginMethods = !showAllLoginMethods;
@@ -298,19 +308,23 @@
   </div>
 </form>
 
-{#if onCreateAccount}
-  <div class="account-switch">
-    <span>{$i18n.t('auth.newToMatrixQuestion')}</span>
-    <button
-      class="account-switch-button"
+<div class="account-switch">
+  {#if onCancel}
+    <Button variant="ghost" type="button" onclick={onCancel}>
+      {i18n.t('auth.cancelAddingAccount')}
+    </Button>
+  {:else if onCreateAccount}
+    <span>{i18n.t('auth.noAccountYet')}</span>
+    <Button
+      variant="ghost"
       type="button"
       disabled={isLoginControlsDisabled}
       onclick={onCreateAccount}
     >
-      {$i18n.t('auth.createAccount')}
-    </button>
-  </div>
-{/if}
+      {i18n.t('auth.createAccount')}
+    </Button>
+  {/if}
+</div>
 
 <style>
   .actions {
@@ -327,41 +341,6 @@
     justify-content: center;
     padding-top: var(--space-200);
     text-align: center;
-  }
-
-  .account-switch-button {
-    background: transparent;
-    border: 0;
-    color: var(--primary-main);
-    cursor: pointer;
-    font: inherit;
-    font-weight: var(--font-weight-bold);
-    padding: 0;
-    text-decoration: underline;
-    text-underline-offset: 0.15em;
-  }
-
-  @media (prefers-reduced-motion: no-preference) {
-    .account-switch-button {
-      transition:
-        color var(--motion-normal) var(--motion-easing-standard),
-        text-decoration-color var(--motion-normal) var(--motion-easing-standard);
-    }
-  }
-
-  .account-switch-button:hover {
-    color: var(--primary-main-hover);
-  }
-
-  .account-switch-button:focus-visible {
-    border-radius: var(--radii-200);
-    outline: var(--focus-ring-width) solid var(--focus-ring);
-    outline-offset: 0.15rem;
-  }
-
-  .account-switch-button:disabled {
-    cursor: default;
-    opacity: 0.65;
   }
 
   .login-form {

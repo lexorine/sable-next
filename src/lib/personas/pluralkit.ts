@@ -1,4 +1,5 @@
 import type { PersonaTriggerView, PersonaView, PronounView } from '#src/generated/protocol';
+import { splitPluralkitNamePronouns } from './pronouns';
 
 export interface PluralkitMember {
   id: string;
@@ -82,15 +83,29 @@ function triggers(tags: PluralkitMember['proxy_tags']): PersonaTriggerView[] {
     .filter((trigger) => trigger.prefix !== null || trigger.suffix !== null);
 }
 
+export type PluralkitImportOptions = {
+  extractPronouns?: boolean;
+};
+
 export function personaFromPluralkit(
   member: PluralkitMember,
-  avatarUrl: string | null
+  avatarUrl: string | null,
+  options: PluralkitImportOptions = {}
 ): PersonaView {
+  let display_name = member.display_name?.trim();
+  let pronoun_set = pronouns(member.pronouns);
+
+  if (options.extractPronouns && display_name) {
+    const parsed = splitPluralkitNamePronouns(display_name);
+    display_name = parsed.name;
+    pronoun_set = parsed.pronouns;
+  }
+
   return {
     id: member.name,
-    display_name: member.display_name?.trim() || member.name,
+    display_name: display_name || member.name,
     avatar_url: avatarUrl,
-    pronouns: pronouns(member.pronouns),
+    pronouns: pronoun_set,
     ...colors(member.color),
     triggers: triggers(member.proxy_tags),
     pluralkit: {
@@ -99,6 +114,8 @@ export function personaFromPluralkit(
       avatar_url: member.avatar_url ?? null,
       description: member.description ?? null,
     },
+    last_used: null,
+    alternate_avatars: null,
   };
 }
 

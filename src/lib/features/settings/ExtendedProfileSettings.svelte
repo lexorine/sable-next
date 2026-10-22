@@ -15,8 +15,8 @@
 
   let { profile }: Props = $props();
   const core = useCoreClient();
-  let emails = $state<string[]>([]);
-  let ignored = $state<string[]>([]);
+  let emails = $state.raw<string[]>([]);
+  let ignored = $state.raw<string[]>([]);
   let userToBlock = $state('');
   let saving = $state<string | null>(null);
   let error = $state<string | null>(null);
@@ -25,7 +25,7 @@
     void core.session?.user_id;
     void profile.user_id;
     let cancelled = false;
-    void Promise.all([core.commands.accountContacts(), core.commands.ignoredUsers()]).then(
+    void Promise.all([core.rpc.account.contacts(), core.rpc.account.ignoredUsers()]).then(
       ([nextEmails, nextIgnored]) => {
         if (cancelled) return;
         emails = nextEmails;
@@ -74,15 +74,15 @@
 <div class="profile-stack">
   {#if error}<Alert variant="critical" aria-live="polite">{error}</Alert>{/if}
 
-  <SettingsSection title={$i18n.t('settings.contactInformation')} headingId="account-contact">
+  <SettingsSection title={i18n.t('settings.contactInformation')} headingId="account-contact">
     <div class="settings-form form-row">
       {#if emails.length}{#each emails as email (email)}<code>{email}</code>{/each}{:else}<span
-          >{$i18n.t('settings.contactInformationNoEmail')}</span
+          >{i18n.t('settings.contactInformationNoEmail')}</span
         >{/if}
     </div>
   </SettingsSection>
 
-  <SettingsSection title={$i18n.t('settings.blockedUsers')} headingId="account-blocked">
+  <SettingsSection title={i18n.t('settings.blockedUsers')} headingId="account-blocked">
     <div class="settings-form">
       <form
         class="form-row"
@@ -93,10 +93,9 @@
       >
         <TextInput
           bind:value={userToBlock}
-          placeholder={$i18n.t('settings.blockedUsersPlaceholder')}
+          placeholder={i18n.t('settings.blockedUsersPlaceholder')}
         />
-        <Button type="submit" loading={saving === 'block'}>{$i18n.t('settings.blockButton')}</Button
-        >
+        <Button type="submit" loading={saving === 'block'}>{i18n.t('common.block')}</Button>
       </form>
       {#if ignored.length}<ul class="ignored-users">
           {#each ignored as userId (userId)}<li>
@@ -104,7 +103,7 @@
                 variant="danger"
                 size="small"
                 loading={saving === userId}
-                onclick={() => void unblock(userId)}>{$i18n.t('settings.unblockButton')}</Button
+                onclick={() => void unblock(userId)}>{i18n.t('common.unblock')}</Button
               >
             </li>{/each}
         </ul>{/if}

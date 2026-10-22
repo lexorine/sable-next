@@ -15,9 +15,9 @@ import {
 import { toasts } from '#lib/ui/toasts.svelte.js';
 
 import CustomThemes from './CustomThemes.svelte';
-import { CATALOG_URL } from './theme-catalog';
+import { CATALOG_URL } from '#lib/settings/theme-catalog.js';
 
-const FILES = 'https://raw.githubusercontent.com/SableClient/themes/main/';
+const FILES = 'https://git.sable.moe/SableClient/themes/raw/branch/main/';
 const NIGHT_URL = `${FILES}themes/night.sable.css`;
 const NIGHT = `/*
 @sable-theme
@@ -78,8 +78,18 @@ function installButtons(): HTMLElement[] {
   return catalog().queryAllByRole('button', { name: 'Install' });
 }
 
+function namedTile(root: HTMLElement, name: string): HTMLElement {
+  const hit = Array.from(root.querySelectorAll<HTMLElement>('.tile-hit')).find(
+    (button) => button.querySelector('.tile-name')?.textContent === name
+  );
+  if (!hit) throw new Error(`No theme tile named ${name}`);
+  return hit;
+}
+
+const catalogTile = (name: string) => namedTile(screen.getByRole('tabpanel'), name);
+
 function catalogCard(name: string) {
-  return within(catalog().getByTitle(name).closest<HTMLElement>('.tile') ?? document.body);
+  return within(catalogTile(name).closest<HTMLElement>('.tile') ?? document.body);
 }
 
 function installButton(name: string): HTMLElement | null {
@@ -87,7 +97,7 @@ function installButton(name: string): HTMLElement | null {
 }
 
 function tile(name: string): HTMLElement {
-  return screen.getAllByTitle(name)[0];
+  return namedTile(document.body, name);
 }
 
 afterEach(() => {
@@ -179,7 +189,7 @@ test('lists each slot by theme kind, keeping a cross-kind choice', () => {
   const names = (slot: string): string[] =>
     within(document.getElementById(`theme-slot-${slot}-items`) ?? document.body)
       .getAllByRole('radio')
-      .map((radio) => radio.getAttribute('title') ?? '');
+      .map((radio) => radio.querySelector('.tile-name')?.textContent ?? '');
   expect(names('light')).toEqual(['Sable (default)', 'Dawn', 'Dusk']);
   expect(names('dark')).toEqual(['Sable (default)', 'Night', 'Dusk']);
 });
@@ -211,7 +221,7 @@ test('tapping a card previews it without installing, and Use installs it', async
   render(CustomThemes);
   await openCatalog();
 
-  await user.click(catalog().getByTitle('Night'));
+  await user.click(catalogTile('Night'));
   await vi.waitFor(() => {
     expect(themePreview.current?.name).toBe('Night');
   });
@@ -223,7 +233,7 @@ test('tapping a card previews it without installing, and Use installs it', async
   expect(customThemes.darkThemeId).toBe(customThemes.themes[0]?.id);
   expect(catalogCard('Night').getByText('In use for dark mode')).toBeInTheDocument();
 
-  await user.click(catalog().getByTitle('Dawn'));
+  await user.click(catalogTile('Dawn'));
   await vi.waitFor(() => {
     expect(themePreview.current?.name).toBe('Dawn');
   });
@@ -330,6 +340,27 @@ test('a failed catalogue install says so on its own card', async () => {
   expect(customThemes.themes).toEqual([]);
 });
 
+test('reopening the catalogue forgets an earlier failed install', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((url: string) =>
+      Promise.resolve(url === DAWN_URL ? new Response('', { status: 500 }) : respond(url))
+    )
+  );
+  render(CustomThemes);
+  await openCatalog();
+  await user.click(installButton('Dawn') ?? document.body);
+  expect(await catalogCard('Dawn').findByRole('alert')).toBeInTheDocument();
+
+  await user.click(button('Close catalogue'));
+  await vi.waitFor(() => {
+    expect(document.body.style.pointerEvents).not.toBe('none');
+  });
+  await openCatalog();
+
+  expect(catalogCard('Dawn').queryByRole('alert')).not.toBeInTheDocument();
+});
+
 test('closing the catalogue discards a preview that is still downloading', async () => {
   stubCatalog();
   render(CustomThemes);
@@ -340,7 +371,7 @@ test('closing the catalogue discards a preview that is still downloading', async
     vi.fn(() => pending.promise)
   );
 
-  await user.click(catalog().getByTitle('Night'));
+  await user.click(catalogTile('Night'));
   await user.click(button('Close catalogue'));
   pending.resolve(new Response(NIGHT));
   await new Promise((resolve) => setTimeout(resolve, 0));
@@ -359,8 +390,8 @@ test('the most recently clicked preview wins when downloads finish out of order'
     vi.fn((url: string) => (url === NIGHT_URL ? night.promise : dawn.promise))
   );
 
-  await user.click(catalog().getByTitle('Night'));
-  await user.click(catalog().getByTitle('Dawn'));
+  await user.click(catalogTile('Night'));
+  await user.click(catalogTile('Dawn'));
   dawn.resolve(new Response(DAWN));
   await vi.waitFor(() => {
     expect(themePreview.current?.name).toBe('Dawn');
@@ -381,7 +412,7 @@ test('leaving settings discards a preview that is still downloading', async () =
     vi.fn(() => pending.promise)
   );
 
-  await user.click(catalog().getByTitle('Night'));
+  await user.click(catalogTile('Night'));
   unmount();
   pending.resolve(new Response(NIGHT));
   await new Promise((resolve) => setTimeout(resolve, 0));
@@ -395,7 +426,7 @@ test.each(['Revert', 'Use for dark mode'])(
     stubCatalog();
     render(CustomThemes);
     await openCatalog();
-    await user.click(catalog().getByTitle('Night'));
+    await user.click(catalogTile('Night'));
     await vi.waitFor(() => {
       expect(themePreview.current?.name).toBe('Night');
     });
@@ -405,7 +436,7 @@ test.each(['Revert', 'Use for dark mode'])(
       vi.fn(() => pending.promise)
     );
 
-    await user.click(catalog().getByTitle('Dawn'));
+    await user.click(catalogTile('Dawn'));
     await user.click(button(action));
     pending.resolve(new Response(DAWN));
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -428,8 +459,8 @@ test('a superseded preview failure does not clear the current download or show a
     vi.fn((url: string) => (url === NIGHT_URL ? night.promise : dawn.promise))
   );
 
-  await user.click(catalog().getByTitle('Night'));
-  await user.click(catalog().getByTitle('Dawn'));
+  await user.click(catalogTile('Night'));
+  await user.click(catalogTile('Dawn'));
   night.resolve(new Response('', { status: 500 }));
   await new Promise((resolve) => setTimeout(resolve, 0));
   expect(installButton('Dawn')).toBeDisabled();

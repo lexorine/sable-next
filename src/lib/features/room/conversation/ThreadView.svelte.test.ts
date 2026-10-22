@@ -19,6 +19,7 @@ vi.mock('../messages/event-items.svelte.js', () => ({
 import { core } from '#lib/core/__mocks__/context.js';
 
 import ThreadViewHarness from './ThreadViewHarness.test.svelte';
+import { withRowFields } from '#lib/features/room/timeline/row-fixtures.js';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -26,7 +27,7 @@ afterEach(() => {
 });
 
 function image(eventId: string, filename: string): TimelineItemView {
-  return {
+  return withRowFields({
     id: eventId,
     event_id: eventId,
     transaction_id: null,
@@ -63,7 +64,7 @@ function image(eventId: string, filename: string): TimelineItemView {
     mention: 'none',
     forwarded: null,
     forum_title: null,
-  };
+  });
 }
 
 test('an image in a thread opens the viewer on that image', async () => {
@@ -95,6 +96,7 @@ test('the header keeps a spoiler-safe topic visible', async () => {
     emote: false,
     notice: false,
     edited: false,
+    jumbo: null,
   };
   vi.spyOn(RoomTimeline.prototype, 'startThread').mockImplementation(function (this: RoomTimeline) {
     this.items = [root];
@@ -108,6 +110,106 @@ test('the header keeps a spoiler-safe topic visible', async () => {
   expect(await screen.findByRole('heading', { name: 'Release [Spoiler]' })).toBeVisible();
   expect(screen.getByRole('button', { name: 'Back to conversation' })).toBeVisible();
   expect(screen.getByRole('button', { name: 'Jump to original message' })).toBeVisible();
+});
+
+test('a linked reply missing from the thread opens on its context', async () => {
+  vi.spyOn(RoomTimeline.prototype, 'startThread').mockImplementation(function (this: RoomTimeline) {
+    this.items = [image('$root', 'first.png')];
+    this.hasSnapshot = true;
+    return Promise.resolve();
+  });
+  const start = vi.spyOn(RoomTimeline.prototype, 'start').mockResolvedValue();
+  const paginate = vi.spyOn(RoomTimeline.prototype, 'paginateBackward');
+  vi.spyOn(RoomTimeline.prototype, 'stop').mockResolvedValue();
+  render(ThreadViewHarness, {
+    panel: {
+      roomId: '!room:example.org',
+      rootEventId: '$root',
+      focusEventId: '$older',
+      onClose: () => {},
+    },
+  });
+
+  await vi.waitFor(() => {
+    expect(start).toHaveBeenCalledWith('!room:example.org', '$older');
+  });
+  expect(paginate).not.toHaveBeenCalled();
+});
+
+test('a linked reply already in the thread keeps the thread timeline', async () => {
+  vi.spyOn(RoomTimeline.prototype, 'startThread').mockImplementation(function (this: RoomTimeline) {
+    this.items = [image('$root', 'first.png'), image('$reply', 'reply.png')];
+    this.hasSnapshot = true;
+    return Promise.resolve();
+  });
+  const start = vi.spyOn(RoomTimeline.prototype, 'start').mockResolvedValue();
+  vi.spyOn(RoomTimeline.prototype, 'stop').mockResolvedValue();
+  render(ThreadViewHarness, {
+    panel: {
+      roomId: '!room:example.org',
+      rootEventId: '$root',
+      focusEventId: '$reply',
+      onClose: () => {},
+    },
+  });
+
+  expect(await screen.findByRole('button', { name: 'Open reply.png' })).toBeVisible();
+  expect(start).not.toHaveBeenCalled();
+});
+
+test('a plain thread offers no jump back to the thread', async () => {
+  vi.spyOn(RoomTimeline.prototype, 'startThread').mockImplementation(function (this: RoomTimeline) {
+    this.mode = { kind: 'thread', rootEventId: '$root' };
+    this.items = [image('$root', 'first.png'), image('$reply', 'reply.png')];
+    this.hasSnapshot = true;
+    return Promise.resolve();
+  });
+  vi.spyOn(RoomTimeline.prototype, 'stop').mockResolvedValue();
+  render(ThreadViewHarness, {
+    panel: { roomId: '!room:example.org', rootEventId: '$root', onClose: () => {} },
+  });
+
+  expect(await screen.findByRole('button', { name: 'Open reply.png' })).toBeVisible();
+  expect(screen.queryByRole('button', { name: 'Jump to latest' })).not.toBeInTheDocument();
+});
+
+test('a reply opened on its context jumps back to the live thread', async () => {
+  vi.spyOn(Element.prototype, 'animate').mockImplementation(
+    () =>
+      ({
+        cancel: () => {},
+        effect: null,
+        onfinish: null,
+        playState: 'finished',
+      }) as unknown as Animation
+  );
+  const startThread = vi.spyOn(RoomTimeline.prototype, 'startThread').mockImplementation(function (
+    this: RoomTimeline
+  ) {
+    this.mode = { kind: 'thread', rootEventId: '$root' };
+    this.items = [image('$root', 'first.png')];
+    this.hasSnapshot = true;
+    return Promise.resolve();
+  });
+  vi.spyOn(RoomTimeline.prototype, 'start').mockImplementation(function (this: RoomTimeline) {
+    this.mode = { kind: 'focused', eventId: '$older' };
+    this.items = [image('$root', 'first.png'), image('$older', 'older.png')];
+    return Promise.resolve();
+  });
+  vi.spyOn(RoomTimeline.prototype, 'stop').mockResolvedValue();
+  const user = userEvent.setup();
+  render(ThreadViewHarness, {
+    panel: {
+      roomId: '!room:example.org',
+      rootEventId: '$root',
+      focusEventId: '$older',
+      onClose: () => {},
+    },
+  });
+
+  await user.click(await screen.findByRole('button', { name: 'Jump to latest' }));
+
+  expect(startThread).toHaveBeenCalledTimes(2);
 });
 
 test('a failed subscription can be retried without replacing the composer', async () => {
@@ -146,6 +248,7 @@ test.each([false, true])(
       emote: false,
       notice: false,
       edited: false,
+      jumbo: null,
     };
     vi.spyOn(RoomTimeline.prototype, 'startThread').mockImplementation(function (
       this: RoomTimeline

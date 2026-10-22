@@ -18,6 +18,12 @@ const TEMPLATES: Record<ReportType, string> = {
 
 const forgeIssuesUrl = `${FORGE_ORIGIN}/${FORGE_REPO}/issues`;
 
+export function issueEnvironment(platform: string): string {
+  const userAgent = typeof navigator === 'undefined' ? 'unknown' : navigator.userAgent;
+  const version = `v${import.meta.env.VITE_APP_VERSION ?? 'dev'}`;
+  return `- OS: ${platform}\n- Browser: ${userAgent}\n- Sable: ${version}`;
+}
+
 export function forgeIssueUrl(
   type: ReportType,
   title: string,
@@ -48,7 +54,10 @@ export async function openForgeIssueUrl(url: string): Promise<void> {
   if (opensExternalUrls()) {
     const opened = await openExternalUrl(url).then(
       () => true,
-      () => false
+      (error: unknown) => {
+        console.debug('[sable report] opening the issue externally failed', error);
+        return false;
+      }
     );
     if (opened) return;
   }

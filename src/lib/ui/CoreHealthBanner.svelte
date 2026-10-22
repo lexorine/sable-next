@@ -18,28 +18,31 @@
 
   const notice = $derived.by(() => {
     if (core.crashed !== null) {
-      return { kind: 'crash' as const, text: $i18n.t('errors.coreCrashed') };
+      return { kind: 'crash' as const, text: i18n.t('errors.coreCrashed') };
+    }
+    if (core.superseded) {
+      return { kind: 'crash' as const, text: i18n.t('errors.coreSuperseded') };
     }
     if (core.storageInterrupted) {
-      return { kind: 'crash' as const, text: $i18n.t('errors.storageInterrupted') };
+      return { kind: 'crash' as const, text: i18n.t('errors.storageInterrupted') };
     }
     if (core.unresponsive) {
-      return { kind: 'warn' as const, text: $i18n.t('errors.coreUnresponsive') };
+      return { kind: 'warn' as const, text: i18n.t('errors.coreUnresponsive') };
     }
     if (core.localNetworkBlocked !== null) {
       return {
         kind: 'warn' as const,
-        text: $i18n.t('errors.localNetworkBlocked', { host: core.localNetworkBlocked }),
+        text: i18n.t('errors.localNetworkBlocked', { host: core.localNetworkBlocked }),
       };
     }
     if (core.sync?.state === 'error') {
       return {
         kind: 'warn' as const,
-        text: $i18n.t('errors.syncFailed', { message: core.sync.message }),
+        text: i18n.t('errors.syncFailed', { message: core.sync.message }),
       };
     }
     if (offlineSettled) {
-      return { kind: 'warn' as const, text: $i18n.t('errors.offline') };
+      return { kind: 'warn' as const, text: i18n.t('errors.offline') };
     }
     return null;
   });
@@ -50,10 +53,12 @@
 </script>
 
 {#if notice}
-  <div class="banner" class:crash={notice.kind === 'crash'} role="alert">
+  <div class={['banner', { crash: notice.kind === 'crash' }]} role="alert">
     <p class="message">{notice.text}</p>
     {#if notice.kind === 'crash'}
-      <Button size="small" variant="danger" onclick={reload}>{$i18n.t('errors.reload')}</Button>
+      <Button class="reload-button" size="small" variant="danger" onclick={reload}
+        >{i18n.t('common.reload')}</Button
+      >
     {/if}
   </div>
 {/if}
@@ -62,16 +67,14 @@
   .banner {
     align-items: center;
     background: var(--warn-container);
-    border-block-end: var(--border-width) solid var(--warn-container-line);
+    border-block-start: var(--border-width) solid var(--warn-container-line);
     color: var(--warn-on-container);
     display: flex;
     gap: var(--space-300);
     inset-block-start: 0;
     inset-inline: 0;
     justify-content: center;
-    padding: calc(var(--space-300) + var(--safe-top)) calc(var(--space-400) + var(--safe-right))
-      var(--space-300) calc(var(--space-400) + var(--safe-left));
-    position: fixed;
+    padding: var(--space-300) var(--space-400);
     z-index: var(--layer-notify);
   }
 
@@ -85,7 +88,8 @@
     margin: 0;
   }
 
-  :global(.btn) {
+  :global(.reload-button) {
+    background-color: var(--crit-container-active);
     flex: none;
   }
 </style>

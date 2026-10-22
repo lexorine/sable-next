@@ -19,6 +19,7 @@ import type { CoreClient } from '#lib/core/client.svelte.js';
 import { RoomTimeline } from '#lib/rooms/timeline.svelte.js';
 
 import TimelineReadReceipt from './TimelineReadReceipt.svelte';
+import { withRowFields } from '#lib/features/room/timeline/row-fixtures.js';
 
 beforeEach(() => {
   native.onFocus = null;
@@ -31,7 +32,7 @@ afterEach(() => {
 });
 
 function item(): TimelineItemView {
-  return {
+  return withRowFields({
     id: 'latest',
     event_id: '$latest',
     transaction_id: null,
@@ -47,6 +48,7 @@ function item(): TimelineItemView {
       emote: false,
       notice: false,
       edited: false,
+      jumbo: null,
     },
     in_reply_to: null,
     thread_root: null,
@@ -61,7 +63,7 @@ function item(): TimelineItemView {
     mention: 'none',
     forwarded: null,
     forum_title: null,
-  };
+  });
 }
 
 function deferred<T>() {
@@ -301,7 +303,7 @@ test('keeps the newest queued receipt when the viewport moves backward', async (
   vi.useRealTimers();
 });
 
-test('flushes the queued newer receipt after hiding during an in-flight request', async () => {
+test('a queued receipt waits for the window instead of being sent while hidden', async () => {
   vi.useFakeTimers();
   const timeline = new RoomTimeline({} as CoreClient);
   timeline.items = [itemWithId('a'), itemWithId('b'), itemWithId('c')];
@@ -322,14 +324,21 @@ test('flushes the queued newer receipt after hiding during an in-flight request'
   await tick();
   first.resolve(undefined);
   await tick();
+  await vi.advanceTimersByTimeAsync(1000);
+
+  expect(read).toHaveBeenCalledTimes(1);
+
+  Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+  document.dispatchEvent(new Event('visibilitychange'));
+  await tick();
+  await vi.advanceTimersByTimeAsync(500);
 
   expect(read).toHaveBeenNthCalledWith(2, '$c');
-  Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
   instance.unmount();
   vi.useRealTimers();
 });
 
-test('hiding the document sends the pending receipt rather than losing it', async () => {
+test('hiding the document does not send the pending receipt', async () => {
   vi.useFakeTimers();
   const timeline = new RoomTimeline({} as CoreClient);
   timeline.items = [itemWithId('a')];
@@ -339,15 +348,19 @@ test('hiding the document sends the pending receipt rather than losing it', asyn
   });
 
   await tick();
-  expect(read).not.toHaveBeenCalled();
-
   Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true });
   document.dispatchEvent(new Event('visibilitychange'));
   await tick();
+  await vi.advanceTimersByTimeAsync(1000);
 
-  expect(read).toHaveBeenCalledWith('$a');
+  expect(read).not.toHaveBeenCalled();
 
   Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+  document.dispatchEvent(new Event('visibilitychange'));
+  await tick();
+  await vi.advanceTimersByTimeAsync(500);
+
+  expect(read).toHaveBeenCalledExactlyOnceWith('$a');
   instance.unmount();
   vi.useRealTimers();
 });

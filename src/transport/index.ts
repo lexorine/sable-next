@@ -1,14 +1,9 @@
 import type {
   AttachmentInfoView,
-  Command,
-  CommandOk,
-  CommandErr,
+  RpcError,
   CoreEvent,
   PerMessageProfileView,
 } from '#src/generated/protocol';
-
-/** Resolves a command's response from its tag, so `send` is typed end to end. */
-export type ResponseFor<T extends Command['type']> = Extract<CommandOk, { type: T }>;
 
 export type Attachment = {
   roomId: string;
@@ -42,13 +37,14 @@ export type Gallery = {
 export type GalleryAttachment = Pick<Attachment, 'filename' | 'mime' | 'bytes' | 'info'>;
 
 export class CoreError extends Error {
-  constructor(readonly detail: CommandErr) {
+  constructor(readonly detail: RpcError) {
     super(detail.code);
   }
 }
 
 export interface Transport {
-  send<C extends Command>(command: C): Promise<ResponseFor<C['type']>>;
+  /** Runs `"<domain>.<method>"`; typed through `createRpc`. */
+  call(method: string, params: unknown): Promise<unknown>;
 
   /** Thumbnail bytes for an `mxc://` URI. */
   fetchMedia(
@@ -61,15 +57,8 @@ export interface Transport {
   /** Drops every stored copy of a source, so the next fetch asks the homeserver. */
   forgetMedia(source: string): Promise<void>;
 
-  /** The MIME type {@link streamVideo} delivers. */
-  videoStreamMime(): Promise<string>;
-
-  /** Calls `onChunk` as bytes are produced; rejects where no re-encoder runs. */
-  streamVideo(source: string, id: number, onChunk: (chunk: Uint8Array) => void): Promise<void>;
-
   /**
-   * Resolves once the event is queued, not once the upload finishes. Progress
-   * and failure arrive as `send_state` on the local echo.
+   * Resolves once the event is queued; progress arrives as `send_state` on the local echo.
    */
   sendAttachment(attachment: Attachment): Promise<void>;
 
@@ -85,6 +74,8 @@ export interface Transport {
   subscribeCrash(onCrash: (message: string) => void): () => void;
 
   subscribeStorageFailure?(onStorageFailure: () => void): () => void;
+
+  subscribeSuperseded?(onSuperseded: () => void): () => void;
 
   subscribeStall(onStall: (stalled: boolean) => void): () => void;
 

@@ -4,16 +4,19 @@
   import { onDestroy } from 'svelte';
   import { SvelteSet } from 'svelte/reactivity';
 
-  import type { ImagePackView, MemberView, TimelineItemView } from '#src/generated/protocol';
+  import type { MemberView, TimelineItemView } from '#src/generated/protocol';
 
   import { useCoreClient } from '#lib/core/context.js';
+  import { RoomPacks } from '#lib/emoji/room-packs.svelte.js';
   import { shortcodeFor } from '#lib/emoji/emoji.js';
   import { i18n } from '#lib/i18n.js';
   import MediaImage from '#lib/ui/MediaImage.svelte';
   import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
 
   import { LongPress, touchContextMenu } from '#lib/ui/long-press.svelte.js';
+  import { MOTION_MS, shouldReduceMotion } from '#lib/ui/motion.js';
   import ReactionSheet from './ReactionSheet.svelte';
+  import EmoteCard from './EmoteCard.svelte';
   import { reactionSummary } from './reaction-summary.js';
   import {
     hasRoomMediaPreviews,
@@ -21,7 +24,6 @@
   } from '../media/room-media-previews.svelte.js';
   import {
     isCustomReaction,
-    loadReactionEmotePacks,
     loadReactionShortcodes,
     reactionEmoteLabel,
     reactionShortcode,
@@ -59,8 +61,9 @@
   }: Props = $props();
 
   let pressIndex = 0;
+  let tapAnimation: Animation | undefined;
   const core = useCoreClient();
-  let imagePacks = $state.raw<ImagePackView[]>([]);
+  const packs = new RoomPacks(core, () => (customKeys.length > 0 ? roomId : undefined));
   let sentShortcodes = $state.raw<ReadonlyMap<string, string>>(new Map());
   let customKeys = $derived(
     reactions
@@ -85,6 +88,7 @@
 
   onDestroy(() => {
     press.cancel();
+    tapAnimation?.cancel();
   });
 
   $effect(() => {
@@ -93,59 +97,58 @@
     if (target === null || keys === '') return;
     let current = true;
     void loadReactionShortcodes(roomId, target, keys.split('\n'), () =>
-      core.commands.reactionShortcodes(roomId, target)
+      core.rpc.messages.reactionShortcodes({ room_id: roomId, event_id: target })
     )
       .then((shortcodes) => {
         if (current) sentShortcodes = shortcodes;
       })
-      .catch(() => {});
+      .catch((error: unknown) => {
+        console.debug('[sable emotes] reaction shortcodes unavailable', error);
+      });
     return () => {
       current = false;
     };
   });
 
-  $effect(() => {
-    let current = true;
-    void loadReactionEmotePacks(roomId, core.commands.imagePacks)
-      .then((packs) => {
-        if (current) imagePacks = packs;
-      })
-      .catch(() => {});
-    return () => {
-      current = false;
-    };
-  });
   const roomMedia = hasRoomMediaPreviews() ? useRoomMediaPreviews() : null;
   let mediaHidden = $derived(roomMedia?.hidden ?? false);
 </script>
 
-<div class="reactions" aria-label={$i18n.t('timeline.reactions')}>
+<div class="reactions" aria-label={i18n.t('timeline.reactions')}>
   {#each reactions as reaction, index (reaction.key)}
     {@const mine = currentUserId !== null && reaction.senders.includes(currentUserId)}
     {@const label = reactionEmoteLabel(
       reaction.key,
-      imagePacks,
-      $i18n.t('timeline.customEmote'),
+      packs.current,
+      i18n.t('timeline.customEmote'),
       sentShortcodes
     )}
-    {@const shortcode = reactionShortcode(reaction.key, imagePacks, sentShortcodes)}
+    {@const shortcode = reactionShortcode(reaction.key, packs.current, sentShortcodes)}
     {#snippet reactionTrigger({ props }: { props: Record<string, unknown> })}
       <button
         {...props}
         class="reaction choice"
         type="button"
         aria-pressed={mine}
-        aria-label={$i18n.t('timeline.toggleReaction', {
+        aria-label={i18n.t('timeline.toggleReaction', {
           key: label,
           count: reaction.senders.length,
         })}
         disabled={eventId === null}
-        onclick={() => {
+        onclick={(event) => {
           if (press.fired) {
             press.fired = false;
             return;
           }
-          if (eventId) onToggleReaction?.(eventId, reaction.key);
+          if (!eventId || !onToggleReaction) return;
+          tapAnimation?.cancel();
+          if (!shouldReduceMotion()) {
+            tapAnimation = event.currentTarget.animate(
+              [{ transform: 'scale(0.96)' }, { transform: 'scale(1)' }],
+              { duration: MOTION_MS.quick, easing: 'ease-out' }
+            );
+          }
+          onToggleReaction(eventId, reaction.key);
         }}
         oncontextmenu={(event) => openDetails(event, index)}
         onpointerdown={(event) => {
@@ -167,6 +170,7 @@
               width={64}
               height={64}
               original
+              emoticon
               onloaded={() => failedImages.delete(reaction.key)}
               onfailed={() => failedImages.add(reaction.key)}
             />
@@ -189,24 +193,16 @@
       reaction.senders,
       emojiShortcode ? `:${emojiShortcode}:` : label,
       members,
-      $i18n.t
+      i18n.t
     )}
     {#snippet emoteCard()}
-      <span class="emote-card">
+      <EmoteCard label={summary} variant="reaction">
         {#if isCustomReaction(reaction.key)}
-          <MediaImage
-            class="emote-card-image"
-            source={reaction.key}
-            alt=""
-            width={64}
-            height={64}
-            original
-          />
+          <MediaImage source={reaction.key} alt="" width={64} height={64} original />
         {:else}
           <span class="emote-card-emoji" aria-hidden="true">{reaction.key}</span>
         {/if}
-        <span>{summary}</span>
-      </span>
+      </EmoteCard>
     {/snippet}
     <Tooltip
       label={summary}
@@ -226,7 +222,7 @@
     <button
       type="button"
       class="add-reaction"
-      aria-label={$i18n.t('timeline.addReaction')}
+      aria-label={i18n.t('timeline.addReaction')}
       bind:this={addReactionButton}
       onclick={() => (addReactionOpen = true)}
     >
@@ -310,19 +306,6 @@
     max-width: 9.375rem;
     object-fit: contain;
     width: calc(1.125rem * var(--media-ratio));
-  }
-
-  .emote-card {
-    align-items: center;
-    display: flex;
-    gap: var(--space-300);
-  }
-
-  .emote-card :global(.emote-card-image) {
-    flex: none;
-    height: var(--space-900);
-    object-fit: contain;
-    width: var(--space-900);
   }
 
   .emote-card-emoji {

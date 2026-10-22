@@ -68,6 +68,16 @@ test('re-sending an unchanged edit does not escape the body again', () => {
   expect(second.body).toBe(typed);
 });
 
+test('a typed backslash before punctuation is sent once and survives every round trip', () => {
+  const typed = '\\>.<';
+  const rich = docOf(para(composerSchema.text(typed)));
+
+  expect(serializeComposer(rich).body).toBe(typed);
+  expect(serializeComposer(textDoc(serializeComposer(rich).body)).body).toBe(typed);
+  expect(serializePlain(textDoc(typed)).body).toBe(typed);
+  expect(plainTextOf(richFromPlain(textDoc(composerMarkdown(rich))))).toBe(typed);
+});
+
 test.each(['one\ntwo', 'one\n\ntwo', 'a\nb\n\nc'])(
   'reloading the body %j for an edit sends the same body back',
   (body) => {
@@ -90,6 +100,38 @@ test('MFM time and color keep their source body in both composer modes', () => {
     expect(message.body).toBe(source);
     expect(message.formatted).toContain('datetime="1970-01-01T00:00:00Z"');
     expect(message.formatted).toContain('<span data-mx-color="#aabbcc">hi</span>');
+  }
+});
+
+test('typed LaTeX is sent as data-mx-maths with the source as body', () => {
+  const expected = 'so <span data-mx-maths="x^2"><code>x^2</code></span> holds';
+  const plain = serializePlain(textDoc('so $x^2$ holds'));
+  expect(plain.body).toBe('so $x^2$ holds');
+  expect(plain.formatted).toBe(expected);
+
+  const rich = serializeComposer(
+    docOf(
+      para([
+        composerSchema.text('so '),
+        composerSchema.nodes.math_inline.create({ latex: 'x^2' }),
+        composerSchema.text(' holds'),
+      ])
+    )
+  );
+  expect(rich.body).toBe('so $x^2$ holds');
+  expect(rich.formatted).toBe(expected);
+});
+
+test('plain mode turns a $$ block into display math', () => {
+  const source = '$$\n\\int_0^1 f\n$$';
+  const message = serializePlain(textDoc(source));
+  expect(message.body).toBe(source);
+  expect(message.formatted).toBe('<div data-mx-maths="\\int_0^1 f"><code>\\int_0^1 f</code></div>');
+});
+
+test('prices and escapes are not LaTeX', () => {
+  for (const source of ['costs $5 and $6', '\\$x$', 'a$x$', '$ x $', '$x$5', '$$']) {
+    expect(serializePlain(textDoc(source)).formatted ?? '').not.toContain('data-mx-maths');
   }
 });
 
@@ -247,7 +289,7 @@ test('a plain-mode edit keeps pills between markdown and across paragraphs', () 
   const html =
     '<p><strong>hey</strong> <a href="https://matrix.to/#/@one:example.org">@_one</a></p>' +
     '<p><a href="https://matrix.to/#/!room:example.org?via=example.org">#Room</a> ' +
-    '<img data-mx-emoticon="" src="mxc://other.org/wave" alt=":wave:" title=":wave:" height="32"></p>';
+    '<img data-mx-emoticon="" src="mxc://other.org/wave" alt="wave" title="wave" height="32"></p>';
   const edited = plainEditDoc('**hey** @_one\n\n#Room :wave:', html);
 
   expect(plainTextOf(edited)).toBe('**hey** @_one\n\n#Room :wave:');
@@ -289,6 +331,23 @@ describe('source mode keeps markdown typed as text', () => {
     ['lines shaped like a table', [para([text('| a |'), hard_break.create(), text('| - |')])]],
     ['a heading that ends in a hash', [heading.create({ level: 2 }, text('a #'))]],
     ['a fence inside a code block', [code_block.create({ language: '' }, text('a\n```\nb'))]],
+    [
+      'a quote marker inside a list code block',
+      [bullet_list.create(null, list_item.create(null, code_block.create(null, text('>'))))],
+    ],
+    [
+      'a blank quote line between list blocks',
+      [
+        blockquote.create(
+          null,
+          bullet_list.create(null, [
+            list_item.create(null, [cells([text('&amp;')], [text('=')]), horizontal_rule.create()]),
+            list_item.create(null, code_block.create(null, text('-'))),
+          ])
+        ),
+        horizontal_rule.create(),
+      ],
+    ],
     ['an entity', [para(text('&amp; &#65;'))]],
     ['spoiler bars', [para(text('||s||'))]],
     ['an autolink', [para(text('<ab:c>'))]],
@@ -364,6 +423,61 @@ test('a quote survives both ways', () => {
   expect(message.formatted).toBe('<blockquote><p>quoted</p></blockquote>');
 });
 
+test.each(['>_<', '>word', '>', '* >_<', '> >_<'])(
+  'an unspaced quote marker stays text in %s',
+  (source) => {
+    expect(richFromPlain(textDoc(source)).textContent).toBe(source.replace(/^(?:\* |>[ \t])/, ''));
+  }
+);
+
+test('a line break ending a quote is not sent', () => {
+  const message = serializeComposer(
+    docOf(
+      blockquote.create(
+        null,
+        para([composerSchema.text('quoted'), composerSchema.nodes.hard_break.create()])
+      )
+    )
+  );
+
+  expect(message.body).toBe('> quoted');
+  expect(message.formatted).toBe('<blockquote><p>quoted</p></blockquote>');
+});
+
+test('runs of spaces survive html whitespace collapsing', () => {
+  const message = serializeComposer(
+    docOf(para([composerSchema.text('a    '), composerSchema.text('b', [strong.create()])]))
+  );
+
+  expect(message.formatted).toBe('a&nbsp;&nbsp;&nbsp; <strong>b</strong>');
+});
+
+test('a newline character in a paragraph is sent as a line break', () => {
+  const message = serializeComposer(
+    docOf(para([composerSchema.text('one\ntwo '), composerSchema.text('x', [strong.create()])]))
+  );
+
+  expect(message.formatted).toBe('one<br>two <strong>x</strong>');
+});
+
+test('blank blocks and edge breaks are not sent', () => {
+  const { code_block, hard_break } = composerSchema.nodes;
+  const message = serializeComposer(
+    docOf(
+      blockquote.create(null, code_block.create()),
+      para([hard_break.create(), composerSchema.text(' text ', [strong.create()])])
+    )
+  );
+
+  expect(message.formatted).toBe('<strong>text</strong>');
+});
+
+test('a fence info string that is not a language is dropped', () => {
+  const message = serializeComposer(doc.create(null, markdownSlice('```>\ncode\n```').content));
+
+  expect(message.formatted).toBe('<pre><code>code</code></pre>');
+});
+
 test('a link keeps its target', () => {
   const message = serializeComposer(
     docOf(para(composerSchema.text('docs', [link.create({ href: 'https://example.org' })])))
@@ -408,7 +522,7 @@ test('an emote keeps its shortcode in the body and an image in the formatted bod
 
   expect(message.body).toBe(':wave:');
   expect(message.formatted).toBe(
-    '<img data-mx-emoticon="" src="mxc://example.org/wave" alt=":wave:" title=":wave:" height="32">'
+    '<img data-mx-emoticon="" src="mxc://example.org/wave" alt="wave" title="wave" height="32">'
   );
 });
 
@@ -591,7 +705,7 @@ describe('plain text mode', () => {
 
     expect(message.body).toBe('hey :wave:');
     expect(message.formatted).toBe(
-      'hey <img data-mx-emoticon="" src="mxc://example.org/wave" alt=":wave:" title=":wave:" height="32">'
+      'hey <img data-mx-emoticon="" src="mxc://example.org/wave" alt="wave" title="wave" height="32">'
     );
   });
 

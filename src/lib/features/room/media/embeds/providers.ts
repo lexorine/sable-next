@@ -7,10 +7,12 @@ import type { BooleanPreference } from '#lib/settings/registry.js';
 
 import { parseInstagramLink } from './instagram';
 import InstagramEmbed from './InstagramEmbed.svelte';
-import { parseTiktokLink } from './tiktok';
+import { isTiktokShortLink, parseTiktokLink } from './tiktok';
 import TiktokEmbed from './TiktokEmbed.svelte';
 import { parseYoutubeLink } from './youtube';
 import YoutubeEmbed from './YoutubeEmbed.svelte';
+import { parseBlueskyLink } from './bluesky';
+import BlueskyEmbed from './BlueskyEmbed.svelte';
 
 export interface EmbedProps {
   url: string;
@@ -34,13 +36,18 @@ const PROVIDERS: EmbedProvider[] = [
   },
   {
     preference: 'tiktokEmbeds',
-    matches: (url) => parseTiktokLink(url) !== null,
+    matches: (url) => parseTiktokLink(url) !== null || isTiktokShortLink(url),
     component: TiktokEmbed,
   },
   {
     preference: 'instagramEmbeds',
     matches: (url) => parseInstagramLink(url) !== null,
     component: InstagramEmbed,
+  },
+  {
+    preference: 'blueskyEmbeds',
+    matches: (url) => parseBlueskyLink(url) !== null,
+    component: BlueskyEmbed,
   },
 ];
 

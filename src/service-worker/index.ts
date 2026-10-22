@@ -8,6 +8,7 @@ import { resolve } from '$app/paths';
 
 import favicon from '#lib/assets/favicon.png';
 import {
+  alertCooling,
   appendLine,
   hideLines,
   readLines,
@@ -15,13 +16,13 @@ import {
 } from '#lib/features/notifications/conversation.js';
 import { notificationPermalink } from '#lib/features/notifications/notification-link.js';
 import {
-  alert,
   parsePushPayload,
-  type PushPayload,
+  pushAlert,
+  type PushNotification,
   silencedByRoomMode,
-  unreadCount,
+  type WebPushValidation,
   webPushValidation,
-} from '#lib/features/notifications/push-payload.js';
+} from '#lib/notifications/push-payload.js';
 import {
   completePushPayload,
   namesOnlyItsEvent,
@@ -31,53 +32,65 @@ import {
   isDiagnosticPush,
   pushTrace,
   type PushHistoryEntry,
-} from '#lib/features/notifications/push-history.js';
+} from '#lib/notifications/push-history.js';
 import {
   pushContentPolicy,
   pushSession,
   recordPush,
   roomMode,
   roomName,
-} from '#lib/features/notifications/room-names.js';
+} from '#lib/notifications/room-names.js';
+import { loadModel, roomTag } from '#lib/model/model.js';
 import type { PushFetchView } from '#src/generated/protocol';
 import { reportWorkerError, watchWorkerOperation } from './telemetry.js';
 
 const worker = globalThis.self as unknown as ServiceWorkerGlobalScope;
 
 worker.addEventListener('error', (event) => {
-  void reportWorkerError('error', event.error ?? new Error(event.message)).catch(() => undefined);
+  void reportWorkerError('error', event.error ?? new Error(event.message)).catch(
+    (error: unknown) => {
+      console.debug('[sable service-worker] error not reported', error);
+    }
+  );
 });
 worker.addEventListener('unhandledrejection', (event) => {
-  void reportWorkerError('unhandledrejection', event.reason).catch(() => undefined);
+  void reportWorkerError('unhandledrejection', event.reason).catch((error: unknown) => {
+    console.debug('[sable service-worker] rejection not reported', error);
+  });
 });
 
 worker.addEventListener('push', (event) => {
   const raw = event.data?.text();
+  event.waitUntil(
+    watchWorkerOperation(
+      'push',
+      loadModel().then(() => receive(raw))
+    )
+  );
+});
 
+async function receive(raw: string | undefined): Promise<void> {
   const validation = webPushValidation(raw);
   if (validation) {
-    event.waitUntil(
-      watchWorkerOperation(
-        'push-validation',
-        Promise.all([
-          record('WEBPUSH_VALIDATION'),
-          worker.clients.matchAll({ type: 'window', includeUncontrolled: true }),
-        ]).then(([, clients]) => {
-          for (const client of clients) {
-            client.postMessage({
-              type: 'sable:webpush-ack',
-              appId: validation.appId,
-              ackToken: validation.ackToken,
-            });
-          }
-        })
-      )
-    );
+    await watchWorkerOperation('push-validation', acknowledge(validation));
     return;
   }
+  await present(parsePushPayload(raw) ?? undefined);
+}
 
-  event.waitUntil(watchWorkerOperation('push', present(parsePushPayload(raw) ?? undefined)));
-});
+async function acknowledge(validation: WebPushValidation): Promise<void> {
+  const [, clients] = await Promise.all([
+    record('WEBPUSH_VALIDATION'),
+    worker.clients.matchAll({ type: 'window', includeUncontrolled: true }),
+  ]);
+  for (const client of clients) {
+    client.postMessage({
+      type: 'sable:webpush-ack',
+      appId: validation.app_id,
+      ackToken: validation.ack_token,
+    });
+  }
+}
 
 worker.addEventListener('message', (event) => {
   const message = event.data as { type?: unknown } | undefined;
@@ -93,7 +106,7 @@ interface StashedShare {
   files: File[];
 }
 
-const shareAction = `${resolve('/').replace(/\/$/, '')}/share`;
+const shareAction = `${resolve('/(app)').replace(/\/$/, '')}/share`;
 const shares = new Map<string, StashedShare>();
 
 worker.addEventListener('fetch', (event) => {
@@ -116,7 +129,7 @@ async function stashShare(event: FetchEvent): Promise<Response> {
   shares.set(id, { text, files });
   event.waitUntil(watchWorkerOperation('share-hold', holdShare(id)));
 
-  return Response.redirect(resolve('/'), 303);
+  return Response.redirect(resolve('/(app)'), 303);
 }
 
 async function holdShare(id: string): Promise<void> {
@@ -146,7 +159,7 @@ function record(outcome: string, trace: Omit<PushHistoryEntry, 'at' | 'outcome'>
   return recordPush({ at: Date.now(), outcome, ...trace });
 }
 
-async function present(pushed: PushPayload | undefined): Promise<void> {
+async function present(pushed: PushNotification | undefined): Promise<void> {
   if (!pushed) {
     await record('INVALID_PAYLOAD');
     return;
@@ -157,9 +170,15 @@ async function present(pushed: PushPayload | undefined): Promise<void> {
     return;
   }
 
-  const count = unreadCount(pushed);
-  if (count !== null && 'setAppBadge' in navigator) {
-    await navigator.setAppBadge(count).catch(() => undefined);
+  if (pushed.unread !== null && 'setAppBadge' in navigator) {
+    await navigator.setAppBadge(pushed.unread).catch((error: unknown) => {
+      console.debug('[sable service-worker] app badge not set', error);
+    });
+  }
+  if (pushed.unread === 0 && (await pushContentPolicy()).clearOnRead) {
+    await closeRead(pushed);
+    await record('READ_DISMISSED', trace);
+    return;
   }
 
   if (await focused()) {
@@ -172,24 +191,26 @@ async function present(pushed: PushPayload | undefined): Promise<void> {
     await record('DISCARDED', trace);
     return;
   }
-  if (fetched) await record(payload.notification?.type ? 'FETCHED' : 'FETCH_FAILED', trace);
-  if (silencedByRoomMode(payload, await roomMode(payload.notification?.room_id ?? ''))) {
+  if (fetched) await record(payload.type ? 'FETCHED' : 'FETCH_FAILED', trace);
+  if (silencedByRoomMode(payload, await roomMode(payload.room_id ?? ''))) {
     await record('ROOM_MODE_SILENCED', trace);
     return;
   }
 
   const policy = await pushContentPolicy();
-  const encrypted =
-    payload.notification?.type === 'm.room.encrypted' || payload.notification?.decrypted === true;
+  const encrypted = payload.type === 'm.room.encrypted' || payload.decrypted;
   const showContent = policy.content && (!encrypted || policy.encryptedContent);
-  const showing = alert(payload, await roomName(payload.notification?.room_id ?? ''), showContent);
+  const showing = pushAlert(payload, await roomName(payload.room_id ?? ''), showContent);
   if (!showing) {
     await record('BADGE_ONLY', trace);
     return;
   }
 
-  const held = await conversation(showing.tag);
+  const { lines: held, alertedAt } = await conversation(showing.tag);
   const lines = appendLine(showContent ? held : hideLines(held), showing.line);
+  const now = Date.now();
+  const renotify =
+    !policy.notifyOnce || held.length === 0 || payload.noisy || !alertCooling(alertedAt, now);
 
   const options: NotificationOptions & {
     renotify?: boolean;
@@ -198,15 +219,17 @@ async function present(pushed: PushPayload | undefined): Promise<void> {
   } = {
     body: lines.length > 1 ? summarise(lines) : showing.body,
     tag: showing.tag,
-    renotify: !policy.notifyOnce || held.length === 0,
-    icon: payload.notification?.icon ?? favicon,
+    renotify,
+    icon: payload.icon ?? favicon,
     badge: favicon,
-    timestamp: Date.now(),
+    timestamp: now,
     data: {
-      roomId: showing.roomId,
-      userId: payload.notification?.user_id,
-      eventId: showing.eventId,
+      roomId: showing.room_id,
+      userId: payload.user_id ?? undefined,
+      eventId: showing.event_id,
+      invite: showing.invite,
       lines,
+      alertedAt: renotify ? now : alertedAt,
     },
   };
   if (showing.ring) {
@@ -216,16 +239,22 @@ async function present(pushed: PushPayload | undefined): Promise<void> {
     ];
     options.requireInteraction = true;
   }
+  if (showing.invite) {
+    options.actions = [
+      { action: 'accept', title: 'Accept' },
+      { action: 'decline', title: 'Decline' },
+    ];
+  }
 
   await worker.registration.showNotification(showing.title, options);
   await record('POSTED', trace);
 }
 
-async function fetchEvent(payload: PushPayload): Promise<PushPayload | null> {
-  const session = await pushSession(payload.notification?.user_id);
+async function fetchEvent(payload: PushNotification): Promise<PushNotification | null> {
+  const session = await pushSession(payload.user_id ?? undefined);
   if (!session) return payload;
   return completePushPayload(
-    { notification: { ...payload.notification, user_id: session.userId } },
+    { ...payload, user_id: session.userId },
     {
       session,
       fetch: (input, init) => fetch(input, init),
@@ -260,22 +289,36 @@ async function decryptInTab(
   return null;
 }
 
+async function closeRead(pushed: PushNotification): Promise<void> {
+  if (!('getNotifications' in worker.registration)) return;
+  const tag = pushed.room_id ? roomTag(pushed.user_id, pushed.room_id) : undefined;
+  for (const notification of await worker.registration.getNotifications(tag ? { tag } : {})) {
+    notification.close();
+  }
+}
+
 async function focused(): Promise<boolean> {
   const clients = await worker.clients.matchAll({ type: 'window', includeUncontrolled: true });
   return clients.some((client) => client.focused);
 }
 
-async function conversation(tag: string): Promise<ReturnType<typeof readLines>> {
-  if (!('getNotifications' in worker.registration)) return [];
+async function conversation(
+  tag: string
+): Promise<{ lines: ReturnType<typeof readLines>; alertedAt: number | undefined }> {
+  if (!('getNotifications' in worker.registration)) return { lines: [], alertedAt: undefined };
   const open = await worker.registration.getNotifications({ tag });
-  const previous = open.at(-1)?.data as { lines?: unknown } | undefined;
-  return readLines(previous?.lines);
+  const previous = open.at(-1)?.data as { lines?: unknown; alertedAt?: unknown } | undefined;
+  const alertedAt = previous?.alertedAt;
+  return {
+    lines: readLines(previous?.lines),
+    alertedAt: typeof alertedAt === 'number' ? alertedAt : undefined,
+  };
 }
 
 worker.addEventListener('notificationclick', (event) => {
   event.notification.close();
   const data = event.notification.data as
-    | { roomId?: string; userId?: string; eventId?: string | null }
+    | { roomId?: string; userId?: string; eventId?: string | null; invite?: boolean }
     | undefined;
   if (event.action === 'answer' || event.action === 'decline') {
     event.waitUntil(
@@ -284,6 +327,16 @@ worker.addEventListener('notificationclick', (event) => {
         callAction(event.action, data?.roomId, data?.userId, data?.eventId ?? null)
       )
     );
+    return;
+  }
+  if (event.action === 'accept' || event.action === 'decline') {
+    event.waitUntil(
+      watchWorkerOperation('invite-action', inviteAction(event.action, data?.roomId, data?.userId))
+    );
+    return;
+  }
+  if (data?.invite === true) {
+    event.waitUntil(watchWorkerOperation('notificationclick', openInvites(data.userId)));
     return;
   }
   event.waitUntil(
@@ -313,6 +366,33 @@ async function callAction(
   }
 }
 
+async function inviteAction(
+  outcome: 'accept' | 'decline',
+  roomId: string | undefined,
+  userId: string | undefined
+): Promise<void> {
+  if (roomId === undefined || userId === undefined) return;
+  const clients = await worker.clients.matchAll({ type: 'window', includeUncontrolled: true });
+  const client = clients.at(0);
+  if (client) {
+    client.postMessage({ type: 'sable:invite-action', outcome, roomId, userId });
+    if (outcome === 'accept') await client.focus();
+    return;
+  }
+  await worker.clients.openWindow(resolve('/(app)/inbox'));
+}
+
+async function openInvites(userId: string | undefined): Promise<void> {
+  const clients = await worker.clients.matchAll({ type: 'window', includeUncontrolled: true });
+  const client = clients.at(0);
+  if (client) {
+    client.postMessage({ type: 'sable:open-invites', userId });
+    await client.focus();
+    return;
+  }
+  await worker.clients.openWindow(resolve('/(app)/inbox'));
+}
+
 async function open(
   roomId: string | undefined,
   userId: string | undefined,
@@ -331,7 +411,7 @@ async function open(
   }
 
   await worker.clients.openWindow(
-    roomId === undefined ? resolve('/') : notificationPermalink(roomId, eventId, userId)
+    roomId === undefined ? resolve('/(app)') : notificationPermalink(roomId, eventId, userId)
   );
 }
 

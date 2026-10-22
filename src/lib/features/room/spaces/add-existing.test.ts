@@ -1,26 +1,29 @@
 import { expect, test } from 'vitest';
 
-import type { RoomSummary } from '#src/generated/protocol';
+import type { RoomListItemView } from '#src/generated/protocol';
 
 import { addableChildren } from './add-existing';
 
-function room(roomId: string, name: string, extra: Partial<RoomSummary> = {}): RoomSummary {
+function room(
+  roomId: string,
+  name: string,
+  extra: Partial<RoomListItemView> = {}
+): RoomListItemView {
   return {
     room_id: roomId,
     name,
     canonical_alias: null,
     state: 'joined',
-    is_space: false,
     is_direct: false,
     is_tombstoned: false,
     space_children: [],
     ...extra,
-  } as unknown as RoomSummary;
+  } as unknown as RoomListItemView;
 }
 
 const space = room('!space:example.org', 'Space', {
-  is_space: true,
-  space_children: [{ room_id: '!listed:example.org' }] as RoomSummary['space_children'],
+  room_kind: 'space',
+  space_children: [{ room_id: '!listed:example.org' }] as RoomListItemView['space_children'],
 });
 
 test('offers joined rooms that are not already children, sorted by name', () => {
@@ -32,7 +35,7 @@ test('offers joined rooms that are not already children, sorted by name', () => 
     room('!dm:example.org', 'Friend', { is_direct: true }),
     room('!invite:example.org', 'Invite', { state: 'invited' }),
     room('!old:example.org', 'Old', { is_tombstoned: true }),
-    room('!sub:example.org', 'Sub', { is_space: true }),
+    room('!sub:example.org', 'Sub', { room_kind: 'space' }),
   ];
   expect(addableChildren(rooms, space, 'rooms', '').map((entry) => entry.name)).toEqual([
     'Alpha',
@@ -43,8 +46,8 @@ test('offers joined rooms that are not already children, sorted by name', () => 
 
 test('filters by name and never offers a space that already contains this one', () => {
   const parent = room('!parent:example.org', 'Parent', {
-    is_space: true,
-    space_children: [{ room_id: space.room_id }] as RoomSummary['space_children'],
+    room_kind: 'space',
+    space_children: [{ room_id: space.room_id }] as RoomListItemView['space_children'],
   });
   const rooms = [
     space,

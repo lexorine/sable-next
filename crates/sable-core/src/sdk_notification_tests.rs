@@ -233,6 +233,80 @@ async fn a_replayed_message_alerts_once() {
 }
 
 #[tokio::test]
+async fn a_message_delivered_late_by_a_resumed_sync_does_not_alert() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room_id = room_id!("!late:example.org");
+    server.mock_room_state_encryption().plain().mount().await;
+    let factory = EventFactory::new().room(room_id).sender(*ALICE);
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_state_event(factory.member(client.user_id().unwrap()))
+                .add_state_event(factory.default_power_levels()),
+        )
+        .await;
+    let (core, mut events) = watching(&server, &client).await;
+    let rules = matrix_sdk::ruma::push::Ruleset::server_default(client.user_id().unwrap());
+    let long_ago = MilliSecondsSinceUnixEpoch::from_system_time(
+        std::time::SystemTime::now() - Duration::from_secs(600),
+    )
+    .unwrap();
+    let message = |event_id: &str, sent: MilliSecondsSinceUnixEpoch| {
+        json!({
+            "type": "m.room.message", "event_id": event_id, "room_id": room_id,
+            "sender": *ALICE, "origin_server_ts": sent,
+            "content": { "msgtype": "m.text", "body": event_id }
+        })
+    };
+    for (event_id, sent) in [
+        ("$late", long_ago),
+        ("$live", MilliSecondsSinceUnixEpoch::now()),
+    ] {
+        let event = message(event_id, sent);
+        Mock::given(method("GET"))
+            .and(path_regex(format!(
+                r"/context/.*{}$",
+                event_id.trim_start_matches('$')
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "event": event, "events_before": [], "events_after": [],
+                "state": [], "start": "s", "end": "e"
+            })))
+            .mount(server.server())
+            .await;
+        server
+            .mock_sync()
+            .ok_and_run(&client, |builder| {
+                builder.add_global_account_data(factory.push_rules(rules.clone()));
+                builder.add_joined_room(
+                    JoinedRoomBuilder::new(room_id)
+                        .set_unread_notifications_count(
+                            json!({"notification_count": 1, "highlight_count": 0}),
+                        )
+                        .add_timeline_event(
+                            matrix_sdk::ruma::serde::Raw::new(&event)
+                                .unwrap()
+                                .cast_unchecked::<matrix_sdk::ruma::events::AnySyncTimelineEvent>(),
+                        ),
+                );
+            })
+            .await;
+    }
+
+    assert_eq!(
+        next_notification(&mut events)
+            .await
+            .event_id
+            .map(|event_id| event_id.to_string()),
+        Some("$live".to_owned()),
+        "a message from before the gap is a catch-up, not an arrival"
+    );
+    core.session_tasks.lock().unwrap().clear();
+}
+
+#[tokio::test]
 #[expect(
     clippy::too_many_lines,
     reason = "one sequential flow kept in a single function"
@@ -246,7 +320,6 @@ async fn bridge_status_events_do_not_notify() {
 
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
-    client.event_cache().subscribe().unwrap();
     let room_id = room_id!("!signal:example.org");
     let bot = user_id!("@signalbot:example.org");
     let factory = EventFactory::new().room(room_id).sender(bot);
@@ -295,6 +368,11 @@ async fn bridge_status_events_do_not_notify() {
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .expect(1)
+        .mount(server.server())
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"/pushrules/global/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .mount(server.server())
         .await;
     core.align_notification_rules().await;
@@ -581,15 +659,10 @@ async fn an_encrypted_room_defaults_to_the_rule_its_decrypted_messages_hit() {
         .await;
     let direct = notifications::uses_direct_push_rules(&room);
     let result = crate::push_rules::room_settings(&rules, room_id, direct);
-    let modes = crate::push_rules::room_modes(&rules, [(room_id.to_owned(), direct)]);
 
     assert!(result.room.is_none());
     assert_eq!(
         serde_json::to_value(result.default).unwrap(),
-        json!("mentions")
-    );
-    assert_eq!(
-        serde_json::to_value(modes[0].default).unwrap(),
         json!("mentions")
     );
 }
@@ -677,7 +750,7 @@ async fn a_missing_rule_on_delete_is_not_a_failure() {
 }
 
 #[tokio::test]
-async fn a_bridge_bot_still_counts_for_one_to_one_push_rules() {
+async fn a_bridged_dm_uses_the_direct_defaults() {
     use std::collections::BTreeSet;
 
     let server = MatrixMockServer::new().await;
@@ -692,7 +765,7 @@ async fn a_bridge_bot_still_counts_for_one_to_one_push_rules() {
         .mock_get_members()
         .ok(members
             .iter()
-            .map(|member| factory.member(member).into_raw())
+            .map(|member| factory.member(*member).into_raw())
             .collect())
         .mount()
         .await;
@@ -701,7 +774,7 @@ async fn a_bridge_bot_still_counts_for_one_to_one_push_rules() {
         .ok_and_run(&client, |builder| {
             builder.add_joined_room(
                 JoinedRoomBuilder::new(room_id)
-                    .add_state_bulk(members.iter().map(|member| factory.member(member).into()))
+                    .add_state_bulk(members.iter().map(|member| factory.member(*member).into()))
                     .add_state_event(
                         factory
                             .member_hints(BTreeSet::from([bot.to_owned()]))
@@ -709,6 +782,23 @@ async fn a_bridge_bot_still_counts_for_one_to_one_push_rules() {
                     )
                     .set_joined_members_count(3),
             );
+            builder.add_global_account_data(factory.direct().add_user(ghost.to_owned(), room_id));
+        })
+        .await;
+    let room = client.get_room(room_id).unwrap();
+
+    assert!(notifications::uses_direct_push_rules(&room));
+}
+
+#[tokio::test]
+async fn a_two_member_room_not_marked_direct_uses_the_group_defaults() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room_id = room_id!("!pair:example.org");
+    server
+        .mock_sync()
+        .ok_and_run(&client, |builder| {
+            builder.add_joined_room(JoinedRoomBuilder::new(room_id).set_joined_members_count(2));
         })
         .await;
     let room = client.get_room(room_id).unwrap();
@@ -717,10 +807,96 @@ async fn a_bridge_bot_still_counts_for_one_to_one_push_rules() {
 }
 
 #[tokio::test]
+async fn rooms_whose_flag_disagrees_with_their_member_count_get_their_own_rules() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let flagged = room_id!("!flagged:example.org");
+    let pair = room_id!("!pair:example.org");
+    let factory = EventFactory::new().room(flagged);
+    let rules = matrix_sdk::ruma::push::Ruleset::server_default(client.user_id().unwrap());
+    for verb in ["PUT", "DELETE"] {
+        Mock::given(method(verb))
+            .and(path_regex(r"/_matrix/client/v3/pushrules/global/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(server.server())
+            .await;
+    }
+    server
+        .mock_sync()
+        .ok_and_run(&client, |builder| {
+            builder.add_global_account_data(factory.push_rules(rules));
+            builder.add_global_account_data(factory.direct().add_user(ALICE.to_owned(), flagged));
+            builder.add_joined_room(JoinedRoomBuilder::new(flagged).set_joined_members_count(3));
+            builder.add_joined_room(JoinedRoomBuilder::new(pair).set_joined_members_count(2));
+        })
+        .await;
+    let (core, _events) = watching(&server, &client).await;
+    let shaped = |mut ids: Vec<String>| {
+        ids.retain(|id| id.starts_with("moe.sable.shape.message."));
+        ids.sort();
+        ids
+    };
+    let rule_ids = || async {
+        core.push_rules()
+            .await
+            .unwrap()
+            .snapshot()
+            .await
+            .underride
+            .iter()
+            .map(|rule| rule.rule_id.clone())
+            .collect::<Vec<_>>()
+    };
+
+    core.align_notification_rules().await;
+    assert_eq!(
+        shaped(rule_ids().await),
+        [
+            format!("moe.sable.shape.message.{flagged}"),
+            format!("moe.sable.shape.message.{pair}"),
+        ]
+    );
+
+    server
+        .mock_sync()
+        .ok_and_run(&client, |builder| {
+            builder.add_global_account_data(factory.direct());
+        })
+        .await;
+    core.align_notification_rules().await;
+    assert_eq!(
+        shaped(rule_ids().await),
+        [format!("moe.sable.shape.message.{pair}")]
+    );
+}
+
+#[tokio::test]
+async fn a_pending_invite_does_not_make_a_room_one_to_one() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room_id = room_id!("!invite:example.org");
+    server
+        .mock_sync()
+        .ok_and_run(&client, |builder| {
+            builder.add_joined_room(JoinedRoomBuilder::new(room_id).set_room_summary(
+                serde_json::json!({ "m.joined_member_count": 1, "m.invited_member_count": 1 }),
+            ));
+        })
+        .await;
+    let room = client.get_room(room_id).unwrap();
+
+    assert_eq!(room.active_members_count(), 2);
+    assert!(!notifications::uses_direct_push_rules(&room));
+}
+
+#[tokio::test]
 async fn resetting_a_bridged_dm_to_default_does_not_create_a_room_push_rule() {
     use std::collections::BTreeSet;
 
-    use crate::protocol::{Command, CommandOk, NotificationModeView};
+    use crate::api::notifications::{
+        SetDefaultModeParams, SetRoomNotificationModeParams, SettingsParams,
+    };
+    use crate::protocol::NotificationModeView;
     use matrix_sdk::ruma::push::{PredefinedUnderrideRuleId, RuleKind, Ruleset};
 
     let server = MatrixMockServer::new().await;
@@ -745,7 +921,7 @@ async fn resetting_a_bridged_dm_to_default_does_not_create_a_room_push_rule() {
             builder.add_global_account_data(factory.push_rules(rules.clone()));
             builder.add_joined_room(
                 JoinedRoomBuilder::new(room_id)
-                    .add_state_bulk(members.iter().map(|member| factory.member(member).into()))
+                    .add_state_bulk(members.iter().map(|member| factory.member(*member).into()))
                     .add_state_event(factory.member_hints(BTreeSet::from([bot.to_owned()])))
                     .set_joined_members_count(3),
             );
@@ -759,7 +935,7 @@ async fn resetting_a_bridged_dm_to_default_does_not_create_a_room_push_rule() {
             .await;
     }
     let (core, _events) = watching(&server, &client).await;
-    core.dispatch(Command::SetRoomNotificationMode {
+    core.run(SetRoomNotificationModeParams {
         room_id: room_id.to_owned(),
         mode: None,
     })
@@ -774,52 +950,34 @@ async fn resetting_a_bridged_dm_to_default_does_not_create_a_room_push_rule() {
         }),
         "resetting to default must not install a room override"
     );
-    let CommandOk::NotificationSettings(settings) = core
-        .dispatch(Command::NotificationSettings {
+    let settings = core
+        .run(SettingsParams {
             room_id: room_id.to_owned(),
         })
         .await
-        .unwrap()
-    else {
-        panic!("notification settings");
-    };
+        .unwrap();
     assert!(settings.room.is_none());
     assert_eq!(settings.default, NotificationModeView::Mentions);
 
-    let CommandOk::RoomNotificationModes { modes } = core
-        .dispatch(Command::RoomNotificationModes {
-            room_ids: vec![room_id.to_owned()],
-        })
-        .await
-        .unwrap()
-    else {
-        panic!("room notification modes");
-    };
-    assert!(modes[0].room.is_none());
-    assert_eq!(modes[0].default, NotificationModeView::Mentions);
-
-    core.dispatch(Command::SetRoomNotificationMode {
+    core.run(SetRoomNotificationModeParams {
         room_id: room_id.to_owned(),
         mode: Some(NotificationModeView::All),
     })
     .await
     .unwrap();
     for direct in [true, false] {
-        core.dispatch(Command::SetDefaultNotificationMode {
+        core.run(SetDefaultModeParams {
             direct,
             mode: NotificationModeView::Mentions,
         })
         .await
         .unwrap();
-        let CommandOk::NotificationSettings(settings) = core
-            .dispatch(Command::NotificationSettings {
+        let settings = core
+            .run(SettingsParams {
                 room_id: room_id.to_owned(),
             })
             .await
-            .unwrap()
-        else {
-            panic!("notification settings");
-        };
+            .unwrap();
         assert_eq!(settings.room, Some(NotificationModeView::All));
     }
     core.session_tasks.lock().unwrap().clear();

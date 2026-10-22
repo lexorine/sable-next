@@ -7,11 +7,12 @@ import { afterEach, expect, test, vi } from 'vitest';
 vi.mock('#lib/core/context.js');
 
 import { core } from '#lib/core/__mocks__/context.js';
+import { flushed } from '#lib/ui/flushed.js';
+
+const cancelVerification = vi.fn(() => Promise.resolve());
 
 Object.assign(core, {
-  acceptVerification: vi.fn(() => Promise.resolve()),
-  cancelVerification: vi.fn(() => Promise.resolve()),
-  confirmVerification: vi.fn(() => Promise.resolve()),
+  requestVerification: vi.fn(() => Promise.resolve('retried')),
   session: { user_id: '@alice:example.org' },
   verification: {
     userId: '@alice:example.org',
@@ -26,11 +27,17 @@ Object.assign(core, {
     },
   },
 });
+Object.assign(core.rpc.encryption, {
+  acceptVerification: vi.fn(() => Promise.resolve()),
+  cancelVerification,
+  confirmVerification: vi.fn(() => Promise.resolve()),
+});
 
 import DeviceVerificationDialog from './DeviceVerificationDialog.svelte';
 
 afterEach(() => {
   vi.clearAllMocks();
+  vi.useRealTimers();
 });
 
 test('renders every SAS emoji slot when a symbol repeats', () => {
@@ -54,11 +61,67 @@ test('dismissing an active flow cancels it and clears it so a new request can re
   await user.keyboard('{Escape}');
 
   await vi.waitFor(() => {
-    expect(core.commands.cancelVerification).toHaveBeenCalledWith(
-      '@alice:example.org',
-      'flow',
-      false
-    );
+    expect(cancelVerification).toHaveBeenCalledWith({
+      user_id: '@alice:example.org',
+      flow_id: 'flow',
+      mismatch: false,
+    });
     expect(core.verification).toBeNull();
+  });
+});
+
+test('a request nobody answers can be cancelled and sent again', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  core.verification = {
+    userId: '@alice:example.org',
+    flowId: 'flow',
+    state: { phase: 'requested' as const, is_self: true, initiated_by_us: true },
+  };
+  render(DeviceVerificationDialog);
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  await screen.findByRole('dialog');
+  expect(screen.queryByRole('button', { name: 'Send the request again' })).toBeNull();
+
+  await vi.advanceTimersByTimeAsync(30_000);
+  await user.click(await screen.findByRole('button', { name: 'Send the request again' }));
+
+  expect(cancelVerification).toHaveBeenCalledWith({
+    user_id: '@alice:example.org',
+    flow_id: 'flow',
+    mismatch: false,
+  });
+  await vi.waitFor(() => {
+    expect(core.requestVerification).toHaveBeenCalledWith('@alice:example.org');
+  });
+});
+
+test('an error stays with its flow and clears when another flow takes over', async () => {
+  const compare = {
+    phase: 'compare' as const,
+    emojis: [{ symbol: '🐶', description: 'Dog' }],
+    decimals: [1, 2, 3] as [number, number, number],
+  };
+  const active = $state<{ current: unknown }>({
+    current: { userId: '@alice:example.org', flowId: 'first', state: compare },
+  });
+  Object.defineProperty(core, 'verification', {
+    configurable: true,
+    get: () => active.current,
+    set: (next: unknown) => (active.current = next),
+  });
+  vi.mocked(core.rpc.encryption.confirmVerification).mockRejectedValueOnce(new Error('nope'));
+  render(DeviceVerificationDialog);
+
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole('button', { name: 'They match' }));
+  expect(await screen.findByRole('alert')).toBeInTheDocument();
+
+  active.current = { userId: '@alice:example.org', flowId: 'first', state: { ...compare } };
+  await flushed();
+  expect(screen.getByRole('alert')).toBeInTheDocument();
+
+  active.current = { userId: '@alice:example.org', flowId: 'second', state: { ...compare } };
+  await vi.waitFor(() => {
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 });

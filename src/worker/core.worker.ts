@@ -3,30 +3,56 @@
 import init, {
   SableCore,
   setLogCapture,
+  setLogFilter,
   setLogHandler,
   setPanicHandler,
 } from '#src/generated/wasm/sable_wasm.js';
 import { clearSession, loadSession, saveSession } from '#lib/platform/session-storage.js';
+import { installFirefoxFetchLimit } from './adaptive-fetch';
 import { createCoreWorkerBoundary } from './core-worker-boundary';
+import { claimStore } from './store-ownership';
+import { installUploadDeadline } from './upload-deadline';
 
 declare const self: SharedWorkerGlobalScope;
 
-const core = init().then(() => {
-  // Before the constructor, so a panic while opening the session store still
-  // carries its Rust message.
-  setPanicHandler(crash);
+const SHUTDOWN_LIMIT_MS = 5_000;
 
-  const instance = new SableCore(
-    'sable-next',
-    () => loadSession(),
-    (bytes: Uint8Array) => saveSession(bytes),
-    () => clearSession(),
-    new URLSearchParams(self.location.search).get('log'),
-    new URLSearchParams(self.location.search).get('event-cache') !== 'memory'
-  );
+installUploadDeadline(self);
+installFirefoxFetchLimit(self);
 
-  return instance;
-});
+let started: SableCore | null = null;
+
+async function stopCore(): Promise<void> {
+  if (!started) return;
+  await Promise.race([
+    started.shutdown(),
+    new Promise((resolve) => setTimeout(resolve, SHUTDOWN_LIMIT_MS)),
+  ]);
+}
+
+const core = claimStore(() => {
+  boundary.handleSuperseded();
+  void stopCore().finally(() => {
+    self.close();
+  });
+})
+  .then(() => init())
+  .then(() => {
+    // Before the constructor, so a panic while opening the session store still
+    // carries its Rust message.
+    setPanicHandler(crash);
+
+    const instance = new SableCore(
+      'sable-next',
+      () => loadSession(),
+      (bytes: Uint8Array) => saveSession(bytes),
+      () => clearSession(),
+      new URLSearchParams(self.location.search).get('event-cache') !== 'memory'
+    );
+    started = instance;
+
+    return instance;
+  });
 
 const boundary = createCoreWorkerBoundary(
   core,
@@ -37,13 +63,16 @@ const boundary = createCoreWorkerBoundary(
   },
   () => {
     self.close();
-  }
+  },
+  (filter) => {
+    void core.then(() => {
+      setLogFilter(filter);
+    });
+  },
+  stopCore
 );
 
-// A trap unwinds only the call that hit it, so the sync loop and the SDK's
-// timers keep re-entering a module whose allocator and borrows were left
-// mid-flight. Closing is what stops the derived failures that follow; the next
-// page connect builds a fresh worker.
+// A trap unwinds only its own call, so close the worker rather than keep re-entering a corrupted module; the next connect builds a fresh one.
 function crash(message: string, stack?: string): void {
   boundary.handlePanic(message, stack);
   setTimeout(() => {
@@ -51,8 +80,12 @@ function crash(message: string, stack?: string): void {
   }, 0);
 }
 
+core.catch((error: unknown) => {
+  crash(`core failed to start: ${String(error)}`, errorStack(error));
+});
+
 // A SharedWorker's runtime failures never reach the pages that opened it, so
-// they ride the same channel as a Rust panic. A failed `init()` lands here too.
+// they ride the same channel as a Rust panic.
 self.addEventListener('error', (event) => {
   crash(
     `worker error: ${event.message}`,
@@ -60,7 +93,14 @@ self.addEventListener('error', (event) => {
       (event.filename ? `    at ${event.filename}:${event.lineno}:${event.colno}` : undefined)
   );
 });
+self.addEventListener('online', () => {
+  boundary.handleOnline();
+});
 self.addEventListener('unhandledrejection', (event) => {
+  if (!(event.reason instanceof WebAssembly.RuntimeError)) {
+    boundary.handleLog(`ERROR unhandled rejection in worker: ${String(event.reason)}`);
+    return;
+  }
   crash(`unhandled rejection in worker: ${String(event.reason)}`, errorStack(event.reason));
 });
 

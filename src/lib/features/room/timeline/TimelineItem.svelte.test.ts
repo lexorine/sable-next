@@ -5,11 +5,17 @@ import { userEvent } from '@testing-library/user-event';
 import { tick } from 'svelte';
 import { afterEach, expect, test, vi } from 'vitest';
 
-import type { CoreEvent, TimelineItemView, UrlPreviewView } from '#src/generated/protocol';
+import type {
+  CoreEvent,
+  ProfileView,
+  TimelineItemView,
+  UrlPreviewView,
+} from '#src/generated/protocol';
 
 vi.mock('#lib/core/context.js');
 
 import { LONG_PRESS_MS } from '#lib/ui/long-press.svelte.js';
+import { guardTouchClicks } from '#lib/ui/trailing-click.js';
 import { core as baseCore } from '#lib/core/__mocks__/context.js';
 
 const core = Object.assign(baseCore, {
@@ -17,7 +23,9 @@ const core = Object.assign(baseCore, {
   setPinned: vi.fn(() => Promise.resolve<string[]>([])),
   bookmarks: vi.fn(() => Promise.resolve([])),
   setBookmark: vi.fn(() => Promise.resolve(false)),
-  urlPreview: vi.fn((url: string): Promise<UrlPreviewView> =>
+});
+Object.assign(core.rpc.messages, {
+  urlPreview: vi.fn(({ url }: { url: string }): Promise<UrlPreviewView> =>
     Promise.resolve({
       url,
       title: url,
@@ -60,11 +68,14 @@ vi.mock('#lib/rooms/presence.svelte.js', async () => {
 });
 
 import { preferences, setPreference } from '#lib/settings/preferences.svelte.js';
+import { RoomMemberLoader } from '#lib/rooms/room-members.svelte.js';
+import { RoomCosmetics } from '#lib/rooms/room-cosmetics.svelte.js';
 
 import TimelineItemHarness from './TimelineItemHarness.test.svelte';
 import { senderColor } from './timeline-format';
 import { FOUNDER_POWER_LEVEL, powerTag } from '../members/power-tags';
-import { parsePowerLevelTags, tagForLevel } from '../settings/power-level-tags';
+import { tagForLevel } from '../settings/power-level-tags';
+import { withRowFields } from '#lib/features/room/timeline/row-fixtures.js';
 
 const user = userEvent.setup({ delay: null });
 
@@ -97,7 +108,7 @@ afterEach(() => {
 });
 
 function item(emote: boolean): TimelineItemView {
-  return {
+  return withRowFields({
     id: 'item',
     event_id: '$item',
     transaction_id: null,
@@ -106,7 +117,15 @@ function item(emote: boolean): TimelineItemView {
     sender_name: 'Alice',
     sender_avatar: null,
     timestamp: 0,
-    content: { kind: 'message', body: 'waves', html: 'waves', emote, notice: false, edited: false },
+    content: {
+      kind: 'message',
+      body: 'waves',
+      html: 'waves',
+      emote,
+      notice: false,
+      edited: false,
+      jumbo: null,
+    },
     in_reply_to: null,
     thread_root: null,
     thread_summary: null,
@@ -120,11 +139,11 @@ function item(emote: boolean): TimelineItemView {
     mention: 'none',
     forwarded: null,
     forum_title: null,
-  };
+  });
 }
 
 function imageItem(body = 'photo.png'): TimelineItemView {
-  return {
+  return withRowFields({
     ...item(false),
     content: {
       kind: 'image',
@@ -141,7 +160,22 @@ function imageItem(body = 'photo.png'): TimelineItemView {
       spoiler: null,
       animated: null,
     },
-  };
+  });
+}
+
+function fileItem(caption: string | null = 'the code'): TimelineItemView {
+  return withRowFields({
+    ...item(false),
+    content: {
+      kind: 'file',
+      filename: 'main.rs',
+      caption,
+      html: null,
+      source: 'mxc://example.org/code',
+      mime: 'text/plain',
+      size: 128,
+    },
+  });
 }
 
 function replyItem(
@@ -158,6 +192,7 @@ function replyItem(
       sender_mentioned: isMentioned,
       sender_name: 'Bob',
       body,
+      fallback: null,
     },
   };
 }
@@ -277,7 +312,7 @@ test('renders placeholders through the standard message layout', async () => {
   expect(message?.getAttribute('aria-hidden')).toBe('true');
 });
 
-test("shows the sender's role icon after their name", async () => {
+test('shows the sender’s role icon after their name', async () => {
   render(TimelineItemHarness, {
     props: {
       core,
@@ -310,9 +345,9 @@ test('shows the role name on hover only when the setting is on', async () => {
 
 test('displays saved founder flair on a message', async () => {
   core.userProfile.mockResolvedValue({ name_color_light: null, name_color_dark: null });
-  const tags = parsePowerLevelTags({
-    [FOUNDER_POWER_LEVEL]: { name: 'Founder', color: '#c04040', icon: { key: '👑' } },
-  });
+  const tags = {
+    [FOUNDER_POWER_LEVEL]: { name: 'Founder', color: '#c04040', icon: '👑' },
+  };
   render(TimelineItemHarness, {
     props: {
       core,
@@ -386,11 +421,11 @@ test('badges a message with its own readers, and only in that placement', async 
 });
 
 test('a deleted message keeps its receipts on the tombstone line', async () => {
-  const deleted = {
+  const deleted = withRowFields({
     ...item(false),
-    content: { kind: 'redacted', reason: null } as const,
+    content: { kind: 'redacted', reason: null, redacted_by: null } as const,
     read_by: ['@bob:example.org'],
-  };
+  });
   render(TimelineItemHarness, {
     props: { core, item: { item: deleted, collapsed: true, currentUserId: '@alice:example.org' } },
   });
@@ -526,6 +561,7 @@ test('strips a per-message-profile fallback from a thread summary', async () => 
             num_replies: 2,
             latest_event_id: '$reply',
             latest_body: 'Josie: the latest reply',
+            latest_fallback: null,
           },
         },
         collapsed: false,
@@ -559,6 +595,7 @@ test('keeps a thread summary body without a fallback', async () => {
             num_replies: 2,
             latest_event_id: null,
             latest_body: 'we shipped it: finally',
+            latest_fallback: null,
           },
         },
         collapsed: false,
@@ -569,6 +606,31 @@ test('keeps a thread summary body without a fallback', async () => {
   await tick();
 
   expect(document.querySelector('.thread-latest')?.textContent).toBe('we shipped it: finally');
+});
+
+test('names a verification request as the latest thread reply', async () => {
+  render(TimelineItemHarness, {
+    props: {
+      core,
+      item: {
+        item: {
+          ...item(false),
+          thread_root: '$root',
+          thread_summary: {
+            num_replies: 1,
+            latest_event_id: '$reply',
+            latest_body: null,
+            latest_fallback: { kind: 'verification_request' },
+          },
+        },
+        collapsed: false,
+        onOpenThread: vi.fn(),
+      },
+    },
+  });
+  await tick();
+
+  expect(document.querySelector('.thread-latest')?.textContent).toBe('Requested verification');
 });
 
 test('clicking the sender name mentions the account behind it', async () => {
@@ -623,11 +685,11 @@ test('with profile on name click, the sender name opens the profile instead', as
 test('edits an own image caption without dropping its media details', async () => {
   const onEdit = vi.fn();
   core.fetchMedia.mockResolvedValue(new Uint8Array());
-  const image = {
+  const image = withRowFields({
     ...imageItem(),
     is_own: true,
     content: { ...imageItem().content, caption: 'caption' },
-  };
+  });
   render(TimelineItemHarness, {
     props: { core, item: { item: image, collapsed: false, onEdit } },
   });
@@ -635,9 +697,54 @@ test('edits an own image caption without dropping its media details', async () =
 
   await hover(document.querySelector('.message'));
   await tick();
-  await press(document.querySelector<HTMLButtonElement>('.message-actions button'));
+  const edit = screen.getByRole('button', { name: 'Edit message' });
+  const hitTest = vi.spyOn(document, 'elementFromPoint').mockReturnValue(edit);
+  try {
+    await press(edit);
+  } finally {
+    hitTest.mockRestore();
+  }
 
   expect(onEdit).toHaveBeenCalledWith('$item', 'caption', null, true);
+});
+
+test('edits an own file caption without dropping its attachment', async () => {
+  const onEdit = vi.fn();
+  core.fetchMedia.mockResolvedValue(new Uint8Array());
+  const file = withRowFields({
+    ...fileItem(),
+    is_own: true,
+  });
+  render(TimelineItemHarness, {
+    props: { core, item: { item: file, collapsed: false, onEdit } },
+  });
+  await tick();
+
+  await hover(document.querySelector('.message'));
+  await tick();
+  const edit = screen.getByRole('button', { name: 'Edit message' });
+  const hitTest = vi.spyOn(document, 'elementFromPoint').mockReturnValue(edit);
+  try {
+    await press(edit);
+  } finally {
+    hitTest.mockRestore();
+  }
+
+  expect(onEdit).toHaveBeenCalledWith('$item', 'the code', null, true);
+});
+
+test('a file from someone else cannot be edited', async () => {
+  const onEdit = vi.fn();
+  core.fetchMedia.mockResolvedValue(new Uint8Array());
+  render(TimelineItemHarness, {
+    props: { core, item: { item: fileItem(), collapsed: false, onEdit } },
+  });
+  await tick();
+
+  await hover(document.querySelector('.message'));
+  await tick();
+
+  expect(screen.queryByRole('button', { name: 'Edit message' })).toBeNull();
 });
 
 test('drops the right-hand side of a bubble when own alignment is off', async () => {
@@ -686,10 +793,9 @@ test('uses the sender profile name color in every message layout', async () => {
   render(TimelineItemHarness, {
     props: { core, item: { item: item(false), collapsed: false } },
   });
-  await tick();
-
-  const name = document.querySelector<HTMLElement>('.sender');
-  expect(name?.classList.contains('tinted')).toBe(true);
+  await vi.waitFor(() => {
+    expect(document.querySelector('.sender')?.classList.contains('tinted')).toBe(true);
+  });
   expect(
     document.querySelector<HTMLElement>('.message')?.style.getPropertyValue('--name-color-on-light')
   ).toBe('#2f5a1f');
@@ -738,10 +844,12 @@ test.each(['connected', 'compact', 'expanded'] as const)(
     render(TimelineItemHarness, {
       props: { core, item: { item: replyItem(), collapsed: false } },
     });
-    await tick();
-
+    await vi.waitFor(() => {
+      expect(
+        document.querySelector('.reply-preview .reply-name')?.classList.contains('tinted')
+      ).toBe(true);
+    });
     const name = document.querySelector<HTMLElement>('.reply-preview .reply-name');
-    expect(name?.classList.contains('tinted')).toBe(true);
     expect(name?.style.getPropertyValue('--name-color-on-light')).toBe('#2244aa');
     expect(name?.style.getPropertyValue('--name-color-on-dark')).toBe('#88aaff');
     expect(core.userProfile).toHaveBeenCalledWith(
@@ -941,6 +1049,24 @@ test('opens message actions on right click', async () => {
   expect(menuLabels()).toContain('Copy link to message');
 });
 
+test('picking a quick reaction from the context menu closes it', async () => {
+  const onToggleReaction = vi.fn();
+  render(TimelineItemHarness, {
+    props: {
+      core,
+      item: { item: item(false), collapsed: false, onReply: vi.fn(), onToggleReaction },
+    },
+  });
+  await tick();
+
+  await openMenu(document.querySelector('article.message'));
+  await tick();
+  await press(document.querySelector('[data-context-menu-content] .quick-reaction'));
+
+  expect(onToggleReaction).toHaveBeenCalledOnce();
+  expect(document.querySelectorAll('[data-context-menu-content]')).toHaveLength(0);
+});
+
 test('copies a message link when it is right-clicked', async () => {
   const writeText = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue();
   const linked = item(false);
@@ -1007,13 +1133,13 @@ test('downloads an image from its message menu, with progress on the message', a
     listener({ type: 'media_progress', source: 'mxc://example.org/photo', current: 3, total: 4 });
   }
   await tick();
-  expect(document.querySelector<HTMLProgressElement>('progress.upload')?.value).toBe(75);
+  expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '75');
 
   finish(bytes);
   await vi.waitFor(() => {
-    expect(saveBytes).toHaveBeenCalledWith(bytes, 'photo.png', 'image/png');
+    expect(saveBytes).toHaveBeenCalledWith(bytes, 'photo.png', 'image/png', true);
   });
-  expect(document.querySelector('progress.upload')).toBeNull();
+  expect(screen.queryByRole('progressbar')).toBeNull();
   instance.unmount();
   subscribe.mockImplementation(() => () => {});
   fetchMedia.mockImplementation(() => new Promise(() => {}));
@@ -1076,7 +1202,7 @@ test('long pressing a reaction opens its people list without toggling it', async
 
 test('renders a redacted row and a worded state change without throwing', async () => {
   for (const content of [
-    { kind: 'redacted', reason: null } as const,
+    { kind: 'redacted', reason: null, redacted_by: null } as const,
     {
       kind: 'state_event',
       event_type: 'm.room.topic',
@@ -1237,8 +1363,9 @@ test('caps the pills at three and counts the rest', async () => {
     const pills = document.querySelectorAll('header .sender-identity-pronoun');
     expect(pills).toHaveLength(4);
     expect(pills[3].textContent).toBe('+1');
-    expect(pills[3].getAttribute('title')).toBe('it/its (en)');
   });
+  await userEvent.hover(document.querySelectorAll('header .sender-identity-pronoun')[3]);
+  expect(await screen.findByText('it/its (en)')).toBeInTheDocument();
 });
 
 test('a touch long press opens the sheet without also opening the context menu', async () => {
@@ -1299,7 +1426,10 @@ test('a deleted message keeps its sender, its time and its menu', async () => {
     props: {
       core,
       item: {
-        item: { ...item(false), content: { kind: 'redacted', reason: null } },
+        item: withRowFields({
+          ...item(false),
+          content: { kind: 'redacted', reason: null, redacted_by: null },
+        }),
         collapsed: false,
         roomId: '!room:example.org',
         onReply: () => undefined,
@@ -1322,7 +1452,7 @@ test('offers to add a message inline emote to your own pack', async () => {
   // The SDK sanitises `data-mx-emoticon` away before the core sees the message.
   const html =
     '<img src="mxc://sable.moe/As8m" alt=":neocat_amogus:" title=":neocat_amogus:" height="32"> ';
-  const emoteItem = {
+  const emoteItem = withRowFields({
     ...item(false),
     content: {
       kind: 'message' as const,
@@ -1331,8 +1461,9 @@ test('offers to add a message inline emote to your own pack', async () => {
       emote: false,
       notice: false,
       edited: false,
+      jumbo: null,
     },
-  };
+  });
   render(TimelineItemHarness, {
     props: { core, item: { item: emoteItem, collapsed: false, onReply: vi.fn() } },
   });
@@ -1346,9 +1477,9 @@ test('offers to add a message inline emote to your own pack', async () => {
   expect(menuLabels()).toContain('Add emote to my pack');
 });
 
-test('a message of only inline emotes reads at jumbo size', async () => {
+test('a message the core sized as jumbo reads at that size', async () => {
   const html = '<img alt="rotate" height="32" src="mxc://example.org/rotate" title="rotate"> ';
-  const emoteItem = {
+  const emoteItem = withRowFields({
     ...item(false),
     content: {
       kind: 'message' as const,
@@ -1357,8 +1488,9 @@ test('a message of only inline emotes reads at jumbo size', async () => {
       emote: false,
       notice: false,
       edited: false,
+      jumbo: 1,
     },
-  };
+  });
   render(TimelineItemHarness, {
     props: { core, item: { item: emoteItem, collapsed: false, onReply: vi.fn() } },
   });
@@ -1368,7 +1500,7 @@ test('a message of only inline emotes reads at jumbo size', async () => {
 });
 
 test('a membership row keeps its notice look and still carries the action layer', async () => {
-  const joined: TimelineItemView = {
+  const joined: TimelineItemView = withRowFields({
     ...item(false),
     content: {
       kind: 'membership',
@@ -1377,7 +1509,7 @@ test('a membership row keeps its notice look and still carries the action layer'
       display_name: 'Alice',
       reason: null,
     },
-  };
+  });
   render(TimelineItemHarness, {
     props: { core, item: { item: joined, collapsed: false, onReply: vi.fn() } },
   });
@@ -1394,11 +1526,11 @@ test('a membership row keeps its notice look and still carries the action layer'
 });
 
 test('a date divider stays a plain annotation with nothing to act on', async () => {
-  const divider: TimelineItemView = {
+  const divider: TimelineItemView = withRowFields({
     ...item(false),
     event_id: null,
     content: { kind: 'date_divider', timestamp: 0 },
-  };
+  });
   render(TimelineItemHarness, {
     props: { core, item: { item: divider, collapsed: false, onReply: vi.fn() } },
   });
@@ -1406,6 +1538,30 @@ test('a date divider stays a plain annotation with nothing to act on', async () 
 
   expect(document.querySelector('article')).toBeNull();
   expect(document.querySelector('.date-divider')).not.toBeNull();
+});
+
+test('a message waiting for the server shows a sending status until it is sent', async () => {
+  const sending: TimelineItemView = {
+    ...item(false),
+    event_id: null,
+    transaction_id: 'txn-text',
+    is_own: true,
+    send_state: { status: 'sending', progress: null },
+  };
+  const view = render(TimelineItemHarness, {
+    props: { core, item: { item: sending, collapsed: false } },
+  });
+  await tick();
+
+  expect(screen.getByRole('status')).toHaveTextContent('Sending…');
+
+  await view.rerender({
+    core,
+    item: { item: { ...sending, event_id: '$sent', send_state: null }, collapsed: false },
+  });
+  await tick();
+
+  expect(screen.queryByRole('status')).toBeNull();
 });
 
 test('shows an indeterminate upload bar until the core reports progress', async () => {
@@ -1420,13 +1576,49 @@ test('shows an indeterminate upload bar until the core reports progress', async 
   });
   await tick();
 
-  const bar = document.querySelector<HTMLProgressElement>('progress.upload');
-  expect(bar).not.toBeNull();
-  expect(bar?.hasAttribute('value')).toBe(false);
+  expect(screen.getByRole('progressbar')).toHaveAttribute('data-indeterminate');
+});
+
+test('a right click on a message still sending does not open the browser menu', async () => {
+  const sending: TimelineItemView = {
+    ...item(false),
+    event_id: null,
+    transaction_id: 'txn-text',
+    is_own: true,
+    send_state: { status: 'sending', progress: null },
+  };
+  render(TimelineItemHarness, { props: { core, item: { item: sending, collapsed: false } } });
+  await tick();
+
+  const native = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+  document.querySelector('article')?.dispatchEvent(native);
+
+  expect(native.defaultPrevented).toBe(true);
+});
+
+test('cancels an upload that is still sending', async () => {
+  const onCancelSend = vi.fn();
+  const upload: TimelineItemView = {
+    ...imageItem(),
+    event_id: null,
+    transaction_id: 'txn-upload',
+    is_own: true,
+    send_state: { status: 'sending', progress: { index: 0, current: 10, total: 100 } },
+  };
+  render(TimelineItemHarness, {
+    props: { core, item: { item: upload, collapsed: false, onCancelSend } },
+  });
+  await tick();
+  const unguard = guardTouchClicks();
+
+  await user.click(screen.getByRole('button', { name: 'Cancel' }));
+
+  unguard();
+  expect(onCancelSend).toHaveBeenCalledWith('txn-upload');
 });
 
 test('fills one bar across a gallery and names the item uploading', async () => {
-  const gallery: TimelineItemView = {
+  const gallery: TimelineItemView = withRowFields({
     ...item(false),
     event_id: null,
     is_own: true,
@@ -1444,19 +1636,19 @@ test('fills one bar across a gallery and names the item uploading', async () => 
         size: null,
       })),
     },
-  };
+  });
   render(TimelineItemHarness, {
     props: { core, item: { item: gallery, collapsed: false } },
   });
   await tick();
 
-  expect(document.querySelector<HTMLProgressElement>('progress.upload')?.value).toBeCloseTo(0.375);
+  expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '37.5');
   expect(document.querySelector('.transfer-count')?.textContent.trim()).toBe('2 of 4');
 });
 
 test('renders a link preview for every link in a message', async () => {
   setPreference('urlPreviews', true);
-  const message: TimelineItemView = {
+  const message: TimelineItemView = withRowFields({
     ...item(false),
     content: {
       kind: 'message',
@@ -1465,8 +1657,9 @@ test('renders a link preview for every link in a message', async () => {
       emote: false,
       notice: false,
       edited: false,
+      jumbo: null,
     },
-  };
+  });
   const instance = render(TimelineItemHarness, {
     props: { core, item: { item: message, collapsed: false, encrypted: false } },
   });
@@ -1483,7 +1676,7 @@ test('renders a link preview for every link in a message', async () => {
 
 test('a message whose embeds were removed renders none, bundled or found', async () => {
   setPreference('urlPreviews', true);
-  const message: TimelineItemView = {
+  const message: TimelineItemView = withRowFields({
     ...item(false),
     content: {
       kind: 'message',
@@ -1492,6 +1685,7 @@ test('a message whose embeds were removed renders none, bundled or found', async
       emote: false,
       notice: false,
       edited: true,
+      jumbo: null,
     },
     bundled_link_previews: [
       {
@@ -1510,7 +1704,7 @@ test('a message whose embeds were removed renders none, bundled or found', async
       },
     ],
     link_previews_removed: true,
-  };
+  });
   const instance = render(TimelineItemHarness, {
     props: { core, item: { item: message, collapsed: false, encrypted: false } },
   });
@@ -1521,7 +1715,7 @@ test('a message whose embeds were removed renders none, bundled or found', async
   setPreference('urlPreviews', false);
 });
 
-test('compact layout shows the time alone and keeps the full date in the title (#514)', async () => {
+test('compact layout shows the time alone and keeps the full date in its tooltip (#514)', async () => {
   const lastWeek = { ...item(false), timestamp: Date.now() - 7 * 24 * 60 * 60 * 1000 };
   render(TimelineItemHarness, {
     props: { core, item: { item: lastWeek, collapsed: false, layout: 'compact' } },
@@ -1529,12 +1723,18 @@ test('compact layout shows the time alone and keeps the full date in the title (
   await tick();
 
   const time = document.querySelector('.compact-gutter time');
-  expect(time).toHaveTextContent(/^\d{1,2}:\d{2}/);
-  expect(time?.getAttribute('title')).toContain(String(new Date(lastWeek.timestamp).getFullYear()));
+  expect(time?.textContent).toMatch(/^\d{1,2}:\d{2}/);
+  if (!time) throw new Error('compact layout has no time');
+  await userEvent.hover(time);
+  await vi.waitFor(() => {
+    expect(document.querySelector('[data-tooltip-content]')).toHaveTextContent(
+      String(new Date(lastWeek.timestamp).getFullYear())
+    );
+  });
 });
 
 test('quotes a reply to a membership event as its timeline text', async () => {
-  const target: TimelineItemView = {
+  const target: TimelineItemView = withRowFields({
     ...item(false),
     id: 'member',
     event_id: '$original',
@@ -1545,7 +1745,7 @@ test('quotes a reply to a membership event as its timeline text', async () => {
       display_name: 'nex',
       reason: null,
     },
-  };
+  });
   const base = replyItem('');
   const reply: TimelineItemView = {
     ...base,
@@ -1560,4 +1760,301 @@ test('quotes a reply to a membership event as its timeline text', async () => {
   await tick();
 
   expect(document.querySelector('.reply-body')?.textContent).toBe('nex left the room');
+});
+
+test('shows the live member name over the one captured on the item', async () => {
+  render(TimelineItemHarness, {
+    props: {
+      core,
+      item: {
+        item: { ...item(false), sender_name: 'Old Alice' },
+        collapsed: false,
+        members: [
+          {
+            user_id: '@alice:example.org',
+            display_name: 'New Alice',
+            avatar_url: null,
+            power_level: 0,
+            membership: 'join',
+            member_ts: null,
+            kicked: false,
+            service: false,
+          },
+        ],
+      },
+    },
+  });
+  await tick();
+
+  expect(document.body.textContent).toContain('New Alice');
+  expect(document.body.textContent).not.toContain('Old Alice');
+});
+
+test('preserves cleared room names and avatars', async () => {
+  core.userProfile.mockResolvedValue({
+    display_name: 'Old Alice',
+    pronouns: [{ summary: 'they/them', language: null }],
+  });
+  render(TimelineItemHarness, {
+    props: {
+      core,
+      item: {
+        item: {
+          ...replyItem(),
+          sender_name: 'Old Alice',
+          sender_avatar: 'mxc://example.org/old-avatar',
+        },
+        collapsed: false,
+        members: ['@alice:example.org', '@bob:example.org'].map((user_id) => ({
+          user_id,
+          display_name: null,
+          avatar_url: null,
+          power_level: 0,
+          membership: 'join' as const,
+          member_ts: null,
+          kicked: false,
+          service: false,
+        })),
+      },
+    },
+  });
+  await vi.waitFor(() => {
+    expect(document.querySelector('header .sender-identity-pronoun')).toHaveTextContent(
+      'they/them'
+    );
+  });
+
+  expect(document.querySelector('header .sender-identity-name')).toHaveTextContent(
+    '@alice:example.org'
+  );
+  expect(document.querySelector('.reply-name')).toHaveTextContent('@bob:example.org');
+  expect(document.querySelector('.message-avatar .media-image')).toBeNull();
+});
+
+test('reopening a room does not replace the current sender with cached members', async () => {
+  const loader = new RoomMemberLoader();
+  const oldMember = {
+    user_id: '@alice:example.org',
+    display_name: 'Old Alice',
+    avatar_url: 'mxc://example.org/cached-avatar',
+    power_level: 0,
+    membership: 'join' as const,
+    member_ts: null,
+    kicked: false,
+    service: false,
+  };
+  await loader.load('!room:example.org', () => Promise.resolve([oldMember]));
+  loader.reset();
+  const request = Promise.withResolvers<typeof loader.members>();
+  const loading = loader.load('!room:example.org', () => request.promise);
+  const message = { ...item(false), sender_name: 'New Alice', sender_avatar: null };
+  const props = { core, item: { item: message, collapsed: false, members: loader.members } };
+  const row = render(TimelineItemHarness, props);
+  await tick();
+
+  expect(document.querySelector('header .sender-identity-name')).toHaveTextContent('New Alice');
+  expect(document.querySelector('.message-avatar .media-image')).toBeNull();
+
+  request.resolve([{ ...oldMember, display_name: 'New Alice', avatar_url: null }]);
+  await loading;
+  await row.rerender({ ...props, item: { ...props.item, members: loader.members } });
+
+  expect(document.querySelector('header .sender-identity-name')).toHaveTextContent('New Alice');
+  expect(document.querySelector('.message-avatar .media-image')).toBeNull();
+});
+
+test.each([
+  { name: 'Room Alice', avatar: 'mxc://example.org/room-identity' },
+  { name: null, avatar: null },
+])(
+  'room profiles stay consistent with receipts after profile loading ($name)',
+  async ({ name, avatar }) => {
+    const request = Promise.withResolvers<ProfileView>();
+    core.userProfile.mockReturnValue(request.promise);
+    const userId = '@alice:example.org';
+    const expectedName = name ?? userId;
+    const cosmeticsCore = {
+      rpc: {
+        rooms: {
+          cosmetics: vi.fn().mockResolvedValue({
+            space_id: '!space:example.org',
+            users: [
+              {
+                user_id: userId,
+                color_on_light: null,
+                color_on_dark: null,
+                pronouns: [],
+                space_display_name: 'Other Alice',
+                space_avatar_url: 'mxc://example.org/other-identity',
+              },
+            ],
+          }),
+        },
+      },
+      subscribeEvents: () => () => {},
+      userProfile: () => request.promise,
+    };
+    const cosmetics = new RoomCosmetics(cosmeticsCore);
+    await cosmetics.load('!room:example.org', '!space:example.org');
+    render(TimelineItemHarness, {
+      core,
+      cosmetics,
+      memberUserId: userId,
+      item: {
+        item: {
+          ...item(false),
+          sender_name: name,
+          sender_avatar: avatar,
+          read_by: [userId],
+        },
+        collapsed: false,
+        members: [
+          {
+            user_id: userId,
+            display_name: name,
+            avatar_url: avatar,
+            power_level: 0,
+            membership: 'join',
+            member_ts: null,
+            kicked: false,
+            service: false,
+          },
+        ],
+      },
+    });
+    await tick();
+    expect(document.querySelector('header .sender-identity-name')).toHaveTextContent(expectedName);
+    expect(document.querySelector('.member-name')).toHaveTextContent(expectedName);
+    expect(
+      within(screen.getByRole('group', { name: 'Seen by' })).getByRole('button', {
+        name: expectedName,
+      })
+    ).toBeInTheDocument();
+
+    request.resolve({
+      user_id: userId,
+      display_name: name,
+      avatar_url: avatar,
+      bio: null,
+      hero_color: null,
+      hero_brightness: null,
+      banner_url: null,
+      status: null,
+      pronouns: [{ summary: 'they/them', language: null }],
+      timezone: null,
+      name_color_light: null,
+      name_color_dark: null,
+      animal: null,
+      extra: [],
+      supporter_awards: null,
+      legacy_fields: [],
+    });
+    await vi.waitFor(() => {
+      expect(document.querySelector('header .sender-identity-pronoun')).toHaveTextContent(
+        'they/them'
+      );
+    });
+    expect(document.querySelector('.member-identity-row .sender-identity-pronoun')).toBeNull();
+    expect(document.querySelector('header .sender-identity-name')).toHaveTextContent(expectedName);
+    expect(document.querySelector('.member-name')).toHaveTextContent(expectedName);
+    expect(
+      within(screen.getByRole('group', { name: 'Seen by' })).getByRole('button', {
+        name: expectedName,
+      })
+    ).toBeInTheDocument();
+    if (avatar) expect(core.fetchMedia).toHaveBeenCalledWith(avatar, 96, 96);
+    expect(core.fetchMedia).not.toHaveBeenCalledWith('mxc://example.org/other-identity', 96, 96);
+  }
+);
+
+async function swipeLeft(message: Element, distance = 400): Promise<void> {
+  const touch = (type: string, x: number) => {
+    const event = new Event(type, { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'touches', {
+      value: type === 'touchend' ? [] : [{ clientX: x, clientY: 0 }],
+    });
+    message.dispatchEvent(event);
+  };
+  touch('touchstart', 0);
+  touch('touchmove', -distance);
+  touch('touchend', 0);
+  await tick();
+}
+
+test('a swipe on a message that is not the reply target replies to it', async () => {
+  const onReply = vi.fn();
+  const onCancelContext = vi.fn();
+  render(TimelineItemHarness, {
+    props: { core, item: { item: item(false), collapsed: false, onReply, onCancelContext } },
+  });
+  await tick();
+  const message = document.querySelector('.message');
+  if (!message) throw new Error('message was not rendered');
+
+  await swipeLeft(message);
+
+  expect(onReply).toHaveBeenCalledOnce();
+  expect(onCancelContext).not.toHaveBeenCalled();
+});
+
+test('a swipe on the message being replied to cancels the reply', async () => {
+  const onReply = vi.fn();
+  const onCancelContext = vi.fn();
+  render(TimelineItemHarness, {
+    props: {
+      core,
+      item: { item: item(false), collapsed: false, selected: true, onReply, onCancelContext },
+    },
+  });
+  await tick();
+  const message = document.querySelector('.message');
+  if (!message) throw new Error('message was not rendered');
+
+  await swipeLeft(message);
+
+  expect(onCancelContext).toHaveBeenCalledOnce();
+  expect(onReply).not.toHaveBeenCalled();
+});
+
+test('a long swipe on the message being edited cancels the edit', async () => {
+  const onEdit = vi.fn();
+  const onCancelContext = vi.fn();
+  render(TimelineItemHarness, {
+    props: {
+      core,
+      item: {
+        item: { ...item(false), is_own: true },
+        collapsed: false,
+        editing: true,
+        onReply: vi.fn(),
+        onEdit,
+        onCancelContext,
+      },
+    },
+  });
+  await tick();
+  const message = document.querySelector('.message');
+  if (!message) throw new Error('message was not rendered');
+
+  await swipeLeft(message, 3000);
+
+  expect(onCancelContext).toHaveBeenCalledOnce();
+  expect(onEdit).not.toHaveBeenCalled();
+});
+
+test('a long swipe on a message that is not being edited edits it', async () => {
+  const onEdit = vi.fn();
+  render(TimelineItemHarness, {
+    props: {
+      core,
+      item: { item: { ...item(false), is_own: true }, collapsed: false, onReply: vi.fn(), onEdit },
+    },
+  });
+  await tick();
+  const message = document.querySelector('.message');
+  if (!message) throw new Error('message was not rendered');
+
+  await swipeLeft(message, 3000);
+
+  expect(onEdit).toHaveBeenCalledOnce();
 });

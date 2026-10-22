@@ -17,10 +17,17 @@ vi.mock('pdfjs-dist', () => ({
   getDocument: () => ({ promise: new Promise(() => {}), destroy: () => Promise.resolve() }),
 }));
 
+vi.mock('#lib/platform/files.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('#lib/platform/files.js')>()),
+  savesNatively: vi.fn(() => false),
+}));
+
+import { savesNatively } from '#lib/platform/files.js';
 import MediaContent from './MediaContent.svelte';
 
 afterEach(() => {
   core.fetchMedia.mockReset();
+  vi.mocked(savesNatively).mockReturnValue(false);
 });
 
 async function settle(): Promise<void> {
@@ -33,7 +40,7 @@ async function settle(): Promise<void> {
 
 test.each([
   { kind: 'video' as const, selector: 'video', width: 1920, height: 1080, start: /^Play / },
-  { kind: 'audio' as const, selector: 'audio', width: null, height: null, start: null },
+  { kind: 'audio' as const, selector: '.audio-container', width: null, height: null, start: null },
   {
     kind: 'file' as const,
     selector: 'a[download="report.pdf"]',
@@ -86,9 +93,8 @@ test('renders the extension badge and human-readable size for a file attachment'
 
   await settle();
 
-  expect(screen.getByText('zip')).toHaveClass('media-file-ext');
   expect(screen.getByText('1.5 MB')).toHaveClass('media-file-size');
-  expect(screen.getByText('Download (1.5 MB)')).toBeInTheDocument();
+  expect(screen.getByText('Download')).toBeInTheDocument();
 });
 
 test('offers a PDF as a file plus a preview that opens the viewer', async () => {
@@ -185,7 +191,7 @@ test('falls back to the plain audio player when there is no waveform', async () 
   await settle();
 
   expect(document.querySelector('.voice-message-player')).toBeNull();
-  expect(document.querySelector('audio.media-content')).not.toBeNull();
+  expect(document.querySelector('.audio-container')).not.toBeNull();
 });
 
 test('labels unavailable attachments', async () => {
@@ -256,4 +262,51 @@ test('a video shows its thumbnail and waits for play before fetching', async () 
   expect(core.fetchMedia).toHaveBeenCalledTimes(1);
   expect(core.fetchMedia).toHaveBeenCalledWith('mxc://example.org/waiting-poster', 800, 600);
   expect(document.querySelector('.media-poster')).not.toBeNull();
+});
+
+test.each([
+  { native: true, controlsList: 'nodownload' },
+  { native: false, controlsList: null },
+])(
+  'a played video hides the native download control when saving natively is $native',
+  async ({ native, controlsList }) => {
+    vi.mocked(savesNatively).mockReturnValue(native);
+    core.fetchMedia.mockResolvedValue(new Uint8Array(new ArrayBuffer()));
+    render(MediaContent, {
+      props: {
+        kind: 'video',
+        source: `mxc://example.org/clip-${String(native)}`,
+        mime: 'video/mp4',
+        filename: 'clip.mp4',
+      },
+    });
+
+    await settle();
+    await userEvent.click(screen.getByRole('button', { name: /^Play / }));
+    await settle();
+
+    expect(document.querySelector('video')?.getAttribute('controlslist')).toBe(controlsList);
+  }
+);
+
+test('voice message speed button cycles the playback rate', async () => {
+  core.fetchMedia.mockResolvedValue(new Uint8Array(new ArrayBuffer()));
+  render(MediaContent, {
+    props: {
+      kind: 'audio',
+      source: 'mxc://example.org/voice',
+      mime: 'audio/ogg',
+      filename: 'Voice message',
+      durationMs: 4200,
+      waveform: [0, 0.5, 1],
+    },
+  });
+  await settle();
+
+  const audio = document.querySelector('audio');
+  const button = screen.getByRole('button', { name: /Playback speed/ });
+  expect(button).toHaveTextContent('1×');
+  await userEvent.click(button);
+  expect(button).toHaveTextContent('1.25×');
+  expect(audio?.playbackRate).toBe(1.25);
 });

@@ -1,6 +1,7 @@
 import type { MemberView, PerMessageProfileView, ProfileView } from '#src/generated/protocol';
 
 import { profileOverrides } from '#lib/profile/profile-overrides.svelte.js';
+import { preferences } from '#lib/settings/preferences.svelte.js';
 import type { SenderCosmetics } from '#lib/rooms/room-cosmetics.svelte.js';
 import { nameColorOnDark, nameColorOnLight } from '#lib/ui/primitives/readable-color.js';
 
@@ -23,17 +24,18 @@ export function senderDisplayColors(
 ): SenderDisplayColors {
   const override = profileOverrides.colors(userId);
   if (override === null) {
-    const nameColor = isOwn ? 'var(--primary-on-container)' : senderColor(userId);
+    const nameColor = isOwn ? 'var(--surface-on-container)' : senderColor(userId);
     return { nameColor, nameColorLight: null, nameColorDark: null, tinted: false };
   }
   const personaTint = personaWithColor(persona);
+  const colored = isOwn || preferences.renderProfileColors ? profile : null;
   const nameColorLight =
     override?.light ??
     override?.dark ??
     personaTint?.color_on_light ??
     room?.colorOnLight ??
-    profile?.name_color_light ??
-    profile?.name_color_dark ??
+    colored?.name_color_light ??
+    colored?.name_color_dark ??
     roleColor ??
     null;
   const nameColorDark =
@@ -41,12 +43,12 @@ export function senderDisplayColors(
     override?.light ??
     personaTint?.color_on_dark ??
     room?.colorOnDark ??
-    profile?.name_color_dark ??
-    profile?.name_color_light ??
+    colored?.name_color_dark ??
+    colored?.name_color_light ??
     roleColor ??
     null;
   const tinted = nameColorLight !== null || nameColorDark !== null;
-  const nameColor = isOwn ? 'var(--primary-on-container)' : senderColor(userId);
+  const nameColor = isOwn ? 'var(--surface-on-container)' : senderColor(userId);
 
   return {
     nameColor,
@@ -56,13 +58,20 @@ export function senderDisplayColors(
   };
 }
 
+const memberIndexes = new WeakMap<readonly MemberView[], Map<string, MemberView>>();
+
 export function findMember(
   members: readonly MemberView[],
   userId: string | null | undefined
 ): MemberView | undefined {
   if (!userId) return undefined;
 
-  return members.find((member) => member.user_id === userId);
+  let index = memberIndexes.get(members);
+  if (!index) {
+    index = new Map(members.map((member) => [member.user_id, member]));
+    memberIndexes.set(members, index);
+  }
+  return index.get(userId);
 }
 
 export function memberName(members: readonly MemberView[], userId: string): string {

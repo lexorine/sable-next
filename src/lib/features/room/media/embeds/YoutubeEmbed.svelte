@@ -2,18 +2,13 @@
   import PlayIcon from 'phosphor-svelte/lib/PlayIcon';
 
   import type { UrlPreviewView } from '#src/generated/protocol';
+  import { preferences } from '#lib/settings/preferences.svelte.js';
 
   import { i18n } from '#lib/i18n.js';
 
   import LinkPreviewCard from '../LinkPreviewCard.svelte';
 
-  import {
-    loadYoutubeDetails,
-    parseYoutubeLink,
-    youtubePlayerUrl,
-    youtubeThumbnailUrl,
-    type YoutubeDetails,
-  } from './youtube';
+  import { loadDetails, parseYoutubeLink, youtubePlayerUrl, type YoutubeEmbed } from './youtube';
 
   interface Props {
     url: string;
@@ -23,7 +18,7 @@
 
   let { url, encrypted, bundled = null }: Props = $props();
   let video = $derived(parseYoutubeLink(url));
-  let details = $state<YoutubeDetails | null | undefined>(undefined);
+  let details = $state<YoutubeEmbed | null | undefined>(undefined);
   let playing = $state(false);
 
   $effect(() => {
@@ -33,7 +28,12 @@
     if (id === undefined) return;
 
     let cancelled = false;
-    void loadYoutubeDetails(id).then((result) => {
+    void loadDetails(
+      id,
+      preferences.useDearrow,
+      preferences.dearrowThumbnailFallback,
+      preferences.youtubeThumbnailPosition
+    ).then((result) => {
       if (!cancelled) details = result;
     });
     return () => {
@@ -44,9 +44,9 @@
 
 {#if video && details}
   <div class="youtube-embed">
-    <a class="youtube-header" href={url} target="_blank" rel="noopener noreferrer">
+    <a class="youtube-header" href={url} target="_blank" rel="external noopener noreferrer">
       <span class="youtube-site">{details.author ?? 'YouTube'}</span>
-      <span class="youtube-title">{details.title}</span>
+      <span class="youtube-title" title={details.title}>{details.title}</span>
     </a>
     <div class="youtube-player">
       {#if playing}
@@ -61,10 +61,10 @@
         <button
           type="button"
           class="youtube-poster"
-          aria-label={$i18n.t('timeline.playVideo', { name: details.title })}
+          aria-label={i18n.t('timeline.playVideo', { name: details.title })}
           onclick={() => (playing = true)}
         >
-          <img src={youtubeThumbnailUrl(video)} alt="" loading="lazy" />
+          <img src={details.thumbnailUrl} alt="" loading="lazy" />
           <span class="youtube-play" aria-hidden="true"><PlayIcon /></span>
         </button>
       {/if}

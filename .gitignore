@@ -1,15 +1,14 @@
-experiment
 dist
+electron/release
 coverage
 node_modules
-devAssets
 .svelte-kit
 
 # WASM build output (`mise run wasm:build`)
 src/generated/wasm/
 src/generated/wasm-e2e/
 
-# Fetched by scripts/fetch-deepfilternet.mjs
+# Fetched by scripts/build/fetch-deepfilternet.mjs
 static/deepfilternet3/
 
 .DS_Store
@@ -28,15 +27,11 @@ Thumbs.db
 *.tfbackend
 !*.tfbackend.example
 crash.log
-build.sh
 
-# the following line was added with the "git ignore" tool by itsrye.dev, version 0.1.0
 .lh
 
 # Tauri
-/build
 /target/
-/gen/schemas
 dist-js
 
 # Gradle / Android build artifacts
@@ -45,8 +40,6 @@ dist-js
 **/android/.gradle/
 **/.gradle/
 
-# Rust build artifacts
-src-tauri/target/
 # Tauri Android build outputs
 src-tauri/gen/android/app/build/
 # Tauri Apple outputs
@@ -55,20 +48,17 @@ src-tauri/gen/apple/*
 # Tauri Android release keystore
 *.jks
 
-# Tauri-typegen cache
-.typecache
-
 # ESLint cache
 .eslintcache
 
 # Worktrees
 .worktrees
 
-# the following line was added with nvim by Shea because its annoying to clear every so often
 .vscode/bookmarks.json
 
-# Playwright visual regression
+# Test output
 /test-results
+/.vitest
 /playwright-report
 /blob-report
 /tests/e2e/.auth
@@ -77,16 +67,13 @@ src-tauri/gen/apple/*
 mise.local.toml
 mise.local.lock
 
-# Nix things
-## nix build output
-result
-## direnv config + local state
+# direnv
 .envrc
 .direnv
-## auto-generated pre-commit config
-.pre-commit-config.yaml
+
 storybook-static
 
 # Rendered by scripts/ci/render-flatpak-nightly.mjs
-packaging/flatpak/nightly/moe.sable.next.Nightly.yml
-packaging/flatpak/nightly/moe.sable.next.Nightly.metainfo.xml
+packaging/flatpak/electron/nightly/moe.sable.next.electron.Nightly.yml
+packaging/flatpak/electron/nightly/moe.sable.next.electron.Nightly.metainfo.xml
+packaging/flatpak/electron/moe.sable.next.electron.yml

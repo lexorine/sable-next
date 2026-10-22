@@ -2,12 +2,18 @@
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
   import { page } from '$app/state';
+  import { untrack } from 'svelte';
   import { Tabs } from 'bits-ui';
   import BookmarkSimpleIcon from 'phosphor-svelte/lib/BookmarkSimpleIcon';
   import { i18n } from '#lib/i18n.js';
   import AppPageShell from '#lib/ui/primitives/AppPageShell.svelte';
+  import { dismissedInvites } from '#lib/rooms/dismissed-invites.svelte.js';
+  import { isDeclining } from '#lib/rooms/invites.svelte.js';
   import { useRoomList } from '#lib/rooms/room-list.svelte.js';
+  import UnreadBadge from '#lib/ui/primitives/UnreadBadge.svelte';
   import {
+    countInvites,
+    countNotifications,
     type InboxTab,
     type NotificationFilter,
     parseFilter,
@@ -19,13 +25,32 @@
   import NotificationList from './NotificationList.svelte';
 
   const roomList = useRoomList();
-  let tab = $derived<InboxTab>(parseInboxTab(page.url.searchParams.get('tab')));
+  let notificationCounts = $derived({
+    unread: 0,
+    highlight: countNotifications(roomList.rooms, roomList.badgeUnreadFor),
+    marked: false,
+  });
+  let inviteCounts = $derived({
+    unread: 0,
+    highlight: countInvites(
+      roomList.rooms.filter(
+        (room) => !isDeclining(room.room_id) && !dismissedInvites.has(room.room_id)
+      )
+    ),
+    marked: false,
+  });
+
+  const landing: InboxTab = untrack(() =>
+    inviteCounts.highlight > 0 ? 'invites' : 'notifications'
+  );
+  let tab = $derived<InboxTab>(parseInboxTab(page.url.searchParams.get('tab'), landing));
   let filter = $derived(parseFilter(page.url.searchParams.get('filter')));
 
   function selectTab(value: string): void {
     const url = new URL(page.url.href);
-    if (value === 'notifications') url.searchParams.delete('tab');
+    if (value === landing) url.searchParams.delete('tab');
     else url.searchParams.set('tab', value);
+    // eslint-disable-next-line svelte/no-navigation-without-resolve -- rewrites the query of the current, already resolved URL
     void goto(`${url.pathname}${url.search}`, { replace: true, reset: false });
   }
 
@@ -34,6 +59,7 @@
     if (value === 'all') url.searchParams.delete('filter');
     else url.searchParams.set('filter', value);
 
+    // eslint-disable-next-line svelte/no-navigation-without-resolve -- rewrites the query of the current, already resolved URL
     void goto(`${url.pathname}${url.search}`, {
       replace: true,
       reset: false,
@@ -41,23 +67,25 @@
   }
 </script>
 
-<AppPageShell title={$i18n.t('nav.inbox')} density="compact">
+<AppPageShell title={i18n.t('nav.inbox')} density="compact">
   {#snippet actions()}
     <a class="bookmarks-link" href={resolve('bookmarks')} draggable="false">
       <BookmarkSimpleIcon aria-hidden="true" />
-      {$i18n.t('inbox.bookmarks')}
+      {i18n.t('inbox.bookmarks')}
     </a>
   {/snippet}
   <Tabs.Root bind:value={tab} onValueChange={selectTab} class="inbox">
-    <Tabs.List class="inbox-tabs" aria-label={$i18n.t('nav.inbox')}>
+    <Tabs.List class="inbox-tabs" aria-label={i18n.t('nav.inbox')}>
       <Tabs.Trigger value="notifications" class="inbox-tab">
-        {$i18n.t('inbox.notifications')}
+        {i18n.t('inbox.notifications')}
+        <UnreadBadge counts={notificationCounts} aria-hidden="true" />
       </Tabs.Trigger>
       <Tabs.Trigger value="invites" class="inbox-tab">
-        {$i18n.t('inbox.invitesTab')}
+        {i18n.t('inbox.invitesTab')}
+        <UnreadBadge counts={inviteCounts} aria-hidden="true" />
       </Tabs.Trigger>
       <Tabs.Trigger value="requests" class="inbox-tab">
-        {$i18n.t('room.membersRequests')}
+        {i18n.t('room.membersRequests')}
       </Tabs.Trigger>
     </Tabs.List>
     <Tabs.Content value="notifications">
@@ -66,7 +94,7 @@
     <Tabs.Content value="invites">
       <InviteList />
       {#if pendingInvites(roomList.rooms).length === 0}
-        <p class="empty">{$i18n.t('inbox.invitesEmpty')}</p>
+        <p class="empty">{i18n.t('inbox.invitesEmpty')}</p>
       {/if}
     </Tabs.Content>
     <Tabs.Content value="requests">
@@ -78,7 +106,7 @@
 <style>
   :global(.inbox) {
     display: grid;
-    gap: var(--space-500);
+    gap: var(--space-300);
   }
 
   :global(.inbox-tabs) {
@@ -89,12 +117,15 @@
   }
 
   :global(.inbox-tab) {
+    align-items: center;
     background: transparent;
     border: 0;
     border-bottom: var(--border-width-500) solid transparent;
     color: var(--surface-var-on-container);
     cursor: pointer;
+    display: inline-flex;
     font: inherit;
+    gap: var(--space-200);
     min-height: var(--control-height-400);
     padding: var(--space-200) var(--space-100);
   }

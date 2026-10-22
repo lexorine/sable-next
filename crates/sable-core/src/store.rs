@@ -96,8 +96,7 @@ impl FileSessionStore {
         }
     }
 
-    /// Own credential refreshes until this store is dropped. Foreground startup
-    /// waits for any cold notification already using the saved login.
+    /// Holds the credentials lock until dropped, so a second app process waits for the first.
     ///
     /// # Errors
     /// Returns an error if the private directory or ownership lock cannot be opened.
@@ -111,6 +110,7 @@ impl FileSessionStore {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn try_exclusive(
         data_dir: impl Into<std::path::PathBuf>,
     ) -> std::io::Result<Option<Self>> {

@@ -6,6 +6,7 @@ import {
   cachedMediaUrl,
   discardMediaUrl,
   holdMediaUrl,
+  isAnimatedImage,
   loadMediaUrl,
   mediaAspectRatio,
   retryMediaUrl,
@@ -33,7 +34,7 @@ test('encrypted media shares one request and URL across display sizes', async ()
   const core = {
     session: session('account-encrypted-sizes', '@a:example.org', 'device-a'),
     subscribeEvents: () => () => {},
-    commands: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array([1]))) },
+    media: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array([1]))) },
   };
 
   const urls = await Promise.all([
@@ -42,7 +43,7 @@ test('encrypted media shares one request and URL across display sizes', async ()
     loadMediaUrl(core, source, 0, 0),
   ]);
 
-  expect(core.commands.fetchMedia).toHaveBeenCalledOnce();
+  expect(core.media.fetchMedia).toHaveBeenCalledOnce();
   expect(urls).toEqual(Array(3).fill('blob:encrypted-sizes'));
   expect(cachedMediaUrl(core, source, 512, 384)).toBe(urls[0]);
 });
@@ -53,7 +54,7 @@ test('plain media keeps server thumbnails separate from the original', async () 
   const core = {
     session: session('account-plain-sizes', '@a:example.org', 'device-a'),
     subscribeEvents: () => () => {},
-    commands: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array([1]))) },
+    media: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array([1]))) },
   };
 
   const urls = await Promise.all([
@@ -62,7 +63,7 @@ test('plain media keeps server thumbnails separate from the original', async () 
     loadMediaUrl(core, 'mxc://example.org/plain-sizes', 0, 0),
   ]);
 
-  expect(core.commands.fetchMedia).toHaveBeenCalledTimes(3);
+  expect(core.media.fetchMedia).toHaveBeenCalledTimes(3);
   expect(new Set(urls).size).toBe(3);
 });
 
@@ -73,7 +74,7 @@ test('an encrypted URL stays held until consumers at every size release it', asy
   const core = {
     session: session('account-encrypted-holds', '@a:example.org', 'device-a'),
     subscribeEvents: () => () => {},
-    commands: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array(40 * 1024 * 1024))) },
+    media: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array(40 * 1024 * 1024))) },
   };
   const releasePreview = holdMediaUrl(core, source, 96, 96);
   const releaseOriginal = holdMediaUrl(core, source, 0, 0);
@@ -97,7 +98,7 @@ test('evicts object URLs when cached media exceeds the byte budget', async () =>
   const core = {
     session: session('account-a', '@a:example.org', 'device-a'),
     subscribeEvents: () => () => {},
-    commands: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array(17 * 1024 * 1024))) },
+    media: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array(17 * 1024 * 1024))) },
   };
 
   await loadMediaUrl(core, 'mxc://example.org/first', 800, 600);
@@ -113,7 +114,7 @@ test('still evicts old small previews when the entry budget is exceeded', async 
   const core = {
     session: session('account-entry-budget', '@a:example.org', 'device-a'),
     subscribeEvents: () => () => {},
-    commands: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array([1]))) },
+    media: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array([1]))) },
   };
   const source = (index: number) => `mxc://example.org/entry-budget-${String(index)}`;
   const first = await loadMediaUrl(core, source(0), 144, 144);
@@ -134,7 +135,7 @@ test('a discarded URL is revoked and not served again until the failure expires'
   const core = {
     session: session('account-discard', '@a:example.org', 'device-a'),
     subscribeEvents: () => () => {},
-    commands: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array([1]))) },
+    media: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array([1]))) },
   };
 
   await loadMediaUrl(core, source, 96, 96);
@@ -143,7 +144,7 @@ test('a discarded URL is revoked and not served again until the failure expires'
   expect(revoke).toHaveBeenCalledWith('blob:undecodable');
   expect(cachedMediaUrl(core, source, 96, 96)).toBeUndefined();
   await expect(loadMediaUrl(core, source, 96, 96)).rejects.toThrow('Media unavailable');
-  expect(core.commands.fetchMedia).toHaveBeenCalledOnce();
+  expect(core.media.fetchMedia).toHaveBeenCalledOnce();
 });
 
 test('does not discard a URL that has since been replaced', async () => {
@@ -153,7 +154,7 @@ test('does not discard a URL that has since been replaced', async () => {
   const core = {
     session: session('account-replaced', '@a:example.org', 'device-a'),
     subscribeEvents: () => () => {},
-    commands: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array([1]))) },
+    media: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array([1]))) },
   };
 
   await loadMediaUrl(core, source, 96, 96);
@@ -170,17 +171,17 @@ test('does not share a media URL between accounts', async () => {
   const accountA = {
     session: session('account-a', '@a:example.org', 'device-a'),
     subscribeEvents: () => () => {},
-    commands: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array([1]))) },
+    media: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array([1]))) },
   };
   const accountB = {
     session: session('account-b', '@b:example.org', 'device-b'),
     subscribeEvents: () => () => {},
-    commands: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array([2]))) },
+    media: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array([2]))) },
   };
 
   await expect(loadMediaUrl(accountA, source, 96, 96)).resolves.toBe('blob:account-0');
   await expect(loadMediaUrl(accountB, source, 96, 96)).resolves.toBe('blob:account-1');
-  expect(accountB.commands.fetchMedia).toHaveBeenCalledOnce();
+  expect(accountB.media.fetchMedia).toHaveBeenCalledOnce();
 });
 
 test('does not revoke an object URL a caller is still displaying', async () => {
@@ -190,7 +191,7 @@ test('does not revoke an object URL a caller is still displaying', async () => {
   const core = {
     session: session('account-held', '@a:example.org', 'device-a'),
     subscribeEvents: () => () => {},
-    commands: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array(17 * 1024 * 1024))) },
+    media: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array(17 * 1024 * 1024))) },
   };
 
   const release = holdMediaUrl(core, 'mxc://example.org/sidebar', 56, 56);
@@ -212,7 +213,7 @@ test('enforces the byte budget when the last media consumer releases its hold', 
   const core = {
     session: session('account-release', '@a:example.org', 'device-a'),
     subscribeEvents: () => () => {},
-    commands: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array(40 * 1024 * 1024))) },
+    media: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array(40 * 1024 * 1024))) },
   };
   const source = 'mxc://example.org/large-video';
   const first = holdMediaUrl(core, source, 0, 0);
@@ -235,7 +236,7 @@ test('a hold released and taken back in one update keeps its url past the cap', 
   const core = {
     session: session('account-rehold', '@a:example.org', 'device-a'),
     subscribeEvents: () => () => {},
-    commands: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array(8))) },
+    media: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array(8))) },
   };
   const holds = Array.from({ length: 520 }, (_, index) =>
     holdMediaUrl(core, `mxc://example.org/emote-${String(index)}`, 0, 0)
@@ -263,7 +264,7 @@ test('keeps the shape of a held URL however much media is measured after it', as
   const core = {
     session: session('account-shaped', '@a:example.org', 'device-a'),
     subscribeEvents: () => () => {},
-    commands: {
+    media: {
       fetchMedia: vi.fn((source: string) =>
         Promise.resolve(new Uint8Array(source.endsWith('wide') ? 4 : 1))
       ),
@@ -288,7 +289,7 @@ test('a cached URL that is held again is evicted after older ones', async () => 
   const core = {
     session: session('account-recent', '@a:example.org', 'device-a'),
     subscribeEvents: () => () => {},
-    commands: {
+    media: {
       fetchMedia: vi.fn((source: string) =>
         Promise.resolve(new Uint8Array(10 * 1024 * 1024 + Number(source.slice(-1))))
       ),
@@ -312,7 +313,7 @@ test('revokes the URL it replaces when a key is fetched twice', async () => {
   const core = {
     session: session('account-replaced', '@a:example.org', 'device-a'),
     subscribeEvents: () => () => {},
-    commands: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array([1]))) },
+    media: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array([1]))) },
   };
   const source = 'mxc://example.org/notification-avatar';
 
@@ -330,7 +331,7 @@ test('revokes a replaced URL once the last caller holding it lets go', async () 
   const core = {
     session: session('account-displaced', '@a:example.org', 'device-a'),
     subscribeEvents: () => () => {},
-    commands: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array([1]))) },
+    media: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array([1]))) },
   };
   const source = 'mxc://example.org/refetched';
 
@@ -353,7 +354,7 @@ test('disk-cache reads reach the core while six downloads are stalled', async ()
   const core = {
     session: session('account-disk-cache', '@a:example.org', 'device-a'),
     subscribeEvents: () => () => {},
-    commands: {
+    media: {
       fetchMedia: vi.fn((source: string) =>
         source === cachedSource
           ? Promise.resolve(new Uint8Array([1]))
@@ -373,7 +374,7 @@ test('disk-cache reads reach the core while six downloads are stalled', async ()
   void cached.catch(() => {});
 
   try {
-    expect(core.commands.fetchMedia).toHaveBeenCalledWith(cachedSource, 144, 144);
+    expect(core.media.fetchMedia).toHaveBeenCalledWith(cachedSource, 144, 144);
     await expect(cached).resolves.toBe('blob:disk-cached');
   } finally {
     for (const resolve of finish) resolve();
@@ -388,7 +389,7 @@ test('never revokes the URL it is about to return', async () => {
   const core = {
     session: session('account-published', '@a:example.org', 'device-a'),
     subscribeEvents: () => () => {},
-    commands: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array(17 * 1024 * 1024))) },
+    media: { fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array(17 * 1024 * 1024))) },
   };
 
   holdMediaUrl(core, 'mxc://example.org/thumbnail', 56, 56);
@@ -403,7 +404,7 @@ test('lets a failed source be fetched again once its backoff has elapsed', async
   const core = {
     session: session('account-recovered', '@a:example.org', 'device-a'),
     subscribeEvents: () => () => {},
-    commands: {
+    media: {
       fetchMedia: vi
         .fn<() => Promise<Uint8Array<ArrayBuffer>>>()
         .mockRejectedValueOnce(new Error('Media unavailable'))
@@ -414,7 +415,7 @@ test('lets a failed source be fetched again once its backoff has elapsed', async
 
   await expect(loadMediaUrl(core, source, 96, 96)).rejects.toThrow();
   await expect(loadMediaUrl(core, source, 96, 96)).rejects.toThrow();
-  expect(core.commands.fetchMedia).toHaveBeenCalledOnce();
+  expect(core.media.fetchMedia).toHaveBeenCalledOnce();
 
   vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 60_000);
 
@@ -428,7 +429,7 @@ test('does not impose a deadline on requests queued or downloading in the core',
   const source = 'mxc://example.org/large';
   const core = {
     session: session('account-large', '@a:example.org', 'device-a'),
-    commands: {
+    media: {
       fetchMedia: vi.fn(
         () =>
           new Promise<Uint8Array<ArrayBuffer>>((resolve) => {
@@ -457,7 +458,7 @@ test('a media server the core refuses is not asked again until it says so, even 
   const core = {
     session: session('account-refused', '@a:example.org', 'device-a'),
     subscribeEvents: () => () => {},
-    commands: { fetchMedia },
+    media: { fetchMedia },
   };
   const source = 'mxc://dead.example/refused';
 
@@ -475,7 +476,7 @@ function failingCore(accountId: string, fetchMedia: () => Promise<Uint8Array<Arr
   return {
     session: session(accountId, '@a:example.org', 'device-a'),
     subscribeEvents: () => () => {},
-    commands: { fetchMedia: vi.fn(fetchMedia) },
+    media: { fetchMedia: vi.fn(fetchMedia) },
   };
 }
 
@@ -487,19 +488,19 @@ test('each failure of a source holds it for twice as long as the last', async ()
   await expect(loadMediaUrl(core, source, 96, 96)).rejects.toThrow();
   await vi.advanceTimersByTimeAsync(1_999);
   await expect(loadMediaUrl(core, source, 96, 96)).rejects.toThrow('Media unavailable');
-  expect(core.commands.fetchMedia).toHaveBeenCalledOnce();
+  expect(core.media.fetchMedia).toHaveBeenCalledOnce();
 
   await vi.advanceTimersByTimeAsync(1);
   await expect(loadMediaUrl(core, source, 96, 96)).rejects.toThrow('Unavailable');
-  expect(core.commands.fetchMedia).toHaveBeenCalledTimes(2);
+  expect(core.media.fetchMedia).toHaveBeenCalledTimes(2);
 
   await vi.advanceTimersByTimeAsync(3_999);
   await expect(loadMediaUrl(core, source, 96, 96)).rejects.toThrow('Media unavailable');
-  expect(core.commands.fetchMedia).toHaveBeenCalledTimes(2);
+  expect(core.media.fetchMedia).toHaveBeenCalledTimes(2);
 
   await vi.advanceTimersByTimeAsync(1);
   await expect(loadMediaUrl(core, source, 96, 96)).rejects.toThrow('Unavailable');
-  expect(core.commands.fetchMedia).toHaveBeenCalledTimes(3);
+  expect(core.media.fetchMedia).toHaveBeenCalledTimes(3);
 });
 
 test('callers sharing a request count as one failure', async () => {
@@ -514,11 +515,11 @@ test('callers sharing a request count as one failure', async () => {
     loadMediaUrl(core, source, 96, 96),
     loadMediaUrl(core, source, 96, 96),
   ]);
-  expect(core.commands.fetchMedia).toHaveBeenCalledOnce();
+  expect(core.media.fetchMedia).toHaveBeenCalledOnce();
 
   await vi.advanceTimersByTimeAsync(2_000);
   await expect(loadMediaUrl(core, source, 96, 96)).rejects.toThrow('Unavailable');
-  expect(core.commands.fetchMedia).toHaveBeenCalledTimes(2);
+  expect(core.media.fetchMedia).toHaveBeenCalledTimes(2);
 });
 
 test('a manual retry asks again whatever the hold, and starts the count over', async () => {
@@ -531,11 +532,11 @@ test('a manual retry asks again whatever the hold, and starts the count over', a
   await expect(loadMediaUrl(core, source, 96, 96)).rejects.toThrow('Unavailable');
 
   await expect(retryMediaUrl(core, source, 96, 96)).rejects.toThrow('Unavailable');
-  expect(core.commands.fetchMedia).toHaveBeenCalledTimes(3);
+  expect(core.media.fetchMedia).toHaveBeenCalledTimes(3);
 
   await vi.advanceTimersByTimeAsync(2_000);
   await expect(loadMediaUrl(core, source, 96, 96)).rejects.toThrow('Unavailable');
-  expect(core.commands.fetchMedia).toHaveBeenCalledTimes(4);
+  expect(core.media.fetchMedia).toHaveBeenCalledTimes(4);
 });
 
 test('a success forgets the failures', async () => {
@@ -561,4 +562,48 @@ test('a success forgets the failures', async () => {
   await vi.advanceTimersByTimeAsync(2_000);
   await expect(loadMediaUrl(core, other, 0, 0)).rejects.toThrow('Unavailable');
   expect(fetch).toHaveBeenCalledTimes(5);
+});
+
+test('an image sent as octet-stream is served with its own type', async () => {
+  const createObjectURL = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:octet');
+  const core = {
+    session: session('account-octet', '@a:example.org', 'device-a'),
+    subscribeEvents: () => () => {},
+    media: {
+      fetchMedia: vi.fn(() => Promise.resolve(new Uint8Array([0x89, 0x50, 0x4e, 0x47]))),
+    },
+  };
+
+  await loadMediaUrl(core, 'mxc://example.org/image.bin', 0, 0, 'application/octet-stream');
+
+  expect(createObjectURL.mock.calls[0]?.[0]).toMatchObject({ type: 'image/png' });
+});
+
+function ascii(text: string): number[] {
+  return Array.from(text, (char) => char.charCodeAt(0));
+}
+
+test('only a multi-frame picture counts as animated', () => {
+  const png = [0x89, 0x50, 0x4e, 0x47, 0, 0, 0, 0];
+  const webp = (flags: number) => [
+    ...ascii('RIFF'),
+    0,
+    0,
+    0,
+    0,
+    ...ascii('WEBP'),
+    ...ascii('VP8X'),
+    0,
+    0,
+    0,
+    0,
+    flags,
+  ];
+
+  expect(isAnimatedImage(new Uint8Array(ascii('GIF89a')))).toBe(true);
+  expect(isAnimatedImage(new Uint8Array([...png, ...ascii('acTL'), ...ascii('IDAT')]))).toBe(true);
+  expect(isAnimatedImage(new Uint8Array([...png, ...ascii('IDAT'), ...ascii('acTL')]))).toBe(false);
+  expect(isAnimatedImage(new Uint8Array(webp(0x02)))).toBe(true);
+  expect(isAnimatedImage(new Uint8Array(webp(0)))).toBe(false);
+  expect(isAnimatedImage(new Uint8Array([0xff, 0xd8, 0xff, 0]))).toBe(false);
 });

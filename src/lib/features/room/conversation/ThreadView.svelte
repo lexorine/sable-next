@@ -10,6 +10,7 @@
   import { personaSpaces } from '#lib/features/composer/persona-spaces.js';
   import { readReceiptIsPrivate } from '#lib/settings/preferences.svelte.js';
   import { i18n } from '#lib/i18n.js';
+  import type { MatrixLink } from '#lib/rooms/matrix-link.js';
   import { usePersonaStore } from '#lib/personas/personas.svelte.js';
   import { useRoomList } from '#lib/rooms/room-list.svelte.js';
   import { RoomTimeline } from '#lib/rooms/timeline.svelte.js';
@@ -19,6 +20,7 @@
   import { SwipeBack } from '#lib/ui/swipe-back.svelte.js';
 
   import ConversationComposer from './ConversationComposer.svelte';
+  import InlineEdit from './InlineEdit.svelte';
   import { Conversation } from './conversation.svelte.js';
   import { timelineMediaItems } from '../media/media-items.js';
   import MediaViewer from '../media/MediaViewer.svelte';
@@ -49,6 +51,7 @@
     encrypted?: boolean | null;
     onClose: () => void;
     onSenderProfile?: (userId: string, anchor: HTMLElement) => void;
+    onMatrixLink?: (link: MatrixLink, anchor: HTMLAnchorElement) => void;
     onCopyLink?: (eventId: string) => void;
   }
 
@@ -69,14 +72,16 @@
     encrypted = null,
     onClose,
     onSenderProfile,
+    onMatrixLink,
     onCopyLink,
   }: Props = $props();
 
   let composer = $state<ConversationComposer>();
   let timelineList = $state<TimelineList>();
   let panel = $state<HTMLElement>();
-  let width = $state(27.5);
   const widthStorageKey = 'sable-thread-panel-width';
+  const storedWidth = Number.parseFloat(localStorage.getItem(widthStorageKey) ?? '');
+  let width = $state(Number.isFinite(storedWidth) ? clampThreadPanelWidth(storedWidth) : 27.5);
   const swipe = new SwipeBack({
     width: () => panel?.clientWidth ?? 0,
     onDismiss: () => onClose(),
@@ -95,7 +100,14 @@
     spaceIds: (id) => personaSpaces(roomList.rooms, id, page.params.spaceId).order,
     encrypted: () => encrypted,
     threadRoot: untrack(() => rootEventId),
+    beforeSend: () => returnToThread(),
   });
+
+  function returnToThread(): Promise<void> {
+    return timeline.mode.kind === 'focused'
+      ? timeline.startThread(roomId, rootEventId)
+      : Promise.resolve();
+  }
 
   $effect(() => {
     const target = focusEventId;
@@ -106,7 +118,9 @@
     const navigation = new AbortController();
     void (async () => {
       await timeline.startThread(roomId, rootEventId);
-      await timeline.loadThreadEvent(target, navigation.signal);
+      if (navigation.signal.aborted || timeline.items.some((item) => item.event_id === target))
+        return;
+      await timeline.start(roomId, target);
     })().catch((error: unknown) => {
       console.debug('[sable thread] linked reply unavailable', error);
     });
@@ -120,8 +134,6 @@
   });
 
   onMount(() => {
-    const stored = Number.parseFloat(localStorage.getItem(widthStorageKey) ?? '');
-    if (Number.isFinite(stored)) width = clampThreadPanelWidth(stored);
     const previousFocus = document.activeElement;
     panel?.focus({ preventScroll: true });
     return () => {
@@ -153,14 +165,15 @@
     await timeline.paginateForward(25);
   }
 
-  function markRead(eventId: string): Promise<void> {
-    return core.commands.markRead(
-      roomId,
-      eventId,
-      readReceiptIsPrivate(),
-      rootEventId,
-      timeline.subscriptionId
-    );
+  async function markRead(eventId: string): Promise<void> {
+    await core.rpc.timeline.markRead({
+      room_id: roomId,
+      event_id: eventId,
+      private_receipt: readReceiptIsPrivate(),
+      thread_root: rootEventId,
+      subscription: timeline.subscriptionId,
+      fully_read: false,
+    });
   }
 </script>
 
@@ -180,12 +193,10 @@
 
 <section
   bind:this={panel}
-  class="thread-view"
-  class:side-panel={sidePanel}
+  class={['thread-view', { 'side-panel': sidePanel, swiping: swipe.swiping }]}
   style:width={sidePanel ? `${width}rem` : undefined}
-  class:swiping={swipe.swiping}
   style:transform={swipe.transform}
-  aria-label={$i18n.t('timeline.thread')}
+  aria-label={i18n.t('timeline.thread')}
   tabindex="-1"
   ontouchstart={swipe.start}
   ontouchmove={swipe.move}
@@ -194,15 +205,15 @@
 >
   <PanelHeader
     class="thread-header"
-    title={topic || $i18n.t('timeline.thread')}
+    title={topic || i18n.t('timeline.thread')}
     titleSize="h1"
     subtitle={roomName ?? ''}
   >
     {#snippet prefix()}
       <PanelHeaderButton
         label={sidePanel
-          ? $i18n.t('timeline.threadClose')
-          : (backLabel ?? $i18n.t('timeline.backToConversation'))}
+          ? i18n.t('timeline.threadClose')
+          : (backLabel ?? i18n.t('timeline.backToConversation'))}
         onclick={onClose}
       >
         {#if sidePanel}<XIcon />{:else}<BackIcon />{/if}
@@ -211,7 +222,7 @@
     {#snippet suffix()}
       {#if timeline.items.some((item) => item.event_id === rootEventId)}
         <PanelHeaderButton
-          label={$i18n.t('timeline.jumpToOriginal')}
+          label={i18n.t('timeline.jumpToOriginal')}
           onclick={() => timelineList?.jumpToEvent(rootEventId)}
         >
           <ArrowUpIcon />
@@ -226,7 +237,7 @@
       min={MIN_THREAD_PANEL_WIDTH}
       max={MAX_THREAD_PANEL_WIDTH}
       step={THREAD_PANEL_WIDTH_STEP}
-      label={$i18n.t('timeline.resizeThread')}
+      label={i18n.t('timeline.resizeThread')}
       grow="left"
       fromPixels={(pixels) =>
         remFromPointerDelta(
@@ -238,13 +249,20 @@
     />
   {/if}
 
+  {#snippet inlineEditor()}
+    <InlineEdit {conversation} {roomId} />
+  {/snippet}
+
   <TimelineList
     bind:this={timelineList}
     replyEventId={conversation.context?.kind === 'reply' ? conversation.context.eventId : null}
+    editEventId={conversation.context?.kind === 'edit' ? conversation.context.eventId : null}
+    inlineEditor={conversation.inlineEdit ? inlineEditor : undefined}
     {timeline}
     {focusEventId}
     threadRootId={rootEventId}
     onRetryLoad={() => timeline.startThread(roomId, rootEventId)}
+    onJumpToLive={timeline.mode.kind === 'focused' ? () => void returnToThread() : undefined}
     {roomId}
     {members}
     {readOnly}
@@ -253,6 +271,7 @@
     {canPin}
     {encrypted}
     {onSenderProfile}
+    {onMatrixLink}
     onMentionUser={(userId, name) => composer?.insertMention(userId, name)}
     {onCopyLink}
     onOpenMedia={(eventId) => (mediaEventId = eventId)}
@@ -260,6 +279,7 @@
     onRequestFuture={requestFuture}
     onRead={markRead}
     onReply={readOnly ? undefined : conversation.reply}
+    onCancelContext={conversation.clearContext}
     onEdit={readOnly ? undefined : conversation.edit}
     onDelete={conversation.redact}
     onToggleReaction={canReact ? conversation.toggleReaction : undefined}
@@ -339,10 +359,12 @@
 
   @media (width >= 48rem) {
     .thread-composer {
+      --composer-band: calc(var(--sidebar-footer-height) - 2 * var(--space-300));
+
       box-sizing: border-box;
       display: flex;
       flex-direction: column;
-      justify-content: center;
+      justify-content: flex-end;
       margin-block-start: calc(-1 * var(--space-300));
       min-height: var(--sidebar-footer-height);
       padding-block: var(--space-300);

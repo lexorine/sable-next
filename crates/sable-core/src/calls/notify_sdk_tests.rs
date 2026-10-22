@@ -1,8 +1,3 @@
-#![expect(
-    clippy::large_futures,
-    reason = "the dispatch future is large and cannot be boxed"
-)]
-
 use std::sync::Arc;
 
 use matrix_sdk::{ruma::room_id, test_utils::mocks::MatrixMockServer};
@@ -13,13 +8,12 @@ use wiremock::{
     matchers::{body_json, method, path, path_regex},
 };
 
-use crate::{Core, protocol::Command, session::Session, store::MemorySessionStore};
+use crate::{Core, api::calls::DeclineParams, session::Session, store::MemorySessionStore};
 
 #[tokio::test]
 async fn core_declines_legacy_notifications_but_rejects_invalid_and_own_events() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
-    client.event_cache().subscribe().unwrap();
     server.mock_room_state_encryption().plain().mount().await;
     let room_id = room_id!("!legacy-call:example.org");
     let room = server.sync_joined_room(&client, room_id).await;
@@ -67,14 +61,14 @@ async fn core_declines_legacy_notifications_but_rejects_invalid_and_own_events()
         .await;
 
     for event_id in ["$own", "$invalid"] {
-        core.dispatch(Command::DeclineCall {
+        core.run(DeclineParams {
             room_id: room_id.to_owned(),
             notification_event_id: event_id.to_owned(),
         })
         .await
         .expect_err("own and malformed notifications cannot be declined");
     }
-    core.dispatch(Command::DeclineCall {
+    core.run(DeclineParams {
         room_id: room_id.to_owned(),
         notification_event_id: "$legacy".to_owned(),
     })

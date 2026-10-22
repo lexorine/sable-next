@@ -1,22 +1,23 @@
 // @vitest-environment happy-dom
 
 import { render, screen } from '@testing-library/svelte';
-import { expect, test } from 'vitest';
+import userEvent from '@testing-library/user-event';
+import { expect, test, vi } from 'vitest';
 
-import SupporterBadgePicker from './SupporterBadgePicker.svelte';
 import { supporterAppearance } from './variants.js';
+import SupporterBadgePicker from './SupporterBadgePicker.svelte';
 
-const props = { value: supporterAppearance(), onChange: () => {} };
+test('typing a hex colour commits it', async () => {
+  const onChange = vi.fn();
+  render(SupporterBadgePicker, {
+    value: supporterAppearance({ variant: 'custom' }),
+    onChange,
+  });
 
-test('hides the ceo badge from a plain donor', () => {
-  render(SupporterBadgePicker, { ...props, tier: null });
+  const input = screen.getByRole('textbox', { name: /hex/i });
+  await userEvent.clear(input);
+  await userEvent.type(input, '#112233');
+  await userEvent.tab();
 
-  expect(screen.getByRole('radio', { name: 'Pride' })).toBeInTheDocument();
-  expect(screen.queryByRole('radio', { name: 'CEO' })).not.toBeInTheDocument();
-});
-
-test('offers the ceo badge to the ceo tier', () => {
-  render(SupporterBadgePicker, { ...props, tier: 'ceo' });
-
-  expect(screen.getByRole('radio', { name: 'CEO' })).toBeInTheDocument();
+  expect(onChange).toHaveBeenCalledWith({ color: '#112233' });
 });

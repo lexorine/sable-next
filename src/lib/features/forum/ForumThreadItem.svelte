@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { copyText } from '#lib/platform/clipboard.js';
   import { onDestroy } from 'svelte';
 
   import DeleteMessageDialog from '#lib/features/room/messages/DeleteMessageDialog.svelte';
@@ -21,7 +22,6 @@
     onDelete: (eventId: string, reason: string | null) => void;
     roomId: string;
     onReact?: (eventId: string, key: string) => void;
-    loadImagePacks: (roomId: string) => Promise<import('#src/generated/protocol').ImagePackView[]>;
     onCopyLink: (eventId: string) => void;
     pinned?: boolean;
     onPin?: (eventId: string) => void;
@@ -35,7 +35,6 @@
     onDelete,
     roomId,
     onReact,
-    loadImagePacks,
     onCopyLink,
     pinned = false,
     onPin,
@@ -46,22 +45,20 @@
   let displayName = $derived(thread.senderName ?? thread.sender ?? '');
   let replyLabel = $derived(
     thread.replyCount === 1
-      ? $i18n.t('forum.replyCount_one', { count: thread.replyCount })
-      : $i18n.t('forum.replyCount_other', { count: thread.replyCount })
+      ? i18n.t('forum.replyCount_one', { count: thread.replyCount })
+      : i18n.t('forum.replyCount_other', { count: thread.replyCount })
   );
   let accessibleLabel = $derived(
     thread.unread
-      ? $i18n.t('forum.threadUnread', { name: displayName, preview: thread.preview })
-      : $i18n.t('forum.thread', { name: displayName, preview: thread.preview })
+      ? i18n.t('forum.threadUnread', { name: displayName, preview: thread.preview })
+      : i18n.t('forum.thread', { name: displayName, preview: thread.preview })
   );
   let actions = $derived({
-    loadImagePacks,
     roomId,
     onReact: onReact ? (key: string) => onReact(thread.eventId, key) : undefined,
     onOpenThread: () => onOpen(thread.eventId),
     onEdit: thread.editable && onEdit ? () => onEdit(thread) : undefined,
-    onCopyText:
-      thread.preview === '' ? undefined : () => void navigator.clipboard.writeText(thread.preview),
+    onCopyText: thread.preview === '' ? undefined : () => void copyText(thread.preview),
     onCopyLink: () => onCopyLink(thread.eventId),
     onPin: onPin ? () => onPin(thread.eventId) : undefined,
     pinned,
@@ -92,10 +89,7 @@
 
 <li class="forum-thread-item">
   <article
-    class:pressed={rowPress.pressing}
-    class:unread={thread.unread}
-    class:pinned
-    class="forum-thread-card"
+    class={['forum-thread-card', { pressed: rowPress.pressing, unread: thread.unread, pinned }]}
     onpointerdown={rowPress.start}
     onpointermove={rowPress.move}
     onpointerup={rowPress.end}
@@ -142,9 +136,9 @@
 <DeleteMessageDialog
   bind:open={deleteOpen}
   preview={thread.preview}
-  title={$i18n.t('forum.deleteThreadTitle')}
-  description={$i18n.t('forum.deleteThreadExplain')}
-  confirmLabel={$i18n.t('forum.deleteThread')}
+  title={i18n.t('forum.deleteThreadTitle')}
+  description={i18n.t('forum.deleteThreadExplain')}
+  confirmLabel={i18n.t('forum.deleteThread')}
   onConfirm={(reason) => onDelete(thread.eventId, reason)}
 />
 

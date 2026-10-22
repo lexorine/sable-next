@@ -5,6 +5,7 @@
   import { holdOverlayBack } from '#lib/platform/overlay-back.svelte.js';
   import { suppressBanners } from '#lib/ui/banner-suppression.svelte.js';
   import { overlayLayer } from '#lib/ui/overlay-layer.js';
+  import { leaveUnlessUnsaved } from '#lib/ui/unsaved-guard.js';
 
   type DialogVariant = 'drawer' | 'settings' | 'verification' | 'sheet' | 'fullscreen';
 
@@ -34,6 +35,18 @@
     children,
   }: Props = $props();
 
+  function setOpen(next: boolean | undefined): void {
+    if (next !== false) {
+      open = next;
+      onOpenChange?.(true);
+      return;
+    }
+    leaveUnlessUnsaved(() => {
+      open = false;
+      onOpenChange?.(false);
+    });
+  }
+
   function submit(event: SubmitEvent): void {
     event.preventDefault();
     onConfirm?.();
@@ -60,7 +73,7 @@
   );
 </script>
 
-<Dialog.Root bind:open {onOpenChange}>
+<Dialog.Root bind:open={() => open, setOpen}>
   <Dialog.Portal>
     <Dialog.Overlay class={['dialog-backdrop', `dialog-backdrop-${variant}`]} {...overlayLayer()} />
     <Dialog.Content
@@ -260,7 +273,7 @@
     }
 
     :global(html:not([data-reduced-motion='on']) .dialog-backdrop[data-state='closed']) {
-      animation: dialog-backdrop-out var(--motion-normal) var(--ease-smooth-out);
+      animation: dialog-backdrop-out var(--motion-normal) var(--ease-smooth-out) forwards;
     }
 
     :global(html:not([data-reduced-motion='on']) .dialog-content-drawer[data-state='open']) {
@@ -268,7 +281,7 @@
     }
 
     :global(html:not([data-reduced-motion='on']) .dialog-content-drawer[data-state='closed']) {
-      animation: drawer-out var(--duration-medium) var(--ease-smooth-out);
+      animation: drawer-out var(--duration-medium) var(--ease-smooth-out) forwards;
     }
 
     :global(html:not([data-reduced-motion='on']) .dialog-content-settings[data-state='open']),
@@ -280,7 +293,7 @@
     :global(html:not([data-reduced-motion='on']) .dialog-content-settings[data-state='closed']),
     :global(html:not([data-reduced-motion='on']) .dialog-content-verification[data-state='closed']),
     :global(html:not([data-reduced-motion='on']) .dialog-content-sheet[data-state='closed']) {
-      animation: sheet-out var(--duration-medium) var(--ease-smooth-out);
+      animation: sheet-out var(--duration-medium) var(--ease-smooth-out) forwards;
     }
 
     :global(html:not([data-reduced-motion='on']) .dialog-content-sheet.sheet-settling) {
@@ -305,7 +318,7 @@
     :global(
       html:not([data-reduced-motion='on']) .dialog-content-verification[data-state='closed']
     ) {
-      animation: dialog-out var(--motion-normal) var(--ease-smooth-out);
+      animation: dialog-out var(--motion-normal) var(--ease-smooth-out) forwards;
     }
   }
 
@@ -315,7 +328,7 @@
     }
 
     :global(html:not([data-reduced-motion='on']) .dialog-content-settings[data-state='closed']) {
-      animation: dialog-out var(--motion-normal) var(--ease-smooth-out);
+      animation: dialog-out var(--motion-normal) var(--ease-smooth-out) forwards;
     }
   }
 </style>

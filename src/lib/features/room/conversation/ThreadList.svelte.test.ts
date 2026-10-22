@@ -48,16 +48,17 @@ vi.mock('../messages/message-scope.svelte.js', async () => {
 import { core } from '#lib/core/__mocks__/context.js';
 
 import ThreadList from './ThreadList.svelte';
+import { withRowFields } from '#lib/features/room/timeline/row-fixtures.js';
 
 const listThreads = vi.fn();
-Object.assign(core, { listThreads });
+Object.assign(core.rpc.timeline, { listThreads });
 
 afterEach(() => {
   listThreads.mockReset();
 });
 
 function root(id: string, body: string): TimelineItemView {
-  return {
+  return withRowFields({
     id,
     event_id: id,
     transaction_id: null,
@@ -66,7 +67,15 @@ function root(id: string, body: string): TimelineItemView {
     sender_name: 'Ana',
     sender_avatar: null,
     timestamp: 0,
-    content: { kind: 'message', body, html: body, emote: false, notice: false, edited: false },
+    content: {
+      kind: 'message',
+      body,
+      html: body,
+      emote: false,
+      notice: false,
+      edited: false,
+      jumbo: null,
+    },
     in_reply_to: null,
     thread_root: null,
     thread_summary: null,
@@ -80,7 +89,7 @@ function root(id: string, body: string): TimelineItemView {
     mention: 'none',
     forwarded: null,
     forum_title: null,
-  };
+  });
 }
 
 const rows = () => within(screen.getByRole('list')).getAllByRole('listitem');
@@ -108,7 +117,7 @@ test('lists thread roots page by page and opens the one picked', async () => {
   await vi.waitFor(() => {
     expect(rows()).toHaveLength(2);
   });
-  expect(listThreads).toHaveBeenLastCalledWith('!room:example.org', 'next');
+  expect(listThreads).toHaveBeenLastCalledWith({ room_id: '!room:example.org', from: 'next' });
   expect(screen.queryByRole('button', { name: 'Load more threads' })).not.toBeInTheDocument();
 
   await user.click(within(rows()[1]).getByText('Second topic'));
@@ -133,7 +142,12 @@ test('a root shows its reply count and latest reply instead of an open button', 
     roots: [
       {
         ...root('$a', 'First topic'),
-        thread_summary: { num_replies: 3, latest_event_id: '$z', latest_body: 'Last word' },
+        thread_summary: {
+          num_replies: 3,
+          latest_event_id: '$z',
+          latest_body: 'Last word',
+          latest_fallback: null,
+        },
       },
     ],
     next_batch: null,

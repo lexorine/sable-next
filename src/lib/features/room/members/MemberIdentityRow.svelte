@@ -1,17 +1,18 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import type { ClassValue } from 'svelte/elements';
-  import type { MemberView, ProfileView } from '#src/generated/protocol';
+  import type { MemberView } from '#src/generated/protocol';
 
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
   import { profileOverrides } from '#lib/profile/profile-overrides.svelte.js';
+  import { UserProfile } from '#lib/profile/user-profile.svelte.js';
   import { useRoomCosmetics } from '#lib/rooms/room-cosmetics.svelte.js';
-  import { preferences } from '#lib/settings/preferences.svelte.js';
   import { usePresenceStore } from '#lib/rooms/presence.svelte.js';
   import { resolveUserStatus } from '#lib/rooms/user-status.js';
   import Avatar from '#lib/ui/primitives/Avatar.svelte';
   import PresenceDot from '#lib/ui/primitives/PresenceDot.svelte';
+  import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
 
   import { findMember, senderDisplayColors } from './members.js';
   import SenderName from './SenderName.svelte';
@@ -41,47 +42,21 @@
   const core = useCoreClient();
   const presenceStore = usePresenceStore();
   const roomCosmetics = useRoomCosmetics();
-  let profile = $state<ProfileView | null>(null);
+  const profile = new UserProfile(core, () => userId);
   let member = $derived(findMember(members, userId));
-  let shown = $derived(
-    roomCosmetics?.identity(userId, {
-      name: member?.display_name ?? profile?.display_name ?? null,
-      avatar: member?.avatar_url ?? profile?.avatar_url ?? null,
-    }) ?? {
-      name: member?.display_name ?? profile?.display_name ?? null,
-      avatar: member?.avatar_url ?? profile?.avatar_url ?? null,
-    }
-  );
-  let displayName = $derived(profileOverrides.name(userId, shown.name ?? userId));
-  let avatarUrl = $derived(profileOverrides.avatar(userId, shown.avatar));
+  let ownIdentity = $derived({
+    name: member ? member.display_name : (profile.current?.display_name ?? null),
+    avatar: member ? member.avatar_url : (profile.current?.avatar_url ?? null),
+  });
+  let displayName = $derived(profileOverrides.name(userId, ownIdentity.name ?? userId));
+  let avatarUrl = $derived(profileOverrides.avatar(userId, ownIdentity.avatar));
   let cosmetics = $derived(roomCosmetics?.for(userId) ?? null);
   let colors = $derived(
-    senderDisplayColors(userId, profile, null, false, cosmetics, powerTag?.color ?? null)
+    senderDisplayColors(userId, profile.current, null, false, cosmetics, powerTag?.color ?? null)
   );
-  let pronouns = $derived(
-    preferences.showPronouns && preferences.showPronounPills
-      ? cosmetics?.pronouns.length
-        ? cosmetics.pronouns
-        : (profile?.pronouns ?? [])
-      : []
-  );
-  let profileLabel = $derived($i18n.t('timeline.senderProfile', { name: displayName }));
+  let profileLabel = $derived(i18n.t('timeline.senderProfile', { name: displayName }));
   let presence = $derived(presenceStore.peek(userId));
-  let userStatus = $derived(showStatus ? resolveUserStatus(profile, presence) : null);
-
-  $effect(() => {
-    profile = null;
-    let current = true;
-    void core.userProfile(userId).then(
-      (next) => {
-        if (current) profile = next;
-      },
-      () => undefined
-    );
-    return () => {
-      current = false;
-    };
-  });
+  let userStatus = $derived(showStatus ? resolveUserStatus(profile.current, presence) : null);
 
   function openProfile(event: MouseEvent & { currentTarget: HTMLButtonElement }): void {
     onProfile?.(userId, event.currentTarget);
@@ -94,7 +69,7 @@
     {#if presence && presence.presence !== 'offline'}
       <PresenceDot
         presence={presence.presence}
-        label={$i18n.t(`presence.${presence.presence}`)}
+        label={i18n.t(`presence.${presence.presence}`)}
         class="member-identity-presence"
         size="medium"
       />
@@ -102,22 +77,19 @@
   </span>
   <div class="member-identity-main">
     <span class="member-identity-text">
-      <SenderName
-        {displayName}
-        {colors}
-        {pronouns}
-        nameClass="member-name"
-        compact={pronouns.length === 0}
-      />
+      <SenderName {displayName} {colors} nameClass="member-name" compact />
       {@render secondary?.()}
       {#if userStatus}
-        <span
-          class="member-identity-status"
-          title={[userStatus.emoji, userStatus.text].filter(Boolean).join(' ')}
-        >
-          {#if userStatus.emoji}<span class="member-identity-status-emoji">{userStatus.emoji}</span
-            >{/if}{userStatus.text}
-        </span>
+        {@const statusLabel = [userStatus.emoji, userStatus.text].filter(Boolean).join(' ')}
+        <Tooltip label={statusLabel}>
+          {#snippet trigger({ props })}
+            <span {...props} class="member-identity-status">
+              {#if userStatus.emoji}<span class="member-identity-status-emoji"
+                  >{userStatus.emoji}</span
+                >{/if}{userStatus.text}
+            </span>
+          {/snippet}
+        </Tooltip>
       {/if}
     </span>
     {#if trailing}

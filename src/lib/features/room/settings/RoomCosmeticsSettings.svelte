@@ -1,20 +1,22 @@
 <script lang="ts">
   import type {
+    FieldEdit,
     PronounView,
     RoomPermissionsView,
     RoomPowerLevelsView,
-    RoomSummary,
+    RoomListItemView,
   } from '#src/generated/protocol';
 
   import { useCoreClient } from '#lib/core/context.js';
-  import {
-    COSMETIC_EVENT_TYPES,
-    pronounContent,
-    writeMemberColors,
-  } from '#lib/features/composer/slash-commands.js';
-  import ColorSetting from '#lib/features/settings/ColorSetting.svelte';
+  import { setMemberLook, type MemberLookEdit } from '#lib/core/api/members.js';
+  import { COSMETIC_EVENT_TYPES, pronounSets } from '#lib/features/composer/slash-commands.js';
+  import { MAX_DISPLAY_NAME_LENGTH } from '#lib/profile/fields.js';
+  import { MAX_PRONOUN_INPUT } from '#lib/profile/pronouns.js';
+  import { nativeFilePicker } from '#lib/platform/native-file-picker.js';
+  import ColorSetting from '#lib/ui/ColorSetting.svelte';
   import { i18n } from '#lib/i18n.js';
   import { useRoomList } from '#lib/rooms/room-list.svelte.js';
+  import { joinedSpaceRooms } from '#lib/rooms/spaces.js';
   import Alert from '#lib/ui/primitives/Alert.svelte';
   import Avatar from '#lib/ui/primitives/Avatar.svelte';
   import Button from '#lib/ui/primitives/Button.svelte';
@@ -26,7 +28,7 @@
 
   import { senderDisplayColors } from '../members/members';
   import SenderName from '../members/SenderName.svelte';
-  import { canSendState, toEventContent } from './permission-groups';
+  import { canSendState } from './permission-groups';
 
   import '#lib/ui/primitives/settings-row.css';
 
@@ -34,7 +36,7 @@
   const MODERATOR_LEVEL = 50;
 
   interface Props {
-    room: RoomSummary | null;
+    room: RoomListItemView | null;
     permissions: RoomPermissionsView | null;
     levels: RoomPowerLevelsView | null;
   }
@@ -46,7 +48,7 @@
 
   let roomId = $derived(room?.room_id ?? null);
   let userId = $derived(core.session?.user_id ?? null);
-  let isSpace = $derived(room?.is_space ?? false);
+  let isSpace = $derived(room?.room_kind === 'space');
   let ownLevel = $derived(permissions?.own_power_level ?? 0);
   let currentLevels = $state.raw<RoomPowerLevelsView | null>(null);
   let effectiveLevels = $derived(currentLevels ?? levels);
@@ -70,40 +72,23 @@
   let canSetPronouns = $derived(
     canSendState(effectiveLevels, ownLevel, COSMETIC_EVENT_TYPES.pronoun)
   );
-  let applyTargets = $derived.by(() => {
-    const found: string[] = [];
-    const seen: string[] = [];
-    const walk = (space: RoomSummary | undefined) => {
-      for (const edge of space?.space_children ?? []) {
-        if (seen.includes(edge.room_id)) continue;
-        seen.push(edge.room_id);
-        const child = roomList.byId(edge.room_id);
-        if (child?.state !== 'joined') continue;
-        if (child.is_space) walk(child);
-        else found.push(child.room_id);
-      }
-    };
-    if (room) {
-      seen.push(room.room_id);
-      walk(room);
-    }
-    return found;
-  });
+  let applyTargets = $derived(joinedSpaceRooms(room, (id) => roomList.byId(id)));
   let applyDescription = $derived.by(() => {
     if (saving === 'apply' && applied)
-      return $i18n.t('room.cosmeticsApplying', {
+      return i18n.t('room.cosmeticsApplying', {
         done: applied.done + applied.failed,
+        count: applied.total,
         total: applied.total,
       });
     if (applied?.failed)
-      return $i18n.t('room.cosmeticsAppliedPartial', {
+      return i18n.t('room.cosmeticsAppliedPartial', {
         count: applied.done,
         failed: applied.failed,
       });
-    if (applied) return $i18n.t('room.cosmeticsApplied', { count: applied.done });
-    if (applyTargets.length === 0) return $i18n.t('room.cosmeticsApplyRoomsNone');
-    if (name !== savedName) return $i18n.t('room.cosmeticsApplyRoomsSaveFirst');
-    return $i18n.t('room.cosmeticsApplyRoomsHint', { count: applyTargets.length });
+    if (applied) return i18n.t('room.cosmeticsApplied', { count: applied.done });
+    if (applyTargets.length === 0) return i18n.t('room.cosmeticsApplyRoomsNone');
+    if (name !== savedName) return i18n.t('room.cosmeticsApplyRoomsSaveFirst');
+    return i18n.t('room.cosmeticsApplyRoomsHint', { count: applyTargets.length });
   });
   let canManage = $derived(permissions?.can_change_power_levels ?? false);
   let membersSetPronouns = $derived(
@@ -133,54 +118,39 @@
     void load(target, self);
   });
 
-  function record(value: unknown): Record<string, unknown> {
-    return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : {};
-  }
-
-  function text(value: unknown): string {
-    return typeof value === 'string' ? value : '';
-  }
-
   async function load(target: string, self: string): Promise<void> {
     const current = ++run;
     try {
-      const [member, pronounEvent, profile] = await Promise.all([
-        core.commands.roomStateEvent(target, 'm.room.member', self),
-        core.commands.roomStateEvent(target, COSMETIC_EVENT_TYPES.pronoun, self),
-        core.refreshUserProfile(self).catch(() => null),
+      const [look, profile] = await Promise.all([
+        core.rpc.members.look({ room_id: target }),
+        core.refreshUserProfile(self).catch((error: unknown) => {
+          console.debug('[sable room] profile unavailable', error);
+          return null;
+        }),
       ]);
       if (current !== run) return;
-      const colors = record(record(member)['eu.she-a.color']);
-      colorOnLight = text(colors.on_light);
-      colorOnDark = text(colors.on_dark);
+      colorOnLight = look.color_on_light ?? '';
+      colorOnDark = look.color_on_dark ?? '';
       profileName = profile?.display_name ?? null;
       profileAvatar = profile?.avatar_url ?? null;
-      const memberAvatar = text(record(member).avatar_url);
-      avatar = memberAvatar === '' || memberAvatar === profileAvatar ? null : memberAvatar;
-      const memberName = text(record(member).displayname);
-      name = memberName === profileName ? '' : memberName;
+      avatar = look.avatar_url === profileAvatar ? null : look.avatar_url;
+      name = look.display_name === profileName ? '' : (look.display_name ?? '');
       savedName = name;
-      const sets = record(pronounEvent).pronouns;
-      pronouns = Array.isArray(sets)
-        ? sets
-            .map((set) => text(record(set).summary))
-            .filter((summary) => summary !== '')
-            .join(', ')
-        : '';
+      pronouns = look.pronouns.map((set) => set.summary).join(', ');
       savedPronouns = pronouns;
     } catch (error) {
       console.warn('[sable room] cosmetics unavailable', error);
     }
   }
 
-  async function save(key: string, write: (target: string, self: string) => Promise<void>) {
+  async function save(key: string, write: (target: string) => Promise<void>) {
     const target = roomId;
     const self = userId;
     if (!target || !self || saving !== null) return;
     saving = key;
     failed = false;
     try {
-      await write(target, self);
+      await write(target);
     } catch (error) {
       console.warn('[sable room] cosmetic not saved', error);
       failed = true;
@@ -190,35 +160,28 @@
   }
 
   function saveColor(theme: 'on_light' | 'on_dark', value: string | undefined): void {
-    void save(theme, (target, self) =>
-      writeMemberColors(core.commands, target, self, {
-        kind: 'set',
-        colors: { [theme]: value },
-      })
+    const edit = field(value);
+    void save(theme, (target) =>
+      setMemberLook(
+        core.rpc,
+        target,
+        theme === 'on_light' ? { color_on_light: edit } : { color_on_dark: edit }
+      )
     );
   }
 
-  async function writeMember(
-    target: string,
-    self: string,
-    fields: Partial<Record<'displayname' | 'avatar_url', string | null>>
-  ): Promise<void> {
-    const rest = Object.fromEntries(
-      Object.entries(
-        record(await core.commands.roomStateEvent(target, 'm.room.member', self))
-      ).filter(([key]) => !(key in fields))
-    );
-    await core.commands.sendStateEvent(target, 'm.room.member', self, {
-      ...rest,
-      membership: 'join',
-      ...Object.fromEntries(Object.entries(fields).filter(([, value]) => value)),
-    });
+  function field(value: string | null | undefined): FieldEdit {
+    return value ? { kind: 'set', value } : { kind: 'clear' };
+  }
+
+  function writeMember(target: string, look: MemberLookEdit): Promise<void> {
+    return setMemberLook(core.rpc, target, look);
   }
 
   function saveName(): void {
-    void save('name', async (target, self) => {
+    void save('name', async (target) => {
       const next = name.trim() || profileName;
-      await writeMember(target, self, { displayname: next });
+      await writeMember(target, { display_name: field(next) });
       name = next === profileName ? '' : (next ?? '');
       savedName = name;
     });
@@ -228,18 +191,18 @@
     const file = event.currentTarget.files?.[0];
     event.currentTarget.value = '';
     if (!file) return;
-    void save('avatar', async (target, self) => {
+    void save('avatar', async (target) => {
       const upright = await uprightJpeg(file);
       const bytes = new Uint8Array(await upright.arrayBuffer());
-      const uri = await core.commands.uploadMedia(upright.type || 'image/*', bytes);
-      await writeMember(target, self, { avatar_url: uri });
+      const uri = await core.media.uploadMedia(upright.type || 'image/*', bytes);
+      await writeMember(target, { avatar_url: field(uri) });
       avatar = uri;
     });
   }
 
   function resetAvatar(): void {
-    void save('avatar', async (target, self) => {
-      await writeMember(target, self, { avatar_url: profileAvatar });
+    void save('avatar', async (target) => {
+      await writeMember(target, { avatar_url: field(profileAvatar) });
       avatar = null;
     });
   }
@@ -248,12 +211,12 @@
     const total = applyTargets.length;
     let progress = { done: 0, failed: 0, total };
     applied = progress;
-    void save('apply', async (_target, self) => {
+    void save('apply', async () => {
       for (const child of applyTargets) {
         try {
-          await writeMember(child, self, {
-            displayname: name.trim() || profileName,
-            avatar_url: avatar ?? profileAvatar,
+          await writeMember(child, {
+            display_name: field(name.trim() || profileName),
+            avatar_url: field(avatar ?? profileAvatar),
           });
         } catch (error) {
           console.warn('[sable room] look not applied to a room', error);
@@ -268,30 +231,37 @@
   }
 
   function savePronouns(): void {
-    void save('pronouns', async (target, self) => {
-      await core.commands.sendStateEvent(
-        target,
-        COSMETIC_EVENT_TYPES.pronoun,
-        self,
-        pronounContent(pronouns.trim() === '' ? 'reset' : pronouns) ?? {}
-      );
+    void save('pronouns', async (target) => {
+      await core.rpc.members.setPronouns({
+        room_id: target,
+        pronouns: pronounSets(pronouns),
+        in_parent_space: false,
+      });
       savedPronouns = pronouns;
     });
   }
 
   function resetLook(): void {
-    void save('reset', async (target, self) => {
-      await writeMember(target, self, { displayname: profileName, avatar_url: profileAvatar });
+    void save('reset', async (target) => {
+      const colored = colorOnLight !== '' || colorOnDark !== '';
+      await writeMember(target, {
+        display_name: field(profileName),
+        avatar_url: field(profileAvatar),
+        ...(colored && { color_on_light: field(null), color_on_dark: field(null) }),
+      });
       name = '';
       savedName = '';
       avatar = null;
-      if (colorOnLight || colorOnDark) {
-        await writeMemberColors(core.commands, target, self, { kind: 'clear' });
+      if (colored) {
         colorOnLight = '';
         colorOnDark = '';
       }
       if (canSetPronouns && savedPronouns !== '') {
-        await core.commands.sendStateEvent(target, COSMETIC_EVENT_TYPES.pronoun, self, {});
+        await core.rpc.members.setPronouns({
+          room_id: target,
+          pronouns: [],
+          in_parent_space: false,
+        });
         pronouns = '';
         savedPronouns = '';
       }
@@ -301,50 +271,49 @@
   function allowMembers(eventType: string, allowed: boolean): void {
     const base = effectiveLevels;
     if (!base) return;
-    const next = {
-      ...base,
-      events: { ...base.events, [eventType]: allowed ? MEMBER_LEVEL : MODERATOR_LEVEL },
-    };
     void save(eventType, async (target) => {
-      await core.commands.sendStateEvent(target, 'm.room.power_levels', '', toEventContent(next));
-      currentLevels = next;
+      currentLevels = await core.rpc.members.setPowerLevel({
+        room_id: target,
+        levels: $state.snapshot(base),
+        location: { kind: 'state', event_type: eventType },
+        level: allowed ? MEMBER_LEVEL : MODERATOR_LEVEL,
+      });
     });
   }
 </script>
 
 <div class="section">
   {#if failed}
-    <Alert variant="critical" role="alert">{$i18n.t('room.cosmeticsFailed')}</Alert>
+    <Alert variant="critical" role="alert">{i18n.t('room.settingsFailed')}</Alert>
   {/if}
 
   <SettingsSection
     headingId="room-settings-cosmetics"
-    title={$i18n.t(isSpace ? 'room.cosmeticsTitleSpace' : 'room.cosmeticsTitleRoom')}
-    description={$i18n.t(isSpace ? 'room.cosmeticsHintSpace' : 'room.cosmeticsHintRoom')}
+    title={i18n.t(isSpace ? 'room.cosmeticsTitleSpace' : 'room.cosmeticsTitleRoom')}
+    description={i18n.t(isSpace ? 'room.cosmeticsHintSpace' : 'room.cosmeticsHintRoom')}
   >
     <div class="preview" aria-hidden="true">
       <SenderName displayName={previewName} colors={previewColors} pronouns={previewPronouns} />
     </div>
     <ul class="settings-rows">
       <SettingsRow
-        title={$i18n.t(isSpace ? 'room.cosmeticsAvatarSpace' : 'room.cosmeticsAvatar')}
-        description={$i18n.t(
-          isSpace ? 'room.cosmeticsAvatarHintSpace' : 'room.cosmeticsAvatarHint'
-        )}
+        title={i18n.t(isSpace ? 'room.cosmeticsAvatarSpace' : 'room.cosmeticsAvatar')}
+        description={i18n.t(isSpace ? 'room.cosmeticsAvatarHintSpace' : 'room.cosmeticsAvatarHint')}
       >
         {#snippet before()}
           <Avatar id={userId} src={avatar ?? profileAvatar} name={previewName} />
         {/snippet}
         <Button size="small" disabled={saving !== null} onclick={() => avatarInput?.click()}>
-          {$i18n.t('room.cosmeticsAvatarChange')}
+          {i18n.t('common.changePicture')}
         </Button>
         {#if avatar}
           <Button size="small" variant="ghost" disabled={saving !== null} onclick={resetAvatar}>
-            {$i18n.t('room.cosmeticsAvatarReset')}
+            {i18n.t('room.cosmeticsAvatarReset')}
           </Button>
         {/if}
         <input
           bind:this={avatarInput}
+          use:nativeFilePicker
           class="avatar-input"
           type="file"
           accept="image/*"
@@ -354,8 +323,8 @@
         />
       </SettingsRow>
       <SettingsRow
-        title={$i18n.t(isSpace ? 'room.cosmeticsNameSpace' : 'room.cosmeticsName')}
-        description={$i18n.t(isSpace ? 'room.cosmeticsNameHintSpace' : 'room.cosmeticsNameHint')}
+        title={i18n.t(isSpace ? 'room.cosmeticsNameSpace' : 'room.cosmeticsName')}
+        description={i18n.t(isSpace ? 'room.cosmeticsNameHintSpace' : 'room.cosmeticsNameHint')}
         wide
       >
         <div class="inline-field">
@@ -363,18 +332,19 @@
             id={`${uid}-name`}
             bind:value={name}
             placeholder={profileName ?? userId ?? ''}
-            aria-label={$i18n.t(isSpace ? 'room.cosmeticsNameSpace' : 'room.cosmeticsName')}
+            maxlength={MAX_DISPLAY_NAME_LENGTH}
+            aria-label={i18n.t(isSpace ? 'room.cosmeticsNameSpace' : 'room.cosmeticsName')}
           />
           <Button
             variant="secondary"
             disabled={name === savedName || saving === 'name'}
-            onclick={saveName}>{$i18n.t('room.cosmeticsSave')}</Button
+            onclick={saveName}>{i18n.t('common.save')}</Button
           >
         </div>
       </SettingsRow>
       {#if isSpace}
         <SettingsRow
-          title={$i18n.t('room.cosmeticsApplyRooms')}
+          title={i18n.t('room.cosmeticsApplyRooms')}
           description={applyDescription}
           disabled={applyTargets.length === 0 || name !== savedName}
         >
@@ -383,14 +353,14 @@
             disabled={saving !== null || applyTargets.length === 0 || name !== savedName}
             onclick={applyToRooms}
           >
-            {$i18n.t('room.cosmeticsApplyRoomsAction')}
+            {i18n.t('common.apply')}
           </Button>
         </SettingsRow>
       {/if}
       {#if canSetColor}
         <li class="settings-form form-stack">
           <ColorSetting
-            label={$i18n.t('room.cosmeticsColorLight')}
+            label={i18n.t('room.cosmeticsColorLight')}
             bind:value={colorOnLight}
             onCommit={() => {
               saveColor('on_light', colorOnLight);
@@ -401,7 +371,7 @@
             }}
           />
           <ColorSetting
-            label={$i18n.t('room.cosmeticsColorDark')}
+            label={i18n.t('room.cosmeticsColorDark')}
             bind:value={colorOnDark}
             onCommit={() => {
               saveColor('on_dark', colorOnDark);
@@ -414,10 +384,10 @@
         </li>
       {/if}
       <SettingsRow
-        title={$i18n.t('room.cosmeticsPronouns')}
+        title={i18n.t('room.cosmeticsPronouns')}
         description={canSetPronouns
-          ? $i18n.t('room.cosmeticsPronounsHint')
-          : $i18n.t('room.cosmeticsNotAllowed')}
+          ? i18n.t('room.cosmeticsPronounsHint')
+          : i18n.t('room.cosmeticsNotAllowed')}
         disabled={!canSetPronouns}
         wide
       >
@@ -426,22 +396,23 @@
             id={`${uid}-pronouns`}
             bind:value={pronouns}
             disabled={!canSetPronouns}
-            placeholder={$i18n.t('room.cosmeticsPronounsPlaceholder')}
-            aria-label={$i18n.t('room.cosmeticsPronouns')}
+            placeholder={i18n.t('room.cosmeticsPronounsPlaceholder')}
+            maxlength={MAX_PRONOUN_INPUT}
+            aria-label={i18n.t('room.cosmeticsPronouns')}
           />
           <Button
             variant="secondary"
             disabled={!canSetPronouns || pronouns === savedPronouns || saving === 'pronouns'}
-            onclick={savePronouns}>{$i18n.t('room.cosmeticsSave')}</Button
+            onclick={savePronouns}>{i18n.t('common.save')}</Button
           >
         </div>
       </SettingsRow>
       <SettingsRow
-        title={$i18n.t('room.cosmeticsReset')}
-        description={$i18n.t('room.cosmeticsResetHint')}
+        title={i18n.t('room.cosmeticsReset')}
+        description={i18n.t('room.cosmeticsResetHint')}
       >
         <Button size="small" disabled={saving !== null} onclick={resetLook}>
-          {$i18n.t('room.cosmeticsResetAction')}
+          {i18n.t('common.reset')}
         </Button>
       </SettingsRow>
     </ul>
@@ -450,19 +421,19 @@
   {#if canManage}
     <SettingsSection
       headingId="room-settings-cosmetics-members"
-      title={$i18n.t('room.cosmeticsMembersTitle')}
+      title={i18n.t('room.cosmeticsMembersTitle')}
     >
       <ul class="settings-rows">
         <SettingsRow
-          title={$i18n.t('room.cosmeticsMembersPronouns')}
-          description={$i18n.t(
+          title={i18n.t('room.cosmeticsMembersPronouns')}
+          description={i18n.t(
             isSpace ? 'room.cosmeticsMembersPronounsSpace' : 'room.cosmeticsMembersPronounsRoom'
           )}
         >
           <Switch
             checked={membersSetPronouns}
             disabled={saving !== null}
-            label={$i18n.t('room.cosmeticsMembersPronouns')}
+            label={i18n.t('room.cosmeticsMembersPronouns')}
             onCheckedChange={(allowed) => {
               allowMembers(COSMETIC_EVENT_TYPES.pronoun, allowed);
             }}
@@ -497,5 +468,9 @@
   .inline-field {
     display: flex;
     gap: var(--space-200);
+
+    :global(button) {
+      flex-shrink: 0;
+    }
   }
 </style>

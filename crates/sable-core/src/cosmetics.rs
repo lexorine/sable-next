@@ -1,7 +1,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use matrix_sdk::ruma::api::client::state::get_state_events;
+use matrix_sdk::executor::spawn;
+use matrix_sdk::ruma::api::client::state::get_state_event_for_key;
 use matrix_sdk::ruma::events::{AnySyncStateEvent, StateEventType};
 use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId};
@@ -11,7 +12,7 @@ use serde_json::Value;
 
 use crate::Core;
 use crate::profiles::{profile_hex_color, pronoun_sets};
-use crate::protocol::{CommandErr, CoreEvent, PronounView, RoomCosmeticsView, SenderCosmeticsView};
+use crate::protocol::{CoreEvent, PronounView, RoomCosmeticsView, RpcError, SenderCosmeticsView};
 
 pub(crate) const MEMBER_EVENT: &str = "m.room.member";
 pub(crate) const MEMBER_COLOR_FIELD: &str = "eu.she-a.color";
@@ -40,6 +41,13 @@ fn member_text(content: &Value, field: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn shown_identity(content: &Value) -> (Option<String>, Option<String>) {
+    (
+        member_text(content, "displayname"),
+        member_text(content, "avatar_url"),
+    )
 }
 
 impl Entry {
@@ -166,6 +174,7 @@ pub(crate) fn resolve(room: &Layer, space: Option<&Layer>) -> Vec<SenderCosmetic
 #[derive(Debug, Default)]
 pub(crate) struct CosmeticsCache {
     layers: HashMap<OwnedRoomId, (Layer, u64)>,
+    checked: HashMap<(OwnedRoomId, OwnedUserId), (Option<String>, Option<String>)>,
     tick: u64,
 }
 
@@ -197,6 +206,39 @@ impl CosmeticsCache {
 
     fn contains(&self, room_id: &RoomId) -> bool {
         self.layers.contains_key(room_id)
+    }
+
+    fn outdated_member(
+        &mut self,
+        room_id: &RoomId,
+        user_id: &UserId,
+        content: &Value,
+        previous: Option<&Value>,
+    ) -> Vec<OwnedRoomId> {
+        let current = shown_identity(content);
+        let replaced = previous.map(shown_identity);
+        if replaced.as_ref() == Some(&current) {
+            return Vec::new();
+        }
+        let outdated: Vec<OwnedRoomId> = self
+            .layers
+            .iter()
+            .filter(|(id, (layer, _))| {
+                *id != room_id
+                    && self.checked.get(&((*id).clone(), user_id.to_owned())) != Some(&current)
+                    && layer.users.get(user_id).is_some_and(|entry| {
+                        let shown = (entry.display_name.clone(), entry.avatar_url.clone());
+                        shown != current
+                            && replaced.as_ref().is_none_or(|replaced| *replaced == shown)
+                    })
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &outdated {
+            self.checked
+                .insert((id.clone(), user_id.to_owned()), current.clone());
+        }
+        outdated
     }
 
     fn apply(
@@ -250,7 +292,7 @@ pub(crate) async fn unjoined_space_parents(
         .collect()
 }
 
-async fn first_space_parent(
+pub(crate) async fn first_space_parent(
     client: &matrix_sdk::Client,
     room: &matrix_sdk::Room,
 ) -> Option<OwnedRoomId> {
@@ -290,9 +332,9 @@ impl Core {
         &self,
         room_id: &OwnedRoomId,
         space_id: Option<OwnedRoomId>,
-    ) -> Result<RoomCosmeticsView, CommandErr> {
+    ) -> Result<RoomCosmeticsView, RpcError> {
         let client = self.client().await?;
-        let room = client.get_room(room_id).ok_or(CommandErr::UnknownRoom)?;
+        let room = client.get_room(room_id).ok_or(RpcError::UnknownRoom)?;
         Ok(self.cosmetics_for(&client, &room, space_id).await)
     }
 
@@ -336,16 +378,10 @@ impl Core {
             return layer;
         }
 
-        match client
-            .send(get_state_events::v3::Request::new(
-                room.room_id().to_owned(),
-            ))
-            .await
-        {
-            Ok(response) => {
+        match self.room_state_snapshot(client, room.room_id()).await {
+            Ok(snapshot) => {
                 let layer = Layer::from_events(
-                    response
-                        .room_state
+                    snapshot
                         .iter()
                         .filter_map(|raw| raw.deserialize_as_unchecked::<StateFields<'_>>().ok()),
                 );
@@ -389,6 +425,35 @@ impl Core {
         is_cosmetic(event_type) && cache.apply(room_id, event_type, state_key, content)
     }
 
+    async fn refresh_member(
+        &self,
+        client: &matrix_sdk::Client,
+        layers: Vec<OwnedRoomId>,
+        user_id: &UserId,
+        generation: u64,
+    ) {
+        for room_id in layers {
+            let request = get_state_event_for_key::v3::Request::new(
+                room_id.clone(),
+                StateEventType::RoomMember,
+                user_id.to_string(),
+            );
+            let content = match client.send(request).await {
+                Ok(response) => {
+                    crate::room_settings::state_event_content(response.event_or_content.get())
+                        .unwrap_or(Value::Null)
+                }
+                Err(error) => {
+                    tracing::warn!(room = %room_id, %error, "member refresh for room cosmetics failed");
+                    continue;
+                }
+            };
+            if self.note_cosmetic_state(&room_id, MEMBER_EVENT, user_id.as_str(), &content) {
+                self.emit_if_current(generation, CoreEvent::RoomCosmeticsChanged { room_id });
+            }
+        }
+    }
+
     pub(crate) fn watch_cosmetics(self: &Arc<Self>, client: &matrix_sdk::Client, generation: u64) {
         let handle = client.add_event_handler({
             let core = self.clone();
@@ -417,6 +482,32 @@ impl Core {
                                 room_id: room.room_id().to_owned(),
                             },
                         );
+                    }
+                    if fields.event_type != MEMBER_EVENT
+                        || content.get("membership").and_then(Value::as_str) != Some("join")
+                    {
+                        return;
+                    }
+                    let Some(Ok(user_id)) = fields.state_key.as_deref().map(UserId::parse) else {
+                        return;
+                    };
+                    let previous = raw
+                        .get_field::<Value>("unsigned")
+                        .ok()
+                        .flatten()
+                        .and_then(|unsigned| unsigned.get("prev_content").cloned());
+                    let outdated = core.cosmetics_cache().outdated_member(
+                        room.room_id(),
+                        &user_id,
+                        &content,
+                        previous.as_ref(),
+                    );
+                    if !outdated.is_empty() {
+                        let client = room.client();
+                        spawn(async move {
+                            core.refresh_member(&client, outdated, &user_id, generation)
+                                .await;
+                        });
                     }
                 }
             }
@@ -556,7 +647,10 @@ mod tests {
             (COLOR_EVENT, ALICE, json!({ "color": "red" })),
         ]);
 
-        assert!(resolve(&room, None).is_empty());
+        assert_eq!(
+            resolve(&room, None),
+            [] as [crate::protocol::SenderCosmeticsView; 0]
+        );
     }
 
     #[test]
@@ -574,7 +668,10 @@ mod tests {
         assert!(room.apply(MEMBER_EVENT, ALICE, &renamed));
         assert!(!room.apply(MEMBER_EVENT, ALICE, &renamed));
         assert!(room.apply(MEMBER_EVENT, ALICE, &json!({ "membership": "leave" })));
-        assert!(resolve(&room, None).is_empty());
+        assert_eq!(
+            resolve(&room, None),
+            [] as [crate::protocol::SenderCosmeticsView; 0]
+        );
     }
 
     #[test]
@@ -585,7 +682,10 @@ mod tests {
             ALICE,
             &json!({ "font": "Georgia" })
         ));
-        assert!(resolve(&room, None).is_empty());
+        assert_eq!(
+            resolve(&room, None),
+            [] as [crate::protocol::SenderCosmeticsView; 0]
+        );
     }
 
     async fn joined(server: &MatrixMockServer, rooms: &[&RoomId]) -> matrix_sdk::Client {
@@ -631,6 +731,41 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(events))
             .expect(times)
             .mount(server.server())
+            .await;
+    }
+
+    async fn serve_member(
+        server: &MatrixMockServer,
+        room_id: &RoomId,
+        content: &Value,
+        times: u64,
+    ) {
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/_matrix/client/v3/rooms/{room_id}/state/m.room.member/{ALICE}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(content))
+            .expect(times)
+            .mount(server.server())
+            .await;
+    }
+
+    async fn rename(
+        server: &MatrixMockServer,
+        client: &matrix_sdk::Client,
+        room_id: &RoomId,
+        old: &Value,
+        new: &Value,
+    ) {
+        let mut renamed = state(MEMBER_EVENT, ALICE, new);
+        renamed["event_id"] = json!("$renamed");
+        renamed["unsigned"] = json!({ "prev_content": old });
+        server
+            .sync_room(
+                client,
+                JoinedRoomBuilder::new(room_id)
+                    .add_timeline_event(Raw::new(&renamed).unwrap().cast_unchecked()),
+            )
             .await;
     }
 
@@ -820,11 +955,9 @@ mod tests {
         core.watch_cosmetics(&client, 1);
         serve_state(&server, room_id, json!([]), 1).await;
         let room = client.get_room(room_id).unwrap();
-        assert!(
-            core.cosmetics_for(&client, &room, None)
-                .await
-                .users
-                .is_empty()
+        assert_eq!(
+            core.cosmetics_for(&client, &room, None).await.users,
+            [] as [crate::protocol::SenderCosmeticsView; 0]
         );
 
         server
@@ -847,5 +980,141 @@ mod tests {
         assert_eq!(announced, [room_id.to_owned()]);
         let found = core.cosmetics_for(&client, &room, None).await;
         assert_eq!(found.users[0].color_on_light.as_deref(), Some("#123456"));
+    }
+
+    #[tokio::test]
+    async fn a_rename_in_one_room_refreshes_the_cached_space() {
+        let server = MatrixMockServer::new().await;
+        let room_id = room_id!("!room:example.org");
+        let space_id = room_id!("!space:example.org");
+        let client = joined(&server, &[room_id, space_id]).await;
+        let (core, mut events) = Core::new("cosmetics", Box::new(MemorySessionStore::default()));
+        core.watch_cosmetics(&client, 1);
+        let old = json!({ "membership": "join", "displayname": "Old Alice" });
+        let new = json!({ "membership": "join", "displayname": "New Alice" });
+        serve_state(
+            &server,
+            room_id,
+            json!([state(MEMBER_EVENT, ALICE, &old)]),
+            1,
+        )
+        .await;
+        serve_state(
+            &server,
+            space_id,
+            json!([state(MEMBER_EVENT, ALICE, &old)]),
+            1,
+        )
+        .await;
+        serve_member(&server, space_id, &new, 1).await;
+        let room = client.get_room(room_id).unwrap();
+        assert_eq!(
+            core.cosmetics_for(&client, &room, Some(space_id.to_owned()))
+                .await
+                .users,
+            [] as [crate::protocol::SenderCosmeticsView; 0]
+        );
+
+        rename(&server, &client, room_id, &old, &new).await;
+
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+                .await
+                .expect("the space is announced")
+                .expect("the core is running");
+            if matches!(&event, CoreEvent::RoomCosmeticsChanged { room_id } if room_id == space_id)
+            {
+                break;
+            }
+        }
+        let found = core
+            .cosmetics_for(&client, &room, Some(space_id.to_owned()))
+            .await;
+        assert!(found.users.is_empty(), "{:?}", found.users);
+    }
+
+    #[tokio::test]
+    async fn a_resent_member_state_re_reads_a_differing_layer_once() {
+        let server = MatrixMockServer::new().await;
+        let room_id = room_id!("!room:example.org");
+        let space_id = room_id!("!space:example.org");
+        let client = joined(&server, &[room_id, space_id]).await;
+        let (core, _events) = Core::new("cosmetics", Box::new(MemorySessionStore::default()));
+        core.watch_cosmetics(&client, 1);
+        let member = json!({ "membership": "join", "displayname": "Alice" });
+        let space = json!({ "membership": "join", "displayname": "Space Alice" });
+        serve_state(
+            &server,
+            room_id,
+            json!([state(MEMBER_EVENT, ALICE, &member)]),
+            1,
+        )
+        .await;
+        serve_state(
+            &server,
+            space_id,
+            json!([state(MEMBER_EVENT, ALICE, &space)]),
+            1,
+        )
+        .await;
+        serve_member(&server, space_id, &space, 1).await;
+        let room = client.get_room(room_id).unwrap();
+        core.cosmetics_for(&client, &room, Some(space_id.to_owned()))
+            .await;
+
+        for _ in 0..3 {
+            server
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(room_id).add_state_event(
+                        Raw::new(&state(MEMBER_EVENT, ALICE, &member))
+                            .unwrap()
+                            .cast_unchecked(),
+                    ),
+                )
+                .await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    #[tokio::test]
+    async fn a_rename_leaves_a_space_name_set_on_purpose() {
+        let server = MatrixMockServer::new().await;
+        let room_id = room_id!("!room:example.org");
+        let space_id = room_id!("!space:example.org");
+        let client = joined(&server, &[room_id, space_id]).await;
+        let (core, _events) = Core::new("cosmetics", Box::new(MemorySessionStore::default()));
+        core.watch_cosmetics(&client, 1);
+        let old = json!({ "membership": "join", "displayname": "Alice" });
+        let new = json!({ "membership": "join", "displayname": "New Alice" });
+        let space = json!({ "membership": "join", "displayname": "Space Alice" });
+        serve_state(
+            &server,
+            room_id,
+            json!([state(MEMBER_EVENT, ALICE, &old)]),
+            1,
+        )
+        .await;
+        serve_state(
+            &server,
+            space_id,
+            json!([state(MEMBER_EVENT, ALICE, &space)]),
+            1,
+        )
+        .await;
+        serve_member(&server, space_id, &space, 0).await;
+        let room = client.get_room(room_id).unwrap();
+        core.cosmetics_for(&client, &room, Some(space_id.to_owned()))
+            .await;
+
+        rename(&server, &client, room_id, &old, &new).await;
+
+        let found = core
+            .cosmetics_for(&client, &room, Some(space_id.to_owned()))
+            .await;
+        assert_eq!(
+            found.users[0].space_display_name.as_deref(),
+            Some("Space Alice")
+        );
     }
 }

@@ -10,15 +10,21 @@
   import { useCoreClient } from '#lib/core/context.js';
   import { i18n } from '#lib/i18n.js';
   import { pickFiles } from '#lib/platform/files.js';
+  import { nativeFilePicker } from '#lib/platform/native-file-picker.js';
   import MediaImage from '#lib/ui/MediaImage.svelte';
   import Alert from '#lib/ui/primitives/Alert.svelte';
   import Button from '#lib/ui/primitives/Button.svelte';
+  import DialogActions from '#lib/ui/primitives/DialogActions.svelte';
+  import DialogFrame from '#lib/ui/primitives/DialogFrame.svelte';
   import FormField from '#lib/ui/primitives/FormField.svelte';
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
   import SettingsRow from '#lib/ui/primitives/SettingsRow.svelte';
   import SettingsSection from '#lib/ui/primitives/SettingsSection.svelte';
+  import Switcher from '#lib/ui/primitives/Switcher.svelte';
   import Switch from '#lib/ui/primitives/Switch.svelte';
+  import TextArea from '#lib/ui/primitives/TextArea.svelte';
   import TextInput from '#lib/ui/primitives/TextInput.svelte';
+  import { holdUnsaved } from '#lib/ui/unsaved-guard.js';
   import { uprightJpeg } from '#lib/ui/upright-jpeg.js';
 
   import {
@@ -28,6 +34,7 @@
     normalizeShortcode,
     packDraft,
     shortcodeWithoutExtension,
+    setImageUsage,
     togglePackUsage,
     uniqueShortcode,
     type PackDraft,
@@ -55,6 +62,7 @@
   let failed = $state(false);
   let renaming = $state<string | null>(null);
   let renameDraft = $state('');
+  let bodyDraft = $state('');
   let shortcode = $state('');
   let imageInput = $state<HTMLInputElement | null>(null);
   let avatarInput = $state<HTMLInputElement | null>(null);
@@ -63,6 +71,14 @@
 
   let dirty = $derived(draft !== null);
   let rejected = $derived(draft === null ? null : invalidShortcode(draft.images));
+  let leaving = $state.raw<{ proceed: () => void; stay?: () => void } | null>(null);
+
+  holdUnsaved({
+    dirty: () => canEdit && dirty && leaving === null,
+    ask: (proceed, stay) => {
+      leaving = { proceed, stay };
+    },
+  });
 
   function edit(next: PackDraft): void {
     draft = next;
@@ -70,13 +86,27 @@
     transferFailed = null;
   }
 
-  function taken(candidate: string): boolean {
-    return current.images.some((image) => image.shortcode === candidate);
+  function taken(): string[] {
+    return current.images.map((image) => image.shortcode);
   }
 
   function toggleUsage(usage: ImageUsageView, on: boolean): void {
     const next = togglePackUsage(current, usage, on);
     if (next !== null) edit(next);
+  }
+
+  function imageUsageChoice(image: PackImageDraft): string {
+    return image.usage.length === 1 ? image.usage[0] : 'both';
+  }
+
+  function chooseImageUsage(image: PackImageDraft, choice: string): void {
+    edit(
+      setImageUsage(
+        current,
+        image.shortcode,
+        choice === 'both' ? ALL_USAGES : [choice as ImageUsageView]
+      )
+    );
   }
 
   function removeImage(target: PackImageDraft): void {
@@ -88,16 +118,26 @@
 
   function commitRename(target: PackImageDraft): void {
     const wanted = normalizeShortcode(renameDraft);
+    const body = bodyDraft.trim() === '' ? null : bodyDraft.trim();
     renaming = null;
-    if (wanted === '' || wanted === target.shortcode) return;
+    const next =
+      wanted === '' || wanted === target.shortcode
+        ? target.shortcode
+        : uniqueShortcode(wanted, taken());
+    if (next === target.shortcode && body === target.body) return;
 
-    const next = uniqueShortcode(wanted, taken);
     edit({
       ...current,
       images: current.images.map((image) =>
-        image.shortcode === target.shortcode ? { ...image, shortcode: next } : image
+        image.shortcode === target.shortcode ? { ...image, shortcode: next, body } : image
       ),
     });
+  }
+
+  function leaveFields(event: FocusEvent & { currentTarget: HTMLElement }, image: PackImageDraft) {
+    const next = event.relatedTarget;
+    if (next instanceof Node && event.currentTarget.contains(next)) return;
+    commitRename(image);
   }
 
   async function addImages(event: Event & { currentTarget: HTMLInputElement }): Promise<void> {
@@ -114,15 +154,15 @@
       const requested = normalizeShortcode(shortcode);
       for (const file of files) {
         const bytes = new Uint8Array(await file.arrayBuffer());
-        const url = await core.commands.uploadMedia(file.type || 'image/*', bytes);
+        const url = await core.media.uploadMedia(file.type || 'image/*', bytes);
         const wanted =
           files.length === 1 && requested !== ''
             ? requested
             : normalizeShortcode(shortcodeWithoutExtension(file.name));
-        const name = uniqueShortcode(
-          wanted,
-          (candidate) => taken(candidate) || added.some((image) => image.shortcode === candidate)
-        );
+        const name = uniqueShortcode(wanted, [
+          ...taken(),
+          ...added.map((image) => image.shortcode),
+        ]);
         added.push({
           shortcode: name,
           url,
@@ -152,9 +192,9 @@
     try {
       const upright = await uprightJpeg(file);
       const bytes = new Uint8Array(await upright.arrayBuffer());
-      const avatarUrl = await core.commands.uploadMedia(upright.type || 'image/*', bytes);
-      await onApply?.({ ...$state.snapshot(saved), avatarUrl });
-      if (draft !== null) draft = { ...draft, avatarUrl };
+      const avatarUrl = await core.media.uploadMedia(upright.type || 'image/*', bytes);
+      await onApply?.({ ...$state.snapshot(saved), avatar_url: avatarUrl });
+      if (draft !== null) draft = { ...draft, avatar_url: avatarUrl };
     } catch (error) {
       console.warn('[sable emotes] the pack avatar could not be saved', error);
       failed = true;
@@ -197,10 +237,10 @@
       for (const image of imported.flatMap((pack) => pack.images)) {
         added.push({
           ...image,
-          shortcode: uniqueShortcode(
-            image.shortcode,
-            (candidate) => taken(candidate) || added.some((entry) => entry.shortcode === candidate)
-          ),
+          shortcode: uniqueShortcode(image.shortcode, [
+            ...taken(),
+            ...added.map((entry) => entry.shortcode),
+          ]),
         });
       }
 
@@ -208,7 +248,7 @@
       edit({
         ...current,
         name: current.name === '' ? (first?.name ?? '') : current.name,
-        avatarUrl: current.avatarUrl ?? first?.avatarUrl ?? null,
+        avatar_url: current.avatar_url ?? first?.avatar_url ?? null,
         attribution: current.attribution === '' ? (first?.attribution ?? '') : current.attribution,
         images: [...current.images, ...added],
       });
@@ -228,42 +268,62 @@
     else await importArchives(picked);
   }
 
-  async function apply(): Promise<void> {
-    if (draft === null || busy) return;
+  async function apply(): Promise<boolean> {
+    if (draft === null || busy) return false;
 
     busy = true;
     failed = false;
     try {
       await onApply?.($state.snapshot(draft));
       draft = null;
+      return true;
     } catch (error) {
       console.warn('[sable emotes] the pack could not be saved', error);
       failed = true;
+      return false;
     } finally {
       busy = false;
     }
+  }
+
+  function stay(): void {
+    const pending = leaving;
+    leaving = null;
+    pending?.stay?.();
+  }
+
+  function discardAndLeave(): void {
+    const pending = leaving;
+    leaving = null;
+    draft = null;
+    pending?.proceed();
+  }
+
+  async function saveAndLeave(): Promise<void> {
+    const pending = leaving;
+    if (!(await apply())) return;
+    leaving = null;
+    pending?.proceed();
   }
 </script>
 
 <div class="pack-editor">
   {#if transferFailed !== null}
     <Alert variant="critical" role="alert">
-      {transferFailed === 'export'
-        ? $i18n.t('emotes.exportFailed')
-        : $i18n.t('emotes.importFailed')}
+      {transferFailed === 'export' ? i18n.t('emotes.exportFailed') : i18n.t('emotes.importFailed')}
     </Alert>
   {/if}
 
   <SettingsSection
     headingId="pack-meta"
-    title={$i18n.t('emotes.packDetails')}
-    description={$i18n.t('emotes.packDetailsHint')}
+    title={i18n.t('emotes.packDetails')}
+    description={i18n.t('emotes.packDetailsHint')}
   >
     <div class="settings-form">
       <div class="meta">
         <MediaImage
           class="pack-avatar"
-          source={current.avatarUrl ?? current.images[0]?.url ?? ''}
+          source={current.avatar_url ?? pack?.avatar_url ?? current.images[0]?.url ?? ''}
           alt=""
           width={56}
           height={56}
@@ -276,10 +336,11 @@
             loading={avatarUploading}
             onclick={() => avatarInput?.click()}
           >
-            {$i18n.t('emotes.changeAvatar')}
+            {i18n.t('common.changePicture')}
           </Button>
           <input
             bind:this={avatarInput}
+            use:nativeFilePicker
             class="file-input"
             type="file"
             accept="image/*"
@@ -292,22 +353,24 @@
         {/if}
       </div>
 
-      <FormField fieldId="pack-name" label={$i18n.t('emotes.packName')}>
+      <FormField fieldId="pack-name" label={i18n.t('emotes.packName')}>
         <TextInput
           id="pack-name"
           value={current.name}
+          placeholder={pack?.name ?? ''}
           readonly={!canEdit}
           oninput={(event: Event & { currentTarget: HTMLInputElement }) => {
             edit({ ...current, name: event.currentTarget.value });
           }}
         />
       </FormField>
-      <FormField fieldId="pack-attribution" label={$i18n.t('emotes.packAttribution')}>
-        <TextInput
+      <FormField fieldId="pack-attribution" label={i18n.t('emotes.packAttribution')}>
+        <TextArea
           id="pack-attribution"
           value={current.attribution}
+          rows={3}
           readonly={!canEdit}
-          oninput={(event: Event & { currentTarget: HTMLInputElement }) => {
+          oninput={(event: Event & { currentTarget: HTMLTextAreaElement }) => {
             edit({ ...current, attribution: event.currentTarget.value });
           }}
         />
@@ -317,7 +380,7 @@
     <ul class="settings-rows">
       {#each ALL_USAGES as usage (usage)}
         {@const label =
-          usage === 'emoticon' ? $i18n.t('emotes.useAsEmoji') : $i18n.t('emotes.useAsSticker')}
+          usage === 'emoticon' ? i18n.t('emotes.useAsEmoji') : i18n.t('emotes.useAsSticker')}
         <SettingsRow title={label}>
           <Switch
             {label}
@@ -334,13 +397,13 @@
 
   <SettingsSection
     headingId="pack-images"
-    title={$i18n.t('emotes.images')}
-    description={$i18n.t('emotes.imageCount', { count: current.images.length })}
+    title={i18n.t('emotes.images')}
+    description={i18n.t('emotes.imageCount', { count: current.images.length })}
   >
     {#if current.images.length > 0}
       <ul class="settings-rows">
         {#each current.images as image (image.shortcode)}
-          <SettingsRow title=":{image.shortcode}:">
+          <SettingsRow title=":{image.shortcode}:" description={image.body ?? undefined}>
             {#snippet before()}
               <MediaImage
                 source={image.url}
@@ -350,30 +413,62 @@
                 original
               />
             {/snippet}
+            <Switcher
+              label={i18n.t('emotes.imageUsage', { shortcode: image.shortcode })}
+              value={imageUsageChoice(image)}
+              disabled={!canEdit || busy}
+              items={[
+                { value: 'emoticon', label: i18n.t('emotes.usageEmoji') },
+                { value: 'sticker', label: i18n.t('emotes.usageSticker') },
+                { value: 'both', label: i18n.t('emotes.usageBoth') },
+              ]}
+              onValueChange={(choice) => {
+                chooseImageUsage(image, choice);
+              }}
+            />
             {#if renaming === image.shortcode}
-              <TextInput
-                bind:value={renameDraft}
-                aria-label={$i18n.t('emotes.shortcode')}
-                onblur={() => {
-                  commitRename(image);
+              <div
+                class="image-fields"
+                role="group"
+                aria-label={i18n.t('emotes.rename', { shortcode: image.shortcode })}
+                onfocusout={(event) => {
+                  leaveFields(event, image);
                 }}
-                onkeydown={(event: KeyboardEvent) => {
-                  if (event.key === 'Enter') {
-                    commitRename(image);
-                    if (rejected === null) void apply();
-                  }
-                  if (event.key === 'Escape') renaming = null;
-                }}
-              />
+              >
+                <TextInput
+                  bind:value={renameDraft}
+                  aria-label={i18n.t('emotes.shortcode')}
+                  onkeydown={(event: KeyboardEvent) => {
+                    if (event.key === 'Enter') {
+                      commitRename(image);
+                      if (rejected === null) void apply();
+                    }
+                    if (event.key === 'Escape') renaming = null;
+                  }}
+                />
+                <TextInput
+                  bind:value={bodyDraft}
+                  aria-label={i18n.t('emotes.body')}
+                  placeholder={i18n.t('emotes.body')}
+                  onkeydown={(event: KeyboardEvent) => {
+                    if (event.key === 'Enter') {
+                      commitRename(image);
+                      if (rejected === null) void apply();
+                    }
+                    if (event.key === 'Escape') renaming = null;
+                  }}
+                />
+              </div>
             {:else if canEdit}
               <IconButton
                 variant="ghost"
                 size="small"
-                label={$i18n.t('emotes.rename', { shortcode: image.shortcode })}
+                label={i18n.t('emotes.rename', { shortcode: image.shortcode })}
                 disabled={busy}
                 onclick={() => {
                   renaming = image.shortcode;
                   renameDraft = image.shortcode;
+                  bodyDraft = image.body ?? '';
                 }}
               >
                 <PencilSimpleIcon />
@@ -381,7 +476,7 @@
               <IconButton
                 variant="ghost"
                 size="small"
-                label={$i18n.t('emotes.remove', { shortcode: image.shortcode })}
+                label={i18n.t('emotes.remove', { shortcode: image.shortcode })}
                 disabled={busy}
                 onclick={() => {
                   removeImage(image);
@@ -394,7 +489,7 @@
         {/each}
       </ul>
     {:else}
-      <p class="status settings-form">{$i18n.t('emotes.noImages')}</p>
+      <p class="status settings-form">{i18n.t('emotes.noImages')}</p>
     {/if}
 
     {#if canEdit}
@@ -402,15 +497,16 @@
         <div class="inline">
           <TextInput
             bind:value={shortcode}
-            placeholder={$i18n.t('emotes.shortcodePlaceholder')}
-            aria-label={$i18n.t('emotes.shortcode')}
+            placeholder={i18n.t('emotes.shortcodePlaceholder')}
+            aria-label={i18n.t('emotes.shortcode')}
           />
           <Button disabled={busy} onclick={() => imageInput?.click()}>
-            {$i18n.t('emotes.upload')}
+            {i18n.t('emotes.upload')}
           </Button>
         </div>
         <input
           bind:this={imageInput}
+          use:nativeFilePicker
           class="file-input"
           type="file"
           accept="image/*"
@@ -427,8 +523,8 @@
 
   <SettingsSection
     headingId="pack-transfer"
-    title={$i18n.t('emotes.transfer')}
-    description={$i18n.t('emotes.transferHint')}
+    title={i18n.t('emotes.transfer')}
+    description={i18n.t('emotes.transferHint')}
   >
     <div class="transfer settings-form">
       <Button
@@ -439,7 +535,7 @@
         }}
       >
         <DownloadSimpleIcon />
-        {$i18n.t('emotes.export')}
+        {i18n.t('emotes.export')}
       </Button>
       {#if canEdit}
         <Button
@@ -450,7 +546,7 @@
           }}
         >
           <UploadSimpleIcon />
-          {$i18n.t('emotes.import')}
+          {i18n.t('emotes.import')}
         </Button>
         <input
           bind:this={archiveInput}
@@ -472,16 +568,16 @@
 
   {#if canEdit}
     {#if rejected !== null}
-      <Alert variant="warning" role="alert" title={$i18n.t('emotes.invalidShortcodeTitle')}>
-        <p>{$i18n.t('emotes.invalidShortcode', { shortcode: rejected })}</p>
+      <Alert variant="warning" role="alert" title={i18n.t('emotes.invalidShortcodeTitle')}>
+        <p>{i18n.t('emotes.invalidShortcode', { shortcode: rejected })}</p>
       </Alert>
     {/if}
     {#if failed}
-      <Alert variant="critical" role="alert">{$i18n.t('emotes.saveFailed')}</Alert>
+      <Alert variant="critical" role="alert">{i18n.t('emotes.saveFailed')}</Alert>
     {/if}
-    <div class="save-bar">
+    <div class={['save-bar', { pending: dirty }]}>
       {#if dirty}
-        <p class="save-status" role="status">{$i18n.t('emotes.unsaved')}</p>
+        <p class="save-status" role="status">{i18n.t('common.unsavedChangesNotice')}</p>
       {/if}
       <Button
         size="small"
@@ -492,7 +588,7 @@
         }}
       >
         <ArrowCounterClockwiseIcon />
-        {$i18n.t('emotes.reset')}
+        {i18n.t('common.reset')}
       </Button>
       <Button
         size="small"
@@ -503,11 +599,46 @@
           void apply();
         }}
       >
-        {$i18n.t('emotes.apply')}
+        {i18n.t('emotes.apply')}
       </Button>
     </div>
   {/if}
 </div>
+
+{#if leaving !== null}
+  <DialogFrame
+    open
+    variant="verification"
+    label={i18n.t('emotes.leaveTitle')}
+    onOpenChange={(next) => {
+      if (!next) stay();
+    }}
+  >
+    <div class="leave">
+      <h2>{i18n.t('emotes.leaveTitle')}</h2>
+      <p>{i18n.t('emotes.leaveHint')}</p>
+      {#if failed}
+        <Alert variant="critical" role="alert">{i18n.t('emotes.saveFailed')}</Alert>
+      {/if}
+      <DialogActions>
+        <Button onclick={stay} disabled={busy}>{i18n.t('emotes.leaveStay')}</Button>
+        <Button variant="danger" onclick={discardAndLeave} disabled={busy}>
+          {i18n.t('emotes.leaveDiscard')}
+        </Button>
+        <Button
+          variant="primary"
+          loading={busy}
+          disabled={rejected !== null}
+          onclick={() => {
+            void saveAndLeave();
+          }}
+        >
+          {i18n.t('common.save')}
+        </Button>
+      </DialogActions>
+    </div>
+  </DialogFrame>
+{/if}
 
 <style>
   .pack-editor {
@@ -544,6 +675,11 @@
     grid-template-columns: 1fr auto;
   }
 
+  .image-fields {
+    display: grid;
+    gap: var(--space-200);
+  }
+
   .file-input {
     height: 0;
     opacity: 0;
@@ -558,10 +694,38 @@
     justify-content: flex-end;
   }
 
+  .save-bar.pending {
+    background: var(--bg-container);
+    border: var(--border-width) solid var(--bg-container-line);
+    border-radius: var(--radius);
+    bottom: var(--space-300);
+    box-shadow: var(--shadow-e200);
+    color: var(--bg-on-container);
+    padding: var(--space-200) var(--space-300);
+    position: sticky;
+    z-index: 1;
+  }
+
+  .leave {
+    display: grid;
+    gap: var(--space-300);
+    width: min(24rem, calc(100vw - 2rem));
+  }
+
+  .leave h2,
+  .leave p {
+    margin: 0;
+  }
+
   .save-status {
     color: var(--surface-var-on-container);
     font-size: var(--font-size-small);
     margin: 0;
     margin-right: auto;
+  }
+
+  .save-bar.pending .save-status {
+    color: var(--bg-on-container);
+    font-weight: var(--font-weight-medium);
   }
 </style>

@@ -1,6 +1,6 @@
 import { BrowserClient, defaultStackParser, makeFetchTransport } from '@sentry/sveltekit';
 
-import { telemetryConsent } from '#lib/features/notifications/room-names.js';
+import { telemetryConsent } from '#lib/notifications/room-names.js';
 import { scrubSentryEvent } from '#lib/observability/sentry-event.js';
 
 let client: BrowserClient | undefined;
@@ -44,7 +44,9 @@ export async function watchWorkerOperation<T>(operation: string, pending: Promis
   try {
     return await pending;
   } catch (error) {
-    await reportWorkerError(operation, error).catch(() => undefined);
+    await reportWorkerError(operation, error).catch((reportError: unknown) => {
+      console.debug('[sable service-worker] error not reported', reportError);
+    });
     throw error;
   }
 }

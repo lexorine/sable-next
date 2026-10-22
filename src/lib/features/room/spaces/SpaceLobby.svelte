@@ -1,6 +1,11 @@
 <script lang="ts">
   import { CoreError } from '#src/transport';
-  import type { RoomPermissionsView, RoomSummary, SpaceChildEdge } from '#src/generated/protocol';
+  import type {
+    LobbyAction,
+    RoomPermissionsView,
+    RoomListItemView,
+    SpaceChildEdge,
+  } from '#src/generated/protocol';
   import BackIcon from 'phosphor-svelte/lib/CaretLeftIcon';
   import DotsThreeVerticalIcon from 'phosphor-svelte/lib/DotsThreeVerticalIcon';
   import ListBulletsIcon from 'phosphor-svelte/lib/ListBulletsIcon';
@@ -10,12 +15,13 @@
   import SquaresFourIcon from 'phosphor-svelte/lib/SquaresFourIcon';
   import UsersThreeIcon from 'phosphor-svelte/lib/UsersThreeIcon';
   import { onDestroy, untrack } from 'svelte';
-  import { SvelteMap, SvelteSet } from 'svelte/reactivity';
+  import { MediaQuery, SvelteMap, SvelteSet } from 'svelte/reactivity';
 
   import { goto } from '$app/navigation';
   import { afterOverlayPops } from '#lib/platform/overlay-back.svelte.js';
   import { resolve } from '$app/paths';
   import { useCoreClient } from '#lib/core/context.js';
+  import { joinRoom, knockRoom } from '#lib/core/api/rooms.js';
   import { i18n } from '#lib/i18n.js';
   import { preferences } from '#lib/settings/preferences.svelte.js';
   import { createDragList, type DropEdge, type DropInstruction } from '#lib/ui/drag-list.js';
@@ -39,7 +45,6 @@
   import Tooltip from '#lib/ui/primitives/Tooltip.svelte';
   import { toasts } from '#lib/ui/toasts.svelte.js';
   import { BREAKPOINTS } from '#lib/ui/breakpoints.js';
-  import { createMediaQuery } from '#lib/ui/media-query.svelte.js';
   import { backToRoomList } from '#lib/features/room/room-navigation.js';
 
   import {
@@ -49,9 +54,7 @@
     childEdges,
     edgeSignature,
     levelTargets,
-    inAllowList,
     joinCandidates,
-    lobbyAction,
     lobbyPhase,
     localHierarchyRooms,
     mergeHierarchyRooms,
@@ -81,9 +84,10 @@
   import SpaceLobbySection from './SpaceLobbySection.svelte';
   import { SpaceHierarchyLoader } from './space-hierarchy-loader.svelte';
   import { JoinQueue } from './join-queue.svelte';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
 
   interface Props {
-    space: RoomSummary | null;
+    space: RoomListItemView | null;
   }
 
   let { space }: Props = $props();
@@ -101,7 +105,7 @@
   const closed = new SvelteSet<string>();
   const visibleLevels = new SvelteSet<string>();
 
-  const appLayout = createMediaQuery(BREAKPOINTS.appLayout);
+  const appLayout = new MediaQuery(BREAKPOINTS.appLayout);
   const hierarchy = new SpaceHierarchyLoader(core);
   let fetched = $derived(hierarchy.fetched);
   let overrides = $state.raw<ChildOrderOverride[]>([]);
@@ -110,6 +114,7 @@
   let addKind = $state<AddExistingKind>('rooms');
   let failed = $derived(hierarchy.failed);
   let topicOpen = $state(false);
+  let topicRoom = $state.raw<HierarchyRoomView | null>(null);
   let joinAllOn = $state(false);
   const joinQueue = new JoinQueue((roomId, error) => {
     console.warn('[sable lobby] join failed', error);
@@ -122,16 +127,20 @@
     const { via } = splitVia(anchor.href);
     const target = roomSectionPath(
       roomList.rooms,
-      link.roomId,
-      link.kind === 'event' ? link.eventId : null,
+      link.room_id,
+      link.kind === 'event' ? link.event_id : null,
       via
     );
+    // eslint-disable-next-line svelte/no-navigation-without-resolve -- roomSectionPath() resolves the route itself
     void afterOverlayPops().then(() => goto(target));
   }
-  let permissions = $state<RoomPermissionsView | null>(null);
+  let permissionsById = $state.raw(new Map<string, RoomPermissionsView>());
+  let permissionsSpace: string | null = null;
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- request bookkeeping, never rendered from
+  const requestedPermissions = new Set<string>();
 
   let spaceId = $derived(space?.room_id ?? null);
-  let canManage = $derived(permissions?.can_manage_children ?? false);
+  let canManage = $derived(canManageIn(spaceId));
   let joinedIds = $derived(
     new Set(roomList.rooms.filter((room) => room.state === 'joined').map((room) => room.room_id))
   );
@@ -146,21 +155,23 @@
   );
   let base = $derived.by<HierarchyRoomView[]>(() => {
     if (spaceId === null) return [];
-    return mergeHierarchyRooms(localHierarchyRooms(roomList.rooms, spaceId), fetched);
+    return mergeHierarchyRooms(
+      localHierarchyRooms(roomList.rooms, spaceId),
+      fetched.map((room) => ({ ...room, is_space: room.room_kind === 'space' }))
+    );
   });
   let ordered = $derived(applyChildOverrides(base, overrides));
   let merged = $derived(applySuggestedOverrides(ordered, suggestedOverrides));
+  let manageable = $derived(merged.filter((room) => room.is_space && canManageIn(room.room_id)));
   let sections = $derived.by<HierarchySection[]>(() => {
     if (spaceId === null) return [];
-    return buildHierarchySections(
-      merged,
-      spaceId,
-      {
-        loaded: hierarchy.loadedLevels,
-        failed: hierarchy.failedLevels,
-      },
-      canManage
-    )
+    return buildHierarchySections(merged, spaceId, {
+      loaded: hierarchy.loadedLevels,
+      failed: hierarchy.failedLevels,
+      keepEmpty: manageable.map((room) => room.room_id),
+      joined: joinedIds,
+      invited: invitedIds,
+    })
       .map((section) => ({
         ...section,
         rooms: section.rooms.filter((entry) => !removed.has(entry.key)),
@@ -170,18 +181,16 @@
           section.rooms.length > 0 ||
           !section.loaded ||
           section.failed ||
-          (canManage && section.space !== null)
+          (section.space !== null && canManageIn(section.parent_id))
       );
   });
   let moveTargets = $derived(
-    merged
-      .filter((room) => room.is_space)
-      .map((room) => ({
-        id: room.room_id,
-        name: room.room_id === spaceId ? (space?.name ?? label(room)) : label(room),
-      }))
+    manageable.map((room) => ({
+      id: room.room_id,
+      name: room.room_id === spaceId ? (space?.name ?? label(room)) : label(room),
+    }))
   );
-  let candidates = $derived(joinCandidates(sections, joinedIds, invitedIds));
+  let candidates = $derived(joinCandidates(sections, joinedIds));
   let pinnedIds = $derived(new Set(layoutSpaceIds(spaceSidebar.items)));
   let phase = $derived(
     lobbyPhase(sections.length, spaceId === null || !hierarchy.loadedLevels.has(spaceId))
@@ -216,9 +225,9 @@
   $effect(() => {
     if (!joinAllOn) return;
     for (const section of sections) visibleLevels.add(section.key);
-    const targets = candidates.map(({ room, via, parentId }) => ({
+    const targets = candidates.map(({ room, via, parent_id: parentId }) => ({
       roomId: room.room_id,
-      run: () => trackedJoin(room, via, parentId),
+      run: () => trackedJoin(room, via, parentId, 'join'),
     }));
     untrack(() => {
       joinQueue.add(targets);
@@ -233,7 +242,7 @@
     const failures = joinQueue.failed;
     joinAllOn = false;
     joinQueue.cancel();
-    if (failures > 0) toasts.error($i18n.t('room.lobbyJoinAllFailed', { count: failures }));
+    if (failures > 0) toasts.error(i18n.t('room.lobbyJoinAllFailed', { count: failures }));
   }
 
   function stopJoinAll(): void {
@@ -250,24 +259,56 @@
     if (kept.length !== overrides.length) overrides = kept;
   });
 
-  $effect(() => {
-    const target = spaceId;
-    if (!target) return;
+  let permissionTargets = $derived(
+    merged
+      .filter(
+        (room) => joinedIds.has(room.room_id) && (room.is_space || boundToParent(room.join_rule))
+      )
+      .map((room) => room.room_id)
+  );
 
-    let current = true;
-    permissions = null;
-    void core.commands
-      .roomPermissions(target)
-      .then((next) => {
-        if (current) permissions = next;
-      })
-      .catch((error: unknown) => {
-        console.debug('[sable lobby] permissions unavailable', error);
-      });
-    return () => {
-      current = false;
-    };
+  $effect(() => {
+    const targets = permissionTargets;
+    const current = spaceId;
+    if (current !== permissionsSpace) {
+      permissionsSpace = current;
+      requestedPermissions.clear();
+      permissionsById = new Map();
+    }
+    for (const roomId of targets) {
+      if (requestedPermissions.has(roomId)) continue;
+      requestedPermissions.add(roomId);
+      void core.rpc.members
+        .permissions({ room_id: roomId })
+        .then((next) => {
+          if (permissionsSpace !== current) return;
+          permissionsById = new Map([...permissionsById, [roomId, next]]);
+        })
+        .catch((error: unknown) => {
+          console.debug('[sable lobby] permissions unavailable', error);
+        });
+    }
   });
+
+  function canManageIn(roomId: string | null): boolean {
+    return roomId !== null && (permissionsById.get(roomId)?.can_manage_children ?? false);
+  }
+
+  function boundToParent(joinRule: string | null): boolean {
+    return joinRule === 'restricted' || joinRule === 'knock_restricted';
+  }
+
+  function canLeaveParent(roomId: string): boolean {
+    const room = merged.find((candidate) => candidate.room_id === roomId);
+    if (!room || !boundToParent(room.join_rule)) return true;
+    return permissionsById.get(roomId)?.can_change_join_rule ?? false;
+  }
+
+  function canDropInto(source: LobbyDragItem, parentId: string): boolean {
+    if (!canManageIn(parentId)) return false;
+    if (source.parentId === parentId || source.roomId === null) return true;
+    return canLeaveParent(source.roomId);
+  }
 
   function open(child: HierarchyRoomView): void {
     const target = roomPathParamFromId(child.room_id);
@@ -278,7 +319,7 @@
     if (!space) return;
     void goto(
       resolve('/(app)/space/[spaceId]/[roomId]', {
-        spaceId: roomPathParam(space),
+        spaceId: roomPathParam(space, roomList.rooms),
         roomId: target,
       })
     );
@@ -311,11 +352,15 @@
     suggestedOverrides = [...suggestedOverrides.filter(others), override];
 
     try {
-      await core.commands.setSpaceChildSuggested(parentId, roomId, suggested);
+      await core.rpc.spaces.setChildSuggested({
+        space_id: parentId,
+        room_id: roomId,
+        suggested,
+      });
     } catch (error) {
       console.warn('[sable lobby] suggestion not saved', error);
       suggestedOverrides = suggestedOverrides.filter((candidate) => candidate !== override);
-      toasts.error($i18n.t('room.lobbySuggestedFailed'));
+      toasts.error(i18n.t('room.lobbySuggestedFailed'));
     }
   }
 
@@ -327,13 +372,13 @@
     let failures = 0;
     for (const roomId of roomIds) {
       try {
-        await core.commands.addToSpace(parentId, roomId, suggested);
+        await core.rpc.spaces.add({ space_id: parentId, room_id: roomId, suggested });
       } catch (error) {
         failures += 1;
         console.warn('[sable lobby] room not added', error);
       }
     }
-    if (failures > 0) toasts.error($i18n.t('room.lobbyAddFailed', { count: failures }));
+    if (failures > 0) toasts.error(i18n.t('room.lobbyAddFailed', { count: failures }));
   }
 
   function retry(levelId: string): void {
@@ -350,29 +395,25 @@
   async function attemptJoin(
     child: HierarchyRoomView,
     via: readonly string[],
-    parentId: string
+    parentId: string,
+    action: LobbyAction
   ): Promise<boolean> {
     const address = child.canonical_alias ?? child.room_id;
     let routing = viaFor(address, via);
     if (routing.length === 0 && child.canonical_alias === null) {
-      routing = await core.commands.roomViaServers(parentId);
+      routing = await core.rpc.rooms.viaServers({ room_id: parentId });
     }
-    const action = lobbyAction(
-      child.join_rule,
-      invitedIds.has(child.room_id),
-      inAllowList(child, joinedIds, parentId)
-    );
     if (action === 'knock') {
-      await core.commands.knockRoom(address, routing);
+      await knockRoom(core.rpc, address, routing);
       knocked.add(child.room_id);
       return false;
     }
     try {
-      await core.commands.joinRoom(address, routing);
+      await joinRoom(core.rpc, address, routing);
     } catch (error) {
       if (child.join_rule !== 'knock_restricted' || !(error instanceof CoreError)) throw error;
       if (error.detail.code !== 'denied') throw error;
-      await core.commands.knockRoom(address, routing);
+      await knockRoom(core.rpc, address, routing);
       knocked.add(child.room_id);
       return false;
     }
@@ -382,12 +423,13 @@
   async function trackedJoin(
     child: HierarchyRoomView,
     via: readonly string[],
-    parentId: string
+    parentId: string,
+    action: LobbyAction
   ): Promise<boolean> {
     joining.add(child.room_id);
     joinErrors.delete(child.room_id);
     try {
-      return await attemptJoin(child, via, parentId);
+      return await attemptJoin(child, via, parentId, action);
     } finally {
       joining.delete(child.room_id);
     }
@@ -396,11 +438,12 @@
   async function join(
     child: HierarchyRoomView,
     via: readonly string[],
-    parentId: string
+    parentId: string,
+    action: LobbyAction
   ): Promise<void> {
     if (joining.has(child.room_id)) return;
     try {
-      await trackedJoin(child, via, parentId);
+      await trackedJoin(child, via, parentId, action);
     } catch (error) {
       console.warn('[sable lobby] join failed', error);
       joinErrors.set(child.room_id, joinErrorMessage(error));
@@ -412,19 +455,22 @@
     if (!parentId) return;
 
     try {
-      await core.commands.removeFromSpace(parentId, entry.room.room_id);
+      await core.rpc.spaces.remove({ space_id: parentId, room_id: entry.room.room_id });
       removed.add(entry.key);
     } catch (error) {
       console.warn('[sable lobby] remove failed', error);
-      toasts.error($i18n.t('errors.actionFailed'));
+      toasts.error(i18n.t('errors.actionFailed'));
     }
   }
 
   async function removeSubspace(section: HierarchySection): Promise<void> {
-    if (section.ownerId === null) return;
+    if (section.owner_id === null) return;
 
     try {
-      await core.commands.removeFromSpace(section.ownerId, section.parentId);
+      await core.rpc.spaces.remove({
+        space_id: section.owner_id,
+        room_id: section.parent_id,
+      });
     } catch (error) {
       console.warn('[sable lobby] remove failed', error);
       hierarchy.fail();
@@ -433,16 +479,16 @@
 
   async function moveRoom(from: string, roomId: string, target: string): Promise<void> {
     try {
-      await core.commands.addToSpace(target, roomId);
+      await core.rpc.spaces.add({ space_id: target, room_id: roomId, suggested: null });
     } catch (error) {
       console.warn('[sable lobby] move failed', error);
       hierarchy.fail();
       return;
     }
     try {
-      await core.commands.removeFromSpace(from, roomId);
+      await core.rpc.spaces.remove({ space_id: from, room_id: roomId });
       for (const section of sections) {
-        if (section.parentId !== from) continue;
+        if (section.parent_id !== from) continue;
         for (const entry of section.rooms) {
           if (entry.room.room_id === roomId) removed.add(entry.key);
         }
@@ -460,13 +506,13 @@
     target: LobbyDragItem,
     instruction: DropInstruction
   ): void {
-    if (source.roomId === null) return;
+    if (source.roomId === null || !canDropInto(source, target.parentId)) return;
     if (source.parentId !== target.parentId) {
       void moveRoom(source.parentId, source.roomId, target.parentId);
       return;
     }
     if (target.roomId === null || instruction === 'into') return;
-    const section = sections.find((candidate) => candidate.parentId === source.parentId);
+    const section = sections.find((candidate) => candidate.parent_id === source.parentId);
     if (section) reorder(section, source.roomId, target.roomId, instruction);
   }
 
@@ -490,7 +536,11 @@
 
     try {
       for (const change of changes) {
-        await core.commands.setSpaceChildOrder(parentId, change.roomId, change.order);
+        await core.rpc.spaces.setChildOrder({
+          space_id: parentId,
+          room_id: change.roomId,
+          order: change.order,
+        });
       }
     } catch (error) {
       console.warn('[sable lobby] reorder failed', error);
@@ -527,24 +577,24 @@
     target: string,
     position: DropEdge
   ): void {
-    reorderIn(section.parentId, section.siblings, source, target, position);
+    reorderIn(section.parent_id, section.siblings, source, target, position);
   }
 
   function moveSubspace(section: HierarchySection, delta: number): void {
-    if (section.ownerId === null) return;
+    if (section.owner_id === null) return;
 
-    const edges = childEdges(merged, section.ownerId);
+    const edges = childEdges(merged, section.owner_id);
     const spaces = edges.filter(
       (edge) => merged.find((room) => room.room_id === edge.room_id)?.is_space
     );
-    const index = spaces.findIndex((edge) => edge.room_id === section.parentId);
+    const index = spaces.findIndex((edge) => edge.room_id === section.parent_id);
     const to = index + delta;
     if (index === -1 || to < 0 || to >= spaces.length) return;
 
     reorderIn(
-      section.ownerId,
+      section.owner_id,
       edges,
-      section.parentId,
+      section.parent_id,
       spaces[to].room_id,
       delta < 0 ? 'above' : 'below'
     );
@@ -575,7 +625,7 @@
   }
 </script>
 
-<section class="lobby" aria-label={$i18n.t('nav.lobby')}>
+<section class="lobby" aria-label={i18n.t('nav.lobby')}>
   <header
     class="hero"
     role="presentation"
@@ -591,12 +641,12 @@
       },
     })}
   >
-    {#if !appLayout.matches}
+    {#if !appLayout.current}
       <div class="mobile-back-menu">
         <IconButton
           variant="ghost"
           size="small"
-          label={$i18n.t('timeline.back')}
+          label={i18n.t('timeline.back')}
           onclick={backToRoomList}
         >
           <BackIcon />
@@ -606,15 +656,16 @@
     {#if space}
       <div class="hero-menu">
         {#if preferences.developerTools}
-          <Tooltip label={$i18n.t('room.menuShowSpaceTimeline')} side="bottom">
+          <Tooltip label={i18n.t('room.menuShowSpaceTimeline')} side="bottom">
             {#snippet trigger({ props })}
               <IconButton
                 {...props}
                 variant="ghost"
                 size="small"
-                label={$i18n.t('room.menuShowSpaceTimeline')}
+                label={i18n.t('room.menuShowSpaceTimeline')}
                 onclick={() => {
-                  void goto(spaceTimelinePath(space));
+                  // eslint-disable-next-line svelte/no-navigation-without-resolve -- spaceTimelinePath() resolves the route itself
+                  void goto(spaceTimelinePath(space, roomList.rooms));
                 }}
               >
                 <ListBulletsIcon />
@@ -625,7 +676,7 @@
         <IconButton
           variant="ghost"
           size="small"
-          label={$i18n.t('room.menuLabel')}
+          label={i18n.t('room.menuLabel')}
           onclick={(event) => {
             openOptions(event.currentTarget instanceof HTMLElement ? event.currentTarget : null);
           }}
@@ -641,12 +692,13 @@
       size="large"
       uniform
     />
-    <h1>{space?.name ?? $i18n.t('nav.space')}</h1>
+    <h1>{space?.name ?? i18n.t('nav.space')}</h1>
     {#if space?.topic}
       <button
         type="button"
         class="topic"
         onclick={() => {
+          topicRoom = null;
           topicOpen = true;
         }}
       >
@@ -656,11 +708,11 @@
     {#if canManage && space}
       {@const managed = space}
       <div class="hero-actions">
-        <ActionMenu label={$i18n.t('room.lobbyAdd')}>
+        <ActionMenu label={i18n.t('common.add')}>
           {#snippet trigger({ props })}
             <Button {...props} variant="primary" size="small" class="hero-action">
               <PlusIcon />
-              {$i18n.t('room.lobbyAdd')}
+              {i18n.t('common.add')}
             </Button>
           {/snippet}
           <IconContext values={{ 'aria-hidden': 'true', size: 16 }}>
@@ -668,23 +720,23 @@
               onSelect={() => {
                 void goto(
                   resolve('/(app)/space/[spaceId]/create-room', {
-                    spaceId: roomPathParam(managed),
+                    spaceId: roomPathParam(managed, roomList.rooms),
                   })
                 );
               }}
             >
-              <PlusIcon />{$i18n.t('nav.createRoomInSpace')}
+              <PlusIcon />{i18n.t('nav.createRoomInSpace')}
             </ActionMenuItem>
             <ActionMenuItem
               onSelect={() => {
                 void goto(
                   resolve('/(app)/space/[spaceId]/create-space', {
-                    spaceId: roomPathParam(managed),
+                    spaceId: roomPathParam(managed, roomList.rooms),
                   })
                 );
               }}
             >
-              <UsersThreeIcon />{$i18n.t('nav.createSubspace')}
+              <UsersThreeIcon />{i18n.t('nav.createSubspace')}
             </ActionMenuItem>
             <ActionMenuItem
               onSelect={() => {
@@ -692,7 +744,7 @@
                 addOpen = true;
               }}
             >
-              <HashIcon />{$i18n.t('room.lobbyAddExistingRooms')}
+              <HashIcon />{i18n.t('room.lobbyAddExistingRooms')}
             </ActionMenuItem>
             <ActionMenuItem
               onSelect={() => {
@@ -700,7 +752,7 @@
                 addOpen = true;
               }}
             >
-              <SquaresFourIcon />{$i18n.t('room.lobbyAddExistingSpaces')}
+              <SquaresFourIcon />{i18n.t('room.lobbyAddExistingSpaces')}
             </ActionMenuItem>
           </IconContext>
         </ActionMenu>
@@ -720,13 +772,13 @@
       <div class="join-all" role="status">
         <Spinner small />
         <span>
-          {$i18n.t(joinQueue.waiting ? 'room.lobbyJoinWaiting' : 'room.lobbyJoinProgress', {
+          {i18n.t(joinQueue.waiting ? 'room.lobbyJoinWaiting' : 'room.lobbyJoinProgress', {
             done: joinQueue.done,
             total: joinQueue.total,
           })}
         </span>
         <Button variant="ghost" size="small" onclick={stopJoinAll}
-          >{$i18n.t('room.lobbyJoinStop')}</Button
+          >{i18n.t('room.lobbyJoinStop')}</Button
         >
       </div>
     {:else if candidates.length > 0}
@@ -740,7 +792,7 @@
           }}
         >
           <PlusIcon />
-          {$i18n.t('room.lobbyJoinAll', { count: candidates.length })}
+          {i18n.t('room.lobbyJoinAll', { count: candidates.length })}
         </Button>
       </div>
     {/if}
@@ -748,7 +800,7 @@
 
   {#if failed}
     <Alert variant="critical" role="alert">
-      <p>{$i18n.t('room.lobbyFailed')}</p>
+      <p>{i18n.t('room.lobbyFailed')}</p>
       {#if spaceId}
         {@const target = spaceId}
         <div>
@@ -757,7 +809,7 @@
             size="small"
             onclick={() => {
               retry(target);
-            }}>{$i18n.t('room.lobbyRetry')}</Button
+            }}>{i18n.t('common.retry')}</Button
           >
         </div>
       {/if}
@@ -765,23 +817,23 @@
   {/if}
 
   {#if phase === 'loading'}
-    <div class="placeholder" role="status" aria-label={$i18n.t('room.lobbyLoading')}>
+    <div class="placeholder" role="status" aria-label={i18n.t('room.lobbyLoading')}>
       <LobbyRoomPlaceholder rows={3} />
     </div>
   {:else if phase === 'empty'}
     {#if canManage}
-      <EmptyState title={$i18n.t('room.lobbyEmpty')} description={$i18n.t('room.lobbyEmptyManage')}>
+      <EmptyState title={i18n.t('room.lobbyEmpty')} description={i18n.t('room.lobbyEmptyManage')}>
         {#snippet actions()}
           <Button
             onclick={() => {
               addKind = 'rooms';
               addOpen = true;
-            }}>{$i18n.t('room.lobbyAddRooms')}</Button
+            }}>{i18n.t('room.lobbyAddRooms')}</Button
           >
         {/snippet}
       </EmptyState>
     {:else}
-      <p class="empty">{$i18n.t('room.lobbyEmpty')}</p>
+      <p class="empty">{i18n.t('room.lobbyEmpty')}</p>
     {/if}
   {:else}
     {#each sections as section (section.key)}
@@ -789,17 +841,28 @@
         {section}
         closed={closed.has(section.key)}
         {joinedIds}
-        {invitedIds}
         {joining}
         knocked={knockedIds}
         {joinErrors}
-        {canManage}
+        canManage={canManageIn(section.parent_id)}
+        canManageOwner={canManageIn(section.owner_id)}
+        {canLeaveParent}
+        {canDropInto}
         {label}
         onToggle={toggle}
         onVisible={(key) => visibleLevels.add(key)}
         onOpen={open}
-        onJoin={(child: HierarchyRoomView, via: readonly string[], parentId: string) => {
-          void join(child, via, parentId);
+        onTopic={(child: HierarchyRoomView) => {
+          topicRoom = child;
+          topicOpen = true;
+        }}
+        onJoin={(
+          child: HierarchyRoomView,
+          via: readonly string[],
+          parentId: string,
+          action: LobbyAction
+        ) => {
+          void join(child, via, parentId, action);
         }}
         onCopyLink={(child: HierarchyRoomView) => {
           void copyRoomLink(core, child);
@@ -825,7 +888,7 @@
           void removeSubspace(section);
         }}
         onMoveTo={(section: HierarchySection, entry: HierarchyRoom, target: string) => {
-          void moveRoom(section.parentId, entry.room.room_id, target);
+          void moveRoom(section.parent_id, entry.room.room_id, target);
         }}
       />
     {/each}
@@ -833,24 +896,45 @@
     {#if hierarchy.pendingLevels.size > 0}
       <p class="loading-note" role="status">
         <Spinner small />
-        <span>{$i18n.t('room.lobbyLoadingMore')}</span>
+        <span>{i18n.t('room.lobbyLoadingMore')}</span>
       </p>
     {/if}
   {/if}
 </section>
 
-<DialogFrame bind:open={topicOpen} variant="verification" label={$i18n.t('room.lobbyTopicTitle')}>
+<DialogFrame bind:open={topicOpen} variant="verification" label={i18n.t('room.lobbyTopicTitle')}>
   <div class="topic-dialog">
-    <h2>{space?.name ?? $i18n.t('nav.space')}</h2>
-    <div class="topic-full">
-      <FormattedBody html={topicHtml(space?.topic ?? '')} onMatrixLink={openTopicLink} />
+    {#if topicRoom}
+      <div class="topic-room">
+        <Avatar id={topicRoom.room_id} src={topicRoom.avatar_url} name={label(topicRoom)} />
+        <div class="topic-room-text">
+          <h2>{label(topicRoom)}</h2>
+          {#if topicRoom.canonical_alias}<span>{topicRoom.canonical_alias}</span>{/if}
+          <span class="topic-room-meta">
+            {#if topicRoom.num_joined_members !== null}
+              <span>{i18n.t('room.lobbyMembers', { count: topicRoom.num_joined_members })}</span>
+            {/if}
+            {#if topicRoom.join_rule !== 'unknown'}
+              <span>{i18n.t(`room.joinRule.${topicRoom.join_rule}`)}</span>
+            {/if}
+          </span>
+        </div>
+      </div>
+    {:else}
+      <h2>{space?.name ?? i18n.t('nav.space')}</h2>
+    {/if}
+    <div class="topic-full" {@attach scrollHint}>
+      <FormattedBody
+        html={topicHtml((topicRoom ? topicRoom.topic : space?.topic) ?? '')}
+        onMatrixLink={openTopicLink}
+      />
     </div>
     <DialogActions>
       <Button
         variant="ghost"
         onclick={() => {
           topicOpen = false;
-        }}>{$i18n.t('room.lobbyTopicClose')}</Button
+        }}>{i18n.t('common.close')}</Button
       >
     </DialogActions>
   </div>
@@ -998,6 +1082,32 @@
     font-size: var(--font-size-heading);
     line-height: 1.3;
     margin: 0;
+  }
+
+  .topic-room {
+    align-items: center;
+    display: flex;
+    gap: var(--space-300);
+    min-width: 0;
+  }
+
+  .topic-room-text {
+    color: var(--surface-var-on-container);
+    display: grid;
+    font-size: var(--font-size-small);
+    gap: var(--space-050);
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .topic-room-text h2 {
+    color: var(--surface-on-container);
+  }
+
+  .topic-room-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-050) var(--space-300);
   }
 
   .topic-full {

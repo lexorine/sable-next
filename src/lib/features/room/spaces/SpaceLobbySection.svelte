@@ -32,25 +32,34 @@
     HierarchyRoom,
     HierarchyRoomView,
     HierarchySection,
+    LobbyAction,
     LobbyDragItem,
   } from './space-hierarchy';
-  import { inAllowList, lobbyAction, placeholderRows } from './space-hierarchy';
+  import { placeholderRows } from './space-hierarchy';
   import LobbyRoomPlaceholder from './LobbyRoomPlaceholder.svelte';
 
   interface Props {
     section: HierarchySection;
     closed: boolean;
     joinedIds: ReadonlySet<string>;
-    invitedIds: ReadonlySet<string>;
     joining: ReadonlySet<string>;
     knocked: ReadonlySet<string>;
     joinErrors: ReadonlyMap<string, string>;
     canManage: boolean;
+    canManageOwner: boolean;
+    canLeaveParent: (roomId: string) => boolean;
+    canDropInto: (source: LobbyDragItem, parentId: string) => boolean;
     label: (child: HierarchyRoomView) => string;
     onToggle: (key: string) => void;
     onVisible: (key: string) => void;
     onOpen: (child: HierarchyRoomView) => void;
-    onJoin: (child: HierarchyRoomView, via: readonly string[], parentId: string) => void;
+    onTopic: (child: HierarchyRoomView) => void;
+    onJoin: (
+      child: HierarchyRoomView,
+      via: readonly string[],
+      parentId: string,
+      action: LobbyAction
+    ) => void;
     onCopyLink: (child: HierarchyRoomView) => void;
     onRemove: (section: HierarchySection, entry: HierarchyRoom) => void;
     dragList: DragList<LobbyDragItem>;
@@ -77,15 +86,18 @@
     section,
     closed,
     joinedIds,
-    invitedIds,
     joining,
     knocked,
     joinErrors,
     canManage,
+    canManageOwner,
+    canLeaveParent,
+    canDropInto,
     label,
     onToggle,
     onVisible,
     onOpen,
+    onTopic,
     onJoin,
     onCopyLink,
     onRemove,
@@ -104,7 +116,7 @@
     onRemoveSubspace,
     onMoveTo,
   }: Props = $props();
-  let otherTargets = $derived(moveTargets.filter((target) => target.id !== section.parentId));
+  let otherTargets = $derived(moveTargets.filter((target) => target.id !== section.parent_id));
   let pendingSubspaceRemoval = $state(false);
 
   let dragging = $state<string | null>(null);
@@ -113,8 +125,9 @@
 
   function dropTarget(roomId: string | null) {
     return dragList.dropTarget(
-      { parentId: section.parentId, roomId },
+      { parentId: section.parent_id, roomId },
       {
+        accepts: (source) => canDropInto(source, section.parent_id),
         onState: (next) => {
           if (roomId === null) headerDrop = next !== null;
           else dropState = next;
@@ -146,8 +159,7 @@
     : undefined}
 >
   <div
-    class="section-header"
-    class:drop-into={headerDrop}
+    class={['section-header', { 'drop-into': headerDrop }]}
     {@attach canManage ? dropTarget(null) : undefined}
   >
     <Button
@@ -166,23 +178,16 @@
           size="small"
         />
         <span class="section-name">{label(section.space)}</span>
-        {#if section.suggested}<span class="badge">{$i18n.t('room.lobbySuggested')}</span>{/if}
+        {#if section.suggested}<span class="badge">{i18n.t('room.lobbySuggested')}</span>{/if}
       {:else}
-        <span class="section-name">{$i18n.t('nav.rooms')}</span>
+        <span class="section-name">{i18n.t('nav.rooms')}</span>
       {/if}
-      <span class="caret" class:closed aria-hidden="true"><CaretDownIcon /></span>
+      <span class={['caret', { closed }]} aria-hidden="true"><CaretDownIcon /></span>
     </Button>
     {#if section.space}
       {@const sectionSpace = section.space}
-      {@const ownerId = section.ownerId}
-      {@const spaceAction =
-        joinedSpace || ownerId === null
-          ? null
-          : lobbyAction(
-              sectionSpace.join_rule,
-              invitedIds.has(sectionSpace.room_id),
-              inAllowList(sectionSpace, joinedIds, ownerId)
-            )}
+      {@const ownerId = section.owner_id}
+      {@const spaceAction = joinedSpace || ownerId === null ? null : section.space_action}
       {#if spaceAction && ownerId !== null}
         <Button
           size="small"
@@ -190,28 +195,28 @@
           disabled={knocked.has(sectionSpace.room_id)}
           loading={joining.has(sectionSpace.room_id)}
           onclick={() => {
-            onJoin(sectionSpace, [], ownerId);
+            onJoin(sectionSpace, [], ownerId, spaceAction);
           }}
         >
-          <PlusIcon size={14} />{$i18n.t(
+          <PlusIcon size={14} />{i18n.t(
             knocked.has(sectionSpace.room_id)
               ? 'room.lobbyKnockSent'
               : spaceAction === 'knock'
-                ? 'room.lobbyKnock'
-                : 'room.lobbyJoin'
+                ? 'common.askToJoin'
+                : 'common.join'
           )}
         </Button>
       {/if}
       {#if joinErrors.has(sectionSpace.room_id)}
         <span class="room-error" role="alert">{joinErrors.get(sectionSpace.room_id)}</span>
       {/if}
-      <ActionMenu label={$i18n.t('room.menuLabel')}>
+      <ActionMenu label={i18n.t('room.menuLabel')}>
         {#snippet trigger({ props })}
           <button
             {...props}
             type="button"
             class="room-menu-trigger selection-open"
-            aria-label={$i18n.t('room.menuLabel')}
+            aria-label={i18n.t('room.menuLabel')}
           >
             <DotsThreeVerticalIcon />
           </button>
@@ -222,14 +227,14 @@
               onOpenLobby(sectionSpace.room_id);
             }}
           >
-            <HouseIcon size={16} />{$i18n.t('room.lobbyOpenSubspace')}
+            <HouseIcon size={16} />{i18n.t('room.lobbyOpenSubspace')}
           </ActionMenuItem>
           <ActionMenuItem
             onSelect={() => {
               onCopyLink(sectionSpace);
             }}
           >
-            <LinkIcon size={16} />{$i18n.t('room.menuCopyLink')}
+            <LinkIcon size={16} />{i18n.t('room.menuCopyLink')}
           </ActionMenuItem>
           {#if joinedSpace}
             <ActionMenuItem
@@ -238,55 +243,55 @@
               }}
             >
               {#if pinned}
-                <PushPinSlashIcon size={16} />{$i18n.t('nav.unpinFromSidebar')}
+                <PushPinSlashIcon size={16} />{i18n.t('nav.unpinFromSidebar')}
               {:else}
-                <PushPinIcon size={16} />{$i18n.t('nav.pinToSidebar')}
+                <PushPinIcon size={16} />{i18n.t('nav.pinToSidebar')}
               {/if}
             </ActionMenuItem>
           {/if}
-          {#if canManage}
+          {#if (canManage && joinedSpace) || canManageOwner}
             <ActionMenuSeparator />
-            {#if joinedSpace}
-              <ActionMenuItem
-                onSelect={() => {
-                  onCreateIn(sectionSpace.room_id, 'create-room');
-                }}
-              >
-                <PlusIcon size={16} />{$i18n.t('nav.createRoomInSpace')}
-              </ActionMenuItem>
-              <ActionMenuItem
-                onSelect={() => {
-                  onCreateIn(sectionSpace.room_id, 'create-space');
-                }}
-              >
-                <UsersThreeIcon size={16} />{$i18n.t('nav.createSubspace')}
-              </ActionMenuItem>
-            {/if}
-            {#if section.ownerId !== null}
-              {@const ownerId = section.ownerId}
-              <ActionMenuItem
-                onSelect={() => {
-                  onSetSuggested(ownerId, sectionSpace.room_id, !section.suggested);
-                }}
-              >
-                <StarFourIcon size={16} />{$i18n.t(
-                  section.suggested ? 'room.lobbyUnmarkSuggested' : 'room.lobbyMarkSuggested'
-                )}
-              </ActionMenuItem>
-            {/if}
+          {/if}
+          {#if canManage && joinedSpace}
+            <ActionMenuItem
+              onSelect={() => {
+                onCreateIn(sectionSpace.room_id, 'create-room');
+              }}
+            >
+              <PlusIcon size={16} />{i18n.t('nav.createRoomInSpace')}
+            </ActionMenuItem>
+            <ActionMenuItem
+              onSelect={() => {
+                onCreateIn(sectionSpace.room_id, 'create-space');
+              }}
+            >
+              <UsersThreeIcon size={16} />{i18n.t('nav.createSubspace')}
+            </ActionMenuItem>
+          {/if}
+          {#if canManageOwner && section.owner_id !== null}
+            {@const ownerId = section.owner_id}
+            <ActionMenuItem
+              onSelect={() => {
+                onSetSuggested(ownerId, sectionSpace.room_id, !section.suggested);
+              }}
+            >
+              <StarFourIcon size={16} />{i18n.t(
+                section.suggested ? 'room.lobbyUnmarkSuggested' : 'room.lobbyMarkSuggested'
+              )}
+            </ActionMenuItem>
             <ActionMenuItem
               onSelect={() => {
                 onMoveSubspace(section, -1);
               }}
             >
-              <ArrowUpIcon size={16} />{$i18n.t('room.lobbyMoveUp')}
+              <ArrowUpIcon size={16} />{i18n.t('room.menuMoveUp')}
             </ActionMenuItem>
             <ActionMenuItem
               onSelect={() => {
                 onMoveSubspace(section, 1);
               }}
             >
-              <ArrowDownIcon size={16} />{$i18n.t('room.lobbyMoveDown')}
+              <ArrowDownIcon size={16} />{i18n.t('room.menuMoveDown')}
             </ActionMenuItem>
             <ActionMenuItem
               destructive
@@ -294,7 +299,7 @@
                 pendingSubspaceRemoval = true;
               }}
             >
-              <TrashIcon size={16} />{$i18n.t('room.lobbyRemove')}
+              <TrashIcon size={16} />{i18n.t('common.remove')}
             </ActionMenuItem>
           {/if}
         </IconContext>
@@ -308,21 +313,21 @@
         {#each section.rooms as entry (entry.key)}
           {@const child = entry.room}
           {@const joined = joinedIds.has(child.room_id)}
-          {@const action = lobbyAction(
-            child.join_rule,
-            invitedIds.has(child.room_id),
-            inAllowList(child, joinedIds, section.parentId)
-          )}
+          {@const action = entry.action}
           <li
-            class="room"
-            class:dragging={dragging === child.room_id}
-            class:drop-above={dropState?.item.roomId === child.room_id &&
-              dropState.instruction === 'above'}
-            class:drop-below={dropState?.item.roomId === child.room_id &&
-              dropState.instruction === 'below'}
+            class={[
+              'room',
+              {
+                dragging: dragging === child.room_id,
+                'drop-above':
+                  dropState?.item.roomId === child.room_id && dropState.instruction === 'above',
+                'drop-below':
+                  dropState?.item.roomId === child.room_id && dropState.instruction === 'below',
+              },
+            ]}
             {@attach canManage
               ? dragList.draggable(
-                  { parentId: section.parentId, roomId: child.room_id },
+                  { parentId: section.parent_id, roomId: child.room_id },
                   (next) => {
                     dragging = next?.roomId ?? null;
                   }
@@ -337,20 +342,24 @@
             <div class="room-text">
               <span class="room-name">
                 {label(child)}
-                {#if child.is_voice}<span class="badge">{$i18n.t('nav.voiceRoom')}</span>{/if}
-                {#if entry.suggested}<span class="badge">{$i18n.t('room.lobbySuggested')}</span
-                  >{/if}
+                {#if entry.suggested}<span class="badge">{i18n.t('room.lobbySuggested')}</span>{/if}
               </span>
               <span class="room-meta">
                 {#if child.num_joined_members !== null}
                   <span class="members"
-                    >{$i18n.t('room.lobbyMembers', { count: child.num_joined_members })}</span
+                    >{i18n.t('room.lobbyMembers', { count: child.num_joined_members })}</span
                   >
                 {/if}
                 {#if child.topic}
                   {#if child.num_joined_members !== null}<span class="divider" aria-hidden="true"
                       >|</span
-                    >{/if}<span class="room-topic">{child.topic}</span>
+                    >{/if}<button
+                    type="button"
+                    class="room-topic"
+                    onclick={() => {
+                      onTopic(child);
+                    }}>{child.topic}</button
+                  >
                 {/if}
               </span>
               {#if joinErrors.has(child.room_id)}
@@ -362,7 +371,7 @@
                 <IconButton
                   variant="ghost"
                   size="small"
-                  label={$i18n.t('room.lobbyOpen')}
+                  label={i18n.t('room.lobbyOpen')}
                   onclick={() => {
                     onOpen(child);
                   }}
@@ -375,25 +384,25 @@
                   disabled={knocked.has(child.room_id)}
                   loading={joining.has(child.room_id)}
                   onclick={() => {
-                    onJoin(child, entry.via, section.parentId);
+                    onJoin(child, entry.via, section.parent_id, action);
                   }}
                 >
-                  <PlusIcon size={14} />{$i18n.t(
+                  <PlusIcon size={14} />{i18n.t(
                     knocked.has(child.room_id)
                       ? 'room.lobbyKnockSent'
                       : action === 'knock'
-                        ? 'room.lobbyKnock'
-                        : 'room.lobbyJoin'
+                        ? 'common.askToJoin'
+                        : 'common.join'
                   )}
                 </Button>
               {/if}
-              <ActionMenu label={$i18n.t('room.menuLabel')}>
+              <ActionMenu label={i18n.t('room.menuLabel')}>
                 {#snippet trigger({ props })}
                   <button
                     {...props}
                     type="button"
                     class="room-menu-trigger selection-open"
-                    aria-label={$i18n.t('room.menuLabel')}
+                    aria-label={i18n.t('room.menuLabel')}
                   >
                     <DotsThreeVerticalIcon />
                   </button>
@@ -404,15 +413,15 @@
                       onCopyLink(child);
                     }}
                   >
-                    <LinkIcon size={16} />{$i18n.t('room.menuCopyLink')}
+                    <LinkIcon size={16} />{i18n.t('room.menuCopyLink')}
                   </ActionMenuItem>
                   {#if canManage}
                     <ActionMenuItem
                       onSelect={() => {
-                        onSetSuggested(section.parentId, child.room_id, !entry.suggested);
+                        onSetSuggested(section.parent_id, child.room_id, !entry.suggested);
                       }}
                     >
-                      <StarFourIcon size={16} />{$i18n.t(
+                      <StarFourIcon size={16} />{i18n.t(
                         entry.suggested ? 'room.lobbyUnmarkSuggested' : 'room.lobbyMarkSuggested'
                       )}
                     </ActionMenuItem>
@@ -421,19 +430,19 @@
                         onMove(section, child.room_id, -1);
                       }}
                     >
-                      <ArrowUpIcon size={16} />{$i18n.t('room.lobbyMoveUp')}
+                      <ArrowUpIcon size={16} />{i18n.t('room.menuMoveUp')}
                     </ActionMenuItem>
                     <ActionMenuItem
                       onSelect={() => {
                         onMove(section, child.room_id, 1);
                       }}
                     >
-                      <ArrowDownIcon size={16} />{$i18n.t('room.lobbyMoveDown')}
+                      <ArrowDownIcon size={16} />{i18n.t('room.menuMoveDown')}
                     </ActionMenuItem>
-                    {#if otherTargets.length > 0}
-                      <ActionMenuSub label={$i18n.t('room.lobbyMoveTo')}>
+                    {#if otherTargets.length > 0 && canLeaveParent(child.room_id)}
+                      <ActionMenuSub label={i18n.t('room.lobbyMoveTo')}>
                         {#snippet trigger()}
-                          <ArrowsLeftRightIcon size={16} />{$i18n.t('room.lobbyMoveTo')}
+                          <ArrowsLeftRightIcon size={16} />{i18n.t('room.lobbyMoveTo')}
                         {/snippet}
                         {#each otherTargets as target (target.id)}
                           <ActionMenuItem
@@ -452,7 +461,7 @@
                         removeEntry(entry);
                       }}
                     >
-                      <TrashIcon size={16} />{$i18n.t('room.lobbyRemove')}
+                      <TrashIcon size={16} />{i18n.t('common.remove')}
                     </ActionMenuItem>
                   {/if}
                 </IconContext>
@@ -466,13 +475,13 @@
       {/if}
       {#if section.failed}
         <p class="section-failed">
-          <span>{$i18n.t('room.lobbyFailed')}</span>
+          <span>{i18n.t('room.lobbyFailed')}</span>
           <Button
             variant="ghost"
             size="small"
             onclick={() => {
-              onRetry(section.parentId);
-            }}>{$i18n.t('room.lobbyRetry')}</Button
+              onRetry(section.parent_id);
+            }}>{i18n.t('common.retry')}</Button
           >
         </p>
       {/if}
@@ -485,10 +494,10 @@
   onOpenChange={(next: boolean) => {
     pendingSubspaceRemoval = next;
   }}
-  title={$i18n.t('room.lobbyRemoveConfirm', {
+  title={i18n.t('room.lobbyRemoveConfirm', {
     room: section.space ? label(section.space) : '',
   })}
-  confirmLabel={$i18n.t('room.lobbyRemove')}
+  confirmLabel={i18n.t('common.remove')}
   onConfirm={() => {
     pendingSubspaceRemoval = false;
     onRemoveSubspace(section);
@@ -500,8 +509,8 @@
   onOpenChange={(next: boolean) => {
     if (!next) pendingRemoval = null;
   }}
-  title={$i18n.t('room.lobbyRemoveConfirm', { room: pendingRemoval?.label ?? '' })}
-  confirmLabel={$i18n.t('room.lobbyRemove')}
+  title={i18n.t('room.lobbyRemoveConfirm', { room: pendingRemoval?.label ?? '' })}
+  confirmLabel={i18n.t('common.remove')}
   onConfirm={confirmRemoval}
 />
 
@@ -659,10 +668,27 @@
   }
 
   .room-topic {
+    background: transparent;
+    border: 0;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
     min-width: 0;
     overflow: hidden;
+    padding: 0;
+    text-align: left;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .room-topic:hover {
+    color: var(--surface-on-container);
+    text-decoration: underline;
+  }
+
+  .room-topic:focus-visible {
+    outline: var(--focus-ring-width) solid var(--focus-ring);
+    outline-offset: var(--focus-ring-offset);
   }
 
   .room-error {

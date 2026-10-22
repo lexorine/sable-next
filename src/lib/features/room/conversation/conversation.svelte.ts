@@ -14,21 +14,36 @@ import { resolve } from '$app/paths';
 import { runtimeConfig } from '#lib/config/runtime-config.js';
 import { t } from '#lib/i18n.js';
 import type { CoreClient, OutgoingMentions } from '#lib/core/client.svelte.js';
-import type { SendAttachmentOptions, SendGalleryOptions } from '#lib/core/commands.svelte.js';
+import type { SendAttachmentOptions, SendGalleryOptions } from '#lib/core/media.svelte.js';
+import { editMessage, sendMessage } from '#lib/core/api/messages.svelte.js';
 import type { BotCommandInvocation } from '#lib/features/composer/bot-commands.js';
-import type { ComposerContext, ScheduledTarget } from '#lib/features/composer/composer-context.js';
-import { dequeue, enqueue } from '#lib/features/composer/scheduled-queue.svelte.js';
+import { readReply, writeReply } from '#lib/composer/composer-drafts.svelte.js';
+import type { Node as ProseMirrorNode } from 'prosemirror-model';
+
+import {
+  formattedForEditing,
+  type ComposerContext,
+  type ScheduledTarget,
+} from '#lib/composer/composer-context.js';
+import { dequeue, enqueue } from '#lib/composer/scheduled-queue.svelte.js';
 import {
   isEncryptedScheduleUnsupported,
   isServerScheduleUnsupported,
   ScheduledOriginalKept,
 } from '#lib/features/composer/send-failure.js';
-import { runSlash } from '#lib/features/composer/slash-commands.js';
-import { gifFilename, proxiedGif, type GifResult } from '#lib/features/gif/providers.js';
-import { replyFallbackFromSource } from '#lib/features/room/messages/reply-fallback.js';
+import {
+  applySed,
+  applySedToHtml,
+  parseSed,
+  type SedEdit,
+} from '#lib/features/composer/sed-edit.js';
+import { runSlash, SlashError } from '#lib/features/composer/slash-commands.js';
+import { knockPagePath } from '#lib/rooms/join-or-knock.js';
+import { gifFilename, proxiedGif, type GifResult } from '#lib/gif/providers.js';
 import { replyPreviewBody, type ReplyVersion } from '#lib/features/room/messages/reply-preview.js';
+import { isMediaCaptionContent } from '#lib/features/room/messages/media-caption.js';
 import { previewableLinks } from '#lib/features/room/media/link-preview.js';
-import { loadUrlPreview } from '#lib/features/room/media/link-preview-cache.js';
+import { previewSources, resolveUrlPreview } from '#lib/features/room/media/link-preview-cache.js';
 import {
   projectPersona,
   resolvePersona,
@@ -63,9 +78,11 @@ function failed(action: string): (error: unknown) => void {
 }
 
 export class Conversation {
-  context = $state<ComposerContext | null>(null);
+  #context = $state<ComposerContext | null>(null);
+  readonly restored: ComposerContext | null;
   scheduledRevision = $state(0);
   forumTitle = $state('');
+  dismissedPreviews = $state.raw<string[]>([]);
 
   readonly #core: CoreClient;
   readonly #personas: PersonaStore;
@@ -96,22 +113,60 @@ export class Conversation {
     this.#encrypted = encrypted ?? (() => null);
     this.#threadRoot = threadRoot;
     this.#beforeSend = beforeSend;
+    this.restored = readReply(this.#replyKey(), this.#accountId()) ?? null;
+    this.#context = this.restored;
+  }
+
+  get context(): ComposerContext | null {
+    return this.#context;
+  }
+
+  followRoom(): void {
+    this.#context = readReply(this.#replyKey(), this.#accountId()) ?? null;
+    this.forumTitle = '';
+    this.dismissedPreviews = [];
+  }
+
+  set context(value: ComposerContext | null) {
+    this.#context = value;
+    writeReply(this.#replyKey(), value?.kind === 'reply' ? value : null, this.#accountId());
+  }
+
+  #replyKey(): string {
+    return this.#threadRoot === null ? this.#roomId() : `${this.#roomId()}/${this.#threadRoot}`;
+  }
+
+  #accountId(): string {
+    return this.#core.session?.account_id ?? '';
   }
 
   get threadRoot(): string | null {
     return this.#threadRoot;
   }
 
-  async #bundledLinkPreviews(html: string | null): Promise<UrlPreviewView[]> {
-    const enabled =
-      this.#encrypted() === false ? preferences.urlPreviews : preferences.encryptedUrlPreviews;
-    if (!enabled) return [];
-    if (!html) return [];
+  async #bundledLinkPreviews(
+    html: string | null,
+    body: string,
+    dismissed: readonly string[]
+  ): Promise<{ previews: UrlPreviewView[]; suppressed: boolean }> {
+    const sources = previewSources(this.#encrypted());
+    if (!sources.server && !sources.client) return { previews: [], suppressed: false };
+    if (!html) return { previews: [], suppressed: false };
+    const links = previewableLinks(html, body);
+    const wanted = links.filter((url) => !dismissed.includes(url));
     const previews = await Promise.all(
-      previewableLinks(html).map((url) => loadUrlPreview(this.#core.commands, url))
+      wanted.map((url) => resolveUrlPreview(this.#core.rpc.messages, url, sources))
     );
-    return previews.filter((preview) => preview !== null);
+    return {
+      previews: previews.filter((preview) => preview !== null),
+      suppressed: links.length > 0 && wanted.length === 0,
+    };
   }
+
+  readonly dismissPreview = (url: string): void => {
+    if (!this.dismissedPreviews.includes(url))
+      this.dismissedPreviews = [...this.dismissedPreviews, url];
+  };
 
   readonly sendMessage = async (
     targetRoomId: string,
@@ -130,8 +185,18 @@ export class Conversation {
           entry.event_id === pending.eventId ||
           entry.transaction_id === pending.eventId
       );
+      const unchanged =
+        body === pending.body &&
+        (formatted === null || formatted === pending.html) &&
+        (pending.persona ?? null) === (edited?.per_message_profile ?? null) &&
+        this.forumTitle === (edited?.forum_title ?? '');
+      if (unchanged) {
+        this.context = null;
+        return;
+      }
       await this.#beforeSend();
-      await this.#core.commands.editMessage(
+      await editMessage(
+        this.#core.rpc,
         targetRoomId,
         edited?.event_id ?? (pending.eventId.startsWith('$') ? pending.eventId : null),
         body,
@@ -151,13 +216,20 @@ export class Conversation {
       return;
     }
 
+    const sed = preferences.sedEdits ? parseSed(body) : null;
+    if (sed) {
+      await this.#sedEdit(targetRoomId, sed);
+      this.context = null;
+      return;
+    }
+
     await this.#beforeSend();
     const outcome = await runSlash(body, {
       roomId: targetRoomId,
       userId: this.#core.session?.user_id ?? null,
       formatted,
       developerTools: preferences.developerTools,
-      commands: this.#core.commands,
+      rpc: this.#core.rpc,
     });
     if (outcome.kind === 'done') {
       this.context = null;
@@ -172,6 +244,12 @@ export class Conversation {
       void goto(resolve('bugreport'));
       return;
     }
+    if (outcome.kind === 'knock') {
+      this.context = null;
+      // eslint-disable-next-line svelte/no-navigation-without-resolve -- knockPagePath() resolves the route itself
+      void goto(knockPagePath(outcome.address, outcome.via));
+      return;
+    }
 
     const untouched = outcome.body === body;
     const outgoing = this.#personaFor(
@@ -180,8 +258,14 @@ export class Conversation {
       untouched ? (outcome.formatted ?? formatted) : (outcome.formatted ?? null)
     );
     if (outgoing.body === '') return;
-    const linkPreviews = await this.#bundledLinkPreviews(outgoing.formatted);
-    await this.#core.commands.sendMessage(targetRoomId, outgoing.body, {
+    const dismissed = this.dismissedPreviews;
+    this.dismissedPreviews = [];
+    const { previews: linkPreviews, suppressed } = await this.#bundledLinkPreviews(
+      outgoing.formatted,
+      outgoing.body,
+      dismissed
+    );
+    await sendMessage(this.#core.rpc, targetRoomId, outgoing.body, {
       inReplyTo: pending?.eventId ?? null,
       threadRoot: this.#threadRoot,
       formatted: outgoing.formatted,
@@ -190,6 +274,7 @@ export class Conversation {
       kind: outcome.msgtype,
       persona: outgoing.persona,
       linkPreviews,
+      noLinkPreviews: suppressed,
       imageSourcePacks,
       forumTitle: this.#threadRoot === null && !pending?.eventId ? this.forumTitle : null,
     });
@@ -205,7 +290,7 @@ export class Conversation {
   ): Promise<void> => {
     const pending = this.context?.kind === 'reply' ? this.context : null;
     await this.#beforeSend();
-    await this.#core.commands.sendMessage(targetRoomId, body, {
+    await sendMessage(this.#core.rpc, targetRoomId, body, {
       inReplyTo: pending?.eventId ?? null,
       threadRoot: this.#threadRoot,
       mentions: { userIds: [bot], room: false },
@@ -227,7 +312,7 @@ export class Conversation {
       options.formattedCaption ?? null
     );
     const reply = this.#consumeReply();
-    await this.#core.commands.sendAttachment(targetRoomId, file, {
+    await this.#core.media.sendAttachment(targetRoomId, file, {
       ...options,
       caption: options.caption == null ? options.caption : outgoing.body,
       formattedCaption: outgoing.formatted,
@@ -245,7 +330,7 @@ export class Conversation {
   ): Promise<void> => {
     await this.#beforeSend();
     const reply = this.#consumeReply();
-    await this.#core.commands.sendGallery(targetRoomId, files, {
+    await this.#core.media.sendGallery(targetRoomId, files, {
       ...options,
       inReplyTo: reply?.eventId ?? null,
       silentReply: reply?.silentReply ?? options.silentReply ?? false,
@@ -261,16 +346,16 @@ export class Conversation {
     sourcePack: ImageSourcePackView | null = null
   ): Promise<void> => {
     await this.#beforeSend();
-    await this.#core.commands.sendSticker(
-      targetRoomId,
+    await this.#core.rpc.messages.sendSticker({
+      room_id: targetRoomId,
       url,
       body,
       info,
-      sourcePack,
-      this.#consumeReply()?.eventId ?? null,
-      this.#threadRoot,
-      this.#personaFor(targetRoomId, '', null).persona
-    );
+      source_pack: $state.snapshot(sourcePack),
+      in_reply_to: this.#consumeReply()?.eventId ?? null,
+      thread_root: this.#threadRoot,
+      persona: $state.snapshot(this.#personaFor(targetRoomId, '', null).persona),
+    });
   };
 
   readonly sendGif = async (targetRoomId: string, gif: GifResult): Promise<void> => {
@@ -280,19 +365,19 @@ export class Conversation {
     if (!proxied) throw new Error('no GIF proxy route for this result');
 
     const reply = this.#consumeReply();
-    await this.#core.commands.sendGif(
-      targetRoomId,
-      proxied.mxcUrl,
-      gifFilename(gif.title, proxied.mimetype),
-      gif.width || null,
-      gif.height || null,
-      proxied.mimetype,
-      gif.size > 0 ? gif.size : null,
-      reply?.eventId ?? null,
-      this.#threadRoot,
-      this.#personaFor(targetRoomId, '', null).persona,
-      reply?.silentReply ?? false
-    );
+    await this.#core.rpc.messages.sendGif({
+      room_id: targetRoomId,
+      url: proxied.mxcUrl,
+      body: gifFilename(gif.title, proxied.mimetype),
+      width: gif.width || null,
+      height: gif.height || null,
+      mimetype: proxied.mimetype,
+      size: gif.size > 0 ? gif.size : null,
+      in_reply_to: reply?.eventId ?? null,
+      silent_reply: reply?.silentReply ?? false,
+      thread_root: this.#threadRoot,
+      persona: $state.snapshot(this.#personaFor(targetRoomId, '', null).persona),
+    });
   };
 
   readonly createPoll = async (
@@ -303,14 +388,14 @@ export class Conversation {
     maxSelections: number = 1
   ): Promise<void> => {
     await this.#beforeSend();
-    await this.#core.commands.createPoll(
-      targetRoomId,
+    await this.#core.rpc.messages.createPoll({
+      room_id: targetRoomId,
       question,
-      answers,
+      answers: [...answers],
       undisclosed,
-      this.#threadRoot,
-      maxSelections
-    );
+      max_selections: maxSelections,
+      thread_root: this.#threadRoot,
+    });
   };
 
   readonly sendLocation = async (
@@ -320,14 +405,14 @@ export class Conversation {
   ): Promise<void> => {
     await this.#beforeSend();
     const reply = this.#consumeReply();
-    await this.#core.commands.sendLocation(
-      targetRoomId,
+    await this.#core.rpc.messages.sendLocation({
+      room_id: targetRoomId,
       body,
-      geoUri,
-      reply?.eventId ?? null,
-      this.#threadRoot,
-      reply?.silentReply ?? false
-    );
+      geo_uri: geoUri,
+      in_reply_to: reply?.eventId ?? null,
+      silent_reply: reply?.silentReply ?? false,
+      thread_root: this.#threadRoot,
+    });
   };
 
   readonly schedule = async (
@@ -350,7 +435,7 @@ export class Conversation {
     this.context = null;
     try {
       if (replacing.scheduled?.source === 'queue') dequeue(replacing.eventId, accountId);
-      else await this.#core.commands.cancelScheduledMessage(replacing.eventId);
+      else await this.#core.rpc.messages.cancelScheduled({ delay_id: replacing.eventId });
     } catch (error) {
       throw new ScheduledOriginalKept(error);
     } finally {
@@ -368,7 +453,12 @@ export class Conversation {
     const accountId = this.#core.session?.account_id ?? '';
     const deviceId = this.#core.session?.device_id ?? '';
     try {
-      await this.#core.commands.scheduleMessage(targetRoomId, body, formatted, delayMs);
+      await this.#core.rpc.messages.schedule({
+        room_id: targetRoomId,
+        body,
+        formatted,
+        delay_ms: delayMs,
+      });
       return;
     } catch (error) {
       if (!isServerScheduleUnsupported(error)) throw error;
@@ -401,18 +491,26 @@ export class Conversation {
 
   readonly setTyping = async (targetRoomId: string, typing: boolean): Promise<void> => {
     if (!preferences.sendTypingNotifications) return;
-    await this.#core.commands.setTyping(targetRoomId, typing);
+    await this.#core.rpc.messages.setTyping({ room_id: targetRoomId, typing });
   };
 
   readonly retrySend = (transactionId: string): void => {
-    void this.#core.commands
-      .retrySend(this.#roomId(), transactionId, this.#threadRoot)
+    void this.#core.rpc.messages
+      .retrySend({
+        room_id: this.#roomId(),
+        transaction_id: transactionId,
+        thread_root: this.#threadRoot,
+      })
       .catch(failed('retry'));
   };
 
   readonly cancelSend = (transactionId: string): void => {
-    void this.#core.commands
-      .cancelSend(this.#roomId(), transactionId, this.#threadRoot)
+    void this.#core.rpc.messages
+      .cancelSend({
+        room_id: this.#roomId(),
+        transaction_id: transactionId,
+        thread_root: this.#threadRoot,
+      })
       .catch(failed('cancel'));
   };
 
@@ -436,7 +534,7 @@ export class Conversation {
       const item = items[index];
       if (
         !item.event_id ||
-        (!isMessageRow(item.content) && item.content.kind !== 'unable_to_decrypt') ||
+        (!isMessageRow(item) && item.content.kind !== 'unable_to_decrypt') ||
         item.content.kind === 'redacted'
       )
         continue;
@@ -456,31 +554,42 @@ export class Conversation {
         (reaction) =>
           reaction.key === key && reaction.senders.includes(this.#core.session?.user_id ?? '')
       );
-    await this.#core.commands.toggleReaction(
-      this.#roomId(),
-      eventId,
+    await this.#core.rpc.messages.react({
+      room_id: this.#roomId(),
+      event_id: eventId,
       key,
-      this.#threadRoot,
-      mine ? null : sourcePack,
-      this.#timeline.subscriptionId
-    );
+      source_pack: $state.snapshot(mine ? null : sourcePack),
+      shortcode: null,
+      thread_root: this.#threadRoot,
+      subscription: this.#timeline.subscriptionId,
+    });
   }
 
   readonly votePoll = (eventId: string, answers: string[]): void => {
-    void this.#core.commands
-      .votePoll(this.#roomId(), eventId, answers, this.#threadRoot)
+    void this.#core.rpc.messages
+      .votePoll({
+        room_id: this.#roomId(),
+        event_id: eventId,
+        answers: [...answers],
+        thread_root: this.#threadRoot,
+      })
       .catch(failed('vote'));
   };
 
   readonly endPoll = (eventId: string): void => {
-    void this.#core.commands
-      .endPoll(this.#roomId(), eventId, this.#threadRoot)
+    void this.#core.rpc.messages
+      .endPoll({ room_id: this.#roomId(), event_id: eventId, thread_root: this.#threadRoot })
       .catch(failed('end poll'));
   };
 
   readonly redact = (eventId: string, reason: string | null): void => {
-    void this.#core.commands
-      .redact(this.#roomId(), eventId, reason, this.#threadRoot)
+    void this.#core.rpc.messages
+      .redact({
+        room_id: this.#roomId(),
+        event_id: eventId,
+        reason,
+        thread_root: this.#threadRoot,
+      })
       .catch(failed('redaction'));
   };
 
@@ -548,11 +657,38 @@ export class Conversation {
       this.edit(itemId, item.content.body, item.content.html);
       return true;
     }
-    if (item.content.kind === 'image') {
+    if (isMediaCaptionContent(item.content)) {
       this.edit(itemId, item.content.caption ?? '', item.content.html, true);
       return true;
     }
     return false;
+  }
+
+  async #sedEdit(targetRoomId: string, sed: SedEdit): Promise<void> {
+    const userId = this.#core.session?.user_id;
+    const items = this.#timeline.items;
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index];
+      const itemId = item.event_id ?? item.transaction_id;
+      if (!itemId || item.sender !== userId || item.content.kind !== 'message') continue;
+
+      const formatted = formattedForEditing(item.content.html);
+      const rich = formatted === null ? null : applySedToHtml(formatted, sed);
+      const body = rich?.body ?? applySed(item.content.body, sed);
+      if (body === null) break;
+      await this.#beforeSend();
+      await editMessage(this.#core.rpc, targetRoomId, item.event_id, body, {
+        transactionId: item.event_id ? null : item.transaction_id,
+        formatted: rich?.formatted ?? null,
+        mentions: rich?.mentions,
+        kind: editedKind(item),
+        threadRoot: this.#threadRoot,
+        persona: item.per_message_profile ?? null,
+        forumTitle: item.forum_title ?? '',
+      });
+      return;
+    }
+    throw new SlashError('composer.sedNoMatch');
   }
 
   readonly editLast = (before?: string): void => {
@@ -594,6 +730,34 @@ export class Conversation {
     this.context = null;
   };
 
+  /** Whether the message being edited is edited where it appears, not in the composer. */
+  get inlineEdit(): boolean {
+    const pending = this.context;
+    if (!preferences.inlineEditing || pending?.kind !== 'edit' || pending.mediaCaption) {
+      return false;
+    }
+    return this.#timeline.items.some(
+      (entry) =>
+        (entry.id === pending.timelineItemId ||
+          entry.event_id === pending.eventId ||
+          entry.transaction_id === pending.eventId) &&
+        entry.content.kind === 'message'
+    );
+  }
+
+  #inlineDraft: { eventId: string; doc: ProseMirrorNode } | null = null;
+
+  /** Keeps the text typed in an inline editor whose row scrolled out of the list. */
+  readonly stashInlineDraft = (eventId: string, doc: ProseMirrorNode): void => {
+    this.#inlineDraft = { eventId, doc };
+  };
+
+  readonly takeInlineDraft = (eventId: string): ProseMirrorNode | undefined => {
+    const draft = this.#inlineDraft;
+    this.#inlineDraft = null;
+    return draft?.eventId === eventId ? draft.doc : undefined;
+  };
+
   readonly forgetRequestedDetails = (): void => {
     this.#requestedDetails.clear();
   };
@@ -603,29 +767,16 @@ export class Conversation {
 
     for (const item of this.#timeline.items) {
       const reply = item.in_reply_to;
-      if (!reply || reply.body !== null) continue;
+      if (!reply || reply.body !== null || reply.fallback !== null) continue;
 
       const eventId = item.event_id;
       if (eventId === null || this.#requestedDetails.has(eventId)) continue;
 
       this.#requestedDetails.add(eventId);
-      const loadFallback = async (): Promise<void> => {
-        const source = await this.#core.commands.eventSource(roomId, reply.event_id);
-        const fallback = replyFallbackFromSource(source, t);
-        if (fallback) this.#timeline.provideReplyFallback(reply.event_id, fallback);
-      };
-      void this.#core.commands
-        .fetchEventDetails(roomId, eventId, this.#threadRoot)
-        .then(async () => {
-          const updated = this.#timeline.items.find((entry) => entry.event_id === eventId);
-          if (updated?.in_reply_to?.body === null) await loadFallback();
-        })
-        .catch(async (error: unknown) => {
-          console.debug('[sable room] reply details unavailable', error);
-          await loadFallback();
-        })
+      void this.#core.rpc.timeline
+        .fetchEventDetails({ room_id: roomId, event_id: eventId, thread_root: this.#threadRoot })
         .catch((error: unknown) => {
-          console.debug('[sable room] replied-to event unavailable', error);
+          console.debug('[sable room] reply details unavailable', error);
         });
     }
   };
@@ -643,12 +794,13 @@ export class Conversation {
   ): { body: string; formatted: string | null; persona: PerMessageProfileView | null } {
     const personas = this.#personas;
     const proxied = preferences.personaProxying ? resolveProxy(personas.personas, body) : undefined;
+    const personaSelection = personas.selectionFor(null);
     const persona = resolvePersona({
       personas: personas.personas,
       proxied: proxied?.persona,
       room: personas.associationFor(targetRoomId),
       spaces: this.#spaceIds(targetRoomId).map((id) => personas.associationFor(id)),
-      account: personas.selectionFor(null) ?? undefined,
+      account: personaSelection ?? undefined,
       now: Date.now(),
     });
 
@@ -656,13 +808,23 @@ export class Conversation {
     if (proxied && preferences.personaLatching !== 'off') {
       void personas
         .select(preferences.personaLatching === 'room' ? targetRoomId : null, proxied.persona.id)
-        .catch(() => {});
+        .catch(failed('latching persona'));
     }
+    persona.last_used = Date.now();
+    personas.save(persona, persona.id).catch(failed('updating persona timestamp'));
+
+    const avatar_url =
+      (personaSelection?.alternate_avatar_id
+        ? persona.alternate_avatars?.find(
+            (avatar) => avatar.id == personaSelection.alternate_avatar_id
+          )
+        : undefined
+      )?.avatar_url ?? persona.avatar_url;
 
     return {
       body: proxied?.body ?? body,
       formatted: proxied ? stripProxyHtml(formatted, proxied.trigger) : formatted,
-      persona: projectPersona(persona, preferences.personaFallback),
+      persona: projectPersona({ ...persona, avatar_url }, preferences.personaFallback),
     };
   }
 }

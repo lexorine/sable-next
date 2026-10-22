@@ -6,21 +6,14 @@
     ImagePackView,
     RoomPermissionsView,
     RoomPowerLevelsView,
-    RoomSummary,
+    RoomListItemView,
   } from '#src/generated/protocol';
 
+  import { imagePacks } from '#lib/core/api/packs.js';
   import { useCoreClient } from '#lib/core/context.js';
   import { invalidatePacks } from '#lib/emoji/load-packs.js';
   import ImagePackEditor from '#lib/features/emotes/ImagePackEditor.svelte';
-  import {
-    ROOM_EMOTES_EVENT_TYPE,
-    ROOM_IMAGE_PACK_EVENT_TYPE,
-  } from '#lib/features/emotes/pack-address.js';
-  import {
-    packEventContent,
-    uniqueShortcode,
-    normalizeShortcode,
-  } from '#lib/features/emotes/pack-content.js';
+  import { ROOM_IMAGE_PACK_EVENT_TYPE } from '#lib/features/emotes/pack-address.js';
   import type { PackDraft } from '#lib/features/emotes/pack-content.js';
   import { i18n } from '#lib/i18n.js';
   import MediaImage from '#lib/ui/MediaImage.svelte';
@@ -32,13 +25,14 @@
   import SettingsSection from '#lib/ui/primitives/SettingsSection.svelte';
   import Spinner from '#lib/ui/primitives/Spinner.svelte';
   import TextInput from '#lib/ui/primitives/TextInput.svelte';
+  import { leaveUnlessUnsaved } from '#lib/ui/unsaved-guard.js';
 
   import { canSendState } from './permission-groups';
 
   import '#lib/ui/primitives/settings-row.css';
 
   interface Props {
-    room: RoomSummary | null;
+    room: RoomListItemView | null;
     permissions: RoomPermissionsView | null;
     levels: RoomPowerLevelsView | null;
   }
@@ -61,6 +55,9 @@
   );
   let roomPacks = $derived(packs.filter((pack) => pack.room_id === roomId));
   let viewingPack = $derived(roomPacks.find((pack) => pack.id === viewing) ?? null);
+  let legacyOnly = $derived(roomPacks.filter((pack) => pack.legacy_event && !pack.stable_event));
+  let legacyCopies = $derived(roomPacks.filter((pack) => pack.legacy_event && pack.stable_event));
+  let confirmingLegacyRemoval = $state(false);
 
   $effect(() => {
     void roomId;
@@ -75,7 +72,7 @@
     loading = true;
     failed = false;
     try {
-      const loaded = await core.commands.imagePacks(target);
+      const loaded = await imagePacks(core.rpc, target);
       if (current !== run) return;
       packs = loaded;
     } catch (error) {
@@ -86,39 +83,21 @@
     }
   }
 
-  async function writePack(stateKey: string, content: unknown): Promise<void> {
-    const target = roomId;
-    if (!target) return;
-
-    await core.commands.sendStateEvent(target, ROOM_IMAGE_PACK_EVENT_TYPE, stateKey, content);
-    invalidatePacks(core.commands);
+  async function changed(): Promise<void> {
+    invalidatePacks(core.rpc);
     await load();
   }
 
-  async function clearLegacyPack(stateKey: string): Promise<void> {
-    const target = roomId;
-    if (!target) return;
-
-    const legacy = await core.commands
-      .roomStateEvent(target, ROOM_EMOTES_EVENT_TYPE, stateKey)
-      .catch(() => null);
-    if (typeof legacy !== 'object' || legacy === null || Object.keys(legacy).length === 0) return;
-    await core.commands.sendStateEvent(target, ROOM_EMOTES_EVENT_TYPE, stateKey, {});
-  }
-
   async function createPack(): Promise<void> {
+    const target = roomId;
     const name = newPackName.trim();
-    if (name === '' || busy) return;
-
-    const wanted = normalizeShortcode(name).toLocaleLowerCase() || 'pack';
-    const stateKey = uniqueShortcode(wanted, (candidate) =>
-      roomPacks.some((pack) => pack.id === candidate)
-    );
+    if (!target || name === '' || busy) return;
 
     busy = true;
     failed = false;
     try {
-      await writePack(stateKey, { pack: { display_name: name }, images: {} });
+      await core.rpc.packs.createRoomPack({ room_id: target, name });
+      await changed();
       newPackName = '';
     } catch (error) {
       console.warn('[sable room] pack creation failed', error);
@@ -129,15 +108,14 @@
   }
 
   async function deletePack(pack: ImagePackView): Promise<void> {
-    if (busy) return;
+    const target = roomId;
+    if (!target || busy) return;
 
     busy = true;
     failed = false;
     try {
-      await clearLegacyPack(pack.id).catch((error: unknown) => {
-        console.warn('[sable room] legacy pack not cleared', error);
-      });
-      await writePack(pack.id, {});
+      await core.rpc.packs.deleteRoomPack({ room_id: target, state_key: pack.id });
+      await changed();
       if (viewing === pack.id) viewing = null;
     } catch (error) {
       console.warn('[sable room] pack removal failed', error);
@@ -154,14 +132,53 @@
     packToRemove = null;
   }
 
+  async function updateLegacy(
+    update: (params: { room_id: string; state_keys: string[] }) => Promise<null>,
+    targets: ImagePackView[]
+  ): Promise<void> {
+    const target = roomId;
+    if (!target || busy) return;
+
+    busy = true;
+    failed = false;
+    try {
+      await update({
+        room_id: target,
+        state_keys: targets.map((pack) => pack.id),
+      });
+    } catch (error) {
+      console.warn('[sable room] legacy packs not updated', error);
+      failed = true;
+    } finally {
+      await changed();
+      busy = false;
+    }
+  }
+
+  function convertLegacyPacks(): Promise<void> {
+    return updateLegacy(core.rpc.packs.convertLegacy, legacyOnly);
+  }
+
+  async function removeLegacyCopies(): Promise<void> {
+    await updateLegacy(core.rpc.packs.removeLegacy, legacyCopies);
+    confirmingLegacyRemoval = false;
+  }
+
   async function applyDraft(pack: ImagePackView, draft: PackDraft): Promise<void> {
-    await writePack(pack.id, packEventContent(draft));
+    const target = roomId;
+    if (!target) return;
+
+    await core.rpc.packs.save({
+      target: { kind: 'room', room_id: target, state_key: pack.id },
+      draft: $state.snapshot(draft),
+    });
+    await changed();
   }
 </script>
 
 <div class="section">
   {#if failed}
-    <Alert variant="critical" role="alert">{$i18n.t('room.emojisFailed')}</Alert>
+    <Alert variant="critical" role="alert">{i18n.t('room.membersFailed')}</Alert>
   {/if}
 
   {#if viewingPack}
@@ -169,11 +186,13 @@
       <Button
         size="small"
         onclick={() => {
-          viewing = null;
+          leaveUnlessUnsaved(() => {
+            viewing = null;
+          });
         }}
       >
         <ArrowLeftIcon />
-        {$i18n.t('emotes.back')}
+        {i18n.t('common.back')}
       </Button>
     </div>
     {#key viewingPack.id}
@@ -187,15 +206,15 @@
     {#if canEdit}
       <SettingsSection
         headingId="room-emojis-create"
-        title={$i18n.t('room.emojisCreateTitle')}
-        description={$i18n.t('room.emojisCreateHint')}
+        title={i18n.t('room.emojisCreateTitle')}
+        description={i18n.t('room.emojisCreateHint')}
       >
         <div class="settings-form">
           <div class="inline">
             <TextInput
               bind:value={newPackName}
-              placeholder={$i18n.t('room.emojisPackNamePlaceholder')}
-              aria-label={$i18n.t('room.emojisPackName')}
+              placeholder={i18n.t('room.emojisPackNamePlaceholder')}
+              aria-label={i18n.t('room.emojisPackName')}
             />
             <Button
               disabled={newPackName.trim() === '' || busy}
@@ -203,7 +222,7 @@
                 void createPack();
               }}
             >
-              {$i18n.t('room.emojisCreate')}
+              {i18n.t('room.emojisCreate')}
             </Button>
           </div>
         </div>
@@ -213,14 +232,14 @@
     {#if loading && packs.length === 0}
       <p class="settings-status" role="status"><Spinner small /></p>
     {:else if roomPacks.length === 0}
-      <p class="settings-status">{$i18n.t('room.emojisEmpty')}</p>
+      <p class="settings-status">{i18n.t('room.emojisEmpty')}</p>
     {:else}
-      <SettingsSection headingId="room-emojis-packs" title={$i18n.t('room.emojisPacks')}>
+      <SettingsSection headingId="room-emojis-packs" title={i18n.t('room.emojisPacks')}>
         <ul class="settings-rows">
           {#each roomPacks as pack (pack.id)}
             <SettingsRow
               title={pack.name ?? pack.id}
-              description={$i18n.t('room.emojisPackCount', { count: pack.images.length })}
+              description={i18n.t('room.emojisPackCount', { count: pack.images.length })}
             >
               {#snippet before()}
                 <MediaImage
@@ -237,13 +256,13 @@
                   viewing = pack.id;
                 }}
               >
-                {$i18n.t('emotes.view')}
+                {i18n.t('emotes.view')}
               </Button>
               {#if canEdit}
                 <IconButton
                   variant="subtle"
                   size="small"
-                  label={$i18n.t('room.emojisDeletePack', { name: pack.name ?? pack.id })}
+                  label={i18n.t('room.emojisDeletePack', { name: pack.name ?? pack.id })}
                   disabled={busy}
                   onclick={() => {
                     packToRemove = pack;
@@ -256,20 +275,62 @@
           {/each}
         </ul>
       </SettingsSection>
+      {#if canEdit && (legacyOnly.length > 0 || legacyCopies.length > 0)}
+        <SettingsSection
+          headingId="room-emojis-legacy"
+          title={i18n.t('room.emojisLegacyTitle')}
+          description={i18n.t('room.emojisLegacyHint')}
+        >
+          <div class="settings-form legacy-actions">
+            {#if legacyOnly.length > 0}
+              <Button
+                disabled={busy}
+                onclick={() => {
+                  void convertLegacyPacks();
+                }}
+              >
+                {i18n.t('room.emojisLegacyConvert', { count: legacyOnly.length })}
+              </Button>
+            {/if}
+            {#if legacyCopies.length > 0}
+              <Button
+                disabled={busy}
+                onclick={() => {
+                  confirmingLegacyRemoval = true;
+                }}
+              >
+                {i18n.t('room.emojisLegacyRemove', { count: legacyCopies.length })}
+              </Button>
+            {/if}
+          </div>
+        </SettingsSection>
+      {/if}
     {/if}
   {/if}
 </div>
+
+<ConfirmDialog
+  open={confirmingLegacyRemoval}
+  onOpenChange={(next: boolean) => {
+    if (!next && busy === false) confirmingLegacyRemoval = false;
+  }}
+  title={i18n.t('room.emojisLegacyRemoveConfirm')}
+  description={i18n.t('room.emojisLegacyRemoveHint')}
+  confirmLabel={i18n.t('common.remove')}
+  {busy}
+  onConfirm={() => void removeLegacyCopies()}
+/>
 
 <ConfirmDialog
   open={packToRemove !== null}
   onOpenChange={(next: boolean) => {
     if (!next && busy === false) packToRemove = null;
   }}
-  title={$i18n.t('room.emojisDeletePackConfirm', {
+  title={i18n.t('room.emojisDeletePackConfirm', {
     name: packToRemove?.name ?? packToRemove?.id ?? '',
   })}
-  description={$i18n.t('room.emojisDeletePackHint')}
-  confirmLabel={$i18n.t('room.remove')}
+  description={i18n.t('room.emojisDeletePackHint')}
+  confirmLabel={i18n.t('common.remove')}
   {busy}
   onConfirm={() => void confirmRemoval()}
 />
@@ -282,6 +343,12 @@
 
   .viewer-header {
     display: flex;
+  }
+
+  .legacy-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-300);
   }
 
   .inline {

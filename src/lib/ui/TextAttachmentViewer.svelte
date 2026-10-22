@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { copyText } from '#lib/platform/clipboard.js';
   import ArrowLeftIcon from 'phosphor-svelte/lib/ArrowLeftIcon';
   import DownloadSimpleIcon from 'phosphor-svelte/lib/DownloadSimpleIcon';
 
@@ -8,6 +9,7 @@
   import IconButton from '#lib/ui/primitives/IconButton.svelte';
   import LinkButton from '#lib/ui/primitives/LinkButton.svelte';
   import { toasts } from '#lib/ui/toasts.svelte.js';
+  import { scrollHint } from '#lib/ui/scroll-hint.js';
 
   const MAX_HIGHLIGHT_CHARS = 100_000;
   const PREVIEW_LINES = 12;
@@ -83,7 +85,7 @@
 
   async function highlight(source: string): Promise<string | null> {
     if (language === null) return null;
-    const { highlightCode } = await import('#lib/features/room/messages/code-highlight.js');
+    const { highlightCode } = await import('#lib/ui/code-highlight.js');
     return highlightCode(source, language);
   }
 
@@ -96,11 +98,11 @@
   async function copy(): Promise<void> {
     if (text === null) return;
     try {
-      await navigator.clipboard.writeText(text);
+      await copyText(text);
       copied = true;
     } catch (error) {
       console.debug('[sable media] clipboard unavailable', error);
-      toasts.error($i18n.t('errors.actionFailed'));
+      toasts.error(i18n.t('errors.actionFailed'));
     }
   }
 </script>
@@ -109,14 +111,14 @@
   <button
     class="text-preview"
     type="button"
-    aria-label={$i18n.t('timeline.openFileNamed', { name })}
+    aria-label={i18n.t('timeline.openFileNamed', { name })}
     onclick={() => {
       open = true;
     }}
   >
     <pre class="text-preview-body"><code {@attach paint(previewHtml)}>{preview}</code></pre>
     {#if truncated}
-      <span class="text-preview-more">{$i18n.t('timeline.openFileMore')}</span>
+      <span class="text-preview-more">{i18n.t('timeline.openFileMore')}</span>
     {/if}
   </button>
 {/if}
@@ -125,7 +127,7 @@
   <div class="text-viewer">
     <header class="text-viewer-head">
       <IconButton
-        label={$i18n.t('timeline.closeFile')}
+        label={i18n.t('timeline.closeFile')}
         size="small"
         variant="ghost"
         onclick={() => {
@@ -136,13 +138,13 @@
       <!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- an object URL for the media bytes, not a route -->
       <LinkButton href={src} download={name} size="small" onclick={onDownload}>
         <DownloadSimpleIcon aria-hidden="true" />
-        {$i18n.t('timeline.downloadFile')}
+        {i18n.t('common.download')}
       </LinkButton>
       <Button variant="primary" size="small" onclick={copy}>
-        {copied ? $i18n.t('timeline.copied') : $i18n.t('timeline.copyAll')}
+        {copied ? i18n.t('common.copied') : i18n.t('timeline.copyAll')}
       </Button>
     </header>
-    <div class="text-viewer-scroll">
+    <div class="text-viewer-scroll" {@attach scrollHint}>
       <pre class="text-viewer-body"><code {@attach paint(html)}>{text ?? ''}</code></pre>
     </div>
   </div>
@@ -173,14 +175,18 @@
   }
 
   .text-preview-body {
-    font-family: var(--font-family-mono);
-    font-size: var(--font-size-small);
     line-height: var(--code-line-height);
     margin: 0;
     max-height: 12rem;
     overflow: auto hidden;
     padding: var(--space-200);
     white-space: pre;
+  }
+
+  .text-preview-body code {
+    font-family: var(--font-family-mono);
+    font-size: var(--font-size-small);
+    font-variant-ligatures: none;
   }
 
   .text-preview-more {
@@ -222,12 +228,24 @@
   }
 
   .text-viewer-body {
-    font-family: var(--font-family-mono);
-    font-size: var(--font-size-small);
     line-height: var(--code-line-height);
     margin: 0;
     overflow-wrap: anywhere;
     padding: var(--space-500);
     white-space: pre-wrap;
+  }
+
+  .text-viewer-body code {
+    font-family: var(--font-family-mono);
+    font-size: var(--font-size-small);
+    font-variant-ligatures: none;
+  }
+
+  :root[data-code-ligatures='on'] .text-preview-body code {
+    font-variant-ligatures: normal;
+  }
+
+  :root[data-code-ligatures='on'] .text-viewer-body code {
+    font-variant-ligatures: normal;
   }
 </style>

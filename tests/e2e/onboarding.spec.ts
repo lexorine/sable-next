@@ -1,5 +1,6 @@
 import { expect, test, SIGNED_OUT } from './fixtures/test';
 import { FakeCoreDriver } from './pages/FakeCoreDriver';
+import { nextFrames } from './fixtures/settle';
 
 test.use({ storageState: SIGNED_OUT });
 
@@ -62,7 +63,7 @@ for (const viewport of [
 
     await expect(page).toHaveURL(/\/rooms$/);
     expect(await core.commands()).toEqual(
-      expect.arrayContaining(['set_default_notification_mode', 'set_account_data'])
+      expect.arrayContaining(['notifications.set_default_mode', 'account.set_data'])
     );
     const pending = await page.evaluate(() =>
       Object.keys(localStorage).filter((key) => key.startsWith('sable-setup:'))
@@ -258,7 +259,7 @@ test('touch: a swipe past device confirmation does not move', async ({
   });
 
   expect(moved).toBe(0);
-  await page.waitForTimeout(400);
+  await nextFrames(page, 24);
   await expect(page).toHaveURL(/\/setup\/device$/);
 });
 

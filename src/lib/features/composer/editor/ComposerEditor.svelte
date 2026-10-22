@@ -26,9 +26,7 @@
 </script>
 
 <div
-  class="editor"
-  class:empty={showPlaceholder}
-  class:expanded
+  class={['editor', { empty: showPlaceholder, expanded }]}
   data-placeholder={placeholder}
   {@attach mount}
 ></div>
@@ -125,6 +123,7 @@
     border-radius: var(--radii-300);
     color: var(--bg-on-container);
     font-family: var(--font-family-mono);
+    font-variant-ligatures: none;
     padding: 0 var(--space-050);
   }
 
@@ -134,15 +133,43 @@
     border-radius: var(--radius);
     color: var(--bg-on-container);
     font-family: var(--font-family-mono);
+    font-variant-ligatures: none;
     margin: 0;
     overflow-x: auto;
     padding: var(--space-200);
+  }
+
+  .editor :global(pre code) {
+    font-family: var(--font-family-mono);
+    font-size: var(--font-size-small);
+    font-variant-ligatures: none;
+  }
+
+  :root[data-code-ligatures='on'] .editor :global(code) {
+    font-variant-ligatures: normal;
   }
 
   /* ProseMirror's caret hack; a `pre` already breaks on the newline itself. */
   /* stylelint-disable-next-line selector-class-pattern */
   .editor :global(pre br.ProseMirror-trailingBreak:not(:only-child)) {
     display: none;
+  }
+
+  /* stylelint-disable-next-line selector-class-pattern */
+  .editor :global(img.ProseMirror-separator) {
+    /* stylelint-disable-next-line declaration-no-important */
+    display: inline-block !important;
+    height: 1lh;
+    vertical-align: bottom;
+    width: 0;
+  }
+
+  .editor :global(.composer-mention-label)::before {
+    content: attr(data-label);
+  }
+
+  .editor :global(.composer-mention-remove)::before {
+    content: '×';
   }
 
   .editor :global(pre[data-language])::before {
@@ -205,6 +232,7 @@
 
   .editor :global([data-mx-maths]) {
     font-family: var(--font-family-mono);
+    font-variant-ligatures: none;
   }
 
   .editor :global([data-sable-room-ping]) {

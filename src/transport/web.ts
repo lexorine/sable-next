@@ -1,51 +1,62 @@
 import * as Sentry from '@sentry/sveltekit';
 
-import type { Command, CommandOk, CoreEvent } from '#src/generated/protocol';
+import type { CoreEvent } from '#src/generated/protocol';
 import type { WorkerMessage, WorkerRequest } from '#src/worker/protocol';
 import wasmVersion from '#src/generated/wasm/sable_wasm_version.js';
 import coreWorkerUrl from '../worker/core.worker.ts?sharedworker&url';
-import { CoreError, type ResponseFor, type Transport } from './index';
+import { CoreError, type Transport } from './index';
 import { on } from 'svelte/events';
 import { recordDebugLog } from '../lib/observability/debug-log.svelte.js';
 import {
+  isReportableCoreWarning,
+  isUndecryptableToDevice,
+  isExpectedCoreFailure,
   wasmErrorFingerprint,
   wasmErrorTitle,
   wasmLogLevel,
 } from '../lib/observability/wasm-log.js';
+import { readText, writeText } from '../lib/platform/local-json.js';
 import { deleteAccountWebStorage, resetWebStorage } from '../lib/platform/session-storage.js';
 import { migrateV1 } from '#lib/migrations/v1/migration.js';
 
-type RequestLabel = Command['type'] | 'media' | 'attachment' | 'upload';
-
 const QUIET_COMMAND_FAILURES = new Set([
   'media:unavailable',
-  'user_profile:unavailable',
-  'unsubscribe:denied',
-  'unsubscribe:unknown_subscription',
+  'account.user_profile:unavailable',
+  'timeline.unsubscribe:denied',
+  'timeline.unsubscribe:unknown_subscription',
 ]);
 
 const reportedCoreErrors = new Set<string>();
 
 function isStorageFailure(line: string): boolean {
-  return /database without an in-progress transaction|connection to indexed database server lost/i.test(
+  return /database without an in-progress transaction|connection to indexed database server lost|database connection is closing|TransactionAborted/i.test(
     line
   );
 }
 
 function reportCoreError(line: string, onStorageFailure: () => void): void {
-  if (isStorageFailure(line)) onStorageFailure();
+  const storage = isStorageFailure(line);
+  if (storage) onStorageFailure();
+  if (isExpectedCoreFailure(line)) {
+    Sentry.addBreadcrumb({
+      category: 'core.sync',
+      level: 'warning',
+      message: wasmErrorTitle(line),
+    });
+    return;
+  }
   const fingerprint = wasmErrorFingerprint(line);
   if (fingerprint === '' || reportedCoreErrors.has(fingerprint)) return;
   reportedCoreErrors.add(fingerprint);
-  Sentry.captureMessage(wasmErrorTitle(line), {
-    level: 'error',
+  Sentry.captureException(Object.assign(new Error(wasmErrorTitle(line)), { name: 'CoreLog' }), {
+    level: storage ? 'warning' : 'error',
     fingerprint: ['wasm-core-error', fingerprint],
     tags: { source: 'wasm-core' },
   });
 }
 
-function requestLabel(request: WorkerRequest): RequestLabel | undefined {
-  if ('command' in request) return request.command.type;
+function requestLabel(request: WorkerRequest): string | undefined {
+  if ('call' in request) return request.call.method;
   if ('media' in request) return 'media';
   if ('attachment' in request) return 'attachment';
   if ('upload' in request) return 'upload';
@@ -54,12 +65,38 @@ function requestLabel(request: WorkerRequest): RequestLabel | undefined {
 
 interface PrewarmedWorker {
   worker: SharedWorker;
+  generation: number;
   failure: string | null;
 }
 
 let prewarmed: PrewarmedWorker | null = null;
 
-function openWorker(): SharedWorker {
+function storedLogFilter(): string | null {
+  try {
+    const stored = JSON.parse(localStorage.getItem('sable-preferences') ?? '{}') as {
+      coreLogLevel?: unknown;
+      developerTools?: unknown;
+    };
+    if (stored.developerTools !== true || stored.coreLogLevel !== 'debug') return null;
+    return 'debug,matrix_sdk::latest_events::latest_event::builder=off,matrix_sdk_base::room::display_name=off';
+  } catch {
+    return null;
+  }
+}
+
+const GENERATION_KEY = 'sable-core-generation';
+
+function readGeneration(): number {
+  const stored = Number(readText(GENERATION_KEY));
+  return Number.isInteger(stored) && stored > 0 ? stored : 0;
+}
+
+/** The browser reuses a shared worker by name, and a panicked one cannot be reused. */
+function retireGeneration(used: number): void {
+  if (readGeneration() <= used) writeText(GENERATION_KEY, String(used + 1));
+}
+
+function openWorker(generation: number): SharedWorker {
   const workerUrl = new URL(coreWorkerUrl, self.location.href);
   // Shared workers outlive tabs, so changing their URL prevents an old glue
   // module from being paired with a freshly generated WASM binary.
@@ -72,41 +109,77 @@ function openWorker(): SharedWorker {
     (navigator as Navigator & { standalone?: boolean }).standalone === true;
   const iosPwa = /iPhone|iPad|iPod/.test(navigator.userAgent) && standalone;
   if (iosPwa) workerUrl.searchParams.set('event-cache', 'memory');
-  const logFilter = new URLSearchParams(self.location.search).get('log');
-  if (logFilter) workerUrl.searchParams.set('log', logFilter);
 
   return new SharedWorker(workerUrl, {
     type: 'module',
-    name: 'sable-core',
+    name: generation === 0 ? 'sable-core' : `sable-core-${String(generation)}`,
   });
 }
 
 export function prewarmWebWorker(): void {
   if (prewarmed || typeof SharedWorker === 'undefined') return;
-  const entry: PrewarmedWorker = { worker: openWorker(), failure: null };
+  const generation = readGeneration();
+  const entry: PrewarmedWorker = { worker: openWorker(generation), generation, failure: null };
   on(entry.worker, 'error', (event) => {
     entry.failure ??= (event as ErrorEvent).message || 'unknown error';
   });
   prewarmed = entry;
 }
 
-export function createWebTransport(): Transport {
+export interface CoreConnection {
+  port: MessagePort;
+  onFailure(handler: (message: string) => void): void;
+  retire(): void;
+  /** Electron's `MessagePortMain` silently drops messages that transfer an `ArrayBuffer`. */
+  copiesBuffers?: true;
+}
+
+function openSharedWorker(): CoreConnection {
+  const adopted = prewarmed;
+  prewarmed = null;
+  const generation = adopted?.generation ?? readGeneration();
+  const worker = adopted?.worker ?? openWorker(generation);
+
+  return {
+    port: worker.port,
+    onFailure(handler) {
+      // Only the worker failing to load reaches here. Runtime failures inside it
+      // are reported to its own global scope, so the worker forwards those itself.
+      on(worker, 'error', (event) => {
+        const { message } = event as ErrorEvent;
+        handler(`shared worker failed to start: ${message || 'unknown error'}`);
+      });
+      if (adopted?.failure) {
+        const failure = adopted.failure;
+        queueMicrotask(() => {
+          handler(`shared worker failed to start: ${failure}`);
+        });
+      }
+    },
+    retire() {
+      retireGeneration(generation);
+    },
+  };
+}
+
+export function createWebTransport(open: () => CoreConnection = openSharedWorker): Transport {
   const listeners = new Set<(event: CoreEvent) => void>();
   // Which reply belongs to which id is a runtime fact, so it cannot be typed.
-  type Reply = CommandOk | Uint8Array<ArrayBuffer> | string | null;
+  type Reply = unknown;
   const pending = new Map<
     number,
     { resolve: (value: Reply) => void; reject: (error: unknown) => void }
   >();
-  const pendingCommands = new Map<number, RequestLabel>();
+  const pendingCommands = new Map<number, string>();
   const crashListeners = new Set<(message: string) => void>();
   const storageFailureListeners = new Set<() => void>();
+  const supersededListeners = new Set<() => void>();
   const stallListeners = new Set<(stalled: boolean) => void>();
   const overdue = new Set<number>();
   let healthProbeTimer: ReturnType<typeof setTimeout> | undefined;
   let stalled = false;
   let nextId = 1;
-  let worker: SharedWorker | null = null;
+  let worker: CoreConnection | null = null;
   let debugLogs = false;
   let closed = false;
 
@@ -190,6 +263,7 @@ export function createWebTransport(): Transport {
       tags: { source: 'wasm-core' },
     });
     console.error('[sable transport] core panicked', error);
+    worker?.retire();
     worker?.port.close();
     worker = null;
     clearHealthProbe();
@@ -199,19 +273,24 @@ export function createWebTransport(): Transport {
     for (const listener of crashListeners) listener(message);
   }
 
-  function connect(): SharedWorker {
+  function handleSuperseded(): void {
+    // Reconnecting would claim the store back from the newer worker.
+    closed = true;
+    worker?.port.close();
+    worker = null;
+    clearHealthProbe();
+    overdue.clear();
+    reportStall(false);
+    rejectPending('core superseded by a newer tab');
+    for (const listener of supersededListeners) listener();
+  }
+
+  function connect(): CoreConnection {
     if (worker) return worker;
 
-    const adopted = prewarmed;
-    prewarmed = null;
-    const nextWorker = adopted?.worker ?? openWorker();
-
-    // Only the worker failing to load reaches here. Runtime failures inside it
-    // are reported to its own global scope, so the worker forwards those itself.
-    on(nextWorker, 'error', (event) => {
-      if (worker !== nextWorker) return;
-      const { message } = event as ErrorEvent;
-      handleCrash(`shared worker failed to start: ${message || 'unknown error'}`);
+    const nextWorker = open();
+    nextWorker.onFailure((message) => {
+      if (worker === nextWorker) handleCrash(message);
     });
 
     nextWorker.port.onmessageerror = () => {
@@ -233,7 +312,10 @@ export function createWebTransport(): Transport {
         for (const line of data.logs) {
           const level = wasmLogLevel(line);
           recordDebugLog(level, level === 'error' ? 'error' : 'general', 'wasm', line.trim());
-          if (level === 'error') {
+          if (line.includes('session tokens:')) {
+            Sentry.addBreadcrumb({ category: 'core.session', level: 'info', message: line.trim() });
+          }
+          if (level === 'error' || isUndecryptableToDevice(line) || isReportableCoreWarning(line)) {
             reportCoreError(line, () => {
               for (const listener of storageFailureListeners) listener();
             });
@@ -244,6 +326,11 @@ export function createWebTransport(): Transport {
 
       if ('panic' in data) {
         handleCrash(data.panic.message, data.panic.stack);
+        return;
+      }
+
+      if ('superseded' in data) {
+        handleSuperseded();
         return;
       }
 
@@ -269,13 +356,14 @@ export function createWebTransport(): Transport {
 
     nextWorker.port.start();
     if (debugLogs) nextWorker.port.postMessage({ debugLogs: true });
-    worker = nextWorker;
-    if (adopted?.failure) {
-      const failure = adopted.failure;
-      queueMicrotask(() => {
-        if (worker === nextWorker) handleCrash(`shared worker failed to start: ${failure}`);
-      });
+    if (typeof document !== 'undefined') {
+      nextWorker.port.postMessage({
+        visible: document.visibilityState === 'visible',
+      } satisfies WorkerRequest);
     }
+    const logFilter = new URLSearchParams(self.location.search).get('log') ?? storedLogFilter();
+    if (logFilter) nextWorker.port.postMessage({ logFilter });
+    worker = nextWorker;
     return nextWorker;
   }
 
@@ -287,11 +375,22 @@ export function createWebTransport(): Transport {
           worker?.port.postMessage({ disconnect: true } satisfies WorkerRequest);
         });
 
+  const releaseVisibility =
+    typeof document === 'undefined'
+      ? undefined
+      : on(document, 'visibilitychange', () => {
+          worker?.port.postMessage({
+            visible: document.visibilityState === 'visible',
+          } satisfies WorkerRequest);
+        });
+
   function detach(reason: string, farewell: WorkerRequest): void {
     closed = true;
     releasePageHide?.();
+    releaseVisibility?.();
     listeners.clear();
     crashListeners.clear();
+    supersededListeners.clear();
     stallListeners.clear();
     clearHealthProbe();
     overdue.clear();
@@ -317,7 +416,7 @@ export function createWebTransport(): Transport {
         const label = requestLabel(request);
         if (label !== undefined) recordDebugLog('debug', 'network', 'transport', label);
         const timeout =
-          label === 'login_flows'
+          label === 'auth.login_flows'
             ? setTimeout(() => {
                 if (!pending.delete(id)) return;
                 pendingCommands.delete(id);
@@ -328,7 +427,7 @@ export function createWebTransport(): Transport {
               }, 20_000)
             : undefined;
         const stall =
-          'command' in request
+          'call' in request
             ? setTimeout(() => {
                 setOverdue(id, true);
               }, stallAfterMs)
@@ -349,14 +448,14 @@ export function createWebTransport(): Transport {
           },
         });
         if (label !== undefined) pendingCommands.set(id, label);
-        activeWorker.port.postMessage(request, transfers);
+        activeWorker.port.postMessage(request, activeWorker.copiesBuffers ? [] : transfers);
       });
     })();
   }
 
   return {
-    send<C extends Command>(command: C) {
-      return request<ResponseFor<C['type']>>((id) => ({ id, command }));
+    call(method, params) {
+      return request<unknown>((id) => ({ id, call: { method, params } }));
     },
 
     fetchMedia(source, width, height, background = false) {
@@ -368,15 +467,6 @@ export function createWebTransport(): Transport {
 
     async forgetMedia(source) {
       await request<null>((id) => ({ id, forget: { source } }));
-    },
-
-    // A browser decodes what it advertises, so nothing here should ask.
-    videoStreamMime() {
-      return Promise.reject(new CoreError({ code: 'unsupported' }));
-    },
-
-    streamVideo() {
-      return Promise.reject(new CoreError({ code: 'unsupported' }));
     },
 
     async sendAttachment({
@@ -478,6 +568,11 @@ export function createWebTransport(): Transport {
     subscribeStorageFailure(onStorageFailure) {
       storageFailureListeners.add(onStorageFailure);
       return () => storageFailureListeners.delete(onStorageFailure);
+    },
+
+    subscribeSuperseded(onSuperseded) {
+      supersededListeners.add(onSuperseded);
+      return () => supersededListeners.delete(onSuperseded);
     },
 
     subscribeStall(onStall) {

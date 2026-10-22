@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import ArrowLeftIcon from 'phosphor-svelte/lib/ArrowLeftIcon';
 
   import type { ImagePackView } from '#src/generated/protocol';
@@ -23,20 +24,7 @@
   import { packDraft } from './pack-content.js';
   import { exportPacks } from './pack-transfer.js';
   import PersonalPackSettings from './PersonalPackSettings.svelte';
-  import {
-    EMOTE_ROOMS_EVENT_TYPE,
-    IMAGE_PACK_ROOMS_EVENT_TYPE,
-    packAddressEqual,
-    packAddressKey,
-    type PackAddress,
-  } from './pack-address.js';
-  import {
-    emoteRoomsEventContent,
-    readEmoteRooms,
-    selectedAddresses,
-    withSelection,
-    type EmoteRoomsContent,
-  } from './emote-rooms.js';
+  import { packAddressEqual, packAddressKey, type PackAddress } from './pack-address.js';
 
   import '#lib/ui/primitives/settings-row.css';
 
@@ -45,22 +33,43 @@
   const category = findCategory(SETTINGS_EMOTES_SECTION);
 
   let packs = $state.raw<ImagePackView[]>([]);
-  let selection = $state.raw<EmoteRoomsContent>({});
+  let chosen = $state.raw<PackAddress[]>([]);
   let loading = $state(true);
   let busy = $state(false);
   let failed = $state(false);
   let viewing = $state<string | null>(null);
   let alive = true;
+  let root = $state<HTMLElement | null>(null);
+  let listScroll = 0;
 
   let roomPacks = $derived(packs.filter((pack) => pack.origin === 'room' && pack.room_id !== null));
-  let chosen = $derived(selectedAddresses(selection));
   let viewingPack = $derived(
     roomPacks.find((pack) => pack.room_id !== null && packAddressKey(address(pack)) === viewing) ??
       null
   );
 
   function address(pack: ImagePackView): PackAddress {
-    return { roomId: pack.room_id ?? '', stateKey: pack.id };
+    return { room_id: pack.room_id ?? '', state_key: pack.id };
+  }
+
+  function scroller(): HTMLElement | null {
+    const found = root?.closest('.settings-scroll');
+    return found instanceof HTMLElement ? found : null;
+  }
+
+  async function view(pack: ImagePackView): Promise<void> {
+    listScroll = scroller()?.scrollTop ?? 0;
+    viewing = packAddressKey(address(pack));
+    await tick();
+    const target = scroller();
+    if (target) target.scrollTop = 0;
+  }
+
+  async function backToList(): Promise<void> {
+    viewing = null;
+    await tick();
+    const target = scroller();
+    if (target) target.scrollTop = listScroll;
   }
 
   function isChosen(pack: ImagePackView): boolean {
@@ -70,8 +79,8 @@
   let byRoom = $derived(
     Object.entries(
       roomPacks.reduce<Record<string, ImagePackView[]>>((grouped, pack) => {
-        const roomId = pack.room_id ?? '';
-        return { ...grouped, [roomId]: [...(grouped[roomId] ?? []), pack] };
+        (grouped[pack.room_id ?? ''] ??= []).push(pack);
+        return grouped;
       }, {})
     ).sort(([left], [right]) => roomList.labelFor(left).localeCompare(roomList.labelFor(right)))
   );
@@ -88,15 +97,13 @@
 
   async function load(): Promise<void> {
     try {
-      const [loaded, stable, unstable] = await Promise.all([
-        core.commands.allImagePacks(),
-        core.commands.accountData(IMAGE_PACK_ROOMS_EVENT_TYPE),
-        core.commands.accountData(EMOTE_ROOMS_EVENT_TYPE),
+      const [loaded, subscribed] = await Promise.all([
+        core.rpc.packs.listAll(),
+        core.rpc.packs.subscriptions(),
       ]);
       if (!alive) return;
       packs = loaded;
-      const chosenStable = readEmoteRooms(stable);
-      selection = Object.keys(chosenStable).length > 0 ? chosenStable : readEmoteRooms(unstable);
+      chosen = subscribed;
     } catch (error) {
       console.warn('[sable emotes] the pack list could not be read', error);
       if (alive) failed = true;
@@ -104,17 +111,15 @@
   }
 
   async function toggle(pack: ImagePackView, wanted: boolean): Promise<void> {
-    const target = address(pack);
-    const next = wanted
-      ? withSelection(selection, [target], [])
-      : withSelection(selection, [], [target]);
+    const target = [address(pack)];
 
     busy = true;
     failed = false;
     try {
-      await core.commands.setAccountData(IMAGE_PACK_ROOMS_EVENT_TYPE, emoteRoomsEventContent(next));
-      invalidatePacks(core.commands);
-      selection = next;
+      chosen = wanted
+        ? await core.rpc.packs.setSubscriptions({ added: target, removed: [] })
+        : await core.rpc.packs.setSubscriptions({ added: [], removed: target });
+      invalidatePacks(core.rpc);
     } catch (error) {
       console.warn('[sable emotes] the pack selection could not be saved', error);
       failed = true;
@@ -141,16 +146,14 @@
   async function toggleRoom(roomId: string, roomsPacks: ImagePackView[]): Promise<void> {
     const all = roomsPacks.every(isChosen);
     const addresses = roomsPacks.map(address);
-    const next = all
-      ? withSelection(selection, [], addresses)
-      : withSelection(selection, addresses, []);
 
     busy = true;
     failed = false;
     try {
-      await core.commands.setAccountData(IMAGE_PACK_ROOMS_EVENT_TYPE, emoteRoomsEventContent(next));
-      invalidatePacks(core.commands);
-      selection = next;
+      chosen = all
+        ? await core.rpc.packs.setSubscriptions({ added: [], removed: addresses })
+        : await core.rpc.packs.setSubscriptions({ added: addresses, removed: [] });
+      invalidatePacks(core.rpc);
     } catch (error) {
       console.warn('[sable emotes] the pack selection could not be saved', error);
       failed = true;
@@ -161,10 +164,10 @@
   }
 </script>
 
-<AppPageShell title={$i18n.t('settings.emotes')} density="compact" class="emote-settings-page">
-  <div class="emote-settings">
+<AppPageShell title={i18n.t('settings.emotes')} density="compact" class="emote-settings-page">
+  <div class="emote-settings" bind:this={root}>
     {#if failed}
-      <Alert variant="critical" role="alert">{$i18n.t('emotes.saveFailed')}</Alert>
+      <Alert variant="critical" role="alert">{i18n.t('emotes.saveFailed')}</Alert>
     {/if}
 
     {#if viewingPack}
@@ -172,11 +175,11 @@
         <Button
           size="small"
           onclick={() => {
-            viewing = null;
+            void backToList();
           }}
         >
           <ArrowLeftIcon />
-          {$i18n.t('emotes.back')}
+          {i18n.t('common.back')}
         </Button>
       </div>
       {#key viewing}
@@ -188,13 +191,13 @@
 
       <SettingsSection
         headingId="emote-room-packs"
-        title={$i18n.t('emotes.roomPacksTitle')}
-        description={$i18n.t('emotes.roomPacksHint')}
+        title={i18n.t('emotes.roomPacksTitle')}
+        description={i18n.t('emotes.roomPacksHint')}
       >
         {#if loading}
           <p class="status settings-form" role="status"><Spinner small /></p>
         {:else if byRoom.length === 0}
-          <p class="status settings-form">{$i18n.t('emotes.noRoomPacks')}</p>
+          <p class="status settings-form">{i18n.t('emotes.noRoomPacks')}</p>
         {:else}
           {#each byRoom as [roomId, roomsPacks] (roomId)}
             <div class="room-group">
@@ -208,7 +211,7 @@
                       void exportRoom(roomsPacks);
                     }}
                   >
-                    {$i18n.t('emotes.exportAll')}
+                    {i18n.t('emotes.exportAll')}
                   </Button>
                   <Button
                     size="small"
@@ -218,8 +221,8 @@
                     }}
                   >
                     {roomsPacks.every(isChosen)
-                      ? $i18n.t('emotes.unselectAll')
-                      : $i18n.t('emotes.selectAll')}
+                      ? i18n.t('emotes.unselectAll')
+                      : i18n.t('common.selectAll')}
                   </Button>
                 </div>
               </div>
@@ -227,7 +230,7 @@
                 {#each roomsPacks as pack (pack.id)}
                   <SettingsRow
                     title={pack.name ?? pack.id}
-                    description={$i18n.t('emotes.imageCount', { count: pack.images.length })}
+                    description={i18n.t('emotes.imageCount', { count: pack.images.length })}
                   >
                     {#snippet before()}
                       <MediaImage
@@ -241,13 +244,13 @@
                     <Button
                       size="small"
                       onclick={() => {
-                        viewing = packAddressKey(address(pack));
+                        void view(pack);
                       }}
                     >
-                      {$i18n.t('emotes.view')}
+                      {i18n.t('emotes.view')}
                     </Button>
                     <Switch
-                      label={$i18n.t('emotes.useEverywhere', { name: pack.name ?? pack.id })}
+                      label={i18n.t('emotes.useEverywhere', { name: pack.name ?? pack.id })}
                       checked={isChosen(pack)}
                       disabled={busy}
                       onCheckedChange={(checked) => {
@@ -276,7 +279,12 @@
   }
 
   .viewer-header {
+    background: var(--surface-container);
     display: flex;
+    inset-block-start: 0;
+    padding-block: var(--space-200);
+    position: sticky;
+    z-index: 1;
   }
 
   .room-group {

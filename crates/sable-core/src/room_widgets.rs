@@ -1,0 +1,155 @@
+use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId, TransactionId};
+use serde::Serialize;
+use url::Url;
+
+use crate::Core;
+use crate::protocol::RpcError;
+use crate::room_settings::EmptyContent;
+
+const WIDGET_STATE_TYPE: &str = "im.vector.modular.widgets";
+
+/// The variables a widget host substitutes, so a bare URL learns who is
+/// looking at it the way an integration manager's widgets do.
+const TEMPLATE_PARAMS: &str = "matrix_user_id=$matrix_user_id\
+    &matrix_display_name=$matrix_display_name\
+    &matrix_avatar_url=$matrix_avatar_url\
+    &matrix_room_id=$matrix_room_id\
+    &matrix_widget_id=$matrix_widget_id\
+    &theme=$org.matrix.msc2873.client_theme\
+    &matrix_client_id=$org.matrix.msc2873.client_id\
+    &matrix_client_language=$org.matrix.msc2873.client_language\
+    &matrix_device_id=$org.matrix.msc3819.matrix_device_id\
+    &matrix_base_url=$org.matrix.msc4039.matrix_base_url";
+
+/// A URL that already names a template variable is left as its author wrote it.
+pub(crate) fn enrich_widget_url(url: &Url) -> String {
+    let raw = url.as_str();
+    if raw.contains("$matrix_") || raw.contains("$org.matrix.") {
+        return raw.to_owned();
+    }
+    let continues_a_query = url
+        .fragment()
+        .map_or_else(|| url.query().is_some(), |fragment| fragment.contains('?'));
+    let separator = if continues_a_query { '&' } else { '?' };
+    format!("{raw}{separator}{TEMPLATE_PARAMS}")
+}
+
+pub(crate) fn widget_url(raw: &str) -> Option<Url> {
+    Url::parse(raw)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type")]
+enum WidgetOut<'a> {
+    #[serde(rename = "m.custom")]
+    Custom {
+        url: &'a str,
+        name: &'a str,
+        id: &'a str,
+        #[serde(rename = "creatorUserId")]
+        creator_user_id: &'a OwnedUserId,
+    },
+}
+
+impl Core {
+    pub(crate) async fn add_room_widget(
+        &self,
+        room_id: OwnedRoomId,
+        name: &str,
+        url: &str,
+    ) -> Result<String, RpcError> {
+        let url = widget_url(url).ok_or(RpcError::InvalidUrl)?;
+        let user_id = self
+            .client()
+            .await?
+            .user_id()
+            .ok_or(RpcError::NotLoggedIn)?
+            .to_owned();
+        let id = TransactionId::new().to_string();
+        let content = WidgetOut::Custom {
+            url: &enrich_widget_url(&url),
+            name,
+            id: &id,
+            creator_user_id: &user_id,
+        };
+        self.send_state(room_id, WIDGET_STATE_TYPE, &id, &content)
+            .await?;
+        Ok(id)
+    }
+
+    pub(crate) async fn remove_room_widget(
+        &self,
+        room_id: OwnedRoomId,
+        widget_id: &str,
+    ) -> Result<(), RpcError> {
+        self.send_state(room_id, WIDGET_STATE_TYPE, widget_id, &EmptyContent {})
+            .await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TEMPLATE_PARAMS, WidgetOut, enrich_widget_url, widget_url};
+
+    #[test]
+    fn a_custom_widget_is_written_with_a_camel_case_creator() {
+        let user_id = matrix_sdk::ruma::owned_user_id!("@a:example.org");
+        let content = serde_json::to_value(WidgetOut::Custom {
+            url: "https://example.org/w",
+            name: "Board",
+            id: "w1",
+            creator_user_id: &user_id,
+        })
+        .unwrap();
+        assert_eq!(
+            content,
+            serde_json::json!({
+                "type": "m.custom",
+                "url": "https://example.org/w",
+                "name": "Board",
+                "id": "w1",
+                "creatorUserId": "@a:example.org",
+            })
+        );
+    }
+
+    fn enriched(raw: &str) -> String {
+        enrich_widget_url(&widget_url(raw).expect("valid url"))
+    }
+
+    #[test]
+    fn the_parameters_follow_the_query_or_the_fragment() {
+        assert_eq!(
+            enriched("https://w.example/app"),
+            format!("https://w.example/app?{TEMPLATE_PARAMS}")
+        );
+        assert_eq!(
+            enriched("https://w.example/app?x=1"),
+            format!("https://w.example/app?x=1&{TEMPLATE_PARAMS}")
+        );
+        assert_eq!(
+            enriched("https://w.example/#/room"),
+            format!("https://w.example/#/room?{TEMPLATE_PARAMS}")
+        );
+        assert_eq!(
+            enriched("https://w.example/#/room?x=1"),
+            format!("https://w.example/#/room?x=1&{TEMPLATE_PARAMS}")
+        );
+    }
+
+    #[test]
+    fn a_templated_url_is_left_alone() {
+        let raw = "https://w.example/app?room=$matrix_room_id";
+        assert_eq!(enriched(raw), raw);
+    }
+
+    #[test]
+    fn only_web_urls_can_be_widgets() {
+        assert!(widget_url("https://w.example").is_some());
+        assert!(widget_url("javascript:alert(1)").is_none());
+        assert!(widget_url("not a url").is_none());
+    }
+}

@@ -1,3 +1,4 @@
+import type { RoomPreviewView } from '#src/generated/protocol';
 // @vitest-environment happy-dom
 
 import { fireEvent, render, screen, type RenderResult } from '@testing-library/svelte';
@@ -17,8 +18,9 @@ vi.mock('#lib/core/context.js');
 
 import { core as baseCore } from '#lib/core/__mocks__/context.js';
 
-const core = Object.assign(baseCore, {
-  roomPreview: vi.fn<() => Promise<{ name: string | null }>>(),
+const core = baseCore;
+Object.assign(core.rpc.rooms, { preview: vi.fn<() => Promise<{ name: string | null }>>() });
+const timeline = Object.assign(baseCore.rpc.timeline, {
   eventItems: vi.fn<() => Promise<unknown[]>>(() => Promise.resolve([])),
 });
 
@@ -48,8 +50,8 @@ test('keeps table semantics inside a keyboard-accessible scroller', async () => 
 
 afterEach(() => {
   core.fetchMedia.mockReset();
-  core.roomPreview.mockReset();
-  core.roomPreview.mockResolvedValue({ name: null });
+  core.rpc.rooms.preview.mockReset();
+  core.rpc.rooms.preview.mockResolvedValue({ name: null } as RoomPreviewView);
   roomList.rooms = [];
   preferences.pauseAnimationsWhenInactive = false;
   preferences.mediaAutoLoad = 'on';
@@ -71,7 +73,7 @@ test('opens Matrix links through the room-level handler', async () => {
   await user.click(link());
 
   expect(onMatrixLink).toHaveBeenCalledWith(
-    { kind: 'event', roomId: '!room:example.org', eventId: '$event' },
+    { kind: 'event', room_id: '!room:example.org', event_id: '$event' },
     expect.any(HTMLAnchorElement)
   );
   expect(onDocumentClick).not.toHaveBeenCalled();
@@ -91,14 +93,30 @@ test.each([
 test.each([
   ['\u2190', '@ezera'],
   ['Ana', '@ezera'],
-  ['@ezera:example.org', '@ezera'],
-])('labels a user mention from the id, not the author text %s', async (label, expected) => {
+  ['hello', '@ezera'],
+  ['https://matrix.to/#/@ezera:example.org', '@ezera'],
+])('labels a user mention %s with the member name', async (label, expected) => {
   render(FormattedBody, {
     props: { html: `<a href="https://matrix.to/#/@ezera:example.org">${label}</a>` },
   });
   await tick();
 
   expect(screen.getByRole('link', { name: expected })).toHaveAttribute('data-matrix-link', 'user');
+});
+
+test('keeps the author text on a user mention when asked to', async () => {
+  render(FormattedBody, {
+    props: {
+      html: '<a href="https://matrix.to/#/@ezera:example.org">@ezera \u2192</a>',
+      keepMentionText: true,
+    },
+  });
+  await tick();
+
+  expect(screen.getByRole('link', { name: '@ezera \u2192' })).toHaveAttribute(
+    'data-matrix-link',
+    'user'
+  );
 });
 
 test('turns a room permalink whose label is its href into a room mention', async () => {
@@ -113,6 +131,21 @@ test('turns a room permalink whose label is its href into a room mention', async
   expect(anchor).toHaveAttribute('data-matrix-link', 'room');
 });
 
+test('renders an explicitly authored MSC4550 room event permalink as a channel link', async () => {
+  const url =
+    'https://matrix.to/#/%23general%3Asable.moe/%24gM49XZzifAGMXXiossf5RM7J-bkDgaw6rluT0Q2du3Q';
+  render(FormattedBody, {
+    props: {
+      html: `<a href="${url}" data-org.matrix.msc4550.link="">${url}</a>`,
+    },
+  });
+  await tick();
+
+  const anchor = screen.getByRole('link', { name: '#general:sable.moe' });
+  expect(anchor).toHaveAttribute('data-matrix-link', 'event');
+  expect(anchor.querySelector('.link-chip-icon')).toBeInTheDocument();
+});
+
 test('renders an @room mention as a chip', async () => {
   render(FormattedBody, {
     props: { html: 'Heads up <span data-mx-room-mention>@room</span>' },
@@ -123,16 +156,17 @@ test('renders an @room mention as a chip', async () => {
 });
 
 test('resolves a room permalink name through its via server', async () => {
-  core.roomPreview.mockResolvedValue({ name: 'Sable' });
+  core.rpc.rooms.preview.mockResolvedValue({ name: 'Sable' } as RoomPreviewView);
   const url = 'https://matrix.to/#/!6DYBIzUfDoKmqk53wyRqcod2G7LTcR9fEm9XBfaenNI?via=sable.moe';
   render(FormattedBody, {
     props: { html: `<a href="${url}">${url}</a>` },
   });
 
   expect(await screen.findByRole('link', { name: '#Sable' })).toBeInTheDocument();
-  expect(core.roomPreview).toHaveBeenCalledWith('!6DYBIzUfDoKmqk53wyRqcod2G7LTcR9fEm9XBfaenNI', [
-    'sable.moe',
-  ]);
+  expect(core.rpc.rooms.preview).toHaveBeenCalledWith({
+    address: '!6DYBIzUfDoKmqk53wyRqcod2G7LTcR9fEm9XBfaenNI',
+    via: ['sable.moe'],
+  });
 });
 
 test('uses the local room-list name before requesting a preview', async () => {
@@ -149,7 +183,7 @@ test('uses the local room-list name before requesting a preview', async () => {
   });
 
   expect(await screen.findByRole('link', { name: '#Sable' })).toBeInTheDocument();
-  expect(core.roomPreview).not.toHaveBeenCalled();
+  expect(core.rpc.rooms.preview).not.toHaveBeenCalled();
 });
 
 test('sends external links to a new tab instead of the handler', async () => {
@@ -528,7 +562,7 @@ test('shows a room abbreviation definition in a tooltip on hover', async () => {
   render(FormattedBodyHarness, {
     props: {
       html: '<p>a foss build</p>',
-      entries: [{ term: 'FOSS', definition: 'Free and open source software' }],
+      entries: [{ term: 'FOSS', definition: 'Free and open source software', cased: false }],
     },
   });
   await tick();
@@ -545,6 +579,21 @@ test('shows a room abbreviation definition in a tooltip on hover', async () => {
   );
 });
 
+test('names a custom emoji by its shortcode, not its alt text, on hover', async () => {
+  core.fetchMedia.mockResolvedValue(new Uint8Array(new ArrayBuffer(1)));
+  render(FormattedBody, {
+    props: {
+      html: '<img data-mx-emoticon src="mxc://example.org/emoji" alt="😈" title=":pulexFoxPrideMonth:" height="32">',
+    },
+  });
+  await tick();
+
+  await user.hover(screen.getByRole('img', { name: '😈' }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  expect(document.querySelector('.tooltip')?.textContent.trim()).toBe(':pulexFoxPrideMonth:');
+});
+
 test('shows the target of a link whose text differs from it on hover', async () => {
   render(FormattedBodyHarness, {
     props: { html: '<p><a href="https://example.com/a">click here</a></p>', entries: [] },
@@ -553,6 +602,36 @@ test('shows the target of a link whose text differs from it on hover', async () 
   await new Promise((resolve) => setTimeout(resolve, 0));
 
   await user.hover(screen.getByRole('link', { name: 'click here' }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  expect(document.querySelector('.tooltip')?.textContent.trim()).toBe('https://example.com/a');
+});
+
+test('closes the link target tooltip when the window loses focus', async () => {
+  render(FormattedBodyHarness, {
+    props: { html: '<p><a href="https://example.com/a">click here</a></p>', entries: [] },
+  });
+  await tick();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  await user.hover(screen.getByRole('link', { name: 'click here' }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(document.querySelector('.tooltip')).toBeInTheDocument();
+
+  window.dispatchEvent(new Event('blur'));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  expect(document.querySelector('.tooltip')).not.toBeInTheDocument();
+});
+
+test('shows the link target when the link takes keyboard focus', async () => {
+  render(FormattedBodyHarness, {
+    props: { html: '<p><a href="https://example.com/a">click here</a></p>', entries: [] },
+  });
+  await tick();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  await user.tab();
   await new Promise((resolve) => setTimeout(resolve, 0));
 
   expect(document.querySelector('.tooltip')?.textContent.trim()).toBe('https://example.com/a');
@@ -587,7 +666,8 @@ test('the sender zone reaches a time chip without rebuilding the body', async ()
   render(FormattedBodyHarness, { props });
   await settle();
 
-  const chip = screen.getByRole('button', { name: /1970/ });
+  const chip = document.querySelector<HTMLButtonElement>('.time-chip');
+  if (!chip) throw new Error('time chip missing');
   const spoiler = screen.getByRole('button', { name: 'secret' });
   await user.click(spoiler);
   expect(spoiler.ariaPressed).toBe('false');
@@ -600,7 +680,7 @@ test('the sender zone reaches a time chip without rebuilding the body', async ()
   props.senderTimezone = 'Asia/Tokyo';
   await settle();
 
-  expect(screen.getByRole('button', { name: /1970/ })).toBe(chip);
+  expect(document.querySelector('.time-chip')).toBe(chip);
   expect(spoiler.ariaPressed).toBe('false');
   expect(chip.ariaLabel).toContain('Asia/Tokyo');
   expect(document.querySelector('.tooltip')?.textContent).toContain('Asia/Tokyo');
@@ -644,7 +724,7 @@ test('a time inside a link stays part of the link', async () => {
 
 test('a bare event link names the room and quotes the message, with an icon', async () => {
   roomList.rooms = [{ room_id: '!room:example.org', canonical_alias: null, name: 'Design' }];
-  core.eventItems.mockResolvedValue([
+  timeline.eventItems.mockResolvedValue([
     { content: { kind: 'message', body: `ship it\n${'x'.repeat(100)}`, html: null } },
   ]);
   const url = 'https://matrix.to/#/!room:example.org/$event';
@@ -654,11 +734,14 @@ test('a bare event link names the room and quotes the message, with an icon', as
 
   const anchor = link();
   await vi.waitFor(() => {
-    expect(anchor).toHaveTextContent(/^#Design: ship it x+…$/);
+    expect(anchor.textContent).toMatch(/^#Design: ship it x+…$/);
   });
   expect(anchor.textContent).toHaveLength('#Design: '.length + 72);
   expect(anchor.querySelector('.link-chip-icon svg')).toBeInTheDocument();
-  expect(core.eventItems).toHaveBeenCalledWith('!room:example.org', ['$event']);
+  expect(timeline.eventItems).toHaveBeenCalledWith({
+    room_id: '!room:example.org',
+    event_ids: ['$event'],
+  });
 });
 
 test('inline images wait behind a prompt where the media preview setting says so (MSC4278)', async () => {
@@ -720,3 +803,16 @@ test.each([
 
   expect(document.querySelector('pre code')?.querySelector('span')).toBeNull();
 });
+
+test.each(['https://matrix.to/#/@ezera:example.org', 'matrix:u/ezera:example.org'])(
+  'labels a user mention the same on %s',
+  async (href) => {
+    render(FormattedBody, { props: { html: `<a href="${href}">hello</a>` } });
+    await tick();
+
+    expect(screen.getByRole('link', { name: '@ezera' })).toHaveAttribute(
+      'data-matrix-link',
+      'user'
+    );
+  }
+);

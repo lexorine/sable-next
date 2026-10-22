@@ -26,6 +26,23 @@
   let loading = $state(false);
   let saving = $state(false);
   let outcome = $state<'json' | 'failed' | 'missing' | 'saved' | null>(null);
+  let listed = $state<string[]>([]);
+  let types = $derived([...new Set([...listed, ...KNOWN_TYPES])].sort());
+
+  $effect(() => {
+    let current = true;
+    core.rpc.room_state
+      .accountDataTypes({ room_id: roomId })
+      .then((found) => {
+        if (current) listed = found;
+      })
+      .catch((error: unknown) => {
+        console.debug('[sable room] room account data types unavailable', error);
+      });
+    return () => {
+      current = false;
+    };
+  });
 
   async function load(): Promise<void> {
     const type = eventType.trim();
@@ -34,7 +51,10 @@
     loading = true;
     outcome = null;
     try {
-      const existing = await core.commands.roomAccountData(roomId, type);
+      const existing = await core.rpc.room_state.accountData({
+        room_id: roomId,
+        event_type: type,
+      });
       if (existing === null || existing === undefined) {
         content = '{}';
         outcome = 'missing';
@@ -63,7 +83,11 @@
     saving = true;
     outcome = null;
     try {
-      await core.commands.setRoomAccountData(roomId, type, parsed);
+      await core.rpc.room_state.setAccountData({
+        room_id: roomId,
+        event_type: type,
+        content: parsed,
+      });
       outcome = 'saved';
     } catch (error) {
       console.warn('[sable room] room account data rejected', error);
@@ -76,11 +100,11 @@
 
 <SettingsSection
   headingId="room-developer-account-data"
-  title={$i18n.t('room.devAccountDataTitle')}
-  description={$i18n.t('room.devAccountDataDescription')}
+  title={i18n.t('room.devAccountDataTitle')}
+  description={i18n.t('room.devAccountDataDescription')}
 >
   <form class="settings-form" onsubmit={save}>
-    <FormField fieldId="room-dev-account-type" label={$i18n.t('room.devEventType')}>
+    <FormField fieldId="room-dev-account-type" label={i18n.t('room.devEventType')}>
       <TextInput
         id="room-dev-account-type"
         bind:value={eventType}
@@ -90,22 +114,22 @@
         spellcheck="false"
       />
       <datalist id={`${listId}-types`}>
-        {#each KNOWN_TYPES as type (type)}
+        {#each types as type (type)}
           <option value={type}></option>
         {/each}
       </datalist>
     </FormField>
-    <FormField fieldId="room-dev-account-content" label={$i18n.t('room.devContent')}>
+    <FormField fieldId="room-dev-account-content" label={i18n.t('room.devContent')}>
       <TextArea id="room-dev-account-content" bind:value={content} rows={8} spellcheck="false" />
     </FormField>
     {#if outcome === 'json'}
-      <Alert variant="critical" role="alert">{$i18n.t('room.devInvalidJson')}</Alert>
+      <Alert variant="critical" role="alert">{i18n.t('room.devInvalidJson')}</Alert>
     {:else if outcome === 'failed'}
-      <Alert variant="critical" role="alert">{$i18n.t('room.devFailed')}</Alert>
+      <Alert variant="critical" role="alert">{i18n.t('common.stateEventRejected')}</Alert>
     {:else if outcome === 'missing'}
-      <Alert variant="info" role="status">{$i18n.t('room.devMissing')}</Alert>
+      <Alert variant="info" role="status">{i18n.t('room.devMissing')}</Alert>
     {:else if outcome === 'saved'}
-      <Alert variant="success" role="status">{$i18n.t('room.devSent')}</Alert>
+      <Alert variant="success" role="status">{i18n.t('room.devSent')}</Alert>
     {/if}
     <div class="actions">
       <Button
@@ -115,10 +139,10 @@
         disabled={eventType.trim() === ''}
         onclick={() => void load()}
       >
-        {$i18n.t('room.devLoad')}
+        {i18n.t('room.devLoad')}
       </Button>
       <Button type="submit" loading={saving} disabled={eventType.trim() === ''}>
-        {$i18n.t('room.devSave')}
+        {i18n.t('common.save')}
       </Button>
     </div>
   </form>

@@ -4,6 +4,7 @@
   import type { ClassValue } from 'svelte/elements';
 
   import { SABLE_DONATE_URL } from '#lib/config/links.js';
+  import { graphemes } from '#lib/graphemes.js';
   import { i18n } from '#lib/i18n.js';
   import { overlayLayer } from '#lib/ui/overlay-layer.js';
   import LinkButton from '#lib/ui/primitives/LinkButton.svelte';
@@ -11,10 +12,13 @@
   import SupporterMark from './SupporterMark.svelte';
   import { supporter } from './supporter.svelte.js';
   import {
+    isSupporterColors,
     supporterAppearance,
     supporterButtonText,
     supporterColor,
+    supportsSupporterColors,
     type SupporterAppearance,
+    type SupporterVariant,
   } from './variants.js';
 
   type Props = Partial<SupporterAppearance> & {
@@ -37,51 +41,117 @@
   }: Props = $props();
   let donated = $derived(viewerIsDonor ?? (isOwnBadge || Boolean(supporter.badge)));
   let selected = $derived(supporterAppearance(appearance));
-  let { variant, color, customCardColors, cardColor, buttonColor } = $derived(selected);
+  let { variant, color, colors, customCardColors, cardColor, buttonColor } = $derived(selected);
   const id = $props.id();
-  const nameSegments = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+  let open = $state(false);
   let donorName = $derived.by(() => {
     let shortened = '';
     let count = 0;
-    for (const { segment } of nameSegments.segment(name?.trim() || $i18n.t('supporter.donor'))) {
+    for (const { segment } of graphemes.segment(name?.trim() || i18n.t('supporter.donor'))) {
       if (count++ === 24) return `${shortened}…`;
       shortened += segment;
     }
     return shortened;
   });
-  const palettes = {
+  const palettes: Record<SupporterVariant, [string, string]> = {
     gold: ['var(--supporter-gold)', 'var(--supporter-gold)'],
+    custom: ['var(--supporter-gold)', 'var(--supporter-gold)'],
+    paw: ['var(--supporter-purple)', 'var(--supporter-purple)'],
     propeller: ['var(--supporter-yellow)', 'var(--supporter-red)'],
     ghost: ['var(--supporter-white)', 'var(--supporter-silver)'],
     evil: ['var(--supporter-red)', 'var(--supporter-evil)'],
-    agender: ['var(--supporter-green)', 'var(--supporter-silver)'],
+    agender: ['var(--supporter-agender-green)', 'var(--supporter-agender-gray)'],
+    agendergradient: ['var(--supporter-agender-green)', 'var(--supporter-agender-gray)'],
+    nonbinary: ['var(--supporter-nonbinary-yellow)', 'var(--supporter-nonbinary-purple)'],
+    nonbinarygradient: ['var(--supporter-nonbinary-yellow)', 'var(--supporter-nonbinary-purple)'],
+    genderfluid: ['var(--supporter-genderfluid-pink)', 'var(--supporter-genderfluid-blue)'],
+    genderfluidgradient: ['var(--supporter-genderfluid-pink)', 'var(--supporter-genderfluid-blue)'],
+    asexual: ['var(--supporter-asexual-black)', 'var(--supporter-asexual-purple)'],
+    asexualgradient: ['var(--supporter-asexual-black)', 'var(--supporter-asexual-purple)'],
+    aromantic: ['var(--supporter-aromantic-green)', 'var(--supporter-aromantic-gray)'],
+    aromanticgradient: ['var(--supporter-aromantic-green)', 'var(--supporter-aromantic-gray)'],
+    aroace: ['var(--supporter-aroace-orange)', 'var(--supporter-aroace-navy)'],
+    aroacegradient: ['var(--supporter-aroace-orange)', 'var(--supporter-aroace-navy)'],
+    graysexual: ['var(--supporter-graysexual-purple)', 'var(--supporter-graysexual-gray)'],
+    graysexualgradient: ['var(--supporter-graysexual-purple)', 'var(--supporter-graysexual-gray)'],
+    polysexual: ['var(--supporter-polysexual-pink)', 'var(--supporter-polysexual-blue)'],
+    polysexualgradient: ['var(--supporter-polysexual-pink)', 'var(--supporter-polysexual-blue)'],
+    omnisexual: [
+      'var(--supporter-omnisexual-light-pink)',
+      'var(--supporter-omnisexual-light-blue)',
+    ],
+    omnisexualgradient: [
+      'var(--supporter-omnisexual-light-pink)',
+      'var(--supporter-omnisexual-light-blue)',
+    ],
+    genderqueer: ['var(--supporter-genderqueer-purple)', 'var(--supporter-genderqueer-green)'],
+    genderqueergradient: [
+      'var(--supporter-genderqueer-purple)',
+      'var(--supporter-genderqueer-green)',
+    ],
+    bigender: ['var(--supporter-bigender-pink)', 'var(--supporter-bigender-blue)'],
+    bigendergradient: ['var(--supporter-bigender-pink)', 'var(--supporter-bigender-blue)'],
+    demigender: ['var(--supporter-demigender-gray)', 'var(--supporter-demigender-yellow)'],
+    demigendergradient: ['var(--supporter-demigender-gray)', 'var(--supporter-demigender-yellow)'],
+    pluraljourney: ['var(--supporter-pluraljourney-purple)', 'var(--supporter-black)'],
+    pluraljourneygradient: ['var(--supporter-pluraljourney-purple)', 'var(--supporter-black)'],
     bisexual: ['var(--supporter-bisexual-pink)', 'var(--supporter-bisexual-blue)'],
-    trans: ['var(--supporter-blue)', 'var(--supporter-pink)'],
-    transgradient: ['var(--supporter-blue)', 'var(--supporter-pink)'],
-    intersex: ['var(--supporter-yellow)', 'var(--supporter-purple)'],
-    lesbian: ['var(--supporter-orange)', 'var(--supporter-bisexual-pink)'],
-    mlm: ['var(--supporter-teal)', 'var(--supporter-bisexual-blue)'],
-    pride: ['var(--supporter-orange)', 'var(--supporter-purple)'],
+    bisexualgradient: ['var(--supporter-bisexual-pink)', 'var(--supporter-bisexual-blue)'],
+    pansexual: ['var(--supporter-pansexual-pink)', 'var(--supporter-pansexual-blue)'],
+    pansexualgradient: ['var(--supporter-pansexual-pink)', 'var(--supporter-pansexual-blue)'],
+    trans: ['var(--supporter-trans-blue)', 'var(--supporter-trans-pink)'],
+    transgradient: ['var(--supporter-trans-blue)', 'var(--supporter-trans-pink)'],
+    intersex: ['var(--supporter-intersex-yellow)', 'var(--supporter-intersex-purple)'],
+    intersexgradient: ['var(--supporter-intersex-yellow)', 'var(--supporter-intersex-purple)'],
+    lesbian: ['var(--supporter-lesbian-dark-orange)', 'var(--supporter-lesbian-dark-magenta)'],
+    lesbiangradient: [
+      'var(--supporter-lesbian-dark-orange)',
+      'var(--supporter-lesbian-dark-magenta)',
+    ],
+    mlm: ['var(--supporter-mlm-green)', 'var(--supporter-mlm-indigo)'],
+    mlmgradient: ['var(--supporter-mlm-green)', 'var(--supporter-mlm-indigo)'],
+    pride: ['var(--supporter-rainbow-red)', 'var(--supporter-rainbow-violet)'],
+    pridegradient: ['var(--supporter-rainbow-red)', 'var(--supporter-rainbow-violet)'],
     ceo: ['var(--supporter-gold)', 'var(--supporter-gold)'],
   };
   let customStyle = $derived.by(() => {
-    const [start, end] =
-      variant === 'custom'
-        ? [supporterColor(color), supporterColor(color)]
-        : (palettes[variant] ?? palettes.gold);
+    const [start, end] = supportsSupporterColors(variant)
+      ? isSupporterColors(colors)
+        ? [supporterColor(colors[0]), supporterColor(colors.at(-1))]
+        : [supporterColor(color), supporterColor(color)]
+      : (palettes[variant] ?? palettes.gold);
     const ground = cardColor;
-    const button = customCardColors ? buttonColor : variant === 'pride' ? end : start;
+    const button = customCardColors
+      ? buttonColor
+      : variant === 'pride' || variant === 'pridegradient'
+        ? end
+        : start;
     const ink =
-      customCardColors || variant === 'custom'
+      customCardColors || supportsSupporterColors(variant)
         ? supporterButtonText(button)
-        : variant === 'bisexual'
+        : [
+              'bisexual',
+              'bisexualgradient',
+              'asexual',
+              'asexualgradient',
+              'graysexual',
+              'graysexualgradient',
+              'demigender',
+              'demigendergradient',
+              'lesbian',
+              'lesbiangradient',
+              'mlm',
+              'mlmgradient',
+              'pride',
+              'pridegradient',
+            ].includes(variant)
           ? 'var(--supporter-white)'
           : 'var(--supporter-card-bg)';
     const mix = customCardColors
       ? ink === 'var(--supporter-white)'
         ? 'var(--supporter-black)'
         : 'var(--supporter-white)'
-      : variant === 'custom' && ink !== 'var(--supporter-white)'
+      : supportsSupporterColors(variant) && ink !== 'var(--supporter-white)'
         ? 'var(--supporter-white)'
         : 'var(--supporter-card-bg)';
     return `
@@ -96,12 +166,14 @@
   });
 </script>
 
-<Popover.Root>
+<svelte:window onblur={() => (open = false)} />
+
+<Popover.Root bind:open>
   <Popover.Trigger
     class={['supporter-badge', className]}
     data-supporter-variant={variant}
     style={customStyle}
-    aria-label={`${label} · ${title ?? $i18n.t('timeline.profileSupporter')}`}
+    aria-label={`${label} · ${title ?? i18n.t('timeline.profileSupporter')}`}
     openOnHover
     openDelay={180}
     closeDelay={200}
@@ -129,7 +201,7 @@
       </div>
       <h2 id={`${id}-heading`}>{label}</h2>
       <p id={`${id}-description`}>
-        {$i18n.t(
+        {i18n.t(
           isOwnBadge
             ? 'supporter.badgeOwnDescription'
             : donated
@@ -144,12 +216,13 @@
         rel="noopener noreferrer"
         block
         class="supporter-card-donate"
+        onclick={() => (open = false)}
       >
         <HeartIcon aria-hidden="true" weight="fill" />
-        {$i18n.t(donated ? 'supporter.badgeDonateAgain' : 'supporter.badgeDonate')}
+        {i18n.t(donated ? 'common.supportSable' : 'supporter.badgeDonate')}
       </LinkButton>
       <small class="supporter-card-hint"
-        >{$i18n.t(donated ? 'supporter.badgeDonorHint' : 'supporter.badgeHint')}</small
+        >{i18n.t(donated ? 'supporter.badgeDonorHint' : 'supporter.badgeHint')}</small
       >
     </Popover.Content>
   </Popover.Portal>

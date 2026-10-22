@@ -34,7 +34,11 @@ function makeCore(awards: unknown[] | null) {
     userProfile: vi.fn(() =>
       Promise.resolve({ supporter_awards: awards && JSON.stringify(awards) })
     ),
-    requestOpenIdToken: vi.fn(() => Promise.resolve(openId)),
+    rpc: {
+      session: {
+        requestOpenIdToken: vi.fn(() => Promise.resolve({ ...openId, expires_in: 3600 })),
+      },
+    },
     setProfileField: vi.fn(() => Promise.resolve()),
   });
   return { stub, core: stub as unknown as CoreClient };
@@ -86,7 +90,7 @@ describe('start', () => {
     await vi.waitFor(() => {
       expect(supporter.badge?.label).toBe('Donor');
     });
-    expect(stub.requestOpenIdToken).toHaveBeenCalledOnce();
+    expect(stub.rpc.session.requestOpenIdToken).toHaveBeenCalledOnce();
     expect(stub.setProfileField).toHaveBeenCalledWith(SUPPORTER_FIELD, [VALID]);
     expect(supporter.status).toBe('idle');
   });
@@ -98,40 +102,45 @@ describe('start', () => {
     supporter.start(core);
 
     await vi.waitFor(() => {
-      expect(supporter.status).toBe('failed');
+      expect(supporter.status).toBe('error');
     });
     expect(stub.setProfileField).not.toHaveBeenCalled();
   });
 });
 
-test('loads customization and preserves it independently of the signed award', async () => {
-  const { stub, core } = makeCore([VALID]);
-  const appearance = {
-    ...supporterAppearance(),
-    variant: 'custom' as const,
-    shape: 'heart' as const,
-    customBackground: true,
-    backgroundColor: '#ffeedd',
-    color: '#123456',
-  };
-  stub.userProfile.mockResolvedValue({
-    supporter_awards: JSON.stringify([VALID]),
-    extra: [{ key: SUPPORTER_BADGE_FIELD, value: JSON.stringify(appearance) }],
-  });
-  supporter.start(core);
-  await vi.waitFor(() => {
+test.each(['pride', 'ceo', 'paw'] as const)(
+  'loads %s customization independently of the signed award',
+  async (variant) => {
+    const { stub, core } = makeCore([VALID]);
+    const appearance = {
+      ...supporterAppearance(),
+      variant: 'custom' as const,
+      shape: 'heart' as const,
+      customBackground: true,
+      backgroundColor: '#ffeedd',
+      color: '#123456',
+    };
+    stub.userProfile.mockResolvedValue({
+      supporter_awards: JSON.stringify([VALID]),
+      extra: [{ key: SUPPORTER_BADGE_FIELD, value: JSON.stringify(appearance) }],
+    });
+    supporter.start(core);
+    await vi.waitFor(() => {
+      expect(supporter.badge?.label).toBe('Donor');
+    });
+    expect(supporter.appearance).toEqual(appearance);
+    const award = supporter.badge;
+    await supporter.selectAppearance({ variant, buttonColor: '#ABC' });
+    expect(stub.setProfileField).toHaveBeenCalledWith(SUPPORTER_BADGE_FIELD, {
+      ...appearance,
+      variant,
+      buttonColor: '#aabbcc',
+    });
+    expect(supporter.badge).toBe(award);
     expect(supporter.badge?.label).toBe('Donor');
-  });
-  expect(supporter.appearance).toEqual(appearance);
-  const award = supporter.badge;
-  await supporter.selectAppearance({ variant: 'pride', buttonColor: '#ABC' });
-  expect(stub.setProfileField).toHaveBeenCalledWith(SUPPORTER_BADGE_FIELD, {
-    ...appearance,
-    variant: 'pride',
-    buttonColor: '#aabbcc',
-  });
-  expect(supporter.badge).toBe(award);
-});
+    expect(supporter.badge?.tier).toBeNull();
+  }
+);
 describe('verify', () => {
   test('opens Open Collective, polls, and stores the award once it appears', async () => {
     vi.mocked(fetchAwards).mockResolvedValueOnce([]).mockResolvedValue([VALID]);
@@ -192,10 +201,28 @@ describe('verify', () => {
     expect(stub.setProfileField).not.toHaveBeenCalled();
   });
 
-  test('fails when the service refuses to start', async () => {
-    vi.mocked(startVerification).mockRejectedValue(new Error('401'));
+  test.each([new Error('401'), new Error('502'), new TypeError('Failed to fetch')])(
+    'reports a startup error without blaming the contribution: %s',
+    async (error) => {
+      vi.mocked(startVerification).mockRejectedValue(error);
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { stub, core } = makeCore(null);
+      supporter.start(core);
+      await vi.waitFor(() => {
+        expect(stub.userProfile).toHaveBeenCalled();
+      });
+
+      await supporter.verify();
+
+      expect(supporter.status).toBe('error');
+      expect(openExternalAuthUrl).not.toHaveBeenCalled();
+    }
+  );
+
+  test('reports an error when the homeserver cannot issue an OpenID token', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     const { stub, core } = makeCore(null);
+    stub.rpc.session.requestOpenIdToken.mockRejectedValueOnce(new Error('offline'));
     supporter.start(core);
     await vi.waitFor(() => {
       expect(stub.userProfile).toHaveBeenCalled();
@@ -203,7 +230,8 @@ describe('verify', () => {
 
     await supporter.verify();
 
-    expect(supporter.status).toBe('failed');
+    expect(supporter.status).toBe('error');
+    expect(startVerification).not.toHaveBeenCalled();
     expect(openExternalAuthUrl).not.toHaveBeenCalled();
   });
 
@@ -220,7 +248,7 @@ describe('verify', () => {
     await vi.advanceTimersByTimeAsync(20_000);
     await done;
 
-    expect(supporter.status).toBe('failed');
+    expect(supporter.status).toBe('error');
   });
 
   test('ignores an award it already holds', async () => {
@@ -292,7 +320,7 @@ describe('claim', () => {
 
     await supporter.claim();
 
-    expect(supporter.status).toBe('failed');
+    expect(supporter.status).toBe('error');
   });
 });
 
@@ -312,9 +340,10 @@ describe('remove', () => {
         })
     );
     const saving = supporter.selectAppearance({ variant: 'pride', shape: 'heart' });
+    const queued = supporter.selectAppearance({ shape: 'square' });
     const removing = supporter.remove();
     finishSave();
-    await Promise.all([saving, removing]);
+    await Promise.all([saving, queued, removing]);
 
     expect(stub.setProfileField).toHaveBeenNthCalledWith(2, SUPPORTER_BADGE_FIELD, null);
     expect(stub.setProfileField).toHaveBeenCalledWith(SUPPORTER_FIELD, null);

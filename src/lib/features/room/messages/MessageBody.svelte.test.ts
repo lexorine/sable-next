@@ -26,14 +26,15 @@ import { setPreference } from '#lib/settings/preferences.svelte.js';
 import MessageBody from './MessageBody.svelte';
 import MessageBodyMediaHarness from './MessageBodyMediaHarness.test.svelte';
 import { mediaPreviewSettings } from '#lib/settings/media-previews.svelte.js';
+import { withRowFields } from '#lib/features/room/timeline/row-fixtures.js';
 
 afterEach(() => {
   setPreference('captionPosition', 'below');
-  core.commands.fetchMedia.mockClear();
+  core.media.fetchMedia.mockClear();
 });
 
 function item(content: TimelineItemContentView): TimelineItemView {
-  return {
+  return withRowFields({
     id: 'item',
     event_id: '$item',
     transaction_id: null,
@@ -56,7 +57,7 @@ function item(content: TimelineItemContentView): TimelineItemView {
     mention: 'none',
     forwarded: null,
     forum_title: null,
-  };
+  });
 }
 
 function attachment(kind: 'image' | 'video' | 'audio' | 'file'): TimelineItemContentView {
@@ -93,6 +94,7 @@ function attachment(kind: 'image' | 'video' | 'audio' | 'file'): TimelineItemCon
         blurhash: null,
         thumbnail: null,
         spoiler: null,
+        playback: null,
       };
     case 'audio':
       return { ...base, kind, duration_ms: null, waveform: null, voice: false, metadata: null };
@@ -298,7 +300,7 @@ test('hides a spoilered gallery item until it is revealed', async () => {
   expect(screen.getAllByRole('button', { name: /^Open / })).toHaveLength(2);
 });
 
-test('gallery captions and images agree when an image leaves and returns to its slot', async () => {
+test('gallery captions stay visible while a spoilered image leaves and returns to its slot', async () => {
   const image = {
     kind: 'image' as const,
     filename: 'ending.png',
@@ -322,7 +324,7 @@ test('gallery captions and images agree when an image leaves and returns to its 
   await userEvent.click(screen.getByRole('button', { name: 'Reveal ending.png' }));
   await view.rerender({ item: gallery('mxc://example.org/replacement') });
   expect(document.querySelector('.spoilerable-media')).toHaveClass('spoilered');
-  expect(screen.queryByText('Secret ending')).not.toBeInTheDocument();
+  expect(screen.getByText('Secret ending')).toBeInTheDocument();
 
   await view.rerender({ item: gallery(image.source) });
   expect(document.querySelector('.spoilerable-media')).not.toHaveClass('spoilered');
@@ -415,12 +417,13 @@ test('opens a valid location using validated coordinates', async () => {
   expect(screen.getByRole('link')).toHaveAttribute('href', 'geo:48.8,2.3');
 });
 
-test('hides video spoilers and their captions until revealed', async () => {
+test('hides video spoilers until revealed but keeps their captions', async () => {
   const content = { ...attachment('video'), spoiler: 'Ending' } as TimelineItemContentView;
   render(MessageBody, { item: item(content), canRedactOthers: false });
   await tick();
-  expect(core.commands.fetchMedia).not.toHaveBeenCalled();
-  expect(document.querySelector('video, .formatted-body')).not.toBeInTheDocument();
+  expect(core.media.fetchMedia).not.toHaveBeenCalled();
+  expect(document.querySelector('video')).not.toBeInTheDocument();
+  expect(document.querySelector('.formatted-body')).toBeInTheDocument();
   await userEvent.click(screen.getByRole('button', { name: /Ending/ }));
   expect(document.querySelector('.formatted-body')).toBeInTheDocument();
 });
@@ -434,7 +437,7 @@ test('blurs a spoilered image and lets it be revealed again', async () => {
   const media = document.querySelector('.spoilerable-media');
   expect(media).toHaveClass('spoilered');
   expect(document.querySelector('.media-image')).toBeInTheDocument();
-  expect(document.querySelector('.formatted-body')).not.toBeInTheDocument();
+  expect(document.querySelector('.formatted-body')).toBeInTheDocument();
 
   await userEvent.click(screen.getByRole('button', { name: 'Reveal photo.png' }));
   expect(media).not.toHaveClass('spoilered');
@@ -460,7 +463,7 @@ test('lets an ordinary image be hidden locally', async () => {
   expect(screen.getByRole('button', { name: 'Reveal photo.png' })).toBeInTheDocument();
 });
 
-test('a recycled image does not inherit the previous image reveal or caption state', async () => {
+test('a recycled image does not inherit the previous image reveal state', async () => {
   const content = { ...attachment('image'), spoiler: 'Ending' } as TimelineItemContentView;
   const view = render(MessageBody, { item: item(content), canRedactOthers: false });
   await userEvent.click(screen.getByRole('button', { name: 'Reveal photo.png' }));
@@ -472,13 +475,12 @@ test('a recycled image does not inherit the previous image reveal or caption sta
   await view.rerender({ item: { ...item(next), id: 'next', event_id: '$next' } });
 
   expect(document.querySelector('.spoilerable-media')).toHaveClass('spoilered');
-  expect(document.querySelector('.formatted-body')).not.toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Reveal photo.png' })).toBeInTheDocument();
 });
 
-test('a sticker can be hidden without opening its viewer', async () => {
+test('a sticker has an emote tooltip that stays hidden with the sticker', async () => {
   const onOpenMedia = vi.fn();
-  render(MessageBody, {
+  render(MessageBodyMediaHarness, {
     item: item({
       kind: 'sticker',
       body: 'Cat sticker',
@@ -487,12 +489,30 @@ test('a sticker can be hidden without opening its viewer', async () => {
       width: 128,
       height: 128,
     }),
-    canRedactOthers: false,
+    joinRule: 'invite',
     onOpenMedia,
   });
 
+  const sticker = screen.getByRole('button', { name: 'Open Cat sticker' });
+  await userEvent.hover(sticker);
+  const tooltip = document.querySelector('.tooltip');
+  expect(tooltip).toHaveTextContent('Cat sticker');
+  expect(tooltip?.querySelector('.emote-card-image')).toBeInTheDocument();
+  await userEvent.unhover(sticker);
+  expect(document.querySelector('.tooltip')).not.toBeInTheDocument();
+  await userEvent.tab();
+  expect(sticker).toHaveFocus();
+  expect(document.querySelector('.tooltip')).toHaveTextContent('Cat sticker');
+  await userEvent.keyboard('{Escape}');
+  expect(document.querySelector('.tooltip')).not.toBeInTheDocument();
+  await userEvent.click(sticker);
+  expect(onOpenMedia).toHaveBeenCalledExactlyOnceWith('$item');
+  onOpenMedia.mockClear();
+
   await userEvent.click(screen.getByRole('button', { name: 'Hide Cat sticker' }));
   expect(document.querySelector('.spoilerable-media')).toHaveClass('spoilered');
+  await userEvent.hover(screen.getByRole('group', { name: 'Cat sticker' }));
+  expect(document.querySelector('.tooltip .emote-card-image')).not.toBeInTheDocument();
   expect(onOpenMedia).not.toHaveBeenCalled();
 });
 
@@ -524,10 +544,24 @@ test('live location expires without another SDK update and keeps its last known 
 });
 
 test('a deleted message keeps its reason', async () => {
-  render(MessageBody, { item: item({ kind: 'redacted', reason: 'spam' }), canRedactOthers: false });
+  render(MessageBody, {
+    item: item({ kind: 'redacted', reason: 'spam', redacted_by: null }),
+    canRedactOthers: false,
+  });
   await tick();
 
   expect(screen.getByText(/spam/)).toBeInTheDocument();
+});
+
+test('a message deleted by someone else names them', async () => {
+  render(MessageBody, {
+    item: item({ kind: 'redacted', reason: 'spam', redacted_by: null }),
+    canRedactOthers: false,
+    redactedBy: '@mod:x',
+  });
+  await tick();
+
+  expect(screen.getByText('Message deleted by @mod:x: spam')).toBeInTheDocument();
 });
 
 test.each(['above', 'below', 'inline'] as const)(
@@ -549,7 +583,7 @@ test.each(['image', 'file'] as const)('a hidden caption is not rendered for %s',
   await tick();
 
   expect(screen.queryByText('caption')).not.toBeInTheDocument();
-  expect(screen.queryByRole('link', { name: '@ana' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('link', { name: 'Ana' })).not.toBeInTheDocument();
 });
 
 test('media is held behind a prompt where the media preview setting says so (MSC4278)', async () => {

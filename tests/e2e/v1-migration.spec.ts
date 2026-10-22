@@ -12,7 +12,12 @@ const fixture = JSON.parse(
       name: string;
       keyPath: string | string[] | null;
       autoIncrement: boolean;
-      indexes: { name: string; keyPath: string | string[]; unique: boolean; multiEntry: boolean }[];
+      indexes: {
+        name: string;
+        keyPath: string | string[];
+        unique: boolean;
+        multiEntry: boolean;
+      }[];
       records: { key: string; value: unknown }[];
     }[];
   };
@@ -276,8 +281,11 @@ test('native carrier exports the complete v1 snapshot before publishing credenti
   expect(await migrate(page)).toBeNull();
   const calls = await page.evaluate(
     () =>
-      (window as unknown as { fixtureCalls: { cmd: string; args: Record<string, unknown> }[] })
-        .fixtureCalls
+      (
+        window as unknown as {
+          fixtureCalls: { cmd: string; args: Record<string, unknown> }[];
+        }
+      ).fixtureCalls
   );
   expect(calls[0].cmd).toBe('v1_migration_complete');
   expect(calls[1].cmd).toBe('begin_v1_migration');
@@ -306,46 +314,55 @@ test('v2 WASM restores the copied v1 device and cross-signing secrets', async ({
         json: { versions: ['v1.11', 'v1.12', 'v1.13'], unstable_features: {} },
       });
     } else if (path.endsWith('/keys/upload')) {
-      await route.fulfill({ json: { one_time_key_counts: { signed_curve25519: 50 } } });
+      await route.fulfill({
+        json: { one_time_key_counts: { signed_curve25519: 50 } },
+      });
     } else if (path.endsWith('/keys/query')) {
       await route.fulfill({ json: { device_keys: {}, failures: {} } });
     } else {
-      await route.fulfill({ status: 404, json: { errcode: 'M_NOT_FOUND', error: 'Fixture' } });
+      await route.fulfill({
+        status: 404,
+        json: { errcode: 'M_NOT_FOUND', error: 'Fixture' },
+      });
     }
   });
   expect(await migrate(page)).toBeNull();
   const restored = await page.evaluate(async () => {
     const wasmPath = '/src/generated/wasm/sable_wasm.js';
     const storagePath = '/src/lib/platform/session-storage.ts';
+    const protocolPath = '/src/generated/protocol.ts';
     const wasm = (await import(
       wasmPath
     )) as typeof import('../../src/generated/wasm/sable_wasm.js');
     const storage = (await import(
       storagePath
     )) as typeof import('../../src/lib/platform/session-storage.js');
+    const { createRpc } = (await import(
+      protocolPath
+    )) as typeof import('../../src/generated/protocol.js');
     await wasm.default();
     const core = new wasm.SableCore(
       'sable-next',
       storage.loadSession,
       storage.saveSession,
       storage.clearSession,
-      'off',
       false
     );
-    const session = JSON.parse(await core.submitCommand(JSON.stringify({ type: 'restore' }))) as {
-      session: unknown;
-    };
-    const status = JSON.parse(
-      await core.submitCommand(JSON.stringify({ type: 'encryption_status' }))
-    ) as { status: { cross_signing_ready: boolean } };
+    wasm.setLogFilter('off');
+    const rpc = createRpc(
+      async (method, params) =>
+        JSON.parse(await core.call(method, JSON.stringify(params))) as unknown
+    );
+    const session = await rpc.session.restore();
+    const status = await rpc.encryption.status();
     return { session, status };
   });
-  expect(restored.session.session).toMatchObject({
+  expect(restored.session).toMatchObject({
     user_id: session.userId,
     device_id: session.deviceId,
     account_id: 'a1',
   });
-  expect(restored.status.status.cross_signing_ready).toBe(true);
+  expect(restored.status.cross_signing_ready).toBe(true);
 });
 
 test('large stores copy all batches before publishing the session', async ({ page }) => {

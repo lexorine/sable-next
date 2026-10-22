@@ -13,12 +13,31 @@
   import VerificationQrCode from './VerificationQrCode.svelte';
   import VerificationQrScanner from './VerificationQrScanner.svelte';
 
+  const NO_REPLY_DELAY_MS = 30_000;
+
   const core = useCoreClient();
-  let error = $state<string | null>(null);
-  let scanning = $state<boolean | null>(null);
+  let activeFlow = $derived(
+    core.verification ? JSON.stringify([core.verification.userId, core.verification.flowId]) : null
+  );
+  let error = $derived.by<string | null>(() => {
+    void activeFlow;
+    return null;
+  });
+  let scanning = $derived.by<boolean | null>(() => {
+    void activeFlow;
+    return null;
+  });
+  let noReply = $derived.by(() => {
+    void activeFlow;
+    return false;
+  });
   let prefersScan = $state(isNativeMobile());
-  let processingScan = $state(false);
-  let activeFlow = $state<string | null>(null);
+  let choosing = $derived(core.verification?.state.phase === 'choose');
+  let processingScan = $derived.by(() => {
+    void activeFlow;
+    void choosing;
+    return false;
+  });
   let scanMode = $derived(
     core.verification?.state.phase === 'choose' &&
       core.verification.state.can_scan &&
@@ -31,17 +50,11 @@
   $effect(() => core.subscribeEvents(() => {}));
 
   $effect(() => {
-    const flow = core.verification;
-    const key = flow ? JSON.stringify([flow.userId, flow.flowId]) : null;
-    if (key === activeFlow) return;
-    activeFlow = key;
-    scanning = null;
-    processingScan = false;
-    error = null;
-  });
-
-  $effect(() => {
-    if (core.verification?.state.phase !== 'choose') processingScan = false;
+    const state = core.verification?.state;
+    if (state?.phase !== 'requested' || !state.initiated_by_us) return;
+    void activeFlow;
+    const timer = setTimeout(() => (noReply = true), NO_REPLY_DELAY_MS);
+    return () => clearTimeout(timer);
   });
 
   onMount(() => {
@@ -50,14 +63,19 @@
       (devices) => {
         prefersScan = devices.some((device) => device.kind === 'videoinput');
       },
-      () => {}
+      (error: unknown) => {
+        console.debug('[sable settings] media devices unavailable', error);
+      }
     );
   });
 
   async function accept(): Promise<void> {
     if (!core.verification) return;
     try {
-      await core.commands.acceptVerification(core.verification.userId, core.verification.flowId);
+      await core.rpc.encryption.acceptVerification({
+        user_id: core.verification.userId,
+        flow_id: core.verification.flowId,
+      });
     } catch (cause) {
       error = verificationErrorMessage(cause);
     }
@@ -69,7 +87,11 @@
     processingScan = true;
     error = null;
     try {
-      await core.commands.scanVerificationQr(flow.userId, flow.flowId, uint8ArrayToBase64(data));
+      await core.rpc.encryption.scanVerificationQr({
+        user_id: flow.userId,
+        flow_id: flow.flowId,
+        data: uint8ArrayToBase64(data),
+      });
     } catch (cause) {
       if (core.verification?.userId === flow.userId && core.verification.flowId === flow.flowId) {
         processingScan = false;
@@ -81,7 +103,10 @@
   async function compareEmoji(): Promise<void> {
     if (!core.verification) return;
     try {
-      await core.commands.startSasVerification(core.verification.userId, core.verification.flowId);
+      await core.rpc.encryption.startSasVerification({
+        user_id: core.verification.userId,
+        flow_id: core.verification.flowId,
+      });
     } catch (cause) {
       error = verificationErrorMessage(cause);
     }
@@ -90,7 +115,25 @@
   async function confirm(): Promise<void> {
     if (!core.verification) return;
     try {
-      await core.commands.confirmVerification(core.verification.userId, core.verification.flowId);
+      await core.rpc.encryption.confirmVerification({
+        user_id: core.verification.userId,
+        flow_id: core.verification.flowId,
+      });
+    } catch (cause) {
+      error = verificationErrorMessage(cause);
+    }
+  }
+
+  async function retry(): Promise<void> {
+    const flow = core.verification;
+    if (!flow) return;
+    try {
+      await core.rpc.encryption.cancelVerification({
+        user_id: flow.userId,
+        flow_id: flow.flowId,
+        mismatch: false,
+      });
+      await core.requestVerification(flow.userId);
     } catch (cause) {
       error = verificationErrorMessage(cause);
     }
@@ -100,7 +143,11 @@
     const flow = core.verification;
     if (!flow) return;
     try {
-      await core.commands.cancelVerification(flow.userId, flow.flowId, mismatch);
+      await core.rpc.encryption.cancelVerification({
+        user_id: flow.userId,
+        flow_id: flow.flowId,
+        mismatch,
+      });
     } catch (cause) {
       error = verificationErrorMessage(cause);
     }
@@ -110,9 +157,7 @@
     if (next || !core.verification) return;
     const phase = core.verification.state.phase;
     if (phase !== 'done' && phase !== 'cancelled') void cancel();
-    // Drop the flow even when we cancel it ourselves, otherwise the flow
-    // outlives the dismissed dialog and a fresh verification request can't
-    // reopen the panel.
+    // Drop the flow on our own cancel too, or it outlives the dialog and blocks a new request.
     core.verification = null;
   }
 </script>
@@ -123,36 +168,41 @@
   variant="verification"
 >
   <Dialog.Title class="verification-title">
-    {$i18n.t(selfVerification ? 'settings.verification' : 'settings.userVerification')}
+    {i18n.t(selfVerification ? 'settings.verification' : 'settings.userVerification')}
   </Dialog.Title>
   {#if core.verification}
     {#if core.verification.state.phase === 'requested'}
       {#if core.verification.state.initiated_by_us}
         <Dialog.Description class="verification-description">
-          {$i18n.t(selfVerification ? 'settings.acceptOtherDevice' : 'settings.acceptOtherUser')}
+          {i18n.t(selfVerification ? 'settings.acceptOtherDevice' : 'settings.acceptOtherUser')}
         </Dialog.Description>
-        <p class="verification-wait" role="status">{$i18n.t('settings.waiting')}</p>
+        <p class="verification-wait" role="status">{i18n.t('settings.waiting')}</p>
+        {#if noReply}
+          <Button class="verification-action" onclick={() => void retry()}
+            >{i18n.t('settings.verificationRetry')}</Button
+          >
+        {/if}
       {:else}
         <Dialog.Description class="verification-description">
-          {$i18n.t(
+          {i18n.t(
             selfVerification
               ? 'settings.verificationRequested'
               : 'settings.userVerificationRequested'
           )}
         </Dialog.Description>
         <Button variant="primary" class="verification-action" onclick={accept}
-          >{$i18n.t('settings.acceptVerification')}</Button
+          >{i18n.t('settings.acceptVerification')}</Button
         >
       {/if}
     {:else if core.verification.state.phase === 'choose' && processingScan}
       <Dialog.Description class="verification-description">
-        {$i18n.t('settings.finishing')}
+        {i18n.t('settings.finishing')}
       </Dialog.Description>
-      <p class="verification-wait" role="status">{$i18n.t('settings.waiting')}</p>
+      <p class="verification-wait" role="status">{i18n.t('settings.waiting')}</p>
     {:else if core.verification.state.phase === 'choose'}
       {@const choice = core.verification.state}
       <Dialog.Description class="verification-description">
-        {$i18n.t(
+        {i18n.t(
           scanMode || !choice.qr
             ? 'settings.verificationScanTheirs'
             : 'settings.verificationShowOurs'
@@ -162,51 +212,51 @@
         {#if scanMode || !choice.qr}
           <VerificationQrScanner onScan={(data: Uint8Array) => void scanned(data)} />
         {:else}
-          <VerificationQrCode code={choice.qr} label={$i18n.t('settings.verificationQrLabel')} />
+          <VerificationQrCode code={choice.qr} label={i18n.t('settings.verificationQrLabel')} />
         {/if}
       </div>
       <div class="verification-actions">
         {#if choice.can_scan && choice.qr}
           <Button class="verification-action" onclick={() => (scanning = !scanMode)}>
-            {$i18n.t(scanMode ? 'settings.showOurCode' : 'settings.scanTheirCode')}
+            {i18n.t(scanMode ? 'settings.showOurCode' : 'settings.scanTheirCode')}
           </Button>
         {/if}
         {#if choice.can_compare}
           <Button class="verification-action" onclick={() => void compareEmoji()}>
-            {$i18n.t('settings.compareEmojiInstead')}
+            {i18n.t('settings.compareEmojiInstead')}
           </Button>
         {/if}
       </div>
     {:else if core.verification.state.phase === 'scanned'}
       <Dialog.Description class="verification-description">
-        {$i18n.t('settings.verificationScannedPrompt')}
+        {i18n.t('settings.verificationScannedPrompt')}
       </Dialog.Description>
       <div class="verification-actions">
         <Button variant="primary" class="verification-action" onclick={confirm}>
-          {$i18n.t('settings.verificationScannedYes')}
+          {i18n.t('settings.verificationScannedYes')}
         </Button>
         <Button
           variant="danger"
           size="small"
           class="verification-action"
-          onclick={() => void cancel(true)}>{$i18n.t('settings.verificationScannedNo')}</Button
+          onclick={() => void cancel(true)}>{i18n.t('settings.verificationScannedNo')}</Button
         >
       </div>
     {:else if core.verification.state.phase === 'reciprocated'}
       <Dialog.Description class="verification-description">
-        {$i18n.t('settings.verificationScanSucceeded')}
+        {i18n.t('settings.verificationScanSucceeded')}
       </Dialog.Description>
-      <p class="verification-wait" role="status">{$i18n.t('settings.waiting')}</p>
+      <p class="verification-wait" role="status">{i18n.t('settings.waiting')}</p>
     {:else if core.verification.state.phase === 'waiting'}
       <Dialog.Description class="verification-description">
-        {$i18n.t('settings.startingEmojiComparison')}
+        {i18n.t('settings.startingEmojiComparison')}
       </Dialog.Description>
-      <p class="verification-wait" role="status">{$i18n.t('settings.waiting')}</p>
+      <p class="verification-wait" role="status">{i18n.t('settings.waiting')}</p>
     {:else if core.verification.state.phase === 'compare'}
       <Dialog.Description class="verification-description">
-        {$i18n.t('settings.compareEmoji')}
+        {i18n.t('settings.compareEmoji')}
       </Dialog.Description>
-      <div class="emoji" aria-label={$i18n.t('settings.verificationEmoji')}>
+      <div class="emoji" aria-label={i18n.t('settings.verificationEmoji')}>
         {#each core.verification.state.emojis as emoji, index (index)}
           <div class="emoji-item">
             <span>{emoji.symbol}</span>
@@ -217,39 +267,39 @@
       <p class="decimals">{core.verification.state.decimals.join(' · ')}</p>
       <div class="verification-actions">
         <Button variant="primary" class="verification-action" onclick={confirm}
-          >{$i18n.t('settings.theyMatch')}</Button
+          >{i18n.t('settings.theyMatch')}</Button
         >
         <Button
           variant="danger"
           size="small"
           class="verification-action"
-          onclick={() => void cancel(true)}>{$i18n.t('settings.theyDoNotMatch')}</Button
+          onclick={() => void cancel(true)}>{i18n.t('settings.theyDoNotMatch')}</Button
         >
       </div>
     {:else if core.verification.state.phase === 'confirmed'}
       <Dialog.Description class="verification-description">
-        {$i18n.t('settings.finishing')}
+        {i18n.t('settings.finishing')}
       </Dialog.Description>
-      <p class="verification-wait" role="status">{$i18n.t('settings.waiting')}</p>
+      <p class="verification-wait" role="status">{i18n.t('settings.waiting')}</p>
     {:else if core.verification.state.phase === 'done'}
       <Dialog.Description class="verification-description">
-        {$i18n.t(
+        {i18n.t(
           selfVerification ? 'settings.verificationComplete' : 'settings.userVerificationComplete'
         )}
       </Dialog.Description>
       <Button
         variant="primary"
         class="verification-action"
-        onclick={() => (core.verification = null)}>{$i18n.t('settings.close')}</Button
+        onclick={() => (core.verification = null)}>{i18n.t('common.close')}</Button
       >
     {:else if core.verification.state.phase === 'cancelled'}
       <Dialog.Description class="verification-description">
-        {$i18n.t('settings.verificationCancelled', { reason: core.verification.state.reason })}
+        {i18n.t('settings.verificationCancelled', { reason: core.verification.state.reason })}
       </Dialog.Description>
       <Button
         variant="primary"
         class="verification-action"
-        onclick={() => (core.verification = null)}>{$i18n.t('settings.close')}</Button
+        onclick={() => (core.verification = null)}>{i18n.t('common.close')}</Button
       >
     {/if}
     {#if error}<Alert variant="critical" role="alert">{error}</Alert>{/if}
@@ -258,7 +308,7 @@
         variant="ghost"
         size="small"
         class="verification-action verification-cancel"
-        onclick={() => void cancel()}>{$i18n.t('settings.cancelVerification')}</Button
+        onclick={() => void cancel()}>{i18n.t('settings.cancelVerification')}</Button
       >
     {/if}
   {/if}

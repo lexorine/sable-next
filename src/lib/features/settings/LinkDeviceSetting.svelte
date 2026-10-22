@@ -14,24 +14,27 @@
   let linkingDevice = $state(false);
 
   $effect(() => {
-    void core.commands.devices().then(
+    void core.rpc.encryption.devices().then(
       ({ oauth: supported }) => {
         oauth = supported;
       },
-      () => {}
+      (error: unknown) => {
+        console.debug('[sable settings] device list unavailable', error);
+      }
     );
   });
 </script>
 
 {#if oauth}
-  <SettingsSection headingId="account-devices" title={$i18n.t('settings.signedInDevices')}>
+  <SettingsSection headingId="account-devices" title={i18n.t('settings.signedInDevices')}>
     <ul class="settings-rows">
       <SettingsRow
-        title={$i18n.t('qrLogin.linkDevice')}
-        description={$i18n.t('qrLogin.linkDeviceHint')}
+        id="link-device"
+        title={i18n.t('qrLogin.titleGrant')}
+        description={i18n.t('qrLogin.linkDeviceHint')}
       >
         <Button onclick={() => (linkingDevice = true)}>
-          <QrCodeIcon size={16} aria-hidden="true" />{$i18n.t('qrLogin.linkDeviceAction')}
+          <QrCodeIcon size={16} aria-hidden="true" />{i18n.t('qrLogin.linkDeviceAction')}
         </Button>
       </SettingsRow>
     </ul>

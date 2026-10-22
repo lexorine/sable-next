@@ -20,9 +20,16 @@ export function mentionHref(userId: string, via: readonly string[]): string {
   return `${matrixTo}${userId}?${query.toString()}`;
 }
 
-export function emoticonLabel(node: ProseMirrorNode): string {
+export function emoticonLabel(
+  node: ProseMirrorNode,
+  fallback = `:${node.attrs.shortcode as string}:`
+): string {
   const body = node.attrs.body as string | null;
-  return body && !body.startsWith('mxc://') ? body : `:${node.attrs.shortcode as string}:`;
+  return body && !body.startsWith('mxc://') ? body : fallback;
+}
+
+export function codeLanguage(word: string): string {
+  return /^[\w-]+$/.test(word) ? word : '';
 }
 
 function languageOf(dom: HTMLElement): string {
@@ -245,7 +252,7 @@ export const composerSchema = new Schema({
       ],
       toDOM: (node) => [
         'time',
-        { class: 'composer-time', datetime: node.attrs.datetime as string },
+        { datetime: node.attrs.datetime as string },
         node.attrs.label as string,
       ],
     },
@@ -273,19 +280,19 @@ export const composerSchema = new Schema({
             return {
               url: dom.getAttribute('src') ?? '',
               shortcode,
-              body: alt && alt !== `:${shortcode}:` ? alt : null,
+              body: alt && alt !== shortcode && alt !== `:${shortcode}:` ? alt : null,
             };
           },
         },
       ],
       toDOM: (node) => {
-        const label = `:${node.attrs.shortcode as string}:`;
+        const label = node.attrs.shortcode as string;
         return [
           'img',
           {
             'data-mx-emoticon': '',
             src: node.attrs.url as string,
-            alt: emoticonLabel(node),
+            alt: emoticonLabel(node, label),
             title: label,
             height: '32',
           },

@@ -1,38 +1,22 @@
 import type { CoreClient } from '#lib/core/client.svelte.js';
-import { isRecord } from '#lib/guards.js';
+import { AccountDataSync } from '#lib/core/account-data-sync.js';
 
 export const DISMISSED_INVITES_EVENT = 'moe.sable.dismissed_invites';
-
-function readRoomIds(content: unknown): string[] {
-  if (!isRecord(content) || !Array.isArray(content.roomIds)) return [];
-  return content.roomIds.filter((roomId): roomId is string => typeof roomId === 'string');
-}
 
 class DismissedInvites {
   roomIds = $state.raw<ReadonlySet<string>>(new Set());
 
-  private core: CoreClient | null = null;
-  private generation = 0;
-  private stopEvents: (() => void) | null = null;
+  private readonly sync = new AccountDataSync([DISMISSED_INVITES_EVENT], (generation) =>
+    this.pull(generation)
+  );
 
   start(core: CoreClient): void {
-    const generation = ++this.generation;
-    this.core = core;
-    this.stopEvents?.();
-    this.stopEvents = core.subscribeEvents((event) => {
-      if (event.type === 'account_data_changed' && event.event_type === DISMISSED_INVITES_EVENT) {
-        void this.pull(generation);
-      }
-    });
-    void this.pull(generation);
+    this.sync.start(core);
   }
 
   stop(): void {
-    this.generation += 1;
-    this.core = null;
+    this.sync.stop();
     this.roomIds = new Set();
-    this.stopEvents?.();
-    this.stopEvents = null;
   }
 
   has(roomId: string): boolean {
@@ -40,29 +24,36 @@ class DismissedInvites {
   }
 
   dismiss(roomId: string): Promise<void> {
-    return this.write(new Set([...this.roomIds, roomId]));
+    return this.write(roomId, true);
   }
 
   restore(roomId: string): Promise<void> {
-    return this.write(new Set([...this.roomIds].filter((entry) => entry !== roomId)));
+    return this.write(roomId, false);
   }
 
   private async pull(generation: number): Promise<void> {
     try {
-      const content = await this.core?.commands.accountData(DISMISSED_INVITES_EVENT);
-      if (generation === this.generation) this.roomIds = new Set(readRoomIds(content));
+      const core = this.sync.core;
+      if (core === null) return;
+      const roomIds = await core.rpc.account.dismissedInvites();
+      if (generation === this.sync.generation) this.roomIds = new Set(roomIds);
     } catch (error) {
       console.debug('[sable room] dismissed invites unavailable', error);
     }
   }
 
-  private async write(next: ReadonlySet<string>): Promise<void> {
-    const core = this.core;
+  private async write(roomId: string, dismissed: boolean): Promise<void> {
+    const core = this.sync.core;
     if (core === null) return;
+    const generation = this.sync.generation;
     const previous = this.roomIds;
+    const next = dismissed
+      ? new Set([...previous, roomId])
+      : new Set([...previous].filter((entry) => entry !== roomId));
     this.roomIds = next;
     try {
-      await core.commands.setAccountData(DISMISSED_INVITES_EVENT, { roomIds: [...next] });
+      const stored = await core.rpc.account.setInviteDismissed({ room_id: roomId, dismissed });
+      if (generation === this.sync.generation) this.roomIds = new Set(stored);
     } catch (error) {
       if (this.roomIds === next) this.roomIds = previous;
       throw error;

@@ -2,7 +2,7 @@
   import type {
     RoomPermissionsView,
     RoomPowerLevelsView,
-    RoomSummary,
+    RoomListItemView,
   } from '#src/generated/protocol';
 
   import { useCoreClient } from '#lib/core/context.js';
@@ -25,7 +25,7 @@
   import TextInput from '#lib/ui/primitives/TextInput.svelte';
 
   interface Props {
-    room: RoomSummary | null;
+    room: RoomListItemView | null;
     permissions: RoomPermissionsView | null;
     levels: RoomPowerLevelsView | null;
   }
@@ -75,7 +75,7 @@
     browsing = true;
     browseFailed = false;
     try {
-      stateEvents = await core.commands.roomFullState(target);
+      stateEvents = await core.rpc.room_state.fullState({ room_id: target });
     } catch (error) {
       console.warn('[sable room] full state unavailable', error);
       browseFailed = true;
@@ -109,7 +109,11 @@
     outcome = null;
     sent = false;
     try {
-      const existing = await core.commands.roomStateEvent(target, type, stateKey);
+      const existing = await core.rpc.room_state.event({
+        room_id: target,
+        event_type: type,
+        state_key: stateKey,
+      });
       if (existing === null || existing === undefined) {
         outcome = 'missing';
         content = '{}';
@@ -124,8 +128,7 @@
     }
   }
 
-  async function send(event: SubmitEvent): Promise<void> {
-    event.preventDefault();
+  async function send(): Promise<void> {
     const target = roomId;
     if (!target || !canSend || sending) return;
 
@@ -140,7 +143,12 @@
     outcome = null;
     sent = false;
     try {
-      await core.commands.sendStateEvent(target, eventType.trim(), stateKey, parsed);
+      await core.rpc.room_state.sendEvent({
+        room_id: target,
+        event_type: eventType.trim(),
+        state_key: stateKey,
+        content: parsed,
+      });
       sent = true;
     } catch (error) {
       console.warn('[sable room] state event rejected', error);
@@ -161,12 +169,12 @@
   {#if roomId}
     <SettingsSection
       headingId="room-developer-state-browser"
-      title={$i18n.t('room.devBrowserTitle')}
-      description={$i18n.t('room.devBrowserDescription')}
+      title={i18n.t('room.devBrowserTitle')}
+      description={i18n.t('room.devBrowserDescription')}
     >
       {#if browseFailed}
         <div class="settings-form">
-          <Alert variant="critical" role="alert">{$i18n.t('room.devFailed')}</Alert>
+          <Alert variant="critical" role="alert">{i18n.t('common.stateEventRejected')}</Alert>
         </div>
       {/if}
       {#if stateTypes.length > 0}
@@ -174,15 +182,15 @@
           <TextInput
             type="search"
             bind:value={typeFilter}
-            placeholder={$i18n.t('room.devBrowserFilter')}
-            aria-label={$i18n.t('room.devBrowserFilter')}
+            placeholder={i18n.t('room.devBrowserFilter')}
+            aria-label={i18n.t('room.devBrowserFilter')}
           />
         </div>
         <ul class="settings-rows">
           {#each shownTypes as [type, keys] (type)}
             <SettingsRow
               title={type}
-              description={$i18n.t('room.devBrowserCount', { count: keys.length })}
+              description={i18n.t('room.devBrowserCount', { count: keys.length })}
             >
               <Button
                 size="small"
@@ -192,9 +200,7 @@
                   openType = openType === type ? null : type;
                 }}
               >
-                {openType === type
-                  ? $i18n.t('room.devBrowserHide')
-                  : $i18n.t('room.devBrowserShow')}
+                {openType === type ? i18n.t('room.devBrowserHide') : i18n.t('room.devBrowserShow')}
               </Button>
             </SettingsRow>
             {#if openType === type}
@@ -209,7 +215,7 @@
                           edit(type, key);
                         }}
                       >
-                        {key === '' ? $i18n.t('room.devBrowserEmptyKey') : key}
+                        {key === '' ? i18n.t('room.devBrowserEmptyKey') : key}
                       </button>
                     </li>
                   {/each}
@@ -222,9 +228,7 @@
       <div class="settings-form">
         <div class="actions">
           <Button variant="secondary" loading={browsing} onclick={() => void browse()}>
-            {stateTypes.length > 0
-              ? $i18n.t('room.devBrowserReload')
-              : $i18n.t('room.devBrowserLoad')}
+            {stateTypes.length > 0 ? i18n.t('common.reload') : i18n.t('room.devBrowserLoad')}
           </Button>
           <Button
             variant="secondary"
@@ -232,7 +236,7 @@
               edit('', '');
             }}
           >
-            {$i18n.t('room.devBrowserNew')}
+            {i18n.t('room.devBrowserNew')}
           </Button>
         </div>
       </div>
@@ -240,11 +244,17 @@
   {/if}
   <SettingsSection
     headingId="room-developer-state"
-    title={$i18n.t('room.devStateTitle')}
-    description={$i18n.t('room.devStateDescription')}
+    title={i18n.t('room.devStateTitle')}
+    description={i18n.t('room.devStateDescription')}
   >
-    <form class="settings-form" onsubmit={send} {@attach revealEditor}>
-      <FormField fieldId="room-dev-type" label={$i18n.t('room.devEventType')}>
+    <form
+      class="settings-form"
+      onsubmit={(event) => {
+        event.preventDefault();
+      }}
+      {@attach revealEditor}
+    >
+      <FormField fieldId="room-dev-type" label={i18n.t('room.devEventType')}>
         <TextInput
           id="room-dev-type"
           bind:value={eventType}
@@ -254,22 +264,22 @@
         />
       </FormField>
 
-      <FormField fieldId="room-dev-key" label={$i18n.t('room.devStateKey')}>
+      <FormField fieldId="room-dev-key" label={i18n.t('room.devStateKey')}>
         <TextInput id="room-dev-key" bind:value={stateKey} autocomplete="off" spellcheck="false" />
       </FormField>
 
-      <FormField fieldId="room-dev-content" label={$i18n.t('room.devContent')}>
+      <FormField fieldId="room-dev-content" label={i18n.t('room.devContent')}>
         <TextArea id="room-dev-content" bind:value={content} rows={10} spellcheck="false" />
       </FormField>
 
       {#if outcome === 'json'}
-        <Alert variant="critical" role="alert">{$i18n.t('room.devInvalidJson')}</Alert>
+        <Alert variant="critical" role="alert">{i18n.t('room.devInvalidJson')}</Alert>
       {:else if outcome === 'failed'}
-        <Alert variant="critical" role="alert">{$i18n.t('room.devFailed')}</Alert>
+        <Alert variant="critical" role="alert">{i18n.t('common.stateEventRejected')}</Alert>
       {:else if outcome === 'missing'}
-        <Alert variant="info" role="status">{$i18n.t('room.devMissing')}</Alert>
+        <Alert variant="info" role="status">{i18n.t('room.devMissing')}</Alert>
       {:else if sent}
-        <Alert variant="success" role="status">{$i18n.t('room.devSent')}</Alert>
+        <Alert variant="success" role="status">{i18n.t('room.devSent')}</Alert>
       {/if}
 
       <div class="actions">
@@ -282,11 +292,18 @@
             void load();
           }}
         >
-          {$i18n.t('room.devLoad')}
+          {i18n.t('room.devLoad')}
         </Button>
         {#if canEditState}
-          <Button type="submit" loading={sending} disabled={eventType.trim() === ''}>
-            {$i18n.t('room.devSend')}
+          <Button
+            type="button"
+            loading={sending}
+            disabled={eventType.trim() === ''}
+            onclick={() => {
+              void send();
+            }}
+          >
+            {i18n.t('room.devSend')}
           </Button>
         {/if}
       </div>
@@ -328,6 +345,7 @@
     font: inherit;
     font-family: var(--font-family-mono);
     font-size: var(--font-size-small);
+    font-variant-ligatures: none;
     overflow-wrap: anywhere;
     padding: var(--space-100) var(--space-200);
     text-align: start;

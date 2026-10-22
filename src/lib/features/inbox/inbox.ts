@@ -1,15 +1,50 @@
-import type { BookmarkView, RoomSummary } from '#src/generated/protocol';
+import type { BookmarkView, InboxItemView, RoomListItemView } from '#src/generated/protocol';
 
 import { formatTime } from '#lib/ui/date-time.js';
 import { currentLocale } from '#lib/i18n.js';
 import { hasUnread, type RoomUnread, roomUnread } from '#lib/rooms/unread.js';
-import type { UnreadCount } from '#lib/rooms/spaces.js';
+import type { UnreadCount } from '#lib/rooms/unread.js';
 
 export type NotificationFilter = 'all' | 'mentions' | 'direct';
 export type InboxTab = 'notifications' | 'invites' | 'requests';
 
-export function parseInboxTab(value: string | null): InboxTab {
-  return value === 'invites' || value === 'requests' ? value : 'notifications';
+export const NOTIFICATION_GROUP_LIMIT = 5;
+
+export interface NotificationGroup {
+  roomId: string;
+  latest: InboxItemView;
+  items: InboxItemView[];
+  hasMore: boolean;
+  firstEventId: string;
+  read: boolean;
+  highlight: boolean;
+}
+
+export function groupNotifications(items: readonly InboxItemView[]): NotificationGroup[] {
+  const rooms = new Map<string, InboxItemView[]>();
+  for (const item of [...items].sort((left, right) => right.ts - left.ts)) {
+    const group = rooms.get(item.room_id) ?? [];
+    group.push(item);
+    rooms.set(item.room_id, group);
+  }
+  return [...rooms].map(([roomId, entries]) => ({
+    roomId,
+    latest: entries[0],
+    items: entries.slice(0, NOTIFICATION_GROUP_LIMIT),
+    hasMore: entries.length > NOTIFICATION_GROUP_LIMIT,
+    firstEventId: entries[entries.length - 1].event_id,
+    read: entries.every((item) => item.read),
+    highlight: entries.some((item) => item.highlight),
+  }));
+}
+
+export function parseInboxTab(
+  value: string | null,
+  fallback: InboxTab = 'notifications'
+): InboxTab {
+  return value === 'notifications' || value === 'invites' || value === 'requests'
+    ? value
+    : fallback;
 }
 
 export function parseFilter(value: string | null): NotificationFilter {
@@ -21,7 +56,7 @@ export function notificationCount(counts: UnreadCount): number {
 }
 
 function matchesFilter(
-  room: RoomSummary,
+  room: RoomListItemView,
   filter: NotificationFilter,
   counts: UnreadCount
 ): boolean {
@@ -35,44 +70,54 @@ function matchesFilter(
   }
 }
 
-function byRecency(left: RoomSummary, right: RoomSummary): number {
+function byRecency(left: RoomListItemView, right: RoomListItemView): number {
   return (right.latest_event?.timestamp ?? 0) - (left.latest_event?.timestamp ?? 0);
 }
 
-const defaultUnread: RoomUnread = (room) => roomUnread(room, null);
-
 export function notifications(
-  rooms: readonly RoomSummary[],
+  rooms: readonly RoomListItemView[],
   filter: NotificationFilter,
-  unreadFor: RoomUnread = defaultUnread
-): RoomSummary[] {
+  unreadFor: RoomUnread = roomUnread
+): RoomListItemView[] {
   return rooms
     .filter((room) => {
-      if (room.state !== 'joined' || room.is_space) return false;
+      if (room.state !== 'joined' || room.room_kind === 'space') return false;
       return matchesFilter(room, filter, unreadFor(room));
     })
     .sort(byRecency);
 }
 
 export function countNotifications(
-  rooms: readonly RoomSummary[],
-  unreadFor: RoomUnread = defaultUnread
+  rooms: readonly RoomListItemView[],
+  unreadFor: RoomUnread = roomUnread
 ): number {
   return rooms
-    .filter((room) => room.state === 'joined' && !room.is_space)
+    .filter((room) => room.state === 'joined' && room.room_kind !== 'space')
     .reduce((total, room) => total + notificationCount(unreadFor(room)), 0);
 }
 
-export function hasMarkedUnread(
-  rooms: readonly RoomSummary[],
-  unreadFor: RoomUnread = defaultUnread
-): boolean {
-  return rooms.some(
-    (room) => room.state === 'joined' && !room.is_space && (unreadFor(room).marked ?? false)
+export function unlistedNotifications(
+  rooms: readonly RoomListItemView[],
+  filter: NotificationFilter,
+  unreadFor: RoomUnread,
+  listed: readonly string[]
+): RoomListItemView[] {
+  return notifications(rooms, filter, unreadFor).filter(
+    (room) => notificationCount(unreadFor(room)) > 0 && !listed.includes(room.room_id)
   );
 }
 
-export function backfillSignal(rooms: readonly RoomSummary[]): string {
+export function hasMarkedUnread(
+  rooms: readonly RoomListItemView[],
+  unreadFor: RoomUnread = roomUnread
+): boolean {
+  return rooms.some(
+    (room) =>
+      room.state === 'joined' && room.room_kind !== 'space' && (unreadFor(room).marked ?? false)
+  );
+}
+
+export function backfillSignal(rooms: readonly RoomListItemView[]): string {
   return JSON.stringify(
     rooms
       .filter((room) => room.unread > 0 || room.notifying > 0 || room.highlight > 0)
@@ -86,15 +131,15 @@ export function backfillSignal(rooms: readonly RoomSummary[]): string {
   );
 }
 
-export function pendingInvites(rooms: readonly RoomSummary[]): RoomSummary[] {
+export function pendingInvites(rooms: readonly RoomListItemView[]): RoomListItemView[] {
   return rooms.filter((room) => room.state === 'invited').sort(byRecency);
 }
 
-export function countInvites(rooms: readonly RoomSummary[]): number {
+export function countInvites(rooms: readonly RoomListItemView[]): number {
   return rooms.reduce((total, room) => total + (room.state === 'invited' ? 1 : 0), 0);
 }
 
-export function inviter(room: RoomSummary): string | null {
+export function inviter(room: RoomListItemView): string | null {
   return room.latest_event?.sender ?? null;
 }
 

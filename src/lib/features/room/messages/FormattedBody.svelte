@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { copyText } from '#lib/platform/clipboard.js';
   import { mount, unmount, untrack, type Component } from 'svelte';
   import { on } from 'svelte/events';
   import ChatCircleIcon from 'phosphor-svelte/lib/ChatCircleIcon';
@@ -38,16 +39,18 @@
   import { parseSettingsLink } from '../settings/settings-link';
   import { replyPreviewBody } from './reply-preview';
   import { FormattedBodyImages } from './formatted-body-images';
+  import EmoteCard from './EmoteCard.svelte';
   import ImageSpoilerControl from '#lib/ui/ImageSpoilerControl.svelte';
   import { toasts } from '#lib/ui/toasts.svelte.js';
 
   interface Props {
     html: string;
     senderTimezone?: string | null;
+    keepMentionText?: boolean;
     onMatrixLink?: (link: MatrixLink, anchor: HTMLAnchorElement) => void;
   }
 
-  let { html, senderTimezone = null, onMatrixLink }: Props = $props();
+  let { html, senderTimezone = null, keepMentionText = false, onMatrixLink }: Props = $props();
   const core = useCoreClient();
   const roomList = useRoomList();
   const abbreviations = hasRoomAbbreviations() ? useRoomAbbreviations() : null;
@@ -179,22 +182,29 @@
     if (image.dataset.mxEmoticon === undefined || !image.complete) return;
     image.classList.toggle(
       'pixelated',
-      pixelatedImage(preferences.pixelatedImages, image.naturalWidth, image.naturalHeight)
+      pixelatedImage(preferences.pixelatedImages, image.naturalWidth, image.naturalHeight, {
+        width: image.clientWidth,
+        height: image.clientHeight,
+      })
     );
   }
 
   function paint(image: HTMLImageElement, url: string): void {
     image.onload = () => {
       pixelateEmote(image);
-      holdStillFrame(image, animationsPaused());
+      holdStillFrame(image, stillFor(image));
     };
     image.src = url;
     delete image.dataset.mediaPending;
   }
 
+  function stillFor(image: HTMLImageElement): boolean {
+    const emoticon = image.dataset.mxEmoticon !== undefined;
+    return animationsPaused() || (emoticon && !preferences.autoplayStickers);
+  }
+
   function holdAnimations(node: HTMLElement): void {
-    const paused = animationsPaused();
-    for (const image of node.querySelectorAll('img')) holdStillFrame(image, paused);
+    for (const image of node.querySelectorAll('img')) holdStillFrame(image, stillFor(image));
   }
 
   function fallbackLabel(image: HTMLImageElement, emoticon: boolean): string {
@@ -204,7 +214,7 @@
   }
 
   function emoteShortcode(image: HTMLImageElement): string | null {
-    const label = image.alt.replace(/^:|:$/g, '');
+    const label = (image.dataset.shortcode || image.alt).replace(/^:|:$/g, '');
     return label ? `:${label}:` : null;
   }
 
@@ -221,12 +231,6 @@
         throwOnError: false,
       });
     }
-  }
-
-  function isExplicitLink(anchor: HTMLAnchorElement): boolean {
-    return (
-      anchor.hasAttribute('data-mx-link') || anchor.hasAttribute('data-org.matrix.msc4550.link')
-    );
   }
 
   function decorate(html: string) {
@@ -256,12 +260,12 @@
           anchor.target = '_blank';
           anchor.rel = 'noopener noreferrer';
 
-          const link = isExplicitLink(anchor) ? null : parseMatrixLink(anchor.href);
+          const link = parseMatrixLink(anchor.href);
           if (link) {
             anchor.dataset.matrixLink = link.kind;
             if (link.kind === 'user') continue;
             const bare = anchor.textContent.trim() === anchor.getAttribute('href')?.trim();
-            if (bare) anchor.textContent = link.roomId;
+            if (bare) anchor.textContent = link.room_id;
             const label = link.kind === 'event' ? withIcon(anchor, ChatCircleIcon) : anchor;
             if (bare) void resolveLinkLabel(link, anchor, label);
             continue;
@@ -283,6 +287,7 @@
         }
         for (const image of node.querySelectorAll<HTMLImageElement>('img[data-mx-emoticon]')) {
           image.alt ||= image.title;
+          if (image.title) image.dataset.shortcode = image.title;
           image.removeAttribute('title');
         }
         for (const element of node.querySelectorAll<HTMLTimeElement>('time[datetime]')) {
@@ -303,7 +308,7 @@
           element.ariaPressed = 'true';
           if (!element.textContent?.trim()) {
             const image = element.querySelector('img');
-            element.ariaLabel = image?.alt || $i18n.t('timeline.spoilerMedia');
+            element.ariaLabel = image?.alt || i18n.t('timeline.spoilerMedia');
           }
         }
 
@@ -317,6 +322,7 @@
         const offPointerOut = on(node, 'pointerout', handleDefinitionOut);
         const offFocusIn = on(node, 'focusin', handleDefinitionOver);
         const offFocusOut = on(node, 'focusout', handleDefinitionOut);
+        const offWindowBlur = on(window, 'blur', closeDefinition);
         return () => {
           offClick();
           offKeydown();
@@ -324,6 +330,7 @@
           offPointerOut();
           offFocusIn();
           offFocusOut();
+          offWindowBlur();
           closeDefinition();
           for (const icon of icons) void unmount(icon);
         };
@@ -336,7 +343,9 @@
       void html;
       for (const anchor of node.querySelectorAll<HTMLAnchorElement>('a[data-matrix-link="user"]')) {
         const link = parseMatrixLink(anchor.href);
-        if (link?.kind === 'user') anchor.textContent = mentionLabel(link.userId, memberNames);
+        if (link?.kind === 'user' && !keepMentionText) {
+          anchor.textContent = mentionLabel(link.user_id, memberNames);
+        }
       }
       for (const chip of node.querySelectorAll<HTMLElement>('.time-chip')) {
         const time = chip.querySelector('time');
@@ -365,13 +374,13 @@
       ? formatTimeInZone(zoned.instant, senderTimezone, preferences.hour24Clock)
       : null;
     return sender
-      ? $i18n.t('timeline.timeMarkupDetailWithSender', {
+      ? i18n.t('timeline.timeMarkupDetailWithSender', {
           local,
           sender,
           timezone: senderTimezone,
           utc,
         })
-      : $i18n.t('timeline.timeMarkupDetail', { local, utc });
+      : i18n.t('timeline.timeMarkupDetail', { local, utc });
   }
 
   const EVENT_SNIPPET_LENGTH = 72;
@@ -382,21 +391,29 @@
     label: HTMLElement
   ) {
     const known = roomList.rooms.find(
-      (room) => room.room_id === link.roomId || room.canonical_alias === link.roomId
+      (room) => room.room_id === link.room_id || room.canonical_alias === link.room_id
     );
     const name =
       known?.name ??
-      (await core.commands.roomPreview(link.roomId, splitVia(anchor.href).via).then(
+      (await core.rpc.rooms.preview({ address: link.room_id, via: splitVia(anchor.href).via }).then(
         (preview) => preview.name,
-        () => null
+        (error: unknown) => {
+          console.debug('[sable timeline] link room preview unavailable', error);
+          return null;
+        }
       ));
     const room = name ? (name.startsWith('#') ? name : `#${name}`) : null;
     const snippet =
       link.kind === 'event' && known
-        ? await core.commands.eventItems(known.room_id, [link.eventId]).then(
-            ([item]) => (item ? replyPreviewBody(item.content).replace(/\s+/g, ' ').trim() : ''),
-            () => ''
-          )
+        ? await core.rpc.timeline
+            .eventItems({ room_id: known.room_id, event_ids: [link.event_id] })
+            .then(
+              ([item]) => (item ? replyPreviewBody(item.content).replace(/\s+/g, ' ').trim() : ''),
+              (error: unknown) => {
+                console.debug('[sable timeline] link event preview unavailable', error);
+                return '';
+              }
+            )
         : '';
     if (!anchor.isConnected || room === null) return;
     const short =
@@ -444,14 +461,14 @@
 
       const label = document.createElement('span');
       label.className = 'code-language';
-      label.textContent = language ?? $i18n.t('timeline.codeLabel');
+      label.textContent = language ?? i18n.t('timeline.codeLabel');
       header.append(label);
 
       const copy = document.createElement('button');
       copy.type = 'button';
       copy.className = 'code-action';
       copy.dataset.codeCopy = '';
-      copy.textContent = $i18n.t('timeline.copyCode');
+      copy.textContent = i18n.t('common.copy');
       header.append(copy);
 
       if (long) {
@@ -459,7 +476,7 @@
         toggle.type = 'button';
         toggle.className = 'code-action';
         toggle.dataset.codeToggle = '';
-        toggle.textContent = $i18n.t('timeline.expandCode');
+        toggle.textContent = i18n.t('timeline.expandCode');
         header.append(toggle);
       }
 
@@ -474,7 +491,7 @@
     const source = code?.textContent;
     if (!code || !source || language === null || source.length > CODE_HIGHLIGHT_LIMIT) return;
 
-    const html = await import('./code-highlight')
+    const html = await import('#lib/ui/code-highlight.js')
       .then(({ highlightCode }) => highlightCode(source, language))
       .catch((error: unknown) => {
         console.debug('[sable code] highlighter chunk unavailable', error);
@@ -496,24 +513,23 @@
       if (collapsed) delete figure.dataset.collapsed;
       else figure.dataset.collapsed = '';
       button.textContent = collapsed
-        ? $i18n.t('timeline.collapseCode')
-        : $i18n.t('timeline.expandCode');
+        ? i18n.t('timeline.collapseCode')
+        : i18n.t('timeline.expandCode');
       return true;
     }
 
     if (button.dataset.codeCopy === undefined) return false;
     const label = button;
-    void navigator.clipboard
-      .writeText(block.textContent)
+    void copyText(block.textContent)
       .then(() => {
-        label.textContent = $i18n.t('timeline.copiedCode');
+        label.textContent = i18n.t('common.copied');
         setTimeout(() => {
-          if (label.isConnected) label.textContent = $i18n.t('timeline.copyCode');
+          if (label.isConnected) label.textContent = i18n.t('common.copy');
         }, 1500);
       })
       .catch((error: unknown) => {
         console.debug('[sable code] clipboard unavailable', error);
-        toasts.error($i18n.t('errors.actionFailed'));
+        toasts.error(i18n.t('errors.actionFailed'));
       });
     return true;
   }
@@ -551,6 +567,7 @@
 
   function handleDefinitionOver(event: PointerEvent | FocusEvent): void {
     const abbr = definitionOf(event.target);
+    if (event.type === 'focusin' && !(event.target as Element).matches(':focus-visible')) return;
     if (
       abbr instanceof HTMLAnchorElement &&
       'pointerType' in event &&
@@ -634,21 +651,16 @@
       revealedImages = true;
     }}
   >
-    {$i18n.t('timeline.showImages')}
+    {i18n.t('timeline.showImages')}
   </Button>
 {/if}
 
 {#snippet emoteCard()}
-  <span class="emote-card">
+  <EmoteCard label={definition}>
     {#if emote?.src}
-      <img
-        class={['emote-card-image', { pixelated: emote.classList.contains('pixelated') }]}
-        src={emote.src}
-        alt=""
-      />
+      <img class={{ pixelated: emote.classList.contains('pixelated') }} src={emote.src} alt="" />
     {/if}
-    <span class="emote-card-name">{definition}</span>
-  </span>
+  </EmoteCard>
 {/snippet}
 
 {#snippet linkCard()}
@@ -667,23 +679,6 @@
 {/if}
 
 <style>
-  .emote-card {
-    align-items: center;
-    display: flex;
-    gap: var(--space-300);
-  }
-
-  .emote-card-image {
-    height: var(--space-800);
-    object-fit: contain;
-    width: var(--space-800);
-  }
-
-  .emote-card-image.pixelated {
-    image-rendering: pixelated;
-  }
-
-  .emote-card-name,
   .link-card {
     font-size: var(--font-size-subheading);
     font-weight: var(--font-weight-medium);
@@ -877,7 +872,6 @@
     padding-left: var(--space-200);
   }
 
-  /* Inline code had no rule at all, so it read as prose. */
   .formatted-body :global(code:not(pre code)) {
     background: var(--surface-var-container);
     border: var(--border-width) solid var(--surface-var-container-line);
@@ -885,6 +879,7 @@
     color: var(--surface-var-on-container);
     font-family: var(--font-family-mono);
     font-size: var(--inline-code-scale);
+    font-variant-ligatures: none;
     padding: 0 var(--space-100);
   }
 
@@ -949,6 +944,11 @@
   .formatted-body :global(pre code) {
     font-family: var(--font-family-mono);
     font-size: var(--font-size-small);
+    font-variant-ligatures: none;
+  }
+
+  :root[data-code-ligatures='on'] .formatted-body :global(code) {
+    font-variant-ligatures: normal;
   }
 
   /* Bounded so a long paste cannot own the viewport, and so the virtualiser's

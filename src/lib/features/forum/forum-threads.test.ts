@@ -3,9 +3,10 @@ import { expect, test } from 'vitest';
 import type { TimelineItemView } from '#src/generated/protocol';
 
 import { collectForumThreads } from './forum-threads';
+import { withRowFields } from '#lib/features/room/timeline/row-fixtures.js';
 
 function item(overrides: Partial<TimelineItemView> & { id: string }): TimelineItemView {
-  return {
+  return withRowFields({
     event_id: `$${overrides.id}`,
     transaction_id: null,
     send_state: null,
@@ -20,6 +21,7 @@ function item(overrides: Partial<TimelineItemView> & { id: string }): TimelineIt
       emote: false,
       notice: false,
       edited: false,
+      jumbo: null,
     },
     in_reply_to: null,
     thread_root: null,
@@ -35,14 +37,19 @@ function item(overrides: Partial<TimelineItemView> & { id: string }): TimelineIt
     forwarded: null,
     forum_title: null,
     ...overrides,
-  };
+  });
 }
 
 test('collects an item with a thread summary as a root', () => {
   const root = item({
     id: 'root',
     timestamp: 100,
-    thread_summary: { num_replies: 2, latest_event_id: null, latest_body: 'latest' },
+    thread_summary: {
+      num_replies: 2,
+      latest_event_id: null,
+      latest_body: 'latest',
+      latest_fallback: null,
+    },
   });
 
   const threads = collectForumThreads([root], null);
@@ -64,6 +71,28 @@ test('collects a post nobody has replied to yet', () => {
   expect(threads[0]?.lastBody).toBeNull();
 });
 
+test('an own attachment post is edited through its caption', () => {
+  const post = item({
+    id: 'file',
+    is_own: true,
+    content: {
+      kind: 'file',
+      filename: 'main.rs',
+      caption: 'the code',
+      html: null,
+      source: 'mxc://example.org/code',
+      mime: 'text/plain',
+      size: 128,
+    },
+  });
+
+  const threads = collectForumThreads([post], null);
+
+  expect(threads[0]?.editable).toBe(true);
+  expect(threads[0]?.mediaCaption).toBe(true);
+  expect(threads[0]?.preview).toBe('the code');
+});
+
 test('ignores a thread reply, a plain reply and a state change', () => {
   const reply = item({ id: 'reply', thread_root: '$root' });
   const quoted = item({
@@ -74,6 +103,7 @@ test('ignores a thread reply, a plain reply and a state change', () => {
       sender_mentioned: false,
       sender_name: null,
       body: null,
+      fallback: null,
     },
   });
   const joined = item({
@@ -94,7 +124,12 @@ test('takes last activity from the newest visible reply, not the root', () => {
   const root = item({
     id: 'root',
     timestamp: 100,
-    thread_summary: { num_replies: 2, latest_event_id: null, latest_body: 'root summary' },
+    thread_summary: {
+      num_replies: 2,
+      latest_event_id: null,
+      latest_body: 'root summary',
+      latest_fallback: null,
+    },
   });
   const reply = item({
     id: 'reply',
@@ -114,12 +149,22 @@ test('sorts threads by most recent activity first', () => {
   const older = item({
     id: 'older',
     timestamp: 10,
-    thread_summary: { num_replies: 0, latest_event_id: null, latest_body: null },
+    thread_summary: {
+      num_replies: 0,
+      latest_event_id: null,
+      latest_body: null,
+      latest_fallback: null,
+    },
   });
   const newer = item({
     id: 'newer',
     timestamp: 20,
-    thread_summary: { num_replies: 0, latest_event_id: null, latest_body: null },
+    thread_summary: {
+      num_replies: 0,
+      latest_event_id: null,
+      latest_body: null,
+      latest_fallback: null,
+    },
   });
 
   const threads = collectForumThreads([older, newer], null);
@@ -132,7 +177,12 @@ test('a thread is unread when the latest activity has no receipt from the curren
     id: 'root',
     timestamp: 10,
     sender: '@bob:example.org',
-    thread_summary: { num_replies: 0, latest_event_id: null, latest_body: null },
+    thread_summary: {
+      num_replies: 0,
+      latest_event_id: null,
+      latest_body: null,
+      latest_fallback: null,
+    },
     read_by: [],
     read_timestamps: {},
   });
@@ -145,7 +195,12 @@ test('a thread is read once the current user has a receipt on the latest activit
     id: 'root',
     timestamp: 10,
     sender: '@bob:example.org',
-    thread_summary: { num_replies: 0, latest_event_id: null, latest_body: null },
+    thread_summary: {
+      num_replies: 0,
+      latest_event_id: null,
+      latest_body: null,
+      latest_fallback: null,
+    },
     read_by: ['@alice:example.org'],
   });
 
@@ -157,7 +212,12 @@ test('a thread you authored yourself is never unread', () => {
     id: 'root',
     timestamp: 10,
     sender: '@alice:example.org',
-    thread_summary: { num_replies: 0, latest_event_id: null, latest_body: null },
+    thread_summary: {
+      num_replies: 0,
+      latest_event_id: null,
+      latest_body: null,
+      latest_fallback: null,
+    },
     read_by: [],
     read_timestamps: {},
   });
@@ -176,6 +236,7 @@ test('keeps the root details needed for its own forum actions', () => {
       emote: false,
       notice: false,
       edited: false,
+      jumbo: null,
     },
   });
 

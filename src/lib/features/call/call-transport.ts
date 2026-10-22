@@ -1,6 +1,6 @@
 import { base64ToUint8Array } from 'uint8array-extras';
 
-import type { ScreenAudioChoice } from '#lib/platform/screen-audio.js';
+import type { ScreenAudioChoice } from '#lib/platform/screen-audio-stream.js';
 
 export type CallEncryptionKey = {
   backendId?: string;
@@ -74,12 +74,22 @@ export type CallVideoOverlay = {
   clear: () => Promise<void>;
 };
 
+export type CallRemoteVideoOverlay = {
+  place: (rect: CallVideoRect & { identity: string; trackId: string }) => Promise<void>;
+  clear: (trackId: string) => Promise<void>;
+};
+
 export type CallTransportCapabilities = {
   camera?: { switch: () => Promise<void> };
   localVideo?: CallVideoOverlay;
+  remoteVideo?: CallRemoteVideoOverlay;
   audioRoutes?: {
     list: () => Promise<CallAudioRoute[]>;
     select: (routeId: string) => Promise<void>;
+  };
+  audioInputs?: {
+    list: () => Promise<CallAudioRoute[]>;
+    select: (inputId: string) => Promise<void>;
   };
   screenShare?: {
     setEnabled: (
@@ -108,7 +118,9 @@ export type CallTransport = {
   roomFor?: (backendId: string | undefined) => import('livekit-client').Room | undefined;
 };
 
-export const ignoreError = (): void => undefined;
+export function ignoreError(error?: unknown): void {
+  console.debug('[sable call] best-effort step failed', error);
+}
 
 export class ScreenAudioError extends Error {
   override name = 'ScreenAudioError';

@@ -73,6 +73,59 @@ test('our own camera on a native call is a slot for the native view', () => {
   expect(localVideo.clear).toHaveBeenCalled();
 });
 
+test('a watched remote screen on a native call is a slot for the native view', () => {
+  const remoteVideo = {
+    place: vi.fn(() => Promise.resolve()),
+    clear: vi.fn(() => Promise.resolve()),
+  };
+  const { container, unmount } = render(CallParticipantTile, {
+    participant: {
+      identity: 'bob',
+      screenShare: { id: 'TR_1', muted: false, subscribed: true },
+    },
+    source: 'screen',
+    room: undefined,
+    remoteVideo,
+    watchingScreen: true,
+    onWatchScreen: vi.fn(),
+    name: 'Bob',
+    userId: '@bob:example.org',
+    avatar: null,
+  });
+
+  expect(container.querySelector('video')).not.toBeInTheDocument();
+  expect(container.querySelector('div.video')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Stop watching Bob’s screen' })).toBeInTheDocument();
+
+  unmount();
+  expect(remoteVideo.clear).toHaveBeenCalledWith('TR_1');
+});
+
+test('a remote camera on a native call is a slot for its own native view', () => {
+  const remoteVideo = {
+    place: vi.fn(() => Promise.resolve()),
+    clear: vi.fn(() => Promise.resolve()),
+  };
+  const { container, unmount } = render(CallParticipantTile, {
+    participant: {
+      identity: 'bob',
+      camera: { id: 'TR_2', muted: false, subscribed: true },
+    },
+    source: 'camera',
+    room: undefined,
+    remoteVideo,
+    name: 'Bob',
+    userId: '@bob:example.org',
+    avatar: null,
+  });
+
+  expect(container.querySelector('video')).not.toBeInTheDocument();
+  expect(container.querySelector('div.video')).toBeInTheDocument();
+
+  unmount();
+  expect(remoteVideo.clear).toHaveBeenCalledWith('TR_2');
+});
+
 test('the volume button still toggles the panel closed', async () => {
   const user = mountTile();
   await openFromContextMenu(user);
@@ -105,8 +158,8 @@ test('a shared screen with sound has its own volume, apart from the voice', asyn
   const onVolumeChange = vi.fn();
   const user = mountScreen(true, onVolumeChange);
 
-  await user.click(screen.getByRole('button', { name: "Volume of Bob's screen" }));
-  const slider = screen.getByRole('slider', { name: "Volume of Bob's screen" });
+  await user.click(screen.getByRole('button', { name: 'Volume of Bob’s screen' }));
+  const slider = screen.getByRole('slider', { name: 'Volume of Bob’s screen' });
   slider.focus();
   await user.keyboard('{ArrowLeft}');
 
@@ -120,7 +173,7 @@ test('a shared screen with sound has its own volume, apart from the voice', asyn
 test('a shared screen without sound offers no volume', () => {
   mountScreen(false);
 
-  expect(screen.queryByRole('button', { name: "Volume of Bob's screen" })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Volume of Bob’s screen' })).not.toBeInTheDocument();
 });
 
 test('attaches screen video only while watching and detaches it when stopped', async () => {
@@ -143,22 +196,22 @@ test('attaches screen video only while watching and detaches it when stopped', a
     watchingScreen: false,
     onWatchScreen,
   });
-  expect(screen.getByText("Bob's screen")).toBeInTheDocument();
-  expect(screen.getByRole('button', { name: "Watch Bob's screen" })).toHaveTextContent('Watch');
+  expect(screen.getByText('Bob’s screen')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Watch Bob’s screen' })).toHaveTextContent('Watch');
   expect(track.attach).not.toHaveBeenCalled();
   expect(container.querySelector('video')).not.toBeInTheDocument();
-  expect(screen.queryByRole('button', { name: "Volume of Bob's screen" })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Volume of Bob’s screen' })).not.toBeInTheDocument();
 
   await rerender({ watchingScreen: true });
   const video = container.querySelector('video');
   expect(track.attach).toHaveBeenCalledWith(video);
-  await userEvent.setup().click(screen.getByRole('button', { name: "Stop watching Bob's screen" }));
+  await userEvent.setup().click(screen.getByRole('button', { name: 'Stop watching Bob’s screen' }));
   expect(onWatchScreen).toHaveBeenCalledOnce();
 
   await rerender({ watchingScreen: false });
   expect(track.detach).toHaveBeenCalledWith(video);
   expect(container.querySelector('video')).not.toBeInTheDocument();
-  expect(screen.getByRole('button', { name: "Watch Bob's screen" })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Watch Bob’s screen' })).toBeInTheDocument();
 });
 
 test('a watched screen attaches the track that arrives after a resubscribe', () => {

@@ -3,40 +3,29 @@ import { afterEach, expect, test, vi } from 'vitest';
 import type { CoreClient } from '#lib/core/client.svelte.js';
 import { preferences } from './preferences.svelte.js';
 
-import {
-  MEDIA_PREVIEW_EVENT,
-  UNSTABLE_MEDIA_PREVIEW_EVENT,
-  mediaPreviewSettings,
-  parseMediaPreviewConfig,
-  previewsShown,
-} from './media-previews.svelte';
+import type { MediaPreviewConfigView } from '#src/generated/protocol';
 
-function fakeCore(accountData: Record<string, unknown>) {
-  const setAccountData = vi.fn(() => Promise.resolve());
+import { mediaPreviewSettings, previewsShown } from './media-previews.svelte';
+
+function fakeCore(stored: MediaPreviewConfigView) {
+  const setMediaPreviewConfig = vi.fn(({ config }: { config: MediaPreviewConfigView }) =>
+    Promise.resolve(config)
+  );
   const core = {
-    commands: {
-      accountData: vi.fn((type: string) => Promise.resolve(accountData[type] ?? null)),
-      roomAccountData: vi.fn(() => Promise.resolve(null)),
-      setAccountData,
+    rpc: {
+      account: {
+        mediaPreviewConfig: vi.fn(() => Promise.resolve(stored)),
+        setMediaPreviewConfig,
+      },
     },
     subscribeEvents: vi.fn(() => () => {}),
   };
-  return { core: core as unknown as CoreClient, setAccountData };
+  return { core: core as unknown as CoreClient, setMediaPreviewConfig };
 }
 
 afterEach(() => {
   mediaPreviewSettings.stop();
   preferences.mediaAutoLoad = 'on';
-});
-
-test('an unknown value is treated as off, a missing one inherits', () => {
-  expect(parseMediaPreviewConfig({ media_previews: 'sometimes', invite_avatars: 'maybe' })).toEqual(
-    {
-      media_previews: 'off',
-      invite_avatars: 'off',
-    }
-  );
-  expect(parseMediaPreviewConfig({})).toEqual({});
 });
 
 test.each([
@@ -50,8 +39,8 @@ test.each([
   expect(previewsShown(level, joinRule)).toBe(shown);
 });
 
-test('reads the stable type first, then the unstable one', async () => {
-  const { core } = fakeCore({ [UNSTABLE_MEDIA_PREVIEW_EVENT]: { media_previews: 'private' } });
+test('adopts the stored config and mirrors it into the preference', async () => {
+  const { core } = fakeCore({ media_previews: 'private', invite_avatars: null });
   mediaPreviewSettings.start(core);
 
   await vi.waitFor(() => {
@@ -61,27 +50,22 @@ test('reads the stable type first, then the unstable one', async () => {
   expect(preferences.mediaAutoLoad).toBe('private');
 });
 
-test('writes both types so other clients see the change', async () => {
-  const { core, setAccountData } = fakeCore({});
+test('a change sends only the fields it sets and keeps the rest locally', async () => {
+  const { core, setMediaPreviewConfig } = fakeCore({ media_previews: null, invite_avatars: null });
   mediaPreviewSettings.start(core);
 
   await mediaPreviewSettings.set({ invite_avatars: 'off' });
 
-  expect(setAccountData).toHaveBeenCalledWith(MEDIA_PREVIEW_EVENT, { invite_avatars: 'off' });
-  expect(setAccountData).toHaveBeenCalledWith(UNSTABLE_MEDIA_PREVIEW_EVENT, {
-    invite_avatars: 'off',
+  expect(setMediaPreviewConfig).toHaveBeenCalledWith({
+    config: { media_previews: null, invite_avatars: 'off' },
   });
   expect(mediaPreviewSettings.inviteAvatars).toBe('off');
   preferences.mediaAutoLoad = 'off';
   expect(mediaPreviewSettings.mediaPreviews).toBe('off');
   await mediaPreviewSettings.set({ media_previews: 'on' });
   expect(preferences.mediaAutoLoad).toBe('on');
-  expect(setAccountData).toHaveBeenCalledWith(MEDIA_PREVIEW_EVENT, {
-    invite_avatars: 'off',
-    media_previews: 'on',
+  expect(setMediaPreviewConfig).toHaveBeenLastCalledWith({
+    config: { media_previews: 'on', invite_avatars: null },
   });
-  expect(setAccountData).toHaveBeenCalledWith(UNSTABLE_MEDIA_PREVIEW_EVENT, {
-    invite_avatars: 'off',
-    media_previews: 'on',
-  });
+  expect(mediaPreviewSettings.inviteAvatars).toBe('off');
 });

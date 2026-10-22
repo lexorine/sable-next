@@ -10,6 +10,8 @@ vi.mock('@sentry/sveltekit', () => ({
   captureConsoleIntegration: vi.fn(() => ({ name: 'CaptureConsole' })),
   init: vi.fn(),
 }));
+const updatedCheck = vi.hoisted(() => vi.fn<() => Promise<boolean>>());
+vi.mock('$app/state', () => ({ updated: { check: updatedCheck } }));
 vi.mock('#lib/platform/telemetry.js', () => ({
   syncTelemetryConsent: vi.fn(),
 }));
@@ -18,6 +20,9 @@ vi.mock('#lib/settings/preferences.svelte.js', () => ({
 }));
 vi.mock('#src/transport', () => ({
   CoreError: class CoreError extends Error {},
+}));
+vi.mock('#lib/model/model.js', () => ({
+  loadModel: vi.fn(() => Promise.resolve()),
 }));
 
 afterEach(() => {
@@ -29,20 +34,31 @@ afterEach(() => {
   vi.resetModules();
 });
 
-test('recovers a global stale-import rejection that never reaches handleError', async () => {
+test('reloads on a global stale-import rejection only when the build is stale', async () => {
   const reload = vi.fn();
   vi.stubGlobal('location', { reload });
   vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+  updatedCheck.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
 
   await import('./hooks.client.js');
-  const event = Object.assign(new Event('unhandledrejection', { cancelable: true }), {
-    reason: new Error('Failed to fetch dynamically imported module'),
+  const dispatch = (): void => {
+    window.dispatchEvent(
+      Object.assign(new Event('unhandledrejection', { cancelable: true }), {
+        reason: new Error('Failed to fetch dynamically imported module'),
+      })
+    );
+  };
+
+  dispatch();
+  await vi.waitFor(() => {
+    expect(updatedCheck).toHaveBeenCalledOnce();
   });
+  expect(reload).not.toHaveBeenCalled();
 
-  window.dispatchEvent(event);
-
-  expect(reload).toHaveBeenCalledOnce();
-  expect(event.defaultPrevented).toBe(true);
+  dispatch();
+  await vi.waitFor(() => {
+    expect(reload).toHaveBeenCalledOnce();
+  });
 });
 
 test('fully samples call traces and inherits sampling for every other trace', async () => {
@@ -113,4 +129,16 @@ test('scrubs custom grouping and captured console arguments', async () => {
   const sent = options.beforeSend?.(event, {});
   expect(JSON.stringify(sent)).not.toContain('secret');
   expect(JSON.stringify(sent)).not.toContain('!private:example.org');
+});
+
+test('a model that fails to load is reported without stopping the app from starting', async () => {
+  const failure = new Error('Load failed');
+  const { loadModel } = await import('#lib/model/model.js');
+  vi.mocked(loadModel).mockRejectedValueOnce(failure);
+  vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+  const { init } = await import('./hooks.client.js');
+
+  await expect(init()).resolves.toBeUndefined();
+  expect(Sentry.captureException).toHaveBeenCalledWith(failure);
 });

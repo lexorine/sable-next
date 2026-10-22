@@ -1,3 +1,5 @@
+use crate::api::timeline::TimelineFocusView;
+use crate::api::{account::ProfilePropagationView, rooms::RoomKind};
 use std::{collections::HashMap, sync::Arc};
 
 use matrix_sdk::{
@@ -16,15 +18,33 @@ use wiremock::{
 
 use crate::{
     Core,
-    protocol::{Command, CommandErr, CommandOk, CoreEvent},
+    api::Handler,
+    api::encryption::{
+        CancelIdentityResetParams, ContinueIdentityResetParams, RecoverIdentityParams,
+        RenameDeviceParams, ResetIdentityParams,
+    },
+    api::packs::{ListAllParams, ListOk, ListParams},
+    api::spaces::{AddParams, SetChildOrderParams, SetChildSuggestedParams, SetSidebarParams},
+    api::timeline::{
+        SubscribeOk, SubscribeParams, SubscribeRoomListOk, SubscribeRoomListParams,
+        UnsubscribeParams,
+    },
+    protocol::{CoreEvent, IdentityResetStep, RpcError},
     session::Session,
     store::MemorySessionStore,
 };
 
-#[expect(clippy::unwrap_used, reason = "test code")]
 async fn core(server: &MatrixMockServer, client: matrix_sdk::Client) -> Arc<Core> {
+    core_with_events(server, client).await.0
+}
+
+#[expect(clippy::unwrap_used, reason = "test code")]
+async fn core_with_events(
+    server: &MatrixMockServer,
+    client: matrix_sdk::Client,
+) -> (Arc<Core>, tokio::sync::mpsc::UnboundedReceiver<CoreEvent>) {
     let sync_service = Arc::new(SyncService::builder(client.clone()).build().await.unwrap());
-    let (core, _events) = Core::new("helpers-test", Box::new(MemorySessionStore::default()));
+    let (core, events) = Core::new("helpers-test", Box::new(MemorySessionStore::default()));
     *core.session.write().await = Some(Session {
         account_id: "test".into(),
         client,
@@ -32,7 +52,120 @@ async fn core(server: &MatrixMockServer, client: matrix_sdk::Client) -> Arc<Core
         homeserver: server.server().uri(),
         oauth: false,
     });
-    core
+    (core, events)
+}
+
+#[tokio::test]
+async fn room_list_keeps_joined_rooms_redirected_to_a_joined_successor() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let old_id = room_id!("!old:example.org");
+    let new_id = room_id!("!new:example.org");
+    server
+        .mock_sync()
+        .ok_and_run(&client, |builder| {
+            builder
+                .add_joined_room(
+                    JoinedRoomBuilder::new(old_id).add_state_event(
+                        Raw::new(&json!({
+                            "type": "m.room.tombstone", "state_key": "",
+                            "sender": "@alice:example.org", "event_id": "$grave",
+                            "origin_server_ts": 1,
+                            "content": {"body": "moved", "replacement_room": new_id}
+                        }))
+                        .unwrap()
+                        .cast_unchecked(),
+                    ),
+                )
+                .add_joined_room(JoinedRoomBuilder::new(new_id));
+        })
+        .await;
+    let (core, mut events) = core_with_events(&server, client).await;
+    let SubscribeRoomListOk { subscription, .. } =
+        core.run(SubscribeRoomListParams {}).await.unwrap();
+    let diffs = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(CoreEvent::RoomListDiff {
+                subscription: current,
+                diffs,
+            }) = events.recv().await
+                && current == subscription
+            {
+                break diffs;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let rooms = diffs
+        .into_iter()
+        .find_map(|diff| match diff {
+            crate::protocol::VectorDiff::Reset { values } => Some(values),
+            _ => None,
+        })
+        .expect("initial room list snapshot");
+    let old = rooms.iter().find(|room| room.room_id == old_id).unwrap();
+    assert!(old.is_tombstoned);
+    assert!(matches!(old.state, crate::protocol::RoomStateView::Joined));
+    assert!(rooms.iter().any(|room| room.room_id == new_id));
+    core.run(UnsubscribeParams { subscription }).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_synced_room_rule_reaches_the_listed_room() {
+    use matrix_sdk::ruma::push::{NewPushRule, NewSimplePushRule, Ruleset};
+    use matrix_sdk_test::event_factory::EventFactory;
+
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room_id = room_id!("!chatty:example.org");
+    server.sync_joined_room(&client, room_id).await;
+    let (core, mut events) = core_with_events(&server, client.clone()).await;
+    let SubscribeRoomListOk { subscription, .. } =
+        core.run(SubscribeRoomListParams {}).await.unwrap();
+    let mut next_room = async || {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(CoreEvent::RoomListDiff {
+                    subscription: current,
+                    diffs,
+                }) = events.recv().await
+                    && current == subscription
+                    && let Some(room) = diffs.into_iter().find_map(|diff| match diff {
+                        crate::protocol::VectorDiff::Reset { values } => values.into_iter().next(),
+                        crate::protocol::VectorDiff::Set { value, .. } => Some(value),
+                        _ => None,
+                    })
+                {
+                    break room;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    };
+    assert_eq!(next_room().await.notification.room, None);
+
+    let mut rules = Ruleset::server_default(client.user_id().unwrap());
+    rules
+        .insert(
+            NewPushRule::Room(NewSimplePushRule::new(room_id.to_owned(), vec![])),
+            None,
+            None,
+        )
+        .unwrap();
+    server
+        .mock_sync()
+        .ok_and_run(&client, |builder| {
+            builder.add_global_account_data(EventFactory::new().push_rules(rules));
+        })
+        .await;
+
+    assert_eq!(
+        next_room().await.notification.room,
+        Some(crate::protocol::NotificationModeView::Mentions)
+    );
+    core.run(UnsubscribeParams { subscription }).await.unwrap();
 }
 
 #[tokio::test]
@@ -98,16 +231,13 @@ async fn room_members_use_cached_or_fetched_power_levels() {
 
         let room = client.get_room(room_id).unwrap();
         let core = core(&server, client).await;
-        let CommandOk::RoomMembers { members } = core
-            .dispatch(Command::RoomMembers {
+        let members = core
+            .run(crate::api::members::ListParams {
                 room_id: room_id.to_owned(),
                 memberships: vec![],
             })
             .await
-            .unwrap()
-        else {
-            panic!("wrong response")
-        };
+            .unwrap();
         let admin_level = if version == "12" {
             9_007_199_254_740_992
         } else {
@@ -170,7 +300,7 @@ async fn device_rename_updates_pusher_state() {
         oauth: false,
     });
 
-    core.dispatch(Command::RenameDevice {
+    core.run(RenameDeviceParams {
         device_id: device_id.clone(),
         display_name: "Work phone".to_owned(),
     })
@@ -205,6 +335,22 @@ async fn devices_without_uploaded_crypto_keys_remain_visible() {
 }
 
 #[tokio::test]
+async fn local_devices_never_ask_the_server() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    Mock::given(method("GET"))
+        .and(path("/_matrix/client/v3/devices"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"devices": []})))
+        .expect(0)
+        .mount(server.server())
+        .await;
+    let devices = crate::verification::local_own_devices(&client).await;
+    let own = devices.iter().find(|device| device.is_own).unwrap();
+    assert_eq!(Some(own.device_id.as_ref()), client.device_id());
+    assert!(own.has_keys);
+}
+
+#[tokio::test]
 async fn image_pack_listing_fetches_complete_state_when_one_pack_is_cached() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
@@ -232,16 +378,13 @@ async fn image_pack_listing_fetches_complete_state_when_one_pack_is_cached() {
         .mount(server.server())
         .await;
     let core = core(&server, client).await;
-    let CommandOk::ImagePacks { packs, .. } = core
-        .dispatch(Command::ImagePacks {
+    let ListOk { packs, .. } = core
+        .run(ListParams {
             room_id: room_id.to_owned(),
             cached_only: false,
         })
         .await
-        .unwrap()
-    else {
-        panic!("wrong response")
-    };
+        .unwrap();
     assert_eq!(
         packs
             .iter()
@@ -270,17 +413,77 @@ async fn healthy_space_summary_does_not_fetch_missing_tombstone_state() {
         .await;
     let item = RoomListItem::from(client.get_room(room_id).unwrap());
     let mut cache = HashMap::new();
-    crate::view::enrich_room_fields(
-        &VectorDiff::Set {
+    crate::view::enrich_room_batch(
+        &[VectorDiff::Set {
             index: 0,
             value: item.clone(),
-        },
+        }],
         &mut cache,
     )
     .await;
-    let summary = crate::view::room_summary(&item, &cache, false);
-    assert!(summary.is_space);
+    let summary =
+        crate::view::room_list_item(&item, &cache, &matrix_sdk::ruma::push::Ruleset::new());
+    assert_eq!(summary.room_kind, Some(RoomKind::Space));
     assert!(!summary.is_tombstoned);
+}
+
+#[tokio::test]
+async fn unreadable_space_children_keep_the_last_edges() {
+    let server = MatrixMockServer::new().await;
+    let store = tempfile::tempdir().unwrap();
+    let client = server
+        .client_builder()
+        .on_builder(|builder| builder.sqlite_store(store.path(), None))
+        .build()
+        .await;
+    let room_id = room_id!("!space:example.org");
+    let state = |kind: &str, key: &str, content: serde_json::Value| {
+        Raw::new(
+            &json!({"type": kind, "state_key": key, "sender": "@alice:example.org",
+            "event_id": format!("${kind}{key}"), "origin_server_ts": 1, "content": content}),
+        )
+        .unwrap()
+        .cast_unchecked()
+    };
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_state_event(state(
+                    "m.room.create",
+                    "",
+                    json!({"type": "m.space", "room_version": "10", "creator": "@alice:example.org"}),
+                ))
+                .add_state_event(state(
+                    "m.space.child",
+                    "!a:example.org",
+                    json!({"via": ["example.org"]}),
+                ))
+                .add_state_event(state(
+                    "m.space.child",
+                    "!b:example.org",
+                    json!({"via": ["example.org"]}),
+                )),
+        )
+        .await;
+    let item = RoomListItem::from(client.get_room(room_id).unwrap());
+    let diffs = [VectorDiff::Set {
+        index: 0,
+        value: item,
+    }];
+    let mut cache = HashMap::new();
+    crate::view::enrich_room_batch(&diffs, &mut cache).await;
+    assert_eq!(cache[room_id].children.len(), 2);
+    assert!(!cache[room_id].children_stale);
+
+    rusqlite::Connection::open(store.path().join("matrix-sdk-state.sqlite3"))
+        .unwrap()
+        .execute_batch("ALTER TABLE state_event RENAME TO state_event_gone")
+        .unwrap();
+    crate::view::enrich_room_batch(&diffs, &mut cache).await;
+
+    assert_eq!(cache[room_id].children.len(), 2);
+    assert!(cache[room_id].children_stale);
 }
 
 #[test]
@@ -305,7 +508,6 @@ fn space_child_ties_follow_ruma_room_id_order() {
 
 #[tokio::test]
 async fn event_focus_clears_its_explicit_sync_subscription_after_unsubscribing() {
-    use crate::protocol::TimelineFocusView;
     use futures_util::StreamExt;
     use matrix_sdk::{ruma::event_id, test_utils::mocks::RoomContextResponseTemplate};
     use matrix_sdk_test::{ALICE, event_factory::EventFactory};
@@ -313,7 +515,6 @@ async fn event_focus_clears_its_explicit_sync_subscription_after_unsubscribing()
 
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
-    client.event_cache().subscribe().unwrap();
     let room_id = room_id!("!focus:example.org");
     let target = event_id!("$target");
     server.sync_joined_room(&client, room_id).await;
@@ -332,8 +533,8 @@ async fn event_focus_clears_its_explicit_sync_subscription_after_unsubscribing()
         .mount()
         .await;
     let core = core(&server, client).await;
-    let CommandOk::SubscribeTimeline { subscription, .. } = core
-        .dispatch(Command::SubscribeTimeline {
+    let SubscribeOk { subscription, .. } = core
+        .run(SubscribeParams {
             room_id: room_id.to_owned(),
             focus: TimelineFocusView::Event {
                 event_id: target.to_owned(),
@@ -341,10 +542,7 @@ async fn event_focus_clears_its_explicit_sync_subscription_after_unsubscribing()
             hidden_events: false,
         })
         .await
-        .unwrap()
-    else {
-        panic!("wrong response")
-    };
+        .unwrap();
     Mock::given(method("POST"))
         .and(path_regex(".*sync.*"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pos": "p1", "rooms": {}})))
@@ -366,9 +564,7 @@ async fn event_focus_clears_its_explicit_sync_subscription_after_unsubscribing()
         body["room_subscriptions"][room_id.as_str()]["timeline_limit"],
         20
     );
-    core.dispatch(Command::Unsubscribe { subscription })
-        .await
-        .unwrap();
+    core.run(UnsubscribeParams { subscription }).await.unwrap();
     stream.next().await.unwrap().unwrap();
     let requests = server.server().received_requests().await.unwrap();
     let request = requests
@@ -378,6 +574,47 @@ async fn event_focus_clears_its_explicit_sync_subscription_after_unsubscribing()
         .unwrap();
     let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
     assert!(body["room_subscriptions"].get(room_id.as_str()).is_none());
+}
+
+#[tokio::test]
+async fn an_open_room_is_resubscribed_after_the_sync_session_expires() {
+    use futures_util::StreamExt;
+
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room_id = room_id!("!open:example.org");
+    server.sync_joined_room(&client, room_id).await;
+    server.mock_room_state_encryption().plain().mount().await;
+    let core = core(&server, client).await;
+    core.run(SubscribeParams {
+        room_id: room_id.to_owned(),
+        focus: TimelineFocusView::Live,
+        hidden_events: false,
+    })
+    .await
+    .unwrap();
+    Mock::given(method("POST"))
+        .and(path_regex(".*sync.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"pos": "p1", "rooms": {}})))
+        .mount(server.server())
+        .await;
+    let sync = core.sync_service().await.unwrap();
+    sync.expire_sessions().await;
+
+    core.resubscribe_timeline_rooms().await;
+    let room_list = sync.room_list_service();
+    let stream = room_list.sync();
+    futures_util::pin_mut!(stream);
+    stream.next().await.unwrap().unwrap();
+
+    let requests = server.server().received_requests().await.unwrap();
+    let request = requests
+        .iter()
+        .rev()
+        .find(|request| request.method == "POST" && request.url.path().contains("sync"))
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    assert!(body["room_subscriptions"].get(room_id.as_str()).is_some());
 }
 
 #[tokio::test]
@@ -450,6 +687,47 @@ async fn scheduled_listing_refreshes_credentials_and_omits_finalized_events() {
 }
 
 #[tokio::test]
+async fn scheduled_attachments_keep_the_spoiler_on_the_wire() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().no_server_versions().build().await;
+    let room_id = room_id!("!scheduled-spoiler:example.org");
+    Mock::given(method("GET"))
+        .and(path("/_matrix/client/versions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"versions": ["v1.13"], "unstable_features": {"org.matrix.msc4140": true}}),
+        ))
+        .mount(server.server())
+        .await;
+    server.sync_joined_room(&client, room_id).await;
+    server.mock_room_state_encryption().plain().mount().await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"/rooms/.*/send/m\.room\.message/"))
+        .and(wiremock::matchers::body_partial_json(
+            json!({"msgtype": "m.image", "page.codeberg.everypizza.msc4193.spoiler": true}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"delay_id": "spoiled"})))
+        .expect(1)
+        .mount(server.server())
+        .await;
+    let core = core(&server, client).await;
+
+    let delay_id = core
+        .schedule_attachment(
+            &room_id.to_owned(),
+            "a.png".to_owned(),
+            "image/png".to_owned(),
+            "mxc://example.org/abc".to_owned(),
+            7,
+            None,
+            true,
+            1000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(delay_id, "spoiled");
+}
+
+#[tokio::test]
 async fn cached_image_packs_return_without_waiting_for_room_state() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
@@ -476,20 +754,13 @@ async fn cached_image_packs_return_without_waiting_for_room_state() {
         .mount(server.server())
         .await;
     let core = core(&server, client).await;
-    let command = serde_json::from_value(
-        json!({"type": "image_packs", "room_id": room_id, "cached_only": true}),
-    )
-    .unwrap();
-    let response = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        core.dispatch(command),
-    )
-    .await
-    .expect("cached emotes do not wait for the server")
-    .unwrap();
-    let CommandOk::ImagePacks { packs, .. } = response else {
-        panic!("wrong response")
-    };
+    let params: ListParams =
+        serde_json::from_value(json!({"room_id": room_id, "cached_only": true})).unwrap();
+    let ListOk { packs, .. } =
+        tokio::time::timeout(std::time::Duration::from_millis(500), core.run(params))
+            .await
+            .expect("cached emotes do not wait for the server")
+            .unwrap();
     assert_eq!(packs.len(), 1);
     assert_eq!(packs[0].id, "cached");
     assert!(
@@ -531,16 +802,13 @@ async fn all_image_packs_return_without_waiting_for_room_state() {
         .await;
     let core = core(&server, client).await;
 
-    let response = tokio::time::timeout(
+    let packs = tokio::time::timeout(
         std::time::Duration::from_millis(500),
-        core.dispatch(Command::AllImagePacks),
+        core.run(ListAllParams {}),
     )
     .await
     .expect("settings packs do not wait for the homeserver")
     .unwrap();
-    let CommandOk::AllImagePacks { packs } = response else {
-        panic!("wrong response")
-    };
     assert_eq!(packs.len(), 1);
     assert_eq!(packs[0].id, "cached");
     assert!(
@@ -572,13 +840,9 @@ async fn a_pack_with_no_images_is_still_listed() {
         )
         .await;
     let core = core(&server, client).await;
-    let command = serde_json::from_value(
-        json!({"type": "image_packs", "room_id": room_id, "cached_only": true}),
-    )
-    .unwrap();
-    let CommandOk::ImagePacks { packs, .. } = core.dispatch(command).await.unwrap() else {
-        panic!("wrong response")
-    };
+    let params: ListParams =
+        serde_json::from_value(json!({"room_id": room_id, "cached_only": true})).unwrap();
+    let ListOk { packs, .. } = core.run(params).await.unwrap();
     assert_eq!(packs.len(), 1);
     assert_eq!(packs[0].id, "fresh");
     assert!(packs[0].images.is_empty());
@@ -601,13 +865,10 @@ async fn messaging_a_user_reuses_the_dm_that_already_exists() {
         })
         .await;
     let core = core(&server, client).await;
-    let command =
-        serde_json::from_value(json!({"type": "create_dm", "user_id": "@bob:example.org"}))
-            .unwrap();
-    let CommandOk::CreateDm { room_id: found } = core.dispatch(command).await.unwrap() else {
-        panic!("wrong response")
-    };
-    assert_eq!(found, room_id);
+    let params: crate::api::rooms::CreateDmParams =
+        serde_json::from_value(json!({"user_id": "@bob:example.org"})).unwrap();
+    let found = core.run(params).await.unwrap();
+    assert_eq!(found, room_id.as_str());
 }
 
 #[tokio::test]
@@ -627,14 +888,10 @@ async fn an_unencrypted_dm_request_reuses_an_unencrypted_dm() {
         })
         .await;
     let core = core(&server, client).await;
-    let command = serde_json::from_value(
-        json!({"type": "create_dm", "user_id": "@bob:example.org", "encrypted": false}),
-    )
-    .unwrap();
-    let CommandOk::CreateDm { room_id: found } = core.dispatch(command).await.unwrap() else {
-        panic!("wrong response")
-    };
-    assert_eq!(found, room_id);
+    let params: crate::api::rooms::CreateDmParams =
+        serde_json::from_value(json!({"user_id": "@bob:example.org", "encrypted": false})).unwrap();
+    let found = core.run(params).await.unwrap();
+    assert_eq!(found, room_id.as_str());
 }
 
 #[tokio::test]
@@ -764,15 +1021,12 @@ async fn a_room_outside_the_list_still_has_a_summary() {
     )).await;
     let core = core(&server, client).await;
 
-    let CommandOk::RoomSummary { room } = core
-        .dispatch(Command::RoomSummary {
+    let room = core
+        .run(crate::api::rooms::ListItemParams {
             room_id: room_id.to_owned(),
         })
         .await
-        .unwrap()
-    else {
-        panic!("wrong response")
-    };
+        .unwrap();
     assert_eq!(room.room_id, room_id);
     assert!(room.is_tombstoned);
 }
@@ -922,7 +1176,7 @@ async fn corrupt_encrypted_media_is_rejected_before_returning_plaintext() {
     .unwrap();
     assert!(matches!(
         core.media_thumbnail(source, 0, 0).await,
-        Err(CommandErr::Unavailable)
+        Err(RpcError::Unavailable)
     ));
 }
 
@@ -1074,7 +1328,7 @@ async fn cached_sticker_reads_bypass_six_stalled_downloads() {
                 .set_body_bytes(vec![1_u8])
                 .set_delay(std::time::Duration::from_secs(60)),
         )
-        .expect(6)
+        .expect(crate::media::MAX_MEDIA_DOWNLOADS as u64)
         .mount(server.server())
         .await;
     let core = core(&server, client).await;
@@ -1084,7 +1338,7 @@ async fn cached_sticker_reads_bypass_six_stalled_downloads() {
         bytes
     );
 
-    let downloads = (0..7)
+    let downloads = (0..=crate::media::MAX_MEDIA_DOWNLOADS)
         .map(|index| {
             let core = core.clone();
             tokio::spawn(async move {
@@ -1101,7 +1355,7 @@ async fn cached_sticker_reads_bypass_six_stalled_downloads() {
                     .iter()
                     .filter(|request| request.url.path().contains("/stalled-"))
                     .count()
-                    == 6
+                    == crate::media::MAX_MEDIA_DOWNLOADS
                 {
                     break;
                 }
@@ -1262,7 +1516,11 @@ async fn queued_previews_recheck_the_original_cache() {
         .mount(server.server())
         .await;
     let core = core(&server, client).await;
-    let slots = core.media_downloads.acquire_many(6).await.unwrap();
+    let slots = core
+        .media_downloads
+        .acquire_many(u32::try_from(crate::media::MAX_MEDIA_DOWNLOADS).unwrap())
+        .await
+        .unwrap();
     let source = "mxc://example.org/queued".to_owned();
     let mut preview = Box::pin(core.media_thumbnail(source.clone(), 144, 144));
     tokio::time::timeout(std::time::Duration::from_millis(50), &mut preview)
@@ -1274,6 +1532,73 @@ async fn queued_previews_recheck_the_original_cache() {
         tokio::time::timeout(std::time::Duration::from_secs(1), preview)
             .await
             .unwrap()
+            .unwrap(),
+        bytes
+    );
+}
+
+#[tokio::test]
+async fn a_transient_download_failure_is_retried() {
+    let server = MatrixMockServer::new().await;
+    let client = server
+        .client_builder()
+        .server_versions(vec![MatrixVersion::V1_11])
+        .build()
+        .await;
+    let bytes = vec![7_u8; 32];
+    Mock::given(method("GET"))
+        .and(path("/_matrix/client/v1/media/download/example.org/blip"))
+        .respond_with(remote_media_error(502))
+        .with_priority(1)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(server.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/_matrix/client/v1/media/download/example.org/blip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
+        .with_priority(2)
+        .expect(1)
+        .mount(server.server())
+        .await;
+    let core = core(&server, client).await;
+
+    assert_eq!(
+        core.media_thumbnail("mxc://example.org/blip".to_owned(), 0, 0)
+            .await
+            .unwrap(),
+        bytes
+    );
+}
+
+#[tokio::test]
+async fn a_refused_authenticated_download_falls_back_to_the_legacy_endpoint() {
+    let server = MatrixMockServer::new().await;
+    let client = server
+        .client_builder()
+        .server_versions(vec![MatrixVersion::V1_11])
+        .build()
+        .await;
+    let bytes = vec![7_u8; 32];
+    Mock::given(method("GET"))
+        .and(path(
+            "/_matrix/client/v1/media/download/example.org/legacy-only",
+        ))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(server.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/_matrix/media/v3/download/example.org/legacy-only"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
+        .expect(1)
+        .mount(server.server())
+        .await;
+    let core = core(&server, client).await;
+
+    assert_eq!(
+        core.media_thumbnail("mxc://example.org/legacy-only".to_owned(), 0, 0)
+            .await
             .unwrap(),
         bytes
     );
@@ -1378,14 +1703,14 @@ async fn a_server_whose_media_keeps_failing_is_refused_without_a_request() {
         assert!(matches!(
             core.media_thumbnail(format!("mxc://dead.example/{id}"), 64, 64)
                 .await,
-            Err(CommandErr::Unavailable)
+            Err(RpcError::Unavailable)
         ));
     }
 
     assert!(matches!(
         core.media_thumbnail("mxc://dead.example/four".to_owned(), 64, 64)
             .await,
-        Err(CommandErr::MediaServerUnavailable { retry_after_ms }) if retry_after_ms > 0
+        Err(RpcError::MediaServerUnavailable { retry_after_ms }) if retry_after_ms > 0
     ));
 }
 
@@ -1409,7 +1734,7 @@ async fn a_refused_server_still_serves_what_is_cached() {
             r"^/_matrix/client/v1/media/download/dead\.example/gone",
         ))
         .respond_with(remote_media_error(502))
-        .expect(3)
+        .expect(9)
         .mount(server.server())
         .await;
     let core = core(&server, client).await;
@@ -1453,9 +1778,45 @@ async fn forbidden_media_never_opens_the_circuit() {
         assert!(matches!(
             core.media_thumbnail(format!("mxc://policy.example/{id}"), 0, 0)
                 .await,
-            Err(CommandErr::Unavailable)
+            Err(RpcError::Unavailable)
         ));
     }
+}
+
+#[tokio::test]
+async fn missing_media_never_opens_the_circuit() {
+    let server = MatrixMockServer::new().await;
+    let client = server
+        .client_builder()
+        .server_versions(vec![MatrixVersion::V1_11])
+        .build()
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/_matrix/client/v1/media/download/gone.example/ok"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1_u8; 16]))
+        .expect(1)
+        .mount(server.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/_matrix/client/v1/media/download/gone\.example/",
+        ))
+        .respond_with(remote_media_error(404))
+        .expect(4)
+        .mount(server.server())
+        .await;
+    let core = core(&server, client).await;
+
+    for id in ["a", "b", "c", "d"] {
+        assert!(matches!(
+            core.media_thumbnail(format!("mxc://gone.example/{id}"), 0, 0)
+                .await,
+            Err(RpcError::Unavailable)
+        ));
+    }
+    core.media_thumbnail("mxc://gone.example/ok".to_owned(), 0, 0)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -1486,7 +1847,7 @@ async fn forgotten_media_is_fetched_again() {
 #[expect(clippy::unwrap_used, reason = "test code")]
 async fn space_child_writes(
     child: Option<serde_json::Value>,
-    command: Command,
+    command: impl Handler,
 ) -> Vec<serde_json::Value> {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
@@ -1512,7 +1873,7 @@ async fn space_child_writes(
         .await;
     let core = core(&server, client).await;
 
-    core.dispatch(command).await.unwrap();
+    core.run(command).await.unwrap();
 
     server
         .server()
@@ -1525,8 +1886,8 @@ async fn space_child_writes(
         .collect()
 }
 
-fn add_child() -> Command {
-    Command::AddToSpace {
+fn add_child() -> AddParams {
+    AddParams {
         space_id: room_id!("!space:example.org").to_owned(),
         room_id: room_id!("!child:example.org").to_owned(),
         suggested: None,
@@ -1562,7 +1923,7 @@ async fn adding_a_delisted_child_lists_it_again() {
 async fn adding_a_suggested_child_marks_it() {
     let writes = space_child_writes(
         None,
-        Command::AddToSpace {
+        AddParams {
             space_id: room_id!("!space:example.org").to_owned(),
             room_id: room_id!("!child:example.org").to_owned(),
             suggested: Some(true),
@@ -1577,7 +1938,7 @@ async fn adding_a_suggested_child_marks_it() {
 async fn suggesting_a_child_keeps_its_via_and_order() {
     let writes = space_child_writes(
         Some(json!({"via": ["other.org"], "order": "b"})),
-        Command::SetSpaceChildSuggested {
+        SetChildSuggestedParams {
             space_id: room_id!("!space:example.org").to_owned(),
             room_id: room_id!("!child:example.org").to_owned(),
             suggested: true,
@@ -1595,7 +1956,7 @@ async fn suggesting_a_child_keeps_its_via_and_order() {
 async fn reordering_a_child_keeps_its_via_and_suggestion() {
     let writes = space_child_writes(
         Some(json!({"via": ["other.org"], "order": "b", "suggested": true})),
-        Command::SetSpaceChildOrder {
+        SetChildOrderParams {
             space_id: room_id!("!space:example.org").to_owned(),
             room_id: room_id!("!child:example.org").to_owned(),
             order: Some("a".to_owned()),
@@ -1615,7 +1976,7 @@ async fn forgetting_an_invalid_uri_is_refused() {
 
     assert!(matches!(
         core.forget_media("not-a-uri".to_owned()).await,
-        Err(CommandErr::InvalidMedia)
+        Err(RpcError::InvalidMedia)
     ));
 }
 
@@ -1690,22 +2051,20 @@ async fn recover_identity_accepts_the_passphrase_as_well_as_the_key() {
         .mount()
         .await;
     let core = core(&server, client).await;
-    let recover = async |recovery_key: String| {
-        core.dispatch(Command::RecoverIdentity { recovery_key })
-            .await
-    };
+    let recover =
+        async |recovery_key: String| core.run(RecoverIdentityParams { recovery_key }).await;
 
     assert!(matches!(
         recover("wrong horse".to_owned()).await,
-        Err(CommandErr::Denied)
+        Err(RpcError::Denied)
     ));
     assert!(matches!(
         recover("correct horse".to_owned()).await,
-        Err(CommandErr::Failed { .. })
+        Err(RpcError::Failed { .. })
     ));
     assert!(matches!(
         recover(key.to_base58()).await,
-        Err(CommandErr::Failed { .. })
+        Err(RpcError::Failed { .. })
     ));
 }
 
@@ -1758,13 +2117,11 @@ async fn an_identity_reset_without_authentication_returns_the_new_key() {
     server.mock_upload_cross_signing_keys().ok().mount().await;
     let core = core(&server, client).await;
 
-    let Ok(CommandOk::ResetIdentity {
-        step: crate::protocol::IdentityResetStep::Done { recovery_key },
-    }) = core.dispatch(Command::ResetIdentity).await
+    let Ok(IdentityResetStep::Done { recovery_key }) = core.run(ResetIdentityParams {}).await
     else {
         panic!("the reset needed no authentication")
     };
-    assert!(!recovery_key.is_empty());
+    assert_ne!(recovery_key, "");
 }
 
 #[tokio::test]
@@ -1809,31 +2166,29 @@ async fn an_identity_reset_retries_a_wrong_password_and_returns_the_new_key() {
     let core = core(&server, client).await;
 
     assert!(matches!(
-        core.dispatch(Command::ResetIdentity).await,
-        Ok(CommandOk::ResetIdentity {
-            step: crate::protocol::IdentityResetStep::Password
-        })
+        core.run(ResetIdentityParams {}).await,
+        Ok(IdentityResetStep::Password)
     ));
     assert!(matches!(
-        core.dispatch(Command::ContinueIdentityReset {
+        core.run(ContinueIdentityResetParams {
             password: Some("wrong".into())
         })
         .await,
-        Err(CommandErr::Denied)
+        Err(RpcError::Denied)
     ));
-    let Ok(CommandOk::ContinueIdentityReset { recovery_key }) = core
-        .dispatch(Command::ContinueIdentityReset {
+    let Ok(recovery_key) = core
+        .run(ContinueIdentityResetParams {
             password: Some("hunter2".into()),
         })
         .await
     else {
         panic!("the right password completes the reset")
     };
-    assert!(!recovery_key.is_empty());
+    assert_ne!(recovery_key, "");
     assert!(matches!(
-        core.dispatch(Command::ContinueIdentityReset { password: None })
+        core.run(ContinueIdentityResetParams { password: None })
             .await,
-        Err(CommandErr::Unavailable)
+        Err(RpcError::Unavailable)
     ));
 }
 
@@ -1849,22 +2204,19 @@ async fn a_cancelled_oauth_identity_reset_hands_back_no_key() {
         .await;
     let core = core(&server, client).await;
 
-    let Ok(CommandOk::ResetIdentity {
-        step: crate::protocol::IdentityResetStep::Approve { url },
-    }) = core.dispatch(Command::ResetIdentity).await
-    else {
+    let Ok(IdentityResetStep::Approve { url }) = core.run(ResetIdentityParams {}).await else {
         panic!("an OAuth account is sent to approve the reset")
     };
     assert!(url.contains("org.matrix.cross_signing_reset"));
 
     let (waiting, ()) = tokio::join!(
-        core.dispatch(Command::ContinueIdentityReset { password: None }),
+        core.run(ContinueIdentityResetParams { password: None }),
         async {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            core.dispatch(Command::CancelIdentityReset).await.unwrap();
+            core.run(CancelIdentityResetParams {}).await.unwrap();
         }
     );
-    assert!(matches!(waiting, Err(CommandErr::Unavailable)));
+    assert!(matches!(waiting, Err(RpcError::Unavailable)));
 }
 
 #[tokio::test]
@@ -1896,26 +2248,22 @@ async fn an_approved_oauth_identity_reset_completes_its_session() {
         .await;
     let core = core(&server, client).await;
 
-    let Ok(CommandOk::ResetIdentity {
-        step: crate::protocol::IdentityResetStep::Approve { url },
-    }) = core.dispatch(Command::ResetIdentity).await
-    else {
+    let Ok(IdentityResetStep::Approve { url }) = core.run(ResetIdentityParams {}).await else {
         panic!("an OAuth account is sent to approve the reset")
     };
     assert_eq!(url, "https://auth.example.org/approve");
 
-    let Ok(CommandOk::ContinueIdentityReset { recovery_key }) = core
-        .dispatch(Command::ContinueIdentityReset { password: None })
+    let Ok(recovery_key) = core
+        .run(ContinueIdentityResetParams { password: None })
         .await
     else {
         panic!("the approved session completes the reset")
     };
-    assert!(!recovery_key.is_empty());
+    assert_ne!(recovery_key, "");
 }
 
 #[tokio::test]
 async fn profile_updates_send_the_chosen_msc4466_propagation() {
-    use crate::protocol::ProfilePropagationView;
     use wiremock::matchers::{path_regex, query_param, query_param_is_missing};
 
     const PROPAGATE_TO: &str = "computer.gingershaped.msc4466.propagate_to";
@@ -1952,19 +2300,19 @@ async fn profile_updates_send_the_chosen_msc4466_propagation() {
     expect_put(&server, "displayname", query_param_is_missing(PROPAGATE_TO)).await;
     let core = core(&server, client).await;
 
-    core.dispatch(Command::SetDisplayName {
+    core.run(crate::api::account::SetDisplayNameParams {
         name: Some("Quiet".to_owned()),
         propagate_to: ProfilePropagationView::None,
     })
     .await
     .unwrap();
-    core.dispatch(Command::SetAvatarUrl {
+    core.run(crate::api::account::SetAvatarUrlParams {
         url: Some("mxc://example.org/avatar".to_owned()),
         propagate_to: ProfilePropagationView::Unchanged,
     })
     .await
     .unwrap();
-    core.dispatch(Command::SetDisplayName {
+    core.run(crate::api::account::SetDisplayNameParams {
         name: Some("Loud".to_owned()),
         propagate_to: ProfilePropagationView::All,
     })
@@ -1993,11 +2341,10 @@ async fn account_data_types_survive_a_restart_and_include_stored_known_types() {
         .await;
 
     let after = core(&server, client).await;
-    let CommandOk::AccountDataTypes { event_types } =
-        after.dispatch(Command::AccountDataTypes).await.unwrap()
-    else {
-        panic!("wrong response")
-    };
+    let event_types = after
+        .run(crate::api::account::DataTypesParams {})
+        .await
+        .unwrap();
     assert!(
         event_types
             .iter()
@@ -2027,11 +2374,10 @@ async fn account_data_types_include_what_the_server_lists_but_sync_never_deliver
         .await;
 
     let core = core(&server, client).await;
-    let CommandOk::AccountDataTypes { event_types } =
-        core.dispatch(Command::AccountDataTypes).await.unwrap()
-    else {
-        panic!("wrong response")
-    };
+    let event_types = core
+        .run(crate::api::account::DataTypesParams {})
+        .await
+        .unwrap();
     assert!(
         event_types
             .iter()
@@ -2094,12 +2440,12 @@ async fn recovery_adopts_an_account_data_key_that_seals_our_documents() {
     let core = core(&server, client.clone()).await;
 
     assert!(matches!(
-        core.dispatch(Command::SetSealedAccountData {
+        core.run(crate::api::account::SetSealedDataParams {
             event_type: "m.push_rules".to_owned(),
             content: json!({}),
         })
         .await,
-        Err(CommandErr::Unsupported)
+        Err(RpcError::Unsupported)
     ));
 
     core.adopt_account_data_key(&client, &key.to_base58()).await;
@@ -2109,7 +2455,7 @@ async fn recovery_adopts_an_account_data_key_that_seals_our_documents() {
     assert!(stored["encrypted"][key.key_id()]["ciphertext"].is_string());
 
     let draft = json!({ "v": 1, "drafts": { "!room:example.org": "unsent" } });
-    core.dispatch(Command::SetSealedAccountData {
+    core.run(crate::api::account::SetSealedDataParams {
         event_type: DRAFTS.to_owned(),
         content: draft.clone(),
     })
@@ -2127,8 +2473,8 @@ async fn recovery_adopts_an_account_data_key_that_seals_our_documents() {
         .respond_with(ResponseTemplate::new(200).set_body_json(sealed))
         .mount(server.server())
         .await;
-    let Ok(CommandOk::SealedAccountData { document }) = core
-        .dispatch(Command::SealedAccountData {
+    let Ok(document) = core
+        .run(crate::api::account::SealedDataParams {
             event_type: DRAFTS.to_owned(),
         })
         .await
@@ -2142,42 +2488,300 @@ async fn recovery_adopts_an_account_data_key_that_seals_our_documents() {
 }
 
 #[tokio::test]
-async fn event_cached_reports_only_events_the_cache_holds() {
-    use matrix_sdk::ruma::{event_id, user_id};
-    use matrix_sdk_test::event_factory::EventFactory;
+async fn markdown_to_content_needs_no_session() {
+    use crate::protocol::ComposerPill;
+
+    let (core, _events) = Core::new("markdown-test", Box::new(MemorySessionStore::default()));
+    let content = core
+        .run(crate::api::messages::MarkdownToContentParams {
+            markdown: "**hi** \u{FFFC}".to_owned(),
+            pills: vec![ComposerPill::Mention {
+                user_id: "@ana:example.org".to_owned(),
+                name: "Ana".to_owned(),
+                via: Vec::new(),
+            }],
+        })
+        .await
+        .unwrap();
+    assert_eq!(content.body, "**hi** Ana");
+    assert_eq!(
+        content.formatted_body.as_deref(),
+        Some("<strong>hi</strong> <a href=\"https://matrix.to/#/@ana:example.org\">Ana</a>")
+    );
+    assert_eq!(content.mentions.user_ids, ["@ana:example.org"]);
+}
+
+/// An account-data event the server stores, served back slowly enough that two
+/// unguarded read-modify-writes would both read the empty document.
+#[derive(Clone, Default)]
+struct StoredAccountData(Arc<std::sync::Mutex<Option<serde_json::Value>>>);
+
+impl wiremock::Respond for StoredAccountData {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let mut stored = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if request.method == wiremock::http::Method::PUT {
+            *stored = request.body_json().ok();
+            return ResponseTemplate::new(200).set_body_json(json!({}));
+        }
+        let delay = std::time::Duration::from_millis(50);
+        stored.as_ref().map_or_else(
+            || {
+                ResponseTemplate::new(404)
+                    .set_body_json(json!({"errcode": "M_NOT_FOUND", "error": "absent"}))
+                    .set_delay(delay)
+            },
+            |content| {
+                ResponseTemplate::new(200)
+                    .set_body_json(content)
+                    .set_delay(delay)
+            },
+        )
+    }
+}
+
+#[tokio::test]
+async fn invites_dismissed_at_once_are_all_kept() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let stored = StoredAccountData::default();
+    Mock::given(path_regex(r"/account_data/moe\.sable\.dismissed_invites$"))
+        .respond_with(stored.clone())
+        .mount(server.server())
+        .await;
+    let core = core(&server, client).await;
+
+    let dismiss = |room_id: &'static str| {
+        core.run(crate::api::account::SetInviteDismissedParams {
+            room_id: room_id.try_into().expect("a room id"),
+            dismissed: true,
+        })
+    };
+    let (first, second) = tokio::join!(
+        dismiss("!first:example.org"),
+        dismiss("!second:example.org")
+    );
+    assert!(first.is_ok() && second.is_ok());
+
+    let kept = stored
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(
+        kept,
+        Some(json!({"roomIds": ["!first:example.org", "!second:example.org"]}))
+    );
+}
+
+#[tokio::test]
+async fn a_sidebar_naming_something_that_is_not_a_room_is_refused() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let core = core(&server, client).await;
+
+    let refused = core
+        .run(SetSidebarParams {
+            items: vec![sable_model::sidebar::SidebarItemView::Folder {
+                id: "folder".to_owned(),
+                name: None,
+                content: vec!["not a room".to_owned()],
+            }],
+        })
+        .await;
+
+    assert!(matches!(refused, Err(RpcError::UnknownRoom)));
+}
+
+#[tokio::test]
+async fn server_features_lists_only_enabled_unstable_features() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().no_server_versions().build().await;
+    Mock::given(method("GET"))
+        .and(path("/_matrix/client/versions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "versions": ["v1.19"],
+            "unstable_features": {
+                "org.matrix.msc4354": true,
+                "org.matrix.msc4140": false,
+                "org.matrix.simplified_msc3575": true,
+            },
+        })))
+        .mount(server.server())
+        .await;
+    let core = core(&server, client).await;
+    let Ok(unstable_features) = core.run(crate::api::session::ServerFeaturesParams {}).await else {
+        panic!("server features failed");
+    };
+    assert_eq!(
+        unstable_features,
+        ["org.matrix.msc4354", "org.matrix.simplified_msc3575"]
+    );
+}
+
+#[tokio::test]
+async fn a_live_redaction_shows_its_reason_in_an_open_timeline() {
+    use matrix_sdk::ruma::event_id;
+    use matrix_sdk_test::{ALICE, event_factory::EventFactory};
+
+    use crate::protocol::TimelineItemContentView;
+    use crate::view::apply_diff;
 
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
-    client.event_cache().subscribe().unwrap();
-    let room_id = room_id!("!cached:example.org");
-    let factory = EventFactory::new()
-        .room(room_id)
-        .sender(user_id!("@alice:example.org"));
+    let room_id = room_id!("!reason:example.org");
+    let target = event_id!("$target");
+    let factory = EventFactory::new().room(room_id).sender(*ALICE);
+    server.mock_room_state_encryption().plain().mount().await;
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id).add_timeline_event(
-                factory
-                    .text_msg("hello")
-                    .event_id(event_id!("$cached:example.org")),
-            ),
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(factory.text_msg("hey").event_id(target)),
         )
         .await;
-    let core = core(&server, client).await;
-    for (event_id, expected) in [
-        (event_id!("$cached:example.org"), true),
-        (event_id!("$missing:example.org"), false),
-    ] {
-        let CommandOk::EventCached { cached } = core
-            .dispatch(Command::EventCached {
-                room_id: room_id.to_owned(),
-                event_id: event_id.to_owned(),
-            })
-            .await
-            .unwrap()
-        else {
-            panic!("unexpected response");
-        };
-        assert_eq!(cached, expected, "{event_id}");
-    }
+    let (core, mut events) = core_with_events(&server, client.clone()).await;
+    core.watch_redactions(&client);
+    let SubscribeOk {
+        subscription,
+        mut items,
+        ..
+    } = core
+        .run(SubscribeParams {
+            room_id: room_id.to_owned(),
+            focus: TimelineFocusView::Live,
+            hidden_events: false,
+        })
+        .await
+        .unwrap();
+
+    let redaction = json!({
+        "type": "m.room.redaction",
+        "sender": ALICE.to_string(),
+        "event_id": "$redaction",
+        "origin_server_ts": 1_000_000,
+        "redacts": target,
+        "content": { "redacts": target, "reason": "spam" },
+    });
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(Raw::new(&redaction).unwrap().cast_unchecked()),
+        )
+        .await;
+
+    let reason = |items: &[crate::protocol::TimelineItemView]| {
+        items.iter().find_map(|item| match &item.content {
+            TimelineItemContentView::Redacted { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while reason(&items) != Some(Some("spam".to_owned())) {
+            let Some(event) = events.recv().await else {
+                break;
+            };
+            if let CoreEvent::TimelineDiff {
+                subscription: from,
+                diffs,
+            } = event
+                && from == subscription
+            {
+                for diff in &diffs {
+                    apply_diff(&mut items, diff);
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(reason(&items), Some(Some("spam".to_owned())));
+}
+
+#[tokio::test]
+async fn a_queued_reproxy_reaches_an_open_timeline_before_the_server_echoes_it() {
+    use matrix_sdk::ruma::{
+        event_id,
+        events::{AnyMessageLikeEventContent, MessageLikeEventType},
+        serde::Raw,
+    };
+    use matrix_sdk_test::event_factory::EventFactory;
+
+    use crate::view::apply_diff;
+
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let own = client.user_id().unwrap().to_owned();
+    let room_id = room_id!("!reproxy:example.org");
+    let target = event_id!("$target");
+    let factory = EventFactory::new().room(room_id).sender(&own);
+    server.mock_room_state_encryption().plain().mount().await;
+    server.mock_room_send().error500().mount().await;
+    let room = server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(factory.text_msg("hey").event_id(target)),
+        )
+        .await;
+    let (core, mut events) = core_with_events(&server, client.clone()).await;
+    let SubscribeOk {
+        subscription,
+        mut items,
+        ..
+    } = core
+        .run(SubscribeParams {
+            room_id: room_id.to_owned(),
+            focus: TimelineFocusView::Live,
+            hidden_events: false,
+        })
+        .await
+        .unwrap();
+
+    let edit = json!({
+        "msgtype": "m.text",
+        "body": "* hey",
+        "m.new_content": { "msgtype": "m.text", "body": "hey" },
+        "m.relates_to": { "rel_type": "m.replace", "event_id": target },
+        "com.beeper.per_message_profile": { "id": "kris", "displayname": "Kris" },
+    });
+    room.send_queue()
+        .send_raw(
+            Raw::<AnyMessageLikeEventContent>::from_json_string(edit.to_string()).unwrap(),
+            MessageLikeEventType::RoomMessage.to_string(),
+        )
+        .await
+        .unwrap();
+
+    let profile_name = |items: &[crate::protocol::TimelineItemView]| {
+        items
+            .iter()
+            .find(|item| item.event_id.as_deref() == Some(target))
+            .and_then(|item| item.per_message_profile.as_ref()?.display_name.clone())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while profile_name(&items).is_none() {
+            let Some(event) = events.recv().await else {
+                break;
+            };
+            if let CoreEvent::TimelineDiff {
+                subscription: from,
+                diffs,
+            } = event
+                && from == subscription
+            {
+                for diff in &diffs {
+                    apply_diff(&mut items, diff);
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(profile_name(&items).as_deref(), Some("Kris"));
 }

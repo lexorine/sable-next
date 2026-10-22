@@ -22,18 +22,22 @@
 
 <PanelHeader class="forum-header" title={roomName} titleSize="h1">
   {#snippet prefix()}
-    <PanelHeaderButton class="back-button" label={$i18n.t('timeline.back')} onclick={onBack}>
+    <PanelHeaderButton class="back-button" label={i18n.t('timeline.back')} onclick={onBack}>
       <BackIcon />
     </PanelHeaderButton>
     <Avatar class="forum-avatar" id={roomId} src={roomAvatar} name={roomName} size="small" />
   {/snippet}
   {#snippet suffix()}
     {#if onEventTimeline}
-      <PanelHeaderButton label={$i18n.t('timeline.eventTimeline')} onclick={onEventTimeline}>
+      <PanelHeaderButton label={i18n.t('timeline.eventTimeline')} onclick={onEventTimeline}>
         <ListBulletsIcon />
       </PanelHeaderButton>
     {/if}
-    <PanelHeaderButton class="search-button" label={$i18n.t('search.open')} onclick={onSearch}>
+    <PanelHeaderButton
+      class="search-button"
+      label={i18n.t('common.searchMessages')}
+      onclick={onSearch}
+    >
       <MagnifyingGlassIcon />
     </PanelHeaderButton>
   {/snippet}

@@ -10,6 +10,7 @@ import type {
 import { preferences } from '#lib/settings/preferences.svelte.js';
 import type { TimelinePreferences } from '#lib/settings/preferences.svelte.js';
 
+import { rowFields } from './row-fixtures';
 import { stateEventSubject, stateEventText, type Translate } from './state-event-text';
 import {
   canRedact,
@@ -17,9 +18,6 @@ import {
   cumulativeReadTimestamps,
   eventBefore,
   isCollapsed,
-  isMessageRow,
-  jumboEmojiLevel,
-  jumboEmoticonLevel,
   mergeAggregations,
   personaLookup,
   readReceiptEventId,
@@ -116,6 +114,7 @@ const defaults: TimelinePreferences = {
   layout: 'modern',
   hideMembershipEvents: false,
   hideProfileChanges: true,
+  hideTopicChanges: false,
   hideMemberInReadOnly: true,
   showTombstoneEvents: false,
   showHiddenEvents: false,
@@ -157,8 +156,13 @@ test('an aggregation is filtered by its own event type', () => {
   ).toEqual(['$redaction', '$edit']);
 });
 
+const noReceipts: Pick<TimelineItemView, 'read_by' | 'read_timestamps'> = {
+  read_by: [],
+  read_timestamps: {},
+};
+
 function item(content: TimelineItemView['content'], id: string = content.kind): TimelineItemView {
-  return { id, content } as TimelineItemView;
+  return { id, content, ...noReceipts, ...rowFields(content) } as TimelineItemView;
 }
 
 const message = item({
@@ -168,6 +172,7 @@ const message = item({
   emote: false,
   notice: false,
   edited: false,
+  jumbo: null,
 });
 const divider = item({ kind: 'date_divider', timestamp: 0 });
 const readMarker = item({ kind: 'read_marker' });
@@ -200,7 +205,7 @@ function withEvent(row: TimelineItemView, eventId: string | null): TimelineItemV
 const replyRows = [
   withEvent(message, '$first'),
   withEvent(joined, '$joined'),
-  withEvent(item({ kind: 'redacted', reason: null }), '$redacted'),
+  withEvent(item({ kind: 'redacted', reason: null, redacted_by: null }), '$redacted'),
   withEvent(divider, null),
   withEvent(message, '$second'),
   withEvent(message, null),
@@ -243,6 +248,27 @@ test('shows an event the SDK left in the timeline twice only once, where it firs
   expect(visible[0].read_by).toEqual(['@bob:example.org']);
 });
 
+test('a receipt on a hidden event moves to the last event before it', () => {
+  const read = { ...withEvent(message, '$read'), read_by: ['@bob:example.org'] };
+  const renameRead = {
+    ...withEvent(renamed, '$rename'),
+    read_by: ['@carol:example.org'],
+    read_timestamps: { '@carol:example.org': 7 },
+  };
+
+  const visible = visibleTimelineItems([read, renameRead], defaults);
+
+  expect(visible).toHaveLength(1);
+  expect(visible[0].read_by).toEqual(['@bob:example.org', '@carol:example.org']);
+  expect(visible[0].read_timestamps).toEqual({ '@carol:example.org': 7 });
+});
+
+test('a receipt on a hidden event before any shown one is dropped', () => {
+  const renameRead = { ...withEvent(renamed, '$rename'), read_by: ['@carol:example.org'] };
+
+  expect(visibleTimelineItems([renameRead, message], defaults)).toEqual([message]);
+});
+
 test('honours each toggle independently', () => {
   const shown = visibleTimelineItems([joined, renamed, topic], {
     ...defaults,
@@ -253,7 +279,7 @@ test('honours each toggle independently', () => {
   expect(shown.map((entry) => entry.content.kind)).toEqual(['profile_change', 'state_event']);
 });
 
-const removed = item({ kind: 'redacted', reason: null });
+const removed = item({ kind: 'redacted', reason: null, redacted_by: null });
 
 test('keeps tombstones out unless the preference asks for them', () => {
   expect(visibleTimelineItems([removed, message], defaults)).toEqual([message]);
@@ -335,11 +361,27 @@ test('keeps described room changes visible with other hidden events disabled', (
 
 test("keeps a persona message out of the account's collapsed run", () => {
   const account = item(
-    { kind: 'message', body: 'a', html: 'a', emote: false, notice: false, edited: false },
+    {
+      kind: 'message',
+      body: 'a',
+      html: 'a',
+      emote: false,
+      notice: false,
+      edited: false,
+      jumbo: null,
+    },
     'a'
   );
   const persona = item(
-    { kind: 'message', body: 'b', html: 'b', emote: false, notice: false, edited: false },
+    {
+      kind: 'message',
+      body: 'b',
+      html: 'b',
+      emote: false,
+      notice: false,
+      edited: false,
+      jumbo: null,
+    },
     'b'
   );
   const items = [
@@ -391,6 +433,7 @@ test('only a connected reply preview starts a new message group', () => {
       sender_mentioned: false,
       sender_name: 'Bob',
       body: 'Earlier message',
+      fallback: null,
     },
   } as TimelineItemView;
   const run = [first, reply];
@@ -473,6 +516,45 @@ test('slots aggregation rows into the timeline by timestamp', () => {
   expect(mergeAggregations([sent, before], [before], whole)).toEqual([sent, before]);
 });
 
+test('date dividers keep aggregations in chronological order across history pages', () => {
+  const at = (day: number, hour: number) => new Date(2026, 9, day, hour).getTime();
+  const dateDivider = (day: number): TimelineItemView => {
+    const timestamp = at(day, 20);
+    return {
+      ...item({ kind: 'date_divider', timestamp }, `day-${day}`),
+      event_id: null,
+      timestamp,
+    };
+  };
+  const first = { ...message, id: 'first', event_id: '$first', timestamp: at(6, 10) };
+  const second = { ...message, id: 'second', event_id: '$second', timestamp: at(6, 20) };
+  const third = { ...message, id: 'third', event_id: '$third', timestamp: at(7, 20) };
+  const firstDay = dateDivider(6);
+  const secondDay = dateDivider(7);
+  const aggregations = [at(6, 12), at(6, 23), at(7, 0), at(7, 12)].map((timestamp, index) => ({
+    ...aggregation('m.reaction', `reaction-${index}`),
+    event_id: `$reaction-${index}`,
+    timestamp,
+  }));
+
+  expect(
+    mergeAggregations([firstDay, first, second, secondDay, third], aggregations, {
+      start: false,
+      end: true,
+    })
+  ).toEqual([
+    firstDay,
+    first,
+    aggregations[0],
+    second,
+    aggregations[1],
+    secondDay,
+    aggregations[2],
+    aggregations[3],
+    third,
+  ]);
+});
+
 test('drops aggregation rows outside the loaded range', () => {
   const at = (id: string, timestamp: number): TimelineItemView => ({
     ...item({ kind: 'hidden_event', event_type: 'm.reaction', content: null, redacts: null }, id),
@@ -506,48 +588,6 @@ test('a live location share counts as unread', () => {
     is_own: false,
   };
   expect(unreadCountAfter([marker, share], 0)).toBe(1);
-});
-
-test('sizes emoji-only bodies by how many there are', () => {
-  expect(jumboEmojiLevel('👍')).toBe(1);
-  expect(jumboEmojiLevel('👍🎉')).toBe(2);
-  expect(jumboEmojiLevel('👍🎉🔥')).toBe(3);
-  expect(jumboEmojiLevel('👍🎉🔥😀😀')).toBe(4);
-});
-
-test('leaves ordinary text alone', () => {
-  expect(jumboEmojiLevel('nice 👍')).toBeNull();
-  expect(jumboEmojiLevel('')).toBeNull();
-  // Digits are Emoji_Component, so a bare number must not count as emoji.
-  expect(jumboEmojiLevel('123')).toBeNull();
-  expect(jumboEmojiLevel('👍👍👍👍👍👍👍👍👍')).toBeNull();
-});
-
-const emote = (name: string) =>
-  `<img alt="${name}" height="32" src="mxc://example.org/${name}" title="${name}">`;
-
-test('sizes a message made only of inline emotes, by how many there are', () => {
-  expect(
-    jumboEmoticonLevel('<img alt="rotate" height="32" src="mxc://a/rotate" title="rotate"> ')
-  ).toBe(1);
-  expect(jumboEmoticonLevel(`<p>${emote('rotate')}</p>`)).toBe(1);
-  expect(jumboEmoticonLevel(`${emote('rotate')}<br>${emote('spin')}`)).toBe(2);
-  expect(jumboEmoticonLevel(`${emote('a')} ${emote('b')}`)).toBe(2);
-  expect(jumboEmoticonLevel(`${emote('a')} ${emote('b')} ${emote('c')} ${emote('d')}`)).toBe(3);
-  expect(jumboEmoticonLevel('<img src="mxc://a/rotate" alt="a > b">')).toBe(1);
-  expect(jumboEmoticonLevel('<img src="mxc://a/rotate" alt=":rotate:">&nbsp;')).toBe(1);
-});
-
-test('leaves messages with words or real images at normal size', () => {
-  expect(jumboEmoticonLevel(`nice ${emote('rotate')}`)).toBeNull();
-  expect(jumboEmoticonLevel('')).toBeNull();
-  expect(jumboEmoticonLevel('<img src="https://example.org/photo.png" width="640">')).toBeNull();
-  expect(
-    jumboEmoticonLevel(`${emote('rotate')}<img src="https://example.org/photo.png">`)
-  ).toBeNull();
-  expect(jumboEmoticonLevel('<a href="https://example.org">link</a>')).toBeNull();
-  expect(jumboEmoticonLevel(`${emote('rotate')} and words`)).toBeNull();
-  expect(jumboEmoticonLevel(Array.from({ length: 9 }, () => emote('rotate')).join(' '))).toBeNull();
 });
 
 function stateChange(change: StateChangeView): TimelineItemView {
@@ -699,15 +739,13 @@ test('anything you sent is yours to redact, not only your text', () => {
   expect(canRedact(own(joined.content), true, false)).toBe(true);
   expect(canRedact(theirs(joined.content), true, true)).toBe(true);
   expect(canRedact(own(divider.content), true, true)).toBe(false);
-  expect(canRedact(own({ kind: 'redacted', reason: null }), true, true)).toBe(false);
-});
-
-test('a tombstone is a message row, so it keeps the sender and the menu', () => {
-  expect(isMessageRow({ kind: 'redacted', reason: null })).toBe(true);
+  expect(canRedact(own({ kind: 'redacted', reason: null, redacted_by: null }), true, true)).toBe(
+    false
+  );
 });
 
 test('a room whose every event is redacted is not blank at the shipped default', () => {
-  const deleted = item({ kind: 'redacted', reason: null }, 'gone');
+  const deleted = item({ kind: 'redacted', reason: null, redacted_by: null }, 'gone');
 
   // A room can be all-redacted — delete every poll in it and this is what is
   // left — and hiding those rows left nothing on screen at all.
@@ -826,6 +864,15 @@ test('a hidden reaction reports the key it carries', () => {
   expect(stateEventText(reaction({ shortcode: 'party', 'm.relates_to': { key: 'x' } }), t)).toBe(
     'timeline.hiddenReaction:{"user":"Alice","key":":party:"}'
   );
+  expect(
+    stateEventText(
+      reaction({ shortcode: ':party:', 'm.relates_to': { key: 'mxc://example.org/party' } }),
+      t
+    )
+  ).toBe('timeline.hiddenReaction:{"user":"Alice","key":":party:"}');
+  expect(stateEventText(reaction({ shortcode: '::', 'm.relates_to': { key: '👍' } }), t)).toBe(
+    'timeline.hiddenReaction:{"user":"Alice","key":"👍"}'
+  );
   expect(stateEventText(reaction({ 'm.relates_to': {} }), t)).toBe(
     'timeline.hiddenEvent:{"user":"Alice","type":"m.reaction"}'
   );
@@ -844,4 +891,28 @@ test('a cleared avatar is not the same sentence as a replaced one', () => {
     'timeline.profileAvatarChanged'
   );
   expect(stateEventText(avatarChange(null), (k) => k)).toBe('timeline.profileAvatarRemoved');
+});
+
+test('topic changes show unless the preference hides them', () => {
+  const retitled = item({
+    kind: 'state_event',
+    event_type: 'm.room.topic',
+    state_key: '',
+    content: null,
+    prev_content: null,
+    change: { kind: 'room_topic', topic: 'Now playing' },
+  });
+  const renamedRoom = item({
+    kind: 'state_event',
+    event_type: 'm.room.name',
+    state_key: '',
+    content: null,
+    prev_content: null,
+    change: { kind: 'room_name', name: 'New', previous: 'Old' },
+  });
+
+  expect(visibleTimelineItems([retitled, renamedRoom], defaults)).toEqual([retitled, renamedRoom]);
+  expect(
+    visibleTimelineItems([retitled, renamedRoom], { ...defaults, hideTopicChanges: true })
+  ).toEqual([renamedRoom]);
 });

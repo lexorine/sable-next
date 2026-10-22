@@ -1,26 +1,21 @@
 {
   "extends": "$app/tsconfig",
   "include": [
-    ".svelte-kit/ambient.d.ts",
-    ".svelte-kit/env.d.ts",
-    ".svelte-kit/non-ambient.d.ts",
     ".svelte-kit/types/**/$types.d.ts",
     ".storybook/**/*.ts",
     "vite.config.ts",
     "vitest.config.ts",
-    "vitest-setup.ts",
     "playwright.config.ts",
-    "playwright.timeline.config.ts",
     "oxfmt.config.ts",
     "tests/**/*.ts",
     "src/app.d.ts",
     "src/**/*.svelte",
     "src/**/*.ts"
   ],
-  "exclude": ["src/service-worker"],
-  "compilerOptions": {
-    "rewriteRelativeImportExtensions": true,
-    "sourceMap": true,
-    "strict": true
-  }
+  "exclude": [
+    "src/service-worker",
+    "src/**/*.browser.test.ts",
+    "tests/e2e/fixtures/*.browser.test.ts",
+    "tests/vitest-browser-setup.ts"
+  ]
 }

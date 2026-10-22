@@ -11,9 +11,12 @@ import JumpToTimeDialog from './JumpToTimeDialog.svelte';
 
 vi.mock('#lib/core/context.js');
 
-const core = Object.assign(baseCore, {
+const timeline = Object.assign(baseCore.rpc.timeline, {
   timestampToEvent: vi.fn<(...args: never[]) => Promise<string | null>>(() =>
     Promise.resolve('$found')
+  ),
+  eventSource: vi.fn<(...args: never[]) => Promise<{ source: string }>>(() =>
+    Promise.resolve({ source: '{"content":{}}' })
   ),
 });
 
@@ -49,5 +52,28 @@ test('shows the moment in the reader format and jumps on Enter', async () => {
   await vi.waitFor(() => {
     expect(onJump).toHaveBeenCalledWith('$found');
   });
-  expect(core.timestampToEvent).toHaveBeenCalledWith('!r:x', midnight.getTime(), 'forward');
+  expect(timeline.timestampToEvent).toHaveBeenCalledWith({
+    room_id: '!r:x',
+    ts: midnight.getTime(),
+    direction: 'forward',
+  });
+});
+
+test('jumps to the thread root when the nearest event is a thread reply', async () => {
+  const user = userEvent.setup();
+  timeline.eventSource.mockResolvedValueOnce({
+    source: JSON.stringify({
+      content: { 'm.relates_to': { rel_type: 'm.thread', event_id: '$root' } },
+    }),
+  });
+  const onJump = vi.fn();
+  render(JumpToTimeDialog, { open: true, roomId: '!r:x', onOpenChange: vi.fn(), onJump });
+
+  await screen.findByRole('dialog');
+  await user.click(screen.getByRole('button', { name: 'Today' }));
+  await user.click(screen.getByRole('button', { name: 'Jump' }));
+
+  await vi.waitFor(() => {
+    expect(onJump).toHaveBeenCalledWith('$root');
+  });
 });

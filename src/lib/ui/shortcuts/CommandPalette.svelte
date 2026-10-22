@@ -1,7 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
 
-  import type { RoomSummary } from '#src/generated/protocol';
+  import type { RoomListItemView } from '#src/generated/protocol';
   import { i18n } from '#lib/i18n.js';
   import { roomSectionPath } from '#lib/rooms/permalink.js';
   import { useRoomList } from '#lib/rooms/room-list.svelte.js';
@@ -19,7 +19,8 @@
 
   const roomList = useRoomList();
 
-  function select(room: RoomSummary): void {
+  function select(room: RoomListItemView): void {
+    // eslint-disable-next-line svelte/no-navigation-without-resolve -- roomSectionPath() resolves the route itself
     void goto(roomSectionPath(roomList.rooms, room.room_id));
   }
 
@@ -29,12 +30,12 @@
   }
 </script>
 
-<DialogFrame bind:open variant="verification" label={$i18n.t('shortcuts.paletteTitle')}>
+<DialogFrame bind:open variant="verification" label={i18n.t('shortcuts.paletteTitle')}>
   <div class="palette">
     <RoomJumpList onSelect={select} onClose={() => (open = false)} />
     <footer>
       <Button variant="ghost" size="small" onclick={openShortcutsHelp}>
-        {$i18n.t('shortcuts.showShortcuts')}
+        {i18n.t('shortcuts.showShortcuts')}
       </Button>
     </footer>
   </div>

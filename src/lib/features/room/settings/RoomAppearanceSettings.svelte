@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { RoomSummary } from '#src/generated/protocol';
+  import type { RoomListItemView } from '#src/generated/protocol';
 
   import { i18n } from '#lib/i18n.js';
   import { preferences } from '#lib/settings/preferences.svelte.js';
@@ -8,14 +8,14 @@
   import SettingsRow from '#lib/ui/primitives/SettingsRow.svelte';
   import SettingsSection from '#lib/ui/primitives/SettingsSection.svelte';
 
-  import { roomIconOverride, setRoomIconOverride } from './room-appearance.svelte';
+  import { roomIconOverride, setRoomIconOverride } from '#lib/rooms/room-appearance.svelte.js';
 
   import '#lib/ui/primitives/settings-row.css';
 
   const DEFAULT = 'default';
 
   interface Props {
-    room: RoomSummary | null;
+    room: RoomListItemView | null;
   }
 
   let { room }: Props = $props();
@@ -25,14 +25,14 @@
   let options = $derived([
     {
       value: DEFAULT,
-      label: $i18n.t('room.appearanceIconDefault', {
-        mode: $i18n.t(`settings.showRoomIcon${label(preferences.showRoomIcon)}`),
+      label: i18n.t('room.appearanceIconDefault', {
+        mode: i18n.t(`settings.showRoomIcon${label(preferences.showRoomIcon)}`),
       }),
     },
-    { value: 'always', label: $i18n.t('settings.showRoomIconAlways') },
-    { value: 'sometimes', label: $i18n.t('settings.showRoomIconSometimes') },
-    { value: 'collapsed', label: $i18n.t('settings.showRoomIconCollapsed') },
-    { value: 'never', label: $i18n.t('settings.showRoomIconNever') },
+    { value: 'always', label: i18n.t('common.always') },
+    { value: 'sometimes', label: i18n.t('settings.showRoomIconSometimes') },
+    { value: 'collapsed', label: i18n.t('settings.showRoomIconCollapsed') },
+    { value: 'never', label: i18n.t('common.never') },
   ]);
 
   function label(mode: ShowRoomIcon): string {
@@ -49,17 +49,17 @@
 <div class="section">
   <SettingsSection
     headingId="room-settings-appearance"
-    title={$i18n.t('room.appearanceVisualTweaks')}
-    description={$i18n.t('room.appearanceHint')}
+    title={i18n.t('room.appearanceVisualTweaks')}
+    description={i18n.t('room.appearanceHint')}
   >
     <ul class="settings-rows">
       <SettingsRow
-        title={$i18n.t('room.appearanceIconTitle')}
-        description={$i18n.t('room.appearanceIconHint')}
+        title={i18n.t('room.appearanceIconTitle')}
+        description={i18n.t('room.appearanceIconHint')}
       >
         <Select
           {value}
-          aria-label={$i18n.t('room.appearanceIconTitle')}
+          aria-label={i18n.t('room.appearanceIconTitle')}
           items={options}
           onValueChange={select}
         />

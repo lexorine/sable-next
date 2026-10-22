@@ -49,8 +49,10 @@ targets:
       path: SableNotificationService/Info.plist
       properties:
         SableAppGroup: group.{{app.identifier}}
+        CFBundleDisplayName: Sable
         CFBundleShortVersionString: {{apple.bundle-version-short}}
         CFBundleVersion: "{{apple.bundle-version}}"
+        NSUserActivityTypes: [INSendMessageIntent]
         NSExtension:
           NSExtensionPointIdentifier: com.apple.usernotifications.service
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
@@ -59,6 +61,7 @@ targets:
       properties:
         com.apple.security.application-groups: [group.{{app.identifier}}]
         com.apple.developer.default-data-protection: NSFileProtectionCompleteUntilFirstUserAuthentication
+        com.apple.developer.usernotifications.communication: true
     settings:
       groups: [app]
       base:
@@ -70,6 +73,7 @@ targets:
         OTHER_LDFLAGS: ["$(inherited)", "$(DERIVED_FILE_DIR)/libsable_push.a", "-lc++", "-lz", "-liconv"]
     dependencies:
       - sdk: CallKit.framework
+      - sdk: Intents.framework
       - sdk: Security.framework
       - sdk: SystemConfiguration.framework
     preBuildScripts:
@@ -83,6 +87,7 @@ targets:
     sources:
       - path: Sources
       - path: ../../ios/Network
+      - path: ../../ios/Localization
       - path: Assets.xcassets
       - path: ../../icons/ios/AppIcons.xcassets
       - path: Externals
@@ -100,6 +105,7 @@ targets:
     info:
       path: {{app.name}}_iOS/Info.plist
       properties:
+        # APP-ICON ALIASES START
         TauriAppIconAliases:
           propeller: AppIconPropeller
           agender: AppIconAgender
@@ -110,9 +116,12 @@ targets:
           lesbian: AppIconLesbian
           mlm: AppIconMlm
           pride: AppIconPride
+        # APP-ICON ALIASES END
         LSRequiresIPhoneOS: true
         UILaunchStoryboardName: LaunchScreen
         UIBackgroundModes: [audio, voip, remote-notification]
+        NSUserActivityTypes: [INSendMessageIntent]
+        ITSAppUsesNonExemptEncryption: false
         NSMicrophoneUsageDescription: Sable uses your microphone for calls and videos.
         NSCameraUsageDescription: Sable uses your camera for video calls, photos and videos.
         NSLocationWhenInUseUsageDescription: Sable shares your location in a conversation when you ask it to.
@@ -136,8 +145,6 @@ targets:
         CFBundleURLTypes:
           - CFBundleURLName: sable
             CFBundleURLSchemes:
-              - sable
-              - moe.sable.app
               - moe.sable.next
         {{~#each apple.plist-pairs}}
         {{this.key}}: {{this.value}}{{/each}}
@@ -145,6 +152,7 @@ targets:
       path: {{app.name}}_iOS/{{app.name}}_iOS.entitlements
       properties:
         aps-environment: development
+        com.apple.developer.usernotifications.communication: true
         com.apple.security.application-groups: [group.{{app.identifier}}]
         com.apple.developer.default-data-protection: NSFileProtectionCompleteUntilFirstUserAuthentication
     scheme:
@@ -187,7 +195,7 @@ targets:
       - target: SableNotificationService
         embed: true
       - package: Sentry
-        product: Sentry
+        product: Sentry-Dynamic
       - framework: {{ lib-output-file-name }}
         embed: false
       {{~#each ios-libraries}}
@@ -232,7 +240,7 @@ targets:
         outputFiles:
           - $(SRCROOT)/Externals/x86_64/${CONFIGURATION}/{{ lib-output-file-name }}
           - $(SRCROOT)/Externals/arm64/${CONFIGURATION}/{{ lib-output-file-name }}
-    {{~#if ios-post-compile-scripts}}
+    {{#if ios-post-compile-scripts}}
     postCompileScripts:
       {{~#each ios-post-compile-scripts}}{{#if this.path}}
       - path {{this.path}}{{/if}}{{#if this.script}}
@@ -252,9 +260,18 @@ targets:
         basedOnDependencyAnalysis: {{this.based-on-dependency-analysis}}{{/if}}{{#if this.discovered-dependency-file}}
         discoveredDependencyFile: {{this.discovered-dependency-file}}{{/if}}
       {{~/each~}}
-    {{~/if~}}
-    {{~#if ios-post-build-scripts}}
+    {{~/if}}
+    # Unsigned API-key archives keep only the app's entitlements through export (tauri-apps/tauri#15663).
+    # Signed here: the extension's own target strips its binary after its script phases.
     postBuildScripts:
+      - name: Keep the notification extension's entitlements
+        script: |
+          if [ "${CODE_SIGNING_ALLOWED:-YES}" = "NO" ]; then
+            /usr/bin/codesign --force --sign - \
+              --entitlements "${SRCROOT:?}/SableNotificationService/SableNotificationService.entitlements" \
+              "${TARGET_BUILD_DIR:?}/${PLUGINS_FOLDER_PATH:?}/SableNotificationService.appex"
+          fi
+        basedOnDependencyAnalysis: false
       {{~#each ios-post-build-scripts}}{{#if this.path}}
       - path {{this.path}}{{/if}}{{#if this.script}}
       - script: {{this.script}}{{/if}}{{#if this.name}}
@@ -272,5 +289,4 @@ targets:
         runOnlyWhenInstalling: {{this.run-only-when-installing}}{{/if}}{{#if this.based-on-dependency-analysis}}
         basedOnDependencyAnalysis: {{this.based-on-dependency-analysis}}{{/if}}{{#if this.discovered-dependency-file}}
         discoveredDependencyFile: {{this.discovered-dependency-file}}{{/if}}
-      {{~/each~}}
-    {{~/if}}
+      {{~/each}}

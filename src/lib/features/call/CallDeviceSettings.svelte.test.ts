@@ -5,8 +5,11 @@ import { userEvent } from '@testing-library/user-event';
 import { afterEach, expect, test, vi } from 'vitest';
 
 vi.mock('#lib/i18n.js', () => import('#lib/test-support/i18n.js'));
-vi.mock('#lib/ui/media-query.svelte.js', () => ({
-  createMediaQuery: () => ({ matches: true }),
+vi.mock('svelte/reactivity', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('svelte/reactivity')>()),
+  MediaQuery: class {
+    current = true;
+  },
 }));
 
 import CallDeviceSettings from './CallDeviceSettings.svelte';
@@ -35,7 +38,7 @@ test.each(['closing settings', 'stopping the test'])(
       expect(start).toHaveBeenCalledOnce();
     });
     if (ending === 'closing settings') instance.unmount();
-    else await user.click(screen.getByRole('button', { name: 'settings.callMicTestStop' }));
+    else await user.click(screen.getByRole('button', { name: 'common.stopTest' }));
     meter.resolve(stop);
     await waitFor(() => {
       expect(stop).toHaveBeenCalledOnce();
@@ -93,4 +96,27 @@ test.each([
     expect(await screen.findByRole('option', { name: label })).toBeInTheDocument();
     await user.keyboard('{Escape}');
   }
+});
+
+test('shows why microphone access failed', async () => {
+  const enumerateDevices = vi.fn(() =>
+    Promise.resolve([{ deviceId: '', kind: 'audioinput', label: '' }])
+  );
+  const getUserMedia = vi.fn(() =>
+    Promise.reject(new DOMException('Could not start audio source', 'NotReadableError'))
+  );
+  const mediaDevices = Object.assign(new EventTarget(), { enumerateDevices, getUserMedia });
+  vi.stubGlobal('navigator', { mediaDevices });
+  vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const user = userEvent.setup();
+
+  render(CallDeviceSettings);
+  await user.click(await screen.findByRole('button', { name: 'settings.callDevicesAllow' }));
+
+  expect(
+    await screen.findByText(
+      'settings.callDevicesFailed:NotReadableError: Could not start audio source'
+    )
+  ).toBeInTheDocument();
+  expect(getUserMedia).toHaveBeenCalledWith({ audio: true });
 });
