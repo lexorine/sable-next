@@ -9,13 +9,13 @@ setting to show it automatically when the message scrolls into view.
 ---
  crates/sable-core/src/api/messages.rs         |   2 +
  crates/sable-core/src/lib.rs                  |   1 +
- crates/sable-core/src/redacted.rs             | 380 ++++++++++++++++++
+ crates/sable-core/src/redacted.rs             | 374 ++++++++++++++++++
  crates/sable-core/src/view/mod.rs             |   2 +
  crates/sable-core/src/view/redacted.rs        |  34 ++
  .../features/room/messages/MessageBody.svelte |   6 +
  .../room/messages/RedactedContent.svelte      |  93 +++++
- .../room/messages/RedactedContent.test.ts     | 160 ++++++++
- .../message-action-controller.svelte.ts       |   8 +
+ .../room/messages/RedactedContent.test.ts     | 158 ++++++++
+ .../message-action-controller.svelte.ts       |   7 +
  .../room/messages/message-menu-items.ts       |   9 +
  .../room/messages/redacted-reveals.svelte.ts  |  56 +++
  .../room/timeline/TimelineItem.svelte         |   2 +
@@ -23,7 +23,7 @@ setting to show it automatically when the message scrolls into view.
  src/lib/settings/registry/timeline.ts         |   8 +
  src/locales/en.json                           |  10 +
  tests/e2e/fake-core.ts                        |   1 +
- 16 files changed, 774 insertions(+)
+ 16 files changed, 765 insertions(+)
  create mode 100644 crates/sable-core/src/redacted.rs
  create mode 100644 crates/sable-core/src/view/redacted.rs
  create mode 100644 src/lib/features/room/messages/RedactedContent.svelte
@@ -31,7 +31,7 @@ setting to show it automatically when the message scrolls into view.
  create mode 100644 src/lib/features/room/messages/redacted-reveals.svelte.ts
 
 diff --git a/crates/sable-core/src/api/messages.rs b/crates/sable-core/src/api/messages.rs
-index 55d862ac8..86844c0a9 100644
+index 612460f40..22f0bac1c 100644
 --- a/crates/sable-core/src/api/messages.rs
 +++ b/crates/sable-core/src/api/messages.rs
 @@ -10,6 +10,7 @@ use matrix_sdk_ui::timeline::{Error as TimelineError, RedactError, TimelineEvent
@@ -40,9 +40,9 @@ index 55d862ac8..86844c0a9 100644
  use super::Handler;
 +use crate::redacted::RedactedContentParams;
  use crate::link_previews::BUNDLED_LINK_PREVIEWS;
- use crate::outgoing::IMAGE_SOURCE_PACKS;
  use crate::link_previews::LEGACY_BUNDLED_LINK_PREVIEWS;
-@@ -44,6 +45,7 @@ domain! {
+ use crate::link_previews::bundled_link_previews;
+@@ -48,6 +49,7 @@ domain! {
      redact,
      delete_thread,
      bulk_redact,
@@ -51,7 +51,7 @@ index 55d862ac8..86844c0a9 100644
      send_location,
      forward,
 diff --git a/crates/sable-core/src/lib.rs b/crates/sable-core/src/lib.rs
-index ffcb6527d..64300c071 100644
+index 54d4475a4..f390c2681 100644
 --- a/crates/sable-core/src/lib.rs
 +++ b/crates/sable-core/src/lib.rs
 @@ -48,6 +48,7 @@ pub mod push_check;
@@ -64,23 +64,25 @@ index ffcb6527d..64300c071 100644
  mod room_list_batch;
 diff --git a/crates/sable-core/src/redacted.rs b/crates/sable-core/src/redacted.rs
 new file mode 100644
-index 000000000..ab4a4380d
+index 000000000..d40411930
 --- /dev/null
 +++ b/crates/sable-core/src/redacted.rs
-@@ -0,0 +1,380 @@
-+//! MSC2815: room moderators read the original content of redacted events.
+@@ -0,0 +1,374 @@
++//! MSC2815: read the original content of redacted events. The homeserver
++//! decides who may: room moderators (users at or above the room's `redact`
++//! level), and — on Tuwunel-family servers — admins of the homeserver itself.
 +
 +use std::sync::Arc;
 +
 +use http::Method;
 +use matrix_sdk::ruma::{
-+    OwnedEventId, OwnedRoomId, UserId,
++    OwnedEventId, OwnedRoomId,
 +    api::{
 +        EmptyBody, IncomingResponse, MatrixVersion, Metadata, OutgoingRequest, auth_scheme,
 +        error::{DeserializationError, IntoHttpError},
 +        path_builder::{PathBuilder, StablePathSelector, VersionHistory},
 +    },
-+    events::{AnySyncTimelineEvent, room::power_levels::RoomPowerLevels},
++    events::AnySyncTimelineEvent,
 +    serde::Raw,
 +};
 +use serde::{Deserialize, Serialize};
@@ -115,10 +117,6 @@ index 000000000..ab4a4380d
 +    async fn run(self, core: &Arc<Core>) -> Result<RedactedContentView, RpcError> {
 +        let room = core.room(&self.room_id).await?;
 +        let client = room.client();
-+        let user_id = client.user_id().ok_or(RpcError::NotLoggedIn)?.to_owned();
-+        if !may_view_redacted(&room.power_levels_or_default().await, &user_id) {
-+            return Err(RpcError::Denied);
-+        }
 +
 +        let advertised = client
 +            .unstable_features()
@@ -135,11 +133,6 @@ index 000000000..ab4a4380d
 +            Err(error) => failure(&error, advertised),
 +        }
 +    }
-+}
-+
-+#[must_use]
-+pub fn may_view_redacted(power_levels: &RoomPowerLevels, user_id: &UserId) -> bool {
-+    power_levels.for_user(user_id) >= power_levels.redact
 +}
 +
 +/// A server without the feature also answers 403/404, so those only mean "refused"/"gone" when it advertises MSC2815.
@@ -406,8 +399,9 @@ index 000000000..ab4a4380d
 +    }
 +
 +    #[tokio::test]
-+    async fn a_user_below_the_redact_level_is_denied_locally() {
++    async fn a_user_below_the_redact_level_gets_the_servers_denial() {
 +        let fixture = fixture(0, true).await;
++        answer(&fixture, 403, json!({ "errcode": "M_FORBIDDEN", "error": "refused" })).await;
 +        assert!(matches!(read(&fixture).await, Err(RpcError::Denied)));
 +    }
 +
@@ -509,7 +503,7 @@ index 000000000..13a68d8fd
 +    })
 +}
 diff --git a/src/lib/features/room/messages/MessageBody.svelte b/src/lib/features/room/messages/MessageBody.svelte
-index 273ca25d3..52ece6958 100644
+index 273ca25d3..2218de5b8 100644
 --- a/src/lib/features/room/messages/MessageBody.svelte
 +++ b/src/lib/features/room/messages/MessageBody.svelte
 @@ -23,6 +23,7 @@
@@ -540,7 +534,7 @@ index 273ca25d3..52ece6958 100644
      <TrashIcon size={14} aria-hidden="true" />
      {redactedLabel(redactedBy ? memberName(members, redactedBy) : null, reason ?? null)}
    </p>
-+  {#if canRedactOthers && roomId && item.event_id}
++  {#if roomId && item.event_id}
 +    <RedactedContent {roomId} eventId={item.event_id} {item} {senderTimezone} {onMatrixLink} />
 +  {/if}
  {:else if item.content.kind === 'sticker'}
@@ -647,10 +641,10 @@ index 000000000..b3ba9ba88
 +</style>
 diff --git a/src/lib/features/room/messages/RedactedContent.test.ts b/src/lib/features/room/messages/RedactedContent.test.ts
 new file mode 100644
-index 000000000..ff880bc1d
+index 000000000..be534befd
 --- /dev/null
 +++ b/src/lib/features/room/messages/RedactedContent.test.ts
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,158 @@
 +// @vitest-environment happy-dom
 +
 +import { render, screen } from '@testing-library/svelte';
@@ -770,16 +764,14 @@ index 000000000..ff880bc1d
 +  expect(screen.getByText(/spam/)).toBeInTheDocument();
 +});
 +
-+test('auto mode fetches once when visible, and only for moderators', async () => {
++test('auto mode fetches once per event while visible, even without moderator power', async () => {
 +  setPreference('autoRevealRedacted', true);
 +  visibleImmediately();
 +  redactedContent.mockResolvedValue(secret);
 +
-+  const hidden = await renderTombstone(false);
-+  expect(redactedContent).not.toHaveBeenCalled();
-+  hidden.unmount();
-+
-+  await renderTombstone();
++  // No canRedactOthers gate any more: the UI mounts for everyone and lets the
++  // homeserver decide. Two mounts of the same event still share one fetch.
++  await renderTombstone(false);
 +  await renderTombstone();
 +  await vi.waitFor(() => expect(screen.getAllByText('the secret')).toHaveLength(2));
 +  expect(redactedContent).toHaveBeenCalledTimes(1);
@@ -812,7 +804,7 @@ index 000000000..ff880bc1d
 +  expect(screen.getByText(/don’t have permission/i)).toBeInTheDocument();
 +});
 diff --git a/src/lib/features/room/messages/message-action-controller.svelte.ts b/src/lib/features/room/messages/message-action-controller.svelte.ts
-index 9a7c84898..7cd65f3ff 100644
+index 9a7c84898..efa2a44b7 100644
 --- a/src/lib/features/room/messages/message-action-controller.svelte.ts
 +++ b/src/lib/features/room/messages/message-action-controller.svelte.ts
 @@ -15,6 +15,7 @@ import type { Bookmarks } from '#lib/rooms/bookmarks.svelte.js';
@@ -823,13 +815,12 @@ index 9a7c84898..7cd65f3ff 100644
  
  export interface MessageCallbacks {
    onToggleReaction?: (
-@@ -317,6 +318,13 @@ export class MessageActionExecutor {
+@@ -317,6 +318,12 @@ export class MessageActionExecutor {
          : undefined,
        onEditHistory: policy.editHistory ? () => void openEditHistory(policy.eventId) : undefined,
        onViewSource: policy.viewSource ? () => void openSource(policy.eventId) : undefined,
 +      onViewRedacted:
 +        item.content.kind === 'redacted' &&
-+        canRedactOthers &&
 +        policy.viewSource &&
 +        redactedReveal(roomId, policy.eventId)?.kind !== 'shown'
 +          ? () => void revealRedacted(core.rpc, roomId, policy.eventId)
@@ -927,10 +918,10 @@ index 000000000..66b72e1f2
 +  serverUnsupported = false;
 +}
 diff --git a/src/lib/features/room/timeline/TimelineItem.svelte b/src/lib/features/room/timeline/TimelineItem.svelte
-index 0ab0f82bd..8d68f48e2 100644
+index fdf4a372a..5d9dc2640 100644
 --- a/src/lib/features/room/timeline/TimelineItem.svelte
 +++ b/src/lib/features/room/timeline/TimelineItem.svelte
-@@ -751,6 +751,8 @@
+@@ -784,6 +784,8 @@
              <MessageBody
                {item}
                {canRedactOthers}
@@ -979,10 +970,10 @@ index 6986b899b..cbf2fbbe9 100644
        key: 'hour24Clock',
        section: 'time-date',
 diff --git a/src/locales/en.json b/src/locales/en.json
-index 93d436c9f..9cee044ac 100644
+index 3b9009859..0fa23f835 100644
 --- a/src/locales/en.json
 +++ b/src/locales/en.json
-@@ -1265,6 +1265,14 @@
+@@ -1267,6 +1267,14 @@
      "redactedWithReason": "Message deleted: {{reason}}",
      "redactedBy": "Message deleted by {{name}}",
      "redactedByWithReason": "Message deleted by {{name}}: {{reason}}",
@@ -997,12 +988,12 @@ index 93d436c9f..9cee044ac 100644
      "locationShowMap": "Show map",
      "locationMapAlt": "Map showing {{label}}",
      "forwardSelected_one": "{{count, number}} room selected",
-@@ -2101,6 +2109,8 @@
+@@ -2103,6 +2111,8 @@
      "captionPositionHidden": "Hidden",
      "doubleTapReact": "Double tap to react",
      "showRoleTooltip": "Show role name on hover",
 +    "autoRevealRedacted": "Show deleted messages’ content automatically",
-+    "autoRevealRedactedHint": "For moderators, on homeservers that support MSC2815.",
++    "autoRevealRedactedHint": "Reads each deleted message from the homeserver (MSC2815) when it becomes visible. Who may read is decided by the server: room moderators, and admin users on the homeserver itself.",
      "doubleTapReaction": "Double tap reaction",
      "hideTypingIndicators": "Hide typing indicators",
      "groupMembersByPresence": "Group members by presence",
