@@ -1,0 +1,260 @@
+name: Sync upstream, build, push to Cachix
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild and commit even if the tree is unchanged
+        type: boolean
+        default: false
+  push:
+    branches: [main, 'wip/**']
+    paths: ['.fork/**', '.github/workflows/sync-build.yml']
+
+permissions: {}
+
+concurrency:
+  group: sync-build-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  STAGING: sync/${{ github.ref_name }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      contents: write
+    outputs:
+      status: ${{ steps.sync.outputs.status }}
+      commit: ${{ steps.sync.outputs.commit }}
+      conflicts: ${{ steps.sync.outputs.conflicts }}
+      upstream: ${{ steps.sync.outputs.upstream }}
+    env:
+      FORCE: ${{ inputs.force || 'false' }}
+    steps:
+      - name: Free disk
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+          tool-cache: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+        with:
+          github_access_token: ${{ github.token }}
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = false
+
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        with:
+          name: sable-cachix
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          pushFilter: '(-vendor|-pnpm-deps|-source|\.tar\.gz|\.zip)$'
+
+      - name: Synthesize msc2815 tree
+        id: sync
+        run: bash .fork/sync.sh msc2815 "$RUNNER_TEMP/w" "$(git rev-parse HEAD)"
+
+      - name: Stop on patch conflict
+        if: steps.sync.outputs.status == 'conflict'
+        env:
+          CONFLICTS: ${{ steps.sync.outputs.conflicts }}
+        run: |
+          echo "::error::MSC2815 patch conflict: $CONFLICTS"
+          exit 1
+
+      - name: Build sable-desktop
+        id: nixbuild
+        if: steps.sync.outputs.status == 'ok'
+        working-directory: ${{ runner.temp }}/w
+        run: |
+          nix build -L --no-link --print-out-paths .#sable-desktop .#sable-unwrapped
+          echo "out=$(nix eval --raw .#sable-desktop.outPath)" >> "$GITHUB_OUTPUT"
+
+      - name: Push staging branch
+        if: steps.nixbuild.outcome == 'success'
+        env:
+          COMMIT: ${{ steps.sync.outputs.commit }}
+        run: |
+          git fetch -q "$RUNNER_TEMP/w" "$COMMIT"
+          git push --force origin "$COMMIT:refs/heads/$STAGING"
+
+      - name: Check the github flake evaluates to the built path
+        if: steps.nixbuild.outcome == 'success'
+        env:
+          COMMIT: ${{ steps.sync.outputs.commit }}
+          LOCAL: ${{ steps.nixbuild.outputs.out }}
+        run: |
+          remote=$(nix eval --raw "github:${GITHUB_REPOSITORY}/${COMMIT}#sable-desktop.outPath")
+          [ "$remote" = "$LOCAL" ] || { echo "outPath mismatch: $remote != $LOCAL"; exit 1; }
+
+  test:
+    needs: build
+    if: needs.build.outputs.status == 'ok'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+    steps:
+      - name: Free disk
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+          tool-cache: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.build.outputs.commit }}
+          persist-credentials: false
+
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+        with:
+          github_access_token: ${{ github.token }}
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = false
+
+      - name: Rust tests
+        run: |
+          nix shell --inputs-from . nixpkgs#cargo nixpkgs#rustc nixpkgs#gcc nixpkgs#cmake nixpkgs#perl \
+            -c cargo test --locked -p sable-core redacted
+
+      - name: Web tests and typecheck
+        run: |
+          nix shell --inputs-from . nixpkgs#nodejs_26 nixpkgs#pnpm_12 nixpkgs#cargo nixpkgs#rustc \
+            nixpkgs#gcc nixpkgs#lld nixpkgs#wasm-bindgen-cli_0_2_129 nixpkgs#binaryen -c bash -euo pipefail -c '
+              pnpm install --frozen-lockfile
+              pnpm wasm:dev
+              pnpm exec svelte-kit sync
+              pnpm exec vitest run --project node src/lib/features/room/messages src/lib/settings src/lib/locales.test.ts
+              pnpm check'
+
+  publish:
+    needs: [build, test]
+    if: github.ref_name == 'main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      issues: write
+    env:
+      COMMIT: ${{ needs.build.outputs.commit }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Fast-forward main
+        run: |
+          git fetch -q origin "refs/heads/$STAGING"
+          [ "$(git rev-parse FETCH_HEAD)" = "$COMMIT" ] || { echo "staging moved"; exit 1; }
+          git push origin "$COMMIT:refs/heads/main"
+
+      - name: Close resolved failure issues
+        run: |
+          for n in $(gh issue list -R "$GITHUB_REPOSITORY" --state open --label sync-failure --json number --jq '.[].number'); do
+            gh issue close "$n" -R "$GITHUB_REPOSITORY" --comment "Fixed by $COMMIT"
+          done
+
+  fallback:
+    needs: [build, test]
+    if: >-
+      always() && github.ref_name == 'main' &&
+      (needs.build.result == 'failure' || needs.test.result == 'failure')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      contents: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Free disk
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+          tool-cache: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+        with:
+          github_access_token: ${{ github.token }}
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = false
+
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        with:
+          name: sable-cachix
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          pushFilter: '(-vendor|-pnpm-deps|-source|\.tar\.gz|\.zip)$'
+
+      - name: Synthesize upstream tree
+        id: up
+        run: FORCE=true bash .fork/sync.sh upstream "$RUNNER_TEMP/w" "$(git rev-parse HEAD)"
+
+      - name: Build sable-desktop (upstream only)
+        id: upbuild
+        if: steps.up.outputs.status == 'ok'
+        working-directory: ${{ runner.temp }}/w
+        run: nix build -L --no-link .#sable-desktop
+
+      - name: Push upstream branch
+        if: steps.upbuild.outcome == 'success'
+        env:
+          COMMIT: ${{ steps.up.outputs.commit }}
+        run: |
+          git fetch -q "$RUNNER_TEMP/w" "$COMMIT"
+          git push --force origin "$COMMIT:refs/heads/upstream"
+
+      - name: Report failure
+        if: always()
+        env:
+          REASON: ${{ needs.build.outputs.status == 'conflict' && format('MSC2815 patch conflict - {0}', needs.build.outputs.conflicts) || 'msc2815 build or test failed' }}
+          UP: ${{ needs.build.outputs.upstream }}
+          FALLBACK: ${{ steps.upbuild.outcome }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          body="Upstream: $UP
+          Reason: $REASON
+          Fallback upstream build: $FALLBACK (branch \`upstream\`)
+          Run: $RUN
+          main was not updated. Refresh .fork/patches (see the .fork/sync.sh header)."
+          n=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --label sync-failure --json number --jq '.[0].number // empty')
+          if [ -n "$n" ]; then gh issue comment "$n" -R "$GITHUB_REPOSITORY" --body "$body"
+          else gh issue create -R "$GITHUB_REPOSITORY" --label sync-failure --title "Nightly sync failed" --body "$body"; fi
+          exit 1

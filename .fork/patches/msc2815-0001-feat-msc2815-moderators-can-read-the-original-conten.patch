@@ -1,0 +1,1014 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: delta <bvccc848@gmail.com>
+Date: Thu, 22 Oct 2026 04:34:48 +0200
+Subject: [PATCH] feat(msc2815): moderators can read the original content of
+ redacted messages
+
+Menu action "View deleted content" on a redacted message, and an opt-in
+setting to show it automatically when the message scrolls into view.
+---
+ crates/sable-core/src/api/messages.rs         |   2 +
+ crates/sable-core/src/lib.rs                  |   1 +
+ crates/sable-core/src/redacted.rs             | 380 ++++++++++++++++++
+ crates/sable-core/src/view/mod.rs             |   2 +
+ crates/sable-core/src/view/redacted.rs        |  34 ++
+ .../features/room/messages/MessageBody.svelte |   6 +
+ .../room/messages/RedactedContent.svelte      |  87 ++++
+ .../room/messages/RedactedContent.test.ts     | 160 ++++++++
+ .../message-action-controller.svelte.ts       |   8 +
+ .../room/messages/message-menu-items.ts       |   9 +
+ .../room/messages/redacted-reveals.svelte.ts  |  56 +++
+ .../room/timeline/TimelineItem.svelte         |   2 +
+ src/lib/settings/preferences.svelte.ts        |   2 +
+ src/lib/settings/registry/timeline.ts         |   8 +
+ src/locales/en.json                           |  10 +
+ tests/e2e/fake-core.ts                        |   1 +
+ 16 files changed, 768 insertions(+)
+ create mode 100644 crates/sable-core/src/redacted.rs
+ create mode 100644 crates/sable-core/src/view/redacted.rs
+ create mode 100644 src/lib/features/room/messages/RedactedContent.svelte
+ create mode 100644 src/lib/features/room/messages/RedactedContent.test.ts
+ create mode 100644 src/lib/features/room/messages/redacted-reveals.svelte.ts
+
+diff --git a/crates/sable-core/src/api/messages.rs b/crates/sable-core/src/api/messages.rs
+index 55d862ac8..86844c0a9 100644
+--- a/crates/sable-core/src/api/messages.rs
++++ b/crates/sable-core/src/api/messages.rs
+@@ -10,6 +10,7 @@ use matrix_sdk_ui::timeline::{Error as TimelineError, RedactError, TimelineEvent
+ use serde::{Deserialize, Serialize};
+ 
+ use super::Handler;
++use crate::redacted::RedactedContentParams;
+ use crate::link_previews::BUNDLED_LINK_PREVIEWS;
+ use crate::outgoing::IMAGE_SOURCE_PACKS;
+ use crate::link_previews::LEGACY_BUNDLED_LINK_PREVIEWS;
+@@ -44,6 +45,7 @@ domain! {
+     redact,
+     delete_thread,
+     bulk_redact,
++    redacted_content,
+     react,
+     send_location,
+     forward,
+diff --git a/crates/sable-core/src/lib.rs b/crates/sable-core/src/lib.rs
+index ffcb6527d..64300c071 100644
+--- a/crates/sable-core/src/lib.rs
++++ b/crates/sable-core/src/lib.rs
+@@ -48,6 +48,7 @@ pub mod push_check;
+ pub mod push_rules;
+ mod qr_login;
+ mod reactions;
++mod redacted;
+ mod registration;
+ mod room_keys;
+ mod room_list_batch;
+diff --git a/crates/sable-core/src/redacted.rs b/crates/sable-core/src/redacted.rs
+new file mode 100644
+index 000000000..ab4a4380d
+--- /dev/null
++++ b/crates/sable-core/src/redacted.rs
+@@ -0,0 +1,380 @@
++//! MSC2815: room moderators read the original content of redacted events.
++
++use std::sync::Arc;
++
++use http::Method;
++use matrix_sdk::ruma::{
++    OwnedEventId, OwnedRoomId, UserId,
++    api::{
++        EmptyBody, IncomingResponse, MatrixVersion, Metadata, OutgoingRequest, auth_scheme,
++        error::{DeserializationError, IntoHttpError},
++        path_builder::{PathBuilder, StablePathSelector, VersionHistory},
++    },
++    events::{AnySyncTimelineEvent, room::power_levels::RoomPowerLevels},
++    serde::Raw,
++};
++use serde::{Deserialize, Serialize};
++
++use crate::Core;
++use crate::api::Handler;
++use crate::protocol::{PerMessageProfileView, RpcError, TimelineItemContentView};
++
++const UNSTABLE_FEATURE: &str = "fi.mau.msc2815";
++const QUERY_PARAMETER: &str = "fi.mau.msc2815.include_unredacted_content";
++
++/// `content` is null when the server returned the event still redacted.
++#[derive(Debug, Clone, Default, Serialize)]
++#[cfg_attr(feature = "typegen", derive(specta::Type))]
++pub struct RedactedContentView {
++    pub content: Option<TimelineItemContentView>,
++    pub per_message_profile: Option<PerMessageProfileView>,
++}
++
++#[derive(Debug, Deserialize)]
++#[cfg_attr(feature = "typegen", derive(specta::Type), specta(inline))]
++pub struct RedactedContentParams {
++    #[cfg_attr(feature = "typegen", specta(type = String))]
++    pub room_id: OwnedRoomId,
++    #[cfg_attr(feature = "typegen", specta(type = String))]
++    pub event_id: OwnedEventId,
++}
++
++impl Handler for RedactedContentParams {
++    type Ok = RedactedContentView;
++
++    async fn run(self, core: &Arc<Core>) -> Result<RedactedContentView, RpcError> {
++        let room = core.room(&self.room_id).await?;
++        let client = room.client();
++        let user_id = client.user_id().ok_or(RpcError::NotLoggedIn)?.to_owned();
++        if !may_view_redacted(&room.power_levels_or_default().await, &user_id) {
++            return Err(RpcError::Denied);
++        }
++
++        let advertised = client
++            .unstable_features()
++            .await
++            .is_ok_and(|features| features.contains(&UNSTABLE_FEATURE.into()));
++        let request = ReadUnredacted {
++            room_id: self.room_id,
++            event_id: self.event_id,
++        };
++        match client.send(request).await {
++            Ok(response) => Ok(crate::view::redacted_content_view(&room, response.0)
++                .await
++                .unwrap_or_default()),
++            Err(error) => failure(&error, advertised),
++        }
++    }
++}
++
++#[must_use]
++pub fn may_view_redacted(power_levels: &RoomPowerLevels, user_id: &UserId) -> bool {
++    power_levels.for_user(user_id) >= power_levels.redact
++}
++
++/// A server without the feature also answers 403/404, so those only mean "refused"/"gone" when it advertises MSC2815.
++fn failure(error: &matrix_sdk::HttpError, advertised: bool) -> Result<RedactedContentView, RpcError> {
++    let status = error
++        .as_client_api_error()
++        .map_or(0, |api_error| api_error.status_code.as_u16());
++    match (status, advertised) {
++        (403, true) => Err(RpcError::Denied),
++        (404, true) => Ok(RedactedContentView::default()),
++        (400 | 403 | 404 | 405 | 501, _) => Err(RpcError::Unsupported),
++        _ => Err(RpcError::Unavailable),
++    }
++}
++
++/// `GET /rooms/{roomId}/event/{eventId}` with the MSC2815 query parameter, which Ruma cannot express.
++#[derive(Clone, Debug)]
++struct ReadUnredacted {
++    room_id: OwnedRoomId,
++    event_id: OwnedEventId,
++}
++
++impl Metadata for ReadUnredacted {
++    const METHOD: Method = Method::GET;
++    const RATE_LIMITED: bool = false;
++    type Authentication = auth_scheme::AccessToken;
++    type PathBuilder = VersionHistory;
++    const PATH_BUILDER: VersionHistory = VersionHistory::new(
++        &[],
++        &[
++            (
++                StablePathSelector::Version(MatrixVersion::V1_0),
++                "/_matrix/client/r0/rooms/{room_id}/event/{event_id}",
++            ),
++            (
++                StablePathSelector::Version(MatrixVersion::V1_1),
++                "/_matrix/client/v3/rooms/{room_id}/event/{event_id}",
++            ),
++        ],
++        None,
++        None,
++    );
++}
++
++impl OutgoingRequest for ReadUnredacted {
++    type Body = EmptyBody;
++    type EndpointError = matrix_sdk::ruma::api::error::Error;
++    type IncomingResponse = UnredactedEvent;
++
++    fn try_into_http_request_inner(
++        self,
++        base_url: &str,
++        path_builder_input: <VersionHistory as PathBuilder>::Input<'_>,
++    ) -> Result<http::Request<Self::Body>, IntoHttpError> {
++        http::Request::builder()
++            .method(Self::METHOD)
++            .uri(Self::make_endpoint_url(
++                path_builder_input,
++                base_url,
++                &[&self.room_id, &self.event_id],
++                &format!("{QUERY_PARAMETER}=true"),
++            )?)
++            .body(EmptyBody)
++            .map_err(Into::into)
++    }
++}
++
++#[derive(Debug)]
++struct UnredactedEvent(Raw<AnySyncTimelineEvent>);
++
++impl IncomingResponse for UnredactedEvent {
++    type EndpointError = matrix_sdk::ruma::api::error::Error;
++
++    fn try_from_http_response_inner(
++        response: http::Response<&[u8]>,
++    ) -> Result<Self, DeserializationError> {
++        Ok(Self(serde_json::from_slice(response.body())?))
++    }
++}
++
++#[cfg(test)]
++#[expect(clippy::expect_used, reason = "test code")]
++mod tests {
++    use std::borrow::Cow;
++    use std::collections::BTreeSet;
++
++    use matrix_sdk::ruma::api::{OutgoingRequestExt, SupportedVersions, auth_scheme::SendAccessToken};
++    use matrix_sdk::ruma::{owned_event_id, owned_room_id};
++
++    use super::*;
++
++    fn request(event_id: OwnedEventId, version: MatrixVersion) -> http::Request<Vec<u8>> {
++        ReadUnredacted {
++            room_id: owned_room_id!("!room:example.org"),
++            event_id,
++        }
++        .try_into_http_request(
++            "https://homeserver.example",
++            SendAccessToken::IfRequired("token"),
++            Cow::Owned(SupportedVersions {
++                versions: BTreeSet::from([version]),
++                features: BTreeSet::new(),
++            }),
++        )
++        .expect("the request is expressible")
++    }
++
++    #[test]
++    fn the_read_carries_the_query_parameter() {
++        let request = request(owned_event_id!("$event"), MatrixVersion::V1_11);
++        assert_eq!(request.method(), Method::GET);
++        assert_eq!(
++            request.uri().path(),
++            "/_matrix/client/v3/rooms/!room:example.org/event/$event"
++        );
++        assert_eq!(
++            request.uri().query(),
++            Some("fi.mau.msc2815.include_unredacted_content=true")
++        );
++        assert_eq!(
++            request.headers().get("Authorization").map(|value| value.as_bytes()),
++            Some(&b"Bearer token"[..])
++        );
++    }
++
++    #[test]
++    fn an_old_homeserver_gets_the_r0_path() {
++        let request = request(owned_event_id!("$event"), MatrixVersion::V1_0);
++        assert_eq!(
++            request.uri().path(),
++            "/_matrix/client/r0/rooms/!room:example.org/event/$event"
++        );
++    }
++
++    #[test]
++    fn the_event_id_stays_one_path_segment() {
++        let request = request(owned_event_id!("$a/b?c#d"), MatrixVersion::V1_11);
++        assert_eq!(request.uri().path().matches('/').count(), 7);
++        assert_eq!(
++            request.uri().query(),
++            Some("fi.mau.msc2815.include_unredacted_content=true")
++        );
++    }
++}
++
++#[cfg(all(test, not(target_family = "wasm")))]
++#[expect(
++    clippy::unwrap_used,
++    clippy::expect_used,
++    clippy::panic,
++    reason = "test code"
++)]
++mod sdk_tests {
++    use std::sync::Arc;
++
++    use matrix_sdk::ruma::{event_id, room_id, serde::Raw};
++    use matrix_sdk::test_utils::mocks::MatrixMockServer;
++    use matrix_sdk_test::{ALICE, JoinedRoomBuilder, event_factory::EventFactory};
++    use matrix_sdk_ui::sync_service::SyncService;
++    use serde_json::{Value, json};
++    use wiremock::matchers::{method, path, query_param};
++    use wiremock::{Mock, ResponseTemplate};
++
++    use super::{RedactedContentParams, RedactedContentView};
++    use crate::Core;
++    use crate::protocol::{RpcError, TimelineItemContentView};
++    use crate::session::Session;
++    use crate::store::MemorySessionStore;
++
++    const ROOM: &str = "!msc2815:example.org";
++    const EVENT: &str = "$redacted";
++
++    struct Fixture {
++        server: MatrixMockServer,
++        core: Arc<Core>,
++    }
++
++    async fn fixture(power_level: u32, advertised: bool) -> Fixture {
++        let server = MatrixMockServer::new().await;
++        Mock::given(method("GET"))
++            .and(path("/_matrix/client/versions"))
++            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
++                "versions": ["v1.11"],
++                "unstable_features": { "fi.mau.msc2815": advertised },
++            })))
++            .mount(server.server())
++            .await;
++        let client = server.client_builder().build().await;
++        // The mock client starts with cached versions that advertise nothing.
++        client.reset_supported_versions().await.unwrap();
++
++        let room_id = room_id!("!msc2815:example.org");
++        let own = client.user_id().unwrap().to_owned();
++        let factory = EventFactory::new().room(room_id).sender(&own);
++        let levels = json!({
++            "type": "m.room.power_levels", "state_key": "", "sender": own,
++            "event_id": "$levels", "origin_server_ts": 1,
++            "content": { "users": { own.as_str(): power_level } },
++        });
++        server
++            .sync_room(
++                &client,
++                JoinedRoomBuilder::new(room_id)
++                    .add_state_bulk(vec![factory.member(&own).into_raw()])
++                    .add_state_event(factory.create(&own, "10".try_into().unwrap()))
++                    .add_state_event(Raw::new(&levels).unwrap().cast_unchecked()),
++            )
++            .await;
++        server.mock_room_state_encryption().plain().mount().await;
++
++        let sync_service = Arc::new(SyncService::builder(client.clone()).build().await.unwrap());
++        let (core, _events) = Core::new("test", Box::new(MemorySessionStore::default()));
++        *core.session.write().await = Some(Session {
++            account_id: "test".to_owned(),
++            client,
++            sync_service,
++            homeserver: server.server().uri(),
++            oauth: false,
++        });
++        Fixture { server, core }
++    }
++
++    async fn answer(fixture: &Fixture, status: u16, body: Value) {
++        Mock::given(method("GET"))
++            .and(path(format!("/_matrix/client/v3/rooms/{ROOM}/event/{EVENT}")))
++            .and(query_param("fi.mau.msc2815.include_unredacted_content", "true"))
++            .respond_with(ResponseTemplate::new(status).set_body_json(body))
++            .mount(fixture.server.server())
++            .await;
++    }
++
++    async fn read(fixture: &Fixture) -> Result<RedactedContentView, RpcError> {
++        fixture
++            .core
++            .run(RedactedContentParams {
++                room_id: room_id!("!msc2815:example.org").to_owned(),
++                event_id: event_id!("$redacted").to_owned(),
++            })
++            .await
++    }
++
++    fn event(content: Value, unsigned: Value) -> Value {
++        json!({
++            "type": "m.room.message",
++            "event_id": EVENT,
++            "sender": ALICE.to_string(),
++            "origin_server_ts": 1,
++            "room_id": ROOM,
++            "content": content,
++            "unsigned": unsigned,
++        })
++    }
++
++    #[tokio::test]
++    async fn a_moderator_reads_the_original_content() {
++        let fixture = fixture(50, true).await;
++        let original = json!({ "msgtype": "m.text", "body": "the secret" });
++        answer(&fixture, 200, event(original, json!({}))).await;
++
++        match read(&fixture).await.expect("a moderator may read it").content {
++            Some(TimelineItemContentView::Message { body, .. }) => assert_eq!(body, "the secret"),
++            other => panic!("expected the original message, got {other:?}"),
++        }
++    }
++
++    #[tokio::test]
++    async fn a_user_below_the_redact_level_is_denied_locally() {
++        let fixture = fixture(0, true).await;
++        assert!(matches!(read(&fixture).await, Err(RpcError::Denied)));
++    }
++
++    #[tokio::test]
++    async fn a_still_redacted_answer_is_empty() {
++        let fixture = fixture(50, true).await;
++        let unsigned = json!({ "redacted_because": { "content": { "reason": "spam" } } });
++        answer(&fixture, 200, event(json!({}), unsigned)).await;
++
++        assert!(read(&fixture).await.expect("the request succeeded").content.is_none());
++    }
++
++    #[tokio::test]
++    async fn erased_content_is_empty_rather_than_an_error() {
++        let fixture = fixture(50, true).await;
++        let body = json!({ "errcode": "FI.MAU.MSC2815_UNREDACTED_CONTENT_DELETED", "error": "gone" });
++        answer(&fixture, 404, body).await;
++
++        assert!(read(&fixture).await.expect("nothing to show").content.is_none());
++    }
++
++    #[tokio::test]
++    async fn server_answers_map_to_rpc_errors() {
++        for (advertised, status, errcode, expected) in [
++            (true, 403, "M_FORBIDDEN", RpcError::Denied),
++            (false, 403, "M_FORBIDDEN", RpcError::Unsupported),
++            (false, 404, "M_NOT_FOUND", RpcError::Unsupported),
++            (false, 405, "M_UNRECOGNIZED", RpcError::Unsupported),
++            (true, 502, "M_UNKNOWN", RpcError::Unavailable),
++        ] {
++            let fixture = fixture(50, advertised).await;
++            answer(&fixture, status, json!({ "errcode": errcode, "error": "refused" })).await;
++            assert_eq!(
++                format!("{:?}", read(&fixture).await),
++                format!("Err({expected:?})"),
++                "{status} {errcode} advertised={advertised}"
++            );
++        }
++    }
++}
+diff --git a/crates/sable-core/src/view/mod.rs b/crates/sable-core/src/view/mod.rs
+index 6285686bd..4461025fd 100644
+--- a/crates/sable-core/src/view/mod.rs
++++ b/crates/sable-core/src/view/mod.rs
+@@ -8,6 +8,7 @@ mod member;
+ mod previews;
+ mod profile;
+ mod raw;
++mod redacted;
+ mod room;
+ mod search;
+ mod space;
+@@ -38,6 +39,7 @@ pub(crate) use media::{
+ pub(crate) use member::clamp_power_level;
+ pub(crate) use profile::per_message_profile;
+ pub(crate) use raw::ObjectOnly;
++pub(crate) use redacted::redacted_content_view;
+ pub(crate) use search::search_hit_view;
+ pub(crate) use state::{
+     CALL_MEMBER_TYPE, CALL_SLOT_ID, CALL_TYPE, FORUM_ROOM_TYPE, FORUM_TITLE, RTC_SLOT_TYPE,
+diff --git a/crates/sable-core/src/view/redacted.rs b/crates/sable-core/src/view/redacted.rs
+new file mode 100644
+index 000000000..13a68d8fd
+--- /dev/null
++++ b/crates/sable-core/src/view/redacted.rs
+@@ -0,0 +1,34 @@
++use matrix_sdk::deserialized_responses::TimelineEvent;
++use matrix_sdk::room::Room;
++use matrix_sdk::ruma::events::AnySyncTimelineEvent;
++use matrix_sdk::ruma::serde::Raw;
++use matrix_sdk_ui::timeline::{MsgLikeKind, TimelineItemContent};
++
++use crate::redacted::RedactedContentView;
++
++use super::content::content;
++use super::profile::per_message_profile;
++use super::raw::RawFields;
++
++/// `None` unless the event is an unredacted message.
++pub async fn redacted_content_view(
++    room: &Room,
++    event: Raw<AnySyncTimelineEvent>,
++) -> Option<RedactedContentView> {
++    let raw = event
++        .deserialize_as_unchecked::<RawFields>()
++        .unwrap_or_default();
++    let item_content =
++        TimelineItemContent::from_event(room, TimelineEvent::from_plaintext(event)).await?;
++    let TimelineItemContent::MsgLike(message) = &item_content else {
++        return None;
++    };
++    if matches!(message.kind, MsgLikeKind::Redacted) {
++        return None;
++    }
++    let profile = per_message_profile(raw.content.as_ref());
++    Some(RedactedContentView {
++        content: Some(content(&item_content, profile.as_ref(), &raw, None)),
++        per_message_profile: profile,
++    })
++}
+diff --git a/src/lib/features/room/messages/MessageBody.svelte b/src/lib/features/room/messages/MessageBody.svelte
+index 273ca25d3..52ece6958 100644
+--- a/src/lib/features/room/messages/MessageBody.svelte
++++ b/src/lib/features/room/messages/MessageBody.svelte
+@@ -23,6 +23,7 @@
+   import TimelineLocation from '../timeline/TimelineLocation.svelte';
+   import { memberName } from '../members/members.js';
+   import { redactedLabel } from './redacted-label';
++  import RedactedContent from './RedactedContent.svelte';
+   import TimelineLiveLocation from '../timeline/TimelineLiveLocation.svelte';
+   import TimelinePoll from '../timeline/TimelinePoll.svelte';
+   import {
+@@ -36,6 +37,7 @@
+   interface Props {
+     item: TimelineItemView;
+     canRedactOthers: boolean;
++    roomId?: string;
+     redactionReason?: string | null;
+     redactedBy?: string | null;
+     encrypted?: boolean | null;
+@@ -51,6 +53,7 @@
+   let {
+     item,
+     canRedactOthers,
++    roomId = '',
+     redactionReason = null,
+     redactedBy = null,
+     encrypted = null,
+@@ -115,6 +118,9 @@
+     <TrashIcon size={14} aria-hidden="true" />
+     {redactedLabel(redactedBy ? memberName(members, redactedBy) : null, reason ?? null)}
+   </p>
++  {#if canRedactOthers && roomId && item.event_id}
++    <RedactedContent {roomId} eventId={item.event_id} {item} {senderTimezone} {onMatrixLink} />
++  {/if}
+ {:else if item.content.kind === 'sticker'}
+   {@const sticker = item.content}
+   <div
+diff --git a/src/lib/features/room/messages/RedactedContent.svelte b/src/lib/features/room/messages/RedactedContent.svelte
+new file mode 100644
+index 000000000..adeab2e32
+--- /dev/null
++++ b/src/lib/features/room/messages/RedactedContent.svelte
+@@ -0,0 +1,87 @@
++<!-- MSC2815: the original content of a redacted message, revealed from the menu or automatically. -->
++<script lang="ts">
++  import type { Attachment } from 'svelte/attachments';
++  import type { TimelineItemView } from '#src/generated/protocol';
++  import type { MatrixLink } from '#lib/rooms/matrix-link.js';
++
++  import { useCoreClient } from '#lib/core/context.js';
++  import { i18n } from '#lib/i18n.js';
++  import { preferences } from '#lib/settings/preferences.svelte.js';
++
++  import MessageBody from './MessageBody.svelte';
++  import { redactedReveal, revealRedacted, type RevealFailure } from './redacted-reveals.svelte.js';
++
++  interface Props {
++    roomId: string;
++    eventId: string;
++    item: TimelineItemView;
++    senderTimezone?: string | null;
++    onMatrixLink?: (link: MatrixLink, anchor: HTMLAnchorElement) => void;
++  }
++
++  let { roomId, eventId, item, senderTimezone = null, onMatrixLink }: Props = $props();
++
++  const core = useCoreClient();
++  const reveal = $derived(redactedReveal(roomId, eventId));
++
++  const FAILURES: Record<RevealFailure, string> = {
++    denied: 'timeline.redactedDenied',
++    unsupported: 'timeline.redactedUnsupported',
++    gone: 'timeline.redactedGone',
++    unavailable: 'timeline.redactedUnavailable',
++    failed: 'timeline.redactedFailed',
++  };
++
++  const autoReveal: Attachment<HTMLElement> = (node) => {
++    if (!preferences.autoRevealRedacted || typeof IntersectionObserver === 'undefined') return;
++    const observer = new IntersectionObserver((entries) => {
++      if (!entries.some((entry) => entry.isIntersecting)) return;
++      observer.disconnect();
++      void revealRedacted(core.rpc, roomId, eventId, true);
++    });
++    observer.observe(node);
++    return () => observer.disconnect();
++  };
++</script>
++
++<div class="redacted-content" {@attach autoReveal}>
++  {#if reveal?.kind === 'shown'}
++    <div class="unredacted">
++      <span class="note">{i18n.t('timeline.redactedShown')}</span>
++      <MessageBody
++        item={{
++          ...item,
++          id: `${item.id}:unredacted`,
++          content: reveal.content,
++          reactions: [],
++          read_by: [],
++          thread_summary: null,
++        }}
++        canRedactOthers={false}
++        {senderTimezone}
++        {onMatrixLink}
++      />
++    </div>
++  {:else if reveal?.kind === 'loading'}
++    <span class="note">{i18n.t('timeline.redactedLoading')}</span>
++  {:else if reveal?.kind === 'failed'}
++    <span class="note">{i18n.t(FAILURES[reveal.reason])}</span>
++  {/if}
++</div>
++
++<style>
++  .unredacted {
++    border-inline-start: var(--border-width) solid var(--primary-main);
++    display: flex;
++    flex-direction: column;
++    gap: var(--space-100);
++    margin-block-start: var(--space-100);
++    padding-inline-start: var(--space-200);
++  }
++
++  .note {
++    color: var(--surface-var-on-container);
++    display: block;
++    font-size: var(--font-size-small);
++  }
++</style>
+diff --git a/src/lib/features/room/messages/RedactedContent.test.ts b/src/lib/features/room/messages/RedactedContent.test.ts
+new file mode 100644
+index 000000000..ff880bc1d
+--- /dev/null
++++ b/src/lib/features/room/messages/RedactedContent.test.ts
+@@ -0,0 +1,160 @@
++// @vitest-environment happy-dom
++
++import { render, screen } from '@testing-library/svelte';
++import { tick } from 'svelte';
++import { afterEach, beforeEach, expect, test, vi } from 'vitest';
++
++import type { Rpc, TimelineItemView } from '#src/generated/protocol';
++import { CoreError } from '#src/transport';
++
++vi.mock('#lib/core/context.js');
++
++import { core } from '#lib/core/__mocks__/context.js';
++
++vi.mock('#lib/rooms/room-list.svelte.js', () => ({
++  useRoomList: () => ({ rooms: [] }),
++}));
++
++import { setPreference } from '#lib/settings/preferences.svelte.js';
++import { withRowFields } from '#lib/features/room/timeline/row-fixtures.js';
++import MessageBody from './MessageBody.svelte';
++import { resetRedactedReveals, revealRedacted } from './redacted-reveals.svelte.js';
++
++const ROOM = '!room:example.org';
++const EVENT = '$redacted';
++const redactedContent = core.rpc.messages.redactedContent;
++const rpc = core.rpc as unknown as Rpc;
++const observerBackup = globalThis.IntersectionObserver;
++
++const secret = {
++  content: {
++    kind: 'message' as const,
++    body: 'the secret',
++    html: '<p>the secret</p>',
++    emote: false,
++    notice: false,
++    edited: false,
++    jumbo: null,
++  },
++  per_message_profile: null,
++};
++
++beforeEach(() => {
++  resetRedactedReveals();
++});
++
++afterEach(() => {
++  redactedContent.mockReset();
++  setPreference('autoRevealRedacted', false);
++  globalThis.IntersectionObserver = observerBackup;
++});
++
++function tombstone(): TimelineItemView {
++  return withRowFields({
++    id: 'item',
++    event_id: EVENT,
++    transaction_id: null,
++    send_state: null,
++    sender: '@alice:example.org',
++    sender_name: 'Alice',
++    sender_avatar: null,
++    timestamp: 0,
++    content: { kind: 'redacted', reason: 'spam', redacted_by: null },
++    in_reply_to: null,
++    thread_root: null,
++    thread_summary: null,
++    reactions: [],
++    is_own: false,
++    read_by: [],
++    read_timestamps: {},
++    per_message_profile: null,
++    bundled_link_previews: [],
++    link_previews_removed: null,
++    mention: 'none',
++    forwarded: null,
++    forum_title: null,
++  });
++}
++
++async function renderTombstone(canRedactOthers = true) {
++  const view = render(MessageBody, { item: tombstone(), canRedactOthers, roomId: ROOM });
++  await tick();
++  return view;
++}
++
++function visibleImmediately() {
++  globalThis.IntersectionObserver = class {
++    readonly callback: IntersectionObserverCallback;
++    constructor(callback: IntersectionObserverCallback) {
++      this.callback = callback;
++    }
++    observe() {
++      this.callback(
++        [{ isIntersecting: true } as IntersectionObserverEntry],
++        this as unknown as IntersectionObserver
++      );
++    }
++    disconnect() {}
++  } as unknown as typeof IntersectionObserver;
++}
++
++test('stays collapsed until revealed', async () => {
++  visibleImmediately();
++  await renderTombstone();
++
++  expect(screen.getByText(/spam/)).toBeInTheDocument();
++  expect(redactedContent).not.toHaveBeenCalled();
++});
++
++test('a reveal shows the original under the trash-icon tombstone', async () => {
++  redactedContent.mockResolvedValue(secret);
++  await renderTombstone();
++  await revealRedacted(rpc, ROOM, EVENT);
++  await tick();
++
++  expect(redactedContent).toHaveBeenCalledWith({ room_id: ROOM, event_id: EVENT });
++  expect(screen.getByText('the secret')).toBeInTheDocument();
++  expect(screen.getByText(/spam/)).toBeInTheDocument();
++});
++
++test('auto mode fetches once when visible, and only for moderators', async () => {
++  setPreference('autoRevealRedacted', true);
++  visibleImmediately();
++  redactedContent.mockResolvedValue(secret);
++
++  const hidden = await renderTombstone(false);
++  expect(redactedContent).not.toHaveBeenCalled();
++  hidden.unmount();
++
++  await renderTombstone();
++  await renderTombstone();
++  await vi.waitFor(() => expect(screen.getAllByText('the secret')).toHaveLength(2));
++  expect(redactedContent).toHaveBeenCalledTimes(1);
++});
++
++test('auto mode stops asking once the server lacks MSC2815', async () => {
++  setPreference('autoRevealRedacted', true);
++  visibleImmediately();
++  redactedContent.mockRejectedValue(new CoreError({ code: 'unsupported' }));
++
++  await renderTombstone();
++  await vi.waitFor(() => expect(screen.getByText(/cannot show deleted/i)).toBeInTheDocument());
++  await revealRedacted(rpc, ROOM, '$other', true);
++
++  expect(redactedContent).toHaveBeenCalledTimes(1);
++});
++
++test('a manual reveal retries an outage but not a refusal', async () => {
++  redactedContent.mockRejectedValue(new CoreError({ code: 'unavailable' }));
++  await revealRedacted(rpc, ROOM, EVENT);
++  await revealRedacted(rpc, ROOM, EVENT, true);
++  expect(redactedContent).toHaveBeenCalledTimes(1);
++
++  redactedContent.mockRejectedValue(new CoreError({ code: 'denied' }));
++  await revealRedacted(rpc, ROOM, EVENT);
++  await revealRedacted(rpc, ROOM, EVENT);
++  expect(redactedContent).toHaveBeenCalledTimes(2);
++
++  await renderTombstone();
++  expect(screen.getByText(/don’t have permission/i)).toBeInTheDocument();
++});
+diff --git a/src/lib/features/room/messages/message-action-controller.svelte.ts b/src/lib/features/room/messages/message-action-controller.svelte.ts
+index 9a7c84898..7cd65f3ff 100644
+--- a/src/lib/features/room/messages/message-action-controller.svelte.ts
++++ b/src/lib/features/room/messages/message-action-controller.svelte.ts
+@@ -15,6 +15,7 @@ import type { Bookmarks } from '#lib/rooms/bookmarks.svelte.js';
+ import type { MessageDialogs } from './message-dialogs.svelte.js';
+ import type { ReplyVersion } from './reply-preview';
+ import { messageActionPolicy } from './message-action-policy';
++import { redactedReveal, revealRedacted } from './redacted-reveals.svelte.js';
+ 
+ export interface MessageCallbacks {
+   onToggleReaction?: (
+@@ -317,6 +318,13 @@ export class MessageActionExecutor {
+         : undefined,
+       onEditHistory: policy.editHistory ? () => void openEditHistory(policy.eventId) : undefined,
+       onViewSource: policy.viewSource ? () => void openSource(policy.eventId) : undefined,
++      onViewRedacted:
++        item.content.kind === 'redacted' &&
++        canRedactOthers &&
++        policy.viewSource &&
++        redactedReveal(roomId, policy.eventId)?.kind !== 'shown'
++          ? () => void revealRedacted(core.rpc, roomId, policy.eventId)
++          : undefined,
+       onReport: policy.report
+         ? () => {
+             dialogs.open(item, { kind: 'report' });
+diff --git a/src/lib/features/room/messages/message-menu-items.ts b/src/lib/features/room/messages/message-menu-items.ts
+index 64d8df607..172f6acf0 100644
+--- a/src/lib/features/room/messages/message-menu-items.ts
++++ b/src/lib/features/room/messages/message-menu-items.ts
+@@ -51,6 +51,7 @@ export type MessageActions = {
+   stealCount?: number;
+   onReport?: () => void;
+   onViewSource?: () => void;
++  onViewRedacted?: () => void;
+   pinned?: boolean;
+   bookmarked?: boolean;
+ };
+@@ -226,6 +227,14 @@ export function messageMenuRows(actions: MessageActions): MessageMenuRow[] {
+       run: actions.onViewSource,
+     });
+   }
++  if (actions.onViewRedacted) {
++    rows.push({
++      key: 'view-redacted',
++      label: 'timeline.viewRedacted',
++      icon: ReceiptIcon,
++      run: actions.onViewRedacted,
++    });
++  }
+   if (actions.onReport) {
+     rows.push({
+       key: 'report',
+diff --git a/src/lib/features/room/messages/redacted-reveals.svelte.ts b/src/lib/features/room/messages/redacted-reveals.svelte.ts
+new file mode 100644
+index 000000000..66b72e1f2
+--- /dev/null
++++ b/src/lib/features/room/messages/redacted-reveals.svelte.ts
+@@ -0,0 +1,56 @@
++import { SvelteMap } from 'svelte/reactivity';
++
++import type { Rpc, TimelineItemContentView } from '#src/generated/protocol';
++import { CoreError } from '#src/transport';
++
++export type RevealFailure = 'denied' | 'unsupported' | 'gone' | 'unavailable' | 'failed';
++
++export type Reveal =
++  | { kind: 'loading' }
++  | { kind: 'shown'; content: TimelineItemContentView }
++  | { kind: 'failed'; reason: RevealFailure };
++
++const FINAL: ReadonlySet<RevealFailure> = new Set(['denied', 'unsupported', 'gone']);
++
++const reveals = new SvelteMap<string, Reveal>();
++let serverUnsupported = false;
++
++const key = (roomId: string, eventId: string) => `${roomId} ${eventId}`;
++
++export function redactedReveal(roomId: string, eventId: string): Reveal | undefined {
++  return reveals.get(key(roomId, eventId));
++}
++
++/** Fetches at most once per event; `auto` never retries and stops once the server lacks MSC2815. */
++export async function revealRedacted(
++  rpc: Rpc,
++  roomId: string,
++  eventId: string,
++  auto = false
++): Promise<Reveal> {
++  const id = key(roomId, eventId);
++  const current = reveals.get(id);
++  if (current && (auto || current.kind !== 'failed' || FINAL.has(current.reason))) return current;
++  if (auto && serverUnsupported) return { kind: 'failed', reason: 'unsupported' };
++
++  reveals.set(id, { kind: 'loading' });
++  let next: Reveal;
++  try {
++    const { content } = await rpc.messages.redactedContent({ room_id: roomId, event_id: eventId });
++    next = content ? { kind: 'shown', content } : { kind: 'failed', reason: 'gone' };
++  } catch (cause) {
++    const code = cause instanceof CoreError ? cause.detail.code : null;
++    next = {
++      kind: 'failed',
++      reason: code === 'denied' || code === 'unsupported' || code === 'unavailable' ? code : 'failed',
++    };
++    if (code === 'unsupported') serverUnsupported = true;
++  }
++  reveals.set(id, next);
++  return next;
++}
++
++export function resetRedactedReveals(): void {
++  reveals.clear();
++  serverUnsupported = false;
++}
+diff --git a/src/lib/features/room/timeline/TimelineItem.svelte b/src/lib/features/room/timeline/TimelineItem.svelte
+index 0ab0f82bd..8d68f48e2 100644
+--- a/src/lib/features/room/timeline/TimelineItem.svelte
++++ b/src/lib/features/room/timeline/TimelineItem.svelte
+@@ -751,6 +751,8 @@
+             <MessageBody
+               {item}
+               {canRedactOthers}
++              {roomId}
++              {onMatrixLink}
+               redactionReason={item.event_id ? events?.redactionReason(item.event_id) : null}
+               redactedBy={events?.redactor(item) ?? item.content.redacted_by ?? null}
+             />
+diff --git a/src/lib/settings/preferences.svelte.ts b/src/lib/settings/preferences.svelte.ts
+index a46b764cc..b8654489d 100644
+--- a/src/lib/settings/preferences.svelte.ts
++++ b/src/lib/settings/preferences.svelte.ts
+@@ -260,6 +260,7 @@ export interface Preferences {
+   usernameClick: UsernameClick;
+   doubleTapReact: boolean;
+   showRoleTooltip: boolean;
++  autoRevealRedacted: boolean;
+   doubleTapReaction: string;
+   hideTypingIndicators: boolean;
+   memberSort: MemberSort;
+@@ -610,6 +611,7 @@ const DEFAULTS: Preferences = {
+   usernameClick: 'mention',
+   doubleTapReact: true,
+   showRoleTooltip: false,
++  autoRevealRedacted: false,
+   doubleTapReaction: '❤️',
+   hideTypingIndicators: false,
+   memberSort: 'name-asc',
+diff --git a/src/lib/settings/registry/timeline.ts b/src/lib/settings/registry/timeline.ts
+index 6986b899b..cbf2fbbe9 100644
+--- a/src/lib/settings/registry/timeline.ts
++++ b/src/lib/settings/registry/timeline.ts
+@@ -304,6 +304,14 @@ export const timelineCategory: SettingsCategory = {
+       name: 'settings.showRoleTooltip',
+       type: 'boolean',
+     },
++    {
++      key: 'autoRevealRedacted',
++      section: 'messages',
++      icon: TrashIcon,
++      name: 'settings.autoRevealRedacted',
++      description: 'settings.autoRevealRedactedHint',
++      type: 'boolean',
++    },
+     {
+       key: 'hour24Clock',
+       section: 'time-date',
+diff --git a/src/locales/en.json b/src/locales/en.json
+index 93d436c9f..9cee044ac 100644
+--- a/src/locales/en.json
++++ b/src/locales/en.json
+@@ -1265,6 +1265,14 @@
+     "redactedWithReason": "Message deleted: {{reason}}",
+     "redactedBy": "Message deleted by {{name}}",
+     "redactedByWithReason": "Message deleted by {{name}}: {{reason}}",
++    "viewRedacted": "View deleted content",
++    "redactedShown": "Original content of the deleted message",
++    "redactedLoading": "Reading the original content…",
++    "redactedGone": "The original content is no longer available.",
++    "redactedFailed": "The original content could not be read.",
++    "redactedDenied": "You don’t have permission to view deleted content in this room.",
++    "redactedUnsupported": "This homeserver cannot show deleted content.",
++    "redactedUnavailable": "The homeserver could not be reached. Try again.",
+     "locationShowMap": "Show map",
+     "locationMapAlt": "Map showing {{label}}",
+     "forwardSelected_one": "{{count, number}} room selected",
+@@ -2101,6 +2109,8 @@
+     "captionPositionHidden": "Hidden",
+     "doubleTapReact": "Double tap to react",
+     "showRoleTooltip": "Show role name on hover",
++    "autoRevealRedacted": "Show deleted messages’ content automatically",
++    "autoRevealRedactedHint": "For moderators, on homeservers that support MSC2815.",
+     "doubleTapReaction": "Double tap reaction",
+     "hideTypingIndicators": "Hide typing indicators",
+     "groupMembersByPresence": "Group members by presence",
+diff --git a/tests/e2e/fake-core.ts b/tests/e2e/fake-core.ts
+index fb662fb3c..6cdf70baa 100644
+--- a/tests/e2e/fake-core.ts
++++ b/tests/e2e/fake-core.ts
+@@ -1017,6 +1017,7 @@ export async function installFakeCore(page: Page, mode: WorkerMode): Promise<voi
+         mentions: { user_ids: [], room: false },
+       }),
+       'messages.bulk_redact': () => 0,
++      'messages.redacted_content': () => ({ content: null, per_message_profile: null }),
+       'messages.delete_thread': () => null,
+       'messages.reaction_shortcodes': () => [],
+       'calendar.entries': () => ({ entries: [], rsvps: [] }),

@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: delta <bvccc848@gmail.com>
+Date: Thu, 22 Oct 2026 04:44:18 +0200
+Subject: [PATCH] nix: expose sable-desktop (Electron) and the sable-cachix
+ substituter
+
+---
+ flake.nix | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/flake.nix b/flake.nix
+index 413a0ae22..c0dc9534f 100644
+--- a/flake.nix
++++ b/flake.nix
+@@ -1,5 +1,12 @@
+ # SPDX-License-Identifier: AGPL-3.0-or-later
+ {
++  nixConfig = {
++    extra-substituters = [ "https://sable-cachix.cachix.org" ];
++    extra-trusted-public-keys = [
++      "sable-cachix.cachix.org-1:XXaZaHCKVrE9XOLfi1yG74+COyIrpjU0jeZ7SxVAz2U="
++    ];
++  };
++
+   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+ 
+   outputs =
+@@ -24,6 +31,10 @@
+             sable-unwrapped = callPackage ./packaging/nix/unwrapped.nix { };
+             sable = callPackage ./packaging/nix/sable.nix { };
+             default = packages.sable;
++          }
++          // lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
++            sable-electron-app = callPackage ./.fork/nix/electron-app.nix { };
++            sable-desktop = callPackage ./.fork/nix/desktop.nix { };
+           };
+         in
+         packages
