@@ -1,4 +1,4 @@
-import MarkdownIt from 'markdown-it';
+import MarkdownIt, { type StateInline } from 'markdown-it';
 import {
   defaultMarkdownSerializer,
   MarkdownParser,
@@ -609,10 +609,16 @@ tokenizer.inline.ruler.at('text', (state, silent) => {
   return true;
 });
 
-function spoilerClose(src: string, from: number, max: number): number {
+function spoilerClose(state: StateInline, from: number, max: number): number {
+  const { src, pos } = state;
   for (let index = from; index + 2 <= max; index += 1) {
     if (src[index] === '\\') index += 1;
-    else if (src.startsWith('||', index)) return index;
+    else if (src[index] === '`') {
+      state.pos = index;
+      state.md.inline.skipToken(state);
+      index = state.pos - 1;
+      state.pos = pos;
+    } else if (src.startsWith('||', index)) return index;
   }
   return -1;
 }
@@ -620,7 +626,7 @@ function spoilerClose(src: string, from: number, max: number): number {
 tokenizer.inline.ruler.before('text', 'spoiler', (state, silent) => {
   const start = state.pos;
   if (!state.src.startsWith('||', start)) return false;
-  const close = spoilerClose(state.src, start + 2, state.posMax);
+  const close = spoilerClose(state, start + 2, state.posMax);
   if (close < 0) return false;
   const inner = state.src.slice(start + 2, close);
   if (inner === '' || /^\s|\s$/.test(inner)) return false;
@@ -779,7 +785,13 @@ function spliceAtoms(node: ProseMirrorNode, atoms: ProseMirrorNode[]): ProseMirr
     for (const [index, part] of (child.text ?? '').split(ATOM_PLACEHOLDER).entries()) {
       if (index > 0) {
         const atom = atoms.shift();
-        if (atom) children.push(node.type.spec.code ? composerSchema.text(atomText(atom)) : atom);
+        if (atom) {
+          const inCode =
+            node.type.spec.code ||
+            (atom.type !== composerSchema.nodes.emoticon &&
+              composerSchema.marks.code.isInSet(child.marks));
+          children.push(inCode ? composerSchema.text(atomText(atom), child.marks) : atom);
+        }
       }
       if (part !== '') children.push(composerSchema.text(part, child.marks));
     }
@@ -791,13 +803,12 @@ function spliceAtoms(node: ProseMirrorNode, atoms: ProseMirrorNode[]): ProseMirr
 /** Plain-text mode: what was typed is the body, parsed as markdown for the HTML. */
 export function serializePlain(doc: ProseMirrorNode): ComposerMessage {
   const body = plainTextOf(doc).replaceAll('\u00a0', ' ').trim();
-  const mentions = mentionsOf(doc);
   const imageSourcePacks = imageSourcePacksOf(doc);
   if (body === '')
     return {
       body,
       formatted: null,
-      mentions,
+      mentions: mentionsOf(doc),
       ...(imageSourcePacks.length > 0 && { imageSourcePacks }),
     };
 
@@ -813,7 +824,7 @@ export function serializePlain(doc: ProseMirrorNode): ComposerMessage {
       isPlain(parsed) && plainTextOf(parsed) === body && !receiverFormats(body)
         ? null
         : html(parsed),
-    mentions,
+    mentions: mentionsOf(parsed),
     ...(imageSourcePacks.length > 0 && { imageSourcePacks }),
   };
 }

@@ -334,6 +334,8 @@ export type ForwardedView = {
 	timestamp: number | null,
 	room_id: string | null,
 	event_id: string | null,
+	sender: string | null,
+	content_valid: boolean | null,
 };
 
 export type Frequency = "daily" | "weekly" | "monthly" | "yearly";
@@ -2386,6 +2388,7 @@ export type Rpc = {
 	room_id: string,
 	event_type: string,
 	content: unknown,
+	persona?: PerMessageProfileView | null,
 }) => Promise<string>;
     sendRedaction: (params: {
 	room_id: string,
@@ -2471,6 +2474,7 @@ export type Rpc = {
 	shortcode?: string | null,
 	thread_root?: string | null,
 	subscription?: SubscriptionId | null,
+	persona?: PerMessageProfileView | null,
 }) => Promise<null>;
     sendLocation: (params: {
 	room_id: string,
@@ -2479,11 +2483,14 @@ export type Rpc = {
 	in_reply_to?: string | null,
 	silent_reply?: boolean,
 	thread_root?: string | null,
+	persona?: PerMessageProfileView | null,
 }) => Promise<null>;
     forward: (params: {
 	room_id: string,
 	event_id: string,
 	to_room_id: string,
+	include_metadata?: boolean | null,
+	persona?: PerMessageProfileView | null,
 }) => Promise<null>;
     report: (params: {
 	room_id: string,
@@ -2505,6 +2512,7 @@ export type Rpc = {
 	body: string,
 	formatted?: string | null,
 	delay_ms: number,
+	persona?: PerMessageProfileView | null,
 }) => Promise<string>;
     scheduleAttachment: (params: {
 	room_id: string,
@@ -2515,6 +2523,7 @@ export type Rpc = {
 	info?: AttachmentInfoView | null,
 	spoiler?: boolean,
 	delay_ms: number,
+	persona?: PerMessageProfileView | null,
 }) => Promise<string>;
     scheduled: (params: {
 	room_id?: string | null,
@@ -2533,6 +2542,7 @@ export type Rpc = {
 	undisclosed: boolean,
 	max_selections: number,
 	thread_root?: string | null,
+	persona?: PerMessageProfileView | null,
 }) => Promise<null>;
     votePoll: (params: {
 	room_id: string,
@@ -2541,16 +2551,19 @@ export type Rpc = {
 	/**  The ids of the chosen answers. */
 	answers: string[],
 	thread_root?: string | null,
+	persona?: PerMessageProfileView | null,
 }) => Promise<null>;
     endPoll: (params: {
 	room_id: string,
 	event_id: string,
 	thread_root?: string | null,
+	persona?: PerMessageProfileView | null,
 }) => Promise<null>;
     sendGesture: (params: {
 	room_id: string,
 	gesture: GestureView,
 	target?: string | null,
+	persona?: PerMessageProfileView | null,
 }) => Promise<null>;
     urlPreview: (params: {
 	url: string,

@@ -26,6 +26,7 @@
 
   import CallControls from './CallControls.svelte';
   import { preferences } from '#lib/settings/preferences.svelte.js';
+  import { electronBridge } from '#lib/platform/electron.js';
   import CallModeDebug from './CallModeDebug.svelte';
   import CallPlayback from './CallPlayback.svelte';
   import CallParticipantTile from './CallParticipantTile.svelte';
@@ -160,7 +161,10 @@
     microphone: 'call.microphoneUnavailable',
     camera: 'call.cameraUnavailable',
     screen: 'call.screenShareUnavailable',
-    screenAudio: 'call.screenAudioUnavailable',
+    screenAudio:
+      electronBridge()?.platform === 'darwin'
+        ? 'call.screenAudioUnavailableMac'
+        : 'call.screenAudioUnavailable',
   } as const;
 
   let stage = $state<HTMLElement>();
@@ -492,7 +496,6 @@
     onWatchScreen={item.source === 'screen' && !item.participant.local && screenShare
       ? () => session.toggleWatchScreenShare(screenShare.id)
       : undefined}
-    onVolumeChange={(identity, volume) => void session.setParticipantVolume(identity, volume)}
   />
 {/snippet}
 

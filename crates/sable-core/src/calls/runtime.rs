@@ -5,6 +5,7 @@ use std::time::Duration;
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use matrix_sdk::event_handler::EventHandlerDropGuard;
 use matrix_sdk::executor::{JoinHandleExt as _, spawn};
+use matrix_sdk::ruma::api::client::delayed_events::update_delayed_event::UpdateAction;
 use matrix_sdk::ruma::events::StateEventType;
 use matrix_sdk::ruma::events::call::member::{
     ActiveFocus, ActiveLivekitFocus, Application, CallApplicationContent, CallMemberEventContent,
@@ -36,7 +37,8 @@ const UNRESOLVED_KEY_REPORT_MS: u64 = 30_000;
 const SILENT_MEMBER_REPORT_MS: u64 = 10_000;
 const RENEW_INTERVAL_MS: u64 = 600_000;
 const STICKY_RENEW_INTERVAL_MS: u64 = 3_300_000;
-const SLOT_CHECK_INTERVAL_MS: u64 = 30_000;
+const ENCRYPTED_STICKY_RENEW_INTERVAL_MS: u64 = 30_000;
+const SLOT_CHECK_INTERVAL_MS: u64 = 5_000;
 const PUBLISHER_RETRY_MS: u64 = 30_000;
 
 struct PendingKey {
@@ -69,6 +71,9 @@ pub(crate) struct State {
 }
 
 impl State {
+    pub(super) const fn wire(&self) -> membership::RtcWire {
+        self.own.wire
+    }
     pub(super) const fn left_because_slot_closed(&self) -> bool {
         self.slot_closed_midcall
     }
@@ -83,15 +88,17 @@ impl State {
         slot_closed: bool,
     ) -> Self {
         let distributor = encrypt_media.then(|| {
-            Arc::new(Mutex::new(KeyDistributor::new(
+            let mut distributor = KeyDistributor::new(
                 room_id.clone(),
                 own.user_id.clone(),
-                own.device_id.clone(),
+                own.own_device_id().to_owned(),
                 own.member_id
                     .clone()
                     .unwrap_or_else(|| own.identity.clone()),
                 own.identity.clone(),
-            )))
+            );
+            distributor.set_wire(own.wire);
+            Arc::new(Mutex::new(distributor))
         });
         Self {
             own,
@@ -204,13 +211,45 @@ fn content_at(
 ) -> MembershipContent {
     let screen_sharing = own.screen_sharing.then_some(ScreenSharing { active: true });
     if own.mode == CallMode::Matrix2 {
+        if own.wire == membership::RtcWire::Stable {
+            return MembershipContent::StableMatrix2(StableMatrix2Out {
+                application: StableApplication {
+                    kind: "m.call",
+                    intent: intent.map(|intent| match intent {
+                        CallIntent::Audio => "m.audio",
+                        CallIntent::Video => "m.video",
+                    }),
+                    capabilities: ["m.render_audio", "m.render_video"],
+                },
+                slot_id: own.wire.slot(),
+                member: StableMember {
+                    id: own.member_id.clone(),
+                    membership: "join",
+                },
+                transports: StableTransports {
+                    published: own
+                        .foci
+                        .iter()
+                        .map(|url| StableFocus {
+                            kind: "m.livekit",
+                            url: url.clone(),
+                            server_name: own.focus_servers.get(url).cloned(),
+                        })
+                        .collect(),
+                    can_subscribe: ["m.livekit"],
+                },
+                sticky_key: own.member_id.clone(),
+                screen_sharing,
+            });
+        }
         MembershipContent::Matrix2(Matrix2Out {
             application: Matrix2Application::Call { intent },
             slot_id: SlotId::CallRoom,
             member: Matrix2Member {
                 user_id: own.user_id.clone(),
-                device_id: own.device_id.clone(),
+                device_id: own.own_device_id().to_owned(),
                 id: own.member_id.clone(),
+                membership: "join",
             },
             transports: Matrix2Transports {
                 published: own
@@ -239,7 +278,7 @@ fn content_at(
         MembershipContent::Legacy(LegacyOut {
             session: CallMemberEventContent::new(
                 Application::Call(application),
-                own.device_id.clone(),
+                own.own_device_id().to_owned(),
                 ActiveFocus::Livekit(focus_active),
                 own.foci
                     .iter()
@@ -265,8 +304,50 @@ fn content_at(
 #[derive(Serialize)]
 #[serde(untagged)]
 enum MembershipContent {
+    StableMatrix2(StableMatrix2Out),
     Matrix2(Matrix2Out),
     Legacy(LegacyOut),
+}
+
+#[derive(Serialize)]
+struct StableMember {
+    id: Option<String>,
+    membership: &'static str,
+}
+
+#[derive(Serialize)]
+struct StableFocus {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_name: Option<matrix_sdk::ruma::OwnedServerName>,
+}
+
+#[derive(Serialize)]
+struct StableTransports {
+    published: Vec<StableFocus>,
+    can_subscribe: [&'static str; 1],
+}
+
+#[derive(Serialize)]
+struct StableMatrix2Out {
+    application: StableApplication,
+    slot_id: &'static str,
+    member: StableMember,
+    transports: StableTransports,
+    sticky_key: Option<String>,
+    #[serde(flatten)]
+    screen_sharing: Option<ScreenSharing>,
+}
+
+#[derive(Serialize)]
+struct StableApplication {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    intent: Option<&'static str>,
+    capabilities: [&'static str; 2],
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -297,6 +378,7 @@ struct Matrix2Member {
     user_id: OwnedUserId,
     device_id: OwnedDeviceId,
     id: Option<String>,
+    membership: &'static str,
 }
 
 #[derive(Serialize)]
@@ -345,7 +427,7 @@ fn state_key(
 ) -> matrix_sdk::ruma::events::call::member::CallMemberStateKey {
     super::membership_state_key(
         &own.user_id,
-        &own.device_id,
+        own.own_device_id(),
         room.version()
             .as_ref()
             .map_or("", |version| version.as_str()),
@@ -360,7 +442,7 @@ async fn publish_membership(
     let room_id = room.room_id().to_owned();
     let body = content(&room_id, own, intent);
     if own.mode == CallMode::Matrix2 {
-        sticky::send(&room.client(), room, &body).await
+        sticky::send_wire(room, &body, own.wire).await
     } else {
         let key = state_key(room, own);
         let raw = matrix_sdk::ruma::serde::Raw::new(&body)?.cast_unchecked();
@@ -378,10 +460,10 @@ async fn retract(core: &Core, room: &Room, own: &CallMember, delay: Option<Strin
         return;
     }
     if own.mode == CallMode::Matrix2 {
-        if sticky::send(
-            &room.client(),
+        if sticky::send_wire(
             room,
-            sticky::LeaveOut::new(own.member_id.clone(), sticky::LeaveCode::Leave),
+            sticky::LeaveOut::for_wire(own.member_id.clone(), sticky::LeaveCode::Leave, own.wire),
+            own.wire,
         )
         .await
         .is_err()
@@ -394,10 +476,18 @@ async fn retract(core: &Core, room: &Room, own: &CallMember, delay: Option<Strin
     }
 }
 
-async fn room_slot_closed(core: &Core, room: &Room) -> Result<bool, RpcError> {
-    Ok(super::slot_closed(room, core.room_is_encrypted(room).await?).await)
+async fn room_slot_closed(
+    core: &Core,
+    room: &Room,
+    wire: membership::RtcWire,
+) -> Result<bool, RpcError> {
+    Ok(super::slot_closed(room, core.room_is_encrypted(room).await?, wire).await)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Discovery and mode selection form one flow"
+)]
 async fn discover(
     core: &Core,
     room: &Room,
@@ -408,6 +498,7 @@ async fn discover(
     let client = room.client();
     let user = client.user_id().ok_or(RpcError::NotLoggedIn)?.to_owned();
     let device = client.device_id().ok_or(RpcError::NotLoggedIn)?.to_owned();
+    let encrypted = core.room_is_encrypted(room).await?;
     let mut sticky_members = StickyMemberships::default();
     let mut sticky_sync = None;
     let features = client.unstable_features().await.unwrap_or_default();
@@ -416,7 +507,7 @@ async fn discover(
         match sync.sync(room, Duration::ZERO).await {
             Ok(events) => {
                 for event in events {
-                    sticky_members.apply(&event, keys::now_ms());
+                    event.apply(&mut sticky_members, encrypted, keys::now_ms());
                 }
                 sticky_sync = Some(sync);
             }
@@ -426,12 +517,38 @@ async fn discover(
         }
     }
     for event in sticky::live_events(room) {
-        sticky_members.apply(&event, keys::now_ms());
+        event.apply(&mut sticky_members, encrypted, keys::now_ms());
     }
-    let slot_closed = sticky_sync.is_some() && room_slot_closed(core, room).await?;
+    let sticky_candidates = sticky_members.members(keys::now_ms());
+    let stable_supported = features.contains(&"org.matrix.msc4143.stable".into());
+    let stable_services = if stable_supported {
+        super::stable_transports(&client).await
+    } else {
+        Vec::new()
+    };
+    let wire = if stable_supported
+        && (sticky_candidates
+            .iter()
+            .any(|member| member.wire == membership::RtcWire::Stable)
+            || (!sticky_candidates
+                .iter()
+                .any(|member| member.wire == membership::RtcWire::Deployed)
+                && !stable_services.is_empty()))
+    {
+        membership::RtcWire::Stable
+    } else {
+        membership::RtcWire::Deployed
+    };
+    let slot_closed = sticky_sync.is_some() && room_slot_closed(core, room, wire).await?;
     let mut members = membership::active_members(room).await;
     if !slot_closed {
-        merge_sticky(&mut members, sticky_members.members(keys::now_ms()));
+        merge_sticky(
+            &mut members,
+            sticky_candidates
+                .into_iter()
+                .filter(|member| member.wire == wire)
+                .collect(),
+        );
     }
     let forced_sticky = requested.is_none()
         && sticky_sync.is_some()
@@ -450,7 +567,20 @@ async fn discover(
     } else {
         requested
     };
-    let mode = select_mode(requested, &members, sticky_sync.is_some())?;
+    let mode = if requested.is_none()
+        && wire == membership::RtcWire::Stable
+        && sticky_sync.is_some()
+        && members.is_empty()
+    {
+        CallMode::Matrix2
+    } else {
+        select_mode(requested, &members, sticky_sync.is_some())?
+    };
+    let wire = if mode == CallMode::Matrix2 {
+        wire
+    } else {
+        membership::RtcWire::Deployed
+    };
     let sticky_available = sticky_sync.is_some();
     let reason = mode_reason(requested, forced_sticky, &members, sticky_available);
     let mut peer_modes = members
@@ -460,24 +590,51 @@ async fn discover(
         .collect::<Vec<_>>();
     peer_modes.dedup();
     members.sort_by_key(|member| member.created_ts);
-    let service = core
-        .resolve_focus(&members, configured, room)
-        .await
-        .ok_or(RpcError::NoCallFocus)?;
+    let (service, focus_server) =
+        if mode == CallMode::Matrix2 && wire == membership::RtcWire::Stable {
+            if let Some(url) = stable_services.first() {
+                (url.clone(), None)
+            } else {
+                let (url, server) = members
+                    .iter()
+                    .filter(|member| member.wire == wire)
+                    .find_map(|member| {
+                        member.foci.first().and_then(|url| {
+                            member
+                                .focus_servers
+                                .get(url)
+                                .map(|server| (url.clone(), server.clone()))
+                        })
+                    })
+                    .ok_or(RpcError::NoCallFocus)?;
+                (url, Some(server))
+            }
+        } else {
+            (
+                core.resolve_focus(&members, configured, room)
+                    .await
+                    .ok_or(RpcError::NoCallFocus)?,
+                None,
+            )
+        };
     let member_id = if mode == CallMode::Matrix2 {
         TransactionId::new().to_string()
     } else {
         sfu::livekit_identity(&user, &device)
     };
     let identity = if mode == CallMode::Matrix2 {
-        membership::sticky_identity(&user, &device, &member_id)
+        if wire == membership::RtcWire::Stable {
+            membership::stable_identity(&user, &member_id)
+        } else {
+            membership::sticky_identity(&user, &device, &member_id)
+        }
     } else {
         sfu::livekit_identity(&user, &device)
     };
     let now = keys::now_ms();
     let own = CallMember {
         user_id: user,
-        device_id: device,
+        device_id: Some(device),
         member_id: if mode == CallMode::Matrix2 {
             Some(member_id)
         } else {
@@ -488,8 +645,12 @@ async fn discover(
         created_ts: now,
         joined_ts: now,
         expires_at_ms: None,
-        foci: vec![service],
+        foci: vec![service.clone()],
         screen_sharing: false,
+        wire,
+        focus_servers: focus_server
+            .map(|server| [(service, server)].into())
+            .unwrap_or_default(),
     };
     Ok(Discovered {
         own,
@@ -537,20 +698,36 @@ async fn publish(
 ) -> Result<Published, RpcError> {
     let state_key = state_key(room, own);
     let delay = if own.mode == CallMode::Matrix2 {
-        if !super::ensure_open_slot(room, encrypted).await {
-            tracing::warn!("no open rtc slot and none could be opened");
+        if !super::ensure_open_slot(room, encrypted, own.wire).await {
+            return Err(core.failed("join_call", "no compatible open RTC slot"));
         }
         let support = core.delayed_events_support().await.unwrap_or_default();
         if support.any() {
-            sticky::send_delayed(
+            match sticky::send_delayed_event(
                 &room.client(),
                 support,
                 room,
-                sticky::LeaveOut::new(own.member_id.clone(), sticky::LeaveCode::DelayedLeave),
+                if own.wire == membership::RtcWire::Stable {
+                    "m.rtc.member"
+                } else {
+                    membership::RTC_MEMBER_EVENT_TYPE
+                },
+                sticky::LeaveOut::for_wire(
+                    own.member_id.clone(),
+                    sticky::LeaveCode::DelayedLeave,
+                    own.wire,
+                ),
                 HANGUP_DELAY,
+                if encrypted { 120_000 } else { 3_600_000 },
             )
             .await
-            .ok()
+            {
+                Ok(id) => Some(id),
+                Err(error) => {
+                    tracing::warn!(?error, "could not schedule a delayed call leave");
+                    None
+                }
+            }
         } else {
             None
         }
@@ -567,16 +744,24 @@ async fn publish(
             return Err(core.room_error("join_call", error));
         }
     };
-    let provision = if own.mode == CallMode::Matrix2 {
+    let provision = if own.mode == CallMode::Matrix2 && own.wire == membership::RtcWire::Stable {
+        sfu::provision_stable(
+            room,
+            service,
+            own.focus_servers.get(service).map(AsRef::as_ref),
+            own.member_id.as_deref().unwrap_or(&own.identity),
+        )
+        .await
+    } else if own.mode == CallMode::Matrix2 {
         sfu::provision_matrix2(
             room,
             service,
-            &own.device_id,
+            own.own_device_id(),
             own.member_id.as_deref().unwrap_or(&own.identity),
         )
         .await
     } else {
-        sfu::provision(room, service, &own.device_id).await
+        sfu::provision(room, service, own.own_device_id()).await
     };
     let provision = match provision {
         Ok(provision) if provision.identity == own.identity => provision,
@@ -606,7 +791,14 @@ async fn publish_elsewhere(
     configured: Option<String>,
     intent: Option<CallIntent>,
 ) -> Option<(CallMember, sfu::Provisioned)> {
-    let service = core.resolve_focus(&[], configured, room).await?;
+    let service = if own.mode == CallMode::Matrix2 && own.wire == membership::RtcWire::Stable {
+        super::stable_transports(&room.client())
+            .await
+            .into_iter()
+            .next()?
+    } else {
+        core.resolve_focus(&[], configured, room).await?
+    };
     if own
         .foci
         .first()
@@ -623,23 +815,32 @@ async fn publish_elsewhere(
         foci: vec![service.clone()],
         ..own.clone()
     };
-    if let Err(error) = publish_membership(room, &moved, intent).await {
-        tracing::warn!(%error, "could not move the call membership to our own focus");
-        return None;
-    }
-    let provisioned = if moved.mode == CallMode::Matrix2 {
-        sfu::provision_matrix2(
-            room,
-            &service,
-            &moved.device_id,
-            moved.member_id.as_deref().unwrap_or(&moved.identity),
-        )
-        .await
-    } else {
-        sfu::provision(room, &service, &moved.device_id).await
-    };
+    let provisioned =
+        if moved.mode == CallMode::Matrix2 && moved.wire == membership::RtcWire::Stable {
+            sfu::provision_stable(
+                room,
+                &service,
+                None,
+                moved.member_id.as_deref().unwrap_or(&moved.identity),
+            )
+            .await
+        } else if moved.mode == CallMode::Matrix2 {
+            sfu::provision_matrix2(
+                room,
+                &service,
+                moved.own_device_id(),
+                moved.member_id.as_deref().unwrap_or(&moved.identity),
+            )
+            .await
+        } else {
+            sfu::provision(room, &service, moved.own_device_id()).await
+        };
     match provisioned {
         Ok(provision) if provision.identity == moved.identity && provision.can_publish => {
+            if let Err(error) = publish_membership(room, &moved, intent).await {
+                tracing::warn!(%error, "could not move the call membership to our own focus");
+                return None;
+            }
             Some((moved, provision))
         }
         Ok(_) => None,
@@ -689,8 +890,14 @@ fn join_handlers(
     let room_id = room.room_id().to_owned();
     let wake = Arc::new(Notify::new());
     let mut handlers = vec![watch_members(&client, &room_id, wake.clone())];
+    handlers.push(watch_redactions(
+        &client,
+        &room_id,
+        state.clone(),
+        wake.clone(),
+    ));
     if encrypt_media {
-        handlers.push(watch_keys(
+        handlers.extend(watch_keys(
             core,
             &client,
             generation,
@@ -732,7 +939,7 @@ async fn confirm_join(
             state
                 .members
                 .iter()
-                .any(|member| !member.is_own(&own.user_id, &own.device_id)),
+                .any(|member| !member.is_own(&own.user_id, own.own_device_id())),
         )
     };
     if !was_running {
@@ -745,6 +952,7 @@ fn same_service(left: &str, right: &str) -> bool {
     left.trim_end_matches('/') == right.trim_end_matches('/')
 }
 
+#[expect(clippy::too_many_lines, reason = "Joining and rollback form one flow")]
 pub(super) async fn join(
     core: &Arc<Core>,
     room_id: OwnedRoomId,
@@ -783,6 +991,9 @@ pub(super) async fn join(
             postpone,
         },
     ) = publish_where_allowed(core, &room, &state, encrypt_media, configured).await?;
+    if own.mode == CallMode::Matrix2 {
+        state.lock().await.slot_closed = false;
+    }
     let mode = own.mode;
     let state_key = state_key(&room, &own);
     if core.session_generation.load(Ordering::SeqCst) != generation {
@@ -813,6 +1024,12 @@ pub(super) async fn join(
         return Err(RpcError::NotLoggedIn);
     }
     let shared = state.clone();
+    let delay = Arc::new(Mutex::new(super::DelayState {
+        id: delay,
+        active: true,
+    }));
+    drop(postpone);
+    let postpone = Some(core.spawn_managed_postpone_loop(delay.clone(), generation, session));
     let updates = updates(
         core.clone(),
         generation,
@@ -821,6 +1038,8 @@ pub(super) async fn join(
         state,
         sticky_sync,
         wake,
+        delay.clone(),
+        encrypt_media,
     );
     calls.insert(
         session,
@@ -853,19 +1072,28 @@ pub(super) async fn join(
 
 fn merge_sticky(members: &mut Vec<CallMember>, sticky: Vec<CallMember>) {
     members.retain(|member| {
-        !sticky
-            .iter()
-            .any(|new| new.is_own(&member.user_id, &member.device_id))
+        !sticky.iter().any(|new| {
+            member
+                .device_id
+                .as_deref()
+                .is_some_and(|device| new.is_own(&member.user_id, device))
+        })
     });
     members.extend(sticky);
 }
 
 fn own_is_present(members: &[CallMember], own: &CallMember) -> bool {
     members.iter().any(|member| {
-        member.is_own(&own.user_id, &own.device_id) && member.member_id == own.member_id
+        member.user_id == own.user_id
+            && member.member_id == own.member_id
+            && (member.device_id.is_none() || member.is_own(&own.user_id, own.own_device_id()))
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Membership and backend refresh form one flow"
+)]
 async fn refresh(
     core: &Arc<Core>,
     generation: u64,
@@ -881,8 +1109,12 @@ async fn refresh(
     let own = {
         let mut state = shared.lock().await;
         let mut sticky = state.sticky.members(keys::now_ms());
+        sticky.retain(|member| member.wire == state.own.wire);
+        if state.own.mode == CallMode::Matrix2 && state.own.wire == membership::RtcWire::Stable {
+            members.clear();
+        }
         if state.slot_closed {
-            sticky.retain(|member| member.is_own(&state.own.user_id, &state.own.device_id));
+            sticky.retain(|member| member.is_own(&state.own.user_id, state.own.own_device_id()));
         }
         merge_sticky(&mut members, sticky);
         let present = own_is_present(&members, &state.own);
@@ -894,11 +1126,14 @@ async fn refresh(
         state.own_observed |= present;
         state.own.clone()
     };
-    members.retain(|member| !member.is_own(&own.user_id, &own.device_id));
+    members.retain(|member| {
+        !(member.is_own(&own.user_id, own.own_device_id())
+            || member.user_id == own.user_id && member.member_id == own.member_id)
+    });
     members.push(own.clone());
     let mut verified = Vec::new();
     for member in members {
-        if member.is_own(&own.user_id, &own.device_id)
+        if member.is_own(&own.user_id, own.own_device_id())
             || room
                 .get_member(&member.user_id)
                 .await
@@ -913,7 +1148,7 @@ async fn refresh(
         } else {
             tracing::info!(
                 user_id = %member.user_id,
-                device_id = %member.device_id,
+                device_id = ?member.device_id,
                 "ignoring a call membership of a user who is not joined in the local room state"
             );
         }
@@ -922,7 +1157,7 @@ async fn refresh(
         let own = follow_oldest_focus(room, shared, own, &verified).await;
         if let Some(entry) = verified
             .iter_mut()
-            .find(|member| member.is_own(&own.user_id, &own.device_id))
+            .find(|member| member.is_own(&own.user_id, own.own_device_id()))
         {
             entry.clone_from(&own);
         }
@@ -935,13 +1170,22 @@ async fn refresh(
         if let Some(service) = member_service(member, &verified) {
             wanted.insert(
                 backend_id(&room.room_id().to_owned(), service),
-                service.to_owned(),
+                (
+                    service.to_owned(),
+                    member.focus_servers.get(service).cloned(),
+                ),
             );
         }
     }
     let own_service = own.foci.first().cloned().unwrap_or_default();
     let publisher_id = backend_id(&room.room_id().to_owned(), &own_service);
-    wanted.insert(publisher_id, own_service);
+    wanted.insert(
+        publisher_id,
+        (
+            own_service.clone(),
+            own.focus_servers.get(&own_service).cloned(),
+        ),
+    );
     let missing = {
         let mut state = shared.lock().await;
         state.members.clone_from(&verified);
@@ -956,6 +1200,7 @@ async fn refresh(
         wanted
             .into_iter()
             .filter(|(id, _)| !state.backends.contains_key(id))
+            .map(|(id, (url, server))| (id, url, server))
             .collect::<Vec<_>>()
     };
     provision_missing(core, generation, session, room, shared, &own, missing).await;
@@ -969,16 +1214,16 @@ async fn recheck_slot(room: &Room, shared: &Mutex<State>) {
         let state = shared.lock().await;
         (
             now.saturating_sub(state.slot_checked_ms) >= SLOT_CHECK_INTERVAL_MS
-                && state
-                    .sticky
-                    .members(now)
-                    .iter()
-                    .any(|member| !member.is_own(&state.own.user_id, &state.own.device_id)),
+                && (state.own.mode == CallMode::Matrix2
+                    || state.sticky.members(now).iter().any(|member| {
+                        !member.is_own(&state.own.user_id, state.own.own_device_id())
+                    })),
             state.distributor.is_some(),
         )
     };
     if due {
-        let closed = super::slot_closed(room, encrypted).await;
+        let wire = shared.lock().await.own.wire;
+        let closed = super::slot_closed(room, encrypted, wire).await;
         let mut state = shared.lock().await;
         state.slot_closed_midcall |= closed && !state.slot_closed;
         state.slot_closed = closed;
@@ -993,19 +1238,30 @@ async fn provision_missing(
     room: &Room,
     shared: &Mutex<State>,
     own: &CallMember,
-    missing: Vec<(String, String)>,
+    missing: Vec<(String, String, Option<matrix_sdk::ruma::OwnedServerName>)>,
 ) {
-    for (id, service) in missing {
-        match sfu::provision_remote(
-            room,
-            &service,
-            &own.device_id,
-            own.member_id.as_deref().unwrap_or(&own.identity),
-            own.mode == CallMode::Matrix2,
-        )
-        .await
+    for (id, service, server_name) in missing {
+        let provision = if own.mode == CallMode::Matrix2 && own.wire == membership::RtcWire::Stable
         {
-            Ok(provision) => {
+            sfu::provision_stable(
+                room,
+                &service,
+                server_name.as_deref(),
+                own.member_id.as_deref().unwrap_or(&own.identity),
+            )
+            .await
+        } else {
+            sfu::provision_remote(
+                room,
+                &service,
+                own.own_device_id(),
+                own.member_id.as_deref().unwrap_or(&own.identity),
+                own.mode == CallMode::Matrix2,
+            )
+            .await
+        };
+        match provision {
+            Ok(provision) if provision.identity == own.identity => {
                 shared.lock().await.backends.insert(
                     id.clone(),
                     CallBackendView {
@@ -1016,7 +1272,7 @@ async fn provision_missing(
                     },
                 );
             }
-            Err(_) => core.emit_if_current(
+            Ok(_) | Err(_) => core.emit_if_current(
                 generation,
                 CoreEvent::CallSignalingError {
                     session,
@@ -1053,7 +1309,7 @@ async fn follow_oldest_focus(
         state.publisher_attempt_ms = now;
         state.intent
     };
-    let provision = match sfu::provision(room, &target, &own.device_id).await {
+    let provision = match sfu::provision(room, &target, own.own_device_id()).await {
         Ok(provision) if provision.identity == own.identity && provision.can_publish => provision,
         Ok(_) => {
             tracing::warn!("the oldest member's focus will not let this device publish");
@@ -1107,6 +1363,10 @@ pub(super) async fn set_screen_sharing(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Roster and key updates are published together"
+)]
 async fn publish_update(
     core: &Arc<Core>,
     generation: u64,
@@ -1147,7 +1407,14 @@ async fn publish_update(
             },
         );
         (
-            state.members.clone(),
+            state
+                .members
+                .iter()
+                .filter(|member| {
+                    state.own.mode != CallMode::Matrix2 || member.mode == CallMode::Matrix2
+                })
+                .cloned()
+                .collect::<Vec<_>>(),
             state.distributor.clone(),
             publisher_id,
         )
@@ -1213,7 +1480,7 @@ async fn publish_update(
     }
 }
 
-fn terminate(
+pub(super) fn terminate(
     core: &Arc<Core>,
     generation: u64,
     session: CallSessionId,
@@ -1246,8 +1513,9 @@ fn emit_pending(
     let pending = std::mem::take(&mut state.pending_keys);
     for pending in pending {
         let member = state.members.iter().find(|member| {
-            member.user_id == pending.sender
-                && member.device_id == pending.device
+            (state.own.mode != CallMode::Matrix2 || member.mode == CallMode::Matrix2)
+                && member.user_id == pending.sender
+                && member.device_id.as_deref() == Some(pending.device.as_ref())
                 && (member.mode != CallMode::Matrix2
                     || (member.member_id.is_some()
                         && member.member_id.as_deref() == pending.content.member_id()))
@@ -1313,7 +1581,7 @@ fn report_silent_members(state: &mut State, now_ms: u64) {
     let members = state.members.clone();
     for member in members
         .iter()
-        .filter(|member| !member.is_own(&state.own.user_id, &state.own.device_id))
+        .filter(|member| !member.is_own(&state.own.user_id, state.own.own_device_id()))
     {
         let first_seen = *state
             .member_first_seen
@@ -1331,7 +1599,7 @@ fn report_silent_members(state: &mut State, now_ms: u64) {
         }
         tracing::warn!(
             user_id = %member.user_id,
-            device_id = %member.device_id,
+            device_id = ?member.device_id,
             mode = ?member.mode,
             waiting_ms = now_ms.saturating_sub(first_seen),
             pending_keys = state.pending_keys.len(),
@@ -1343,7 +1611,10 @@ fn report_silent_members(state: &mut State, now_ms: u64) {
 fn unresolved_reason(pending: &PendingKey, members: &[CallMember]) -> &'static str {
     let mut devices = members
         .iter()
-        .filter(|member| member.user_id == pending.sender && member.device_id == pending.device)
+        .filter(|member| {
+            member.user_id == pending.sender
+                && member.device_id.as_deref() == Some(pending.device.as_ref())
+        })
         .peekable();
     if devices.peek().is_none() {
         return "no membership for the sending device";
@@ -1361,6 +1632,84 @@ fn unresolved_reason(pending: &PendingKey, members: &[CallMember]) -> &'static s
     "unknown"
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Event handlers pass session and sender context"
+)]
+async fn receive_call_key(
+    core: Arc<Core>,
+    generation: u64,
+    session: CallSessionId,
+    room_id: OwnedRoomId,
+    state: Arc<Mutex<State>>,
+    sender: OwnedUserId,
+    content: keys::ToDeviceCallEncryptionKeysEventContent,
+    encryption: Option<matrix_sdk::deserialized_responses::EncryptionInfo>,
+    wire: membership::RtcWire,
+) {
+    if content.room_id != room_id {
+        return;
+    }
+    if !content.session.is_legacy_room_call() {
+        tracing::warn!(sender = %sender, "ignoring a call media key for another session");
+        return;
+    }
+    let Some(payload) = content.key() else {
+        tracing::warn!(sender = %sender, "ignoring a call media key event without a key");
+        return;
+    };
+    if keys::decode_key_for_wire(&payload.key, wire).is_none() {
+        tracing::warn!(sender = %sender, "ignoring a call media key with invalid encoding or length");
+        return;
+    }
+    tracing::debug!(
+        sender = %sender,
+        index = payload.index,
+        "received a call media key"
+    );
+    let Some(encryption) = encryption else {
+        tracing::warn!(sender = %sender, "ignoring a call media key sent in clear");
+        return;
+    };
+    let Some(device) = encryption.sender_device else {
+        tracing::warn!(sender = %sender, "ignoring a call media key from an unknown device");
+        return;
+    };
+    if encryption.sender != sender
+        || content
+            .claimed_device_id()
+            .is_some_and(|claimed| claimed != device.as_str())
+    {
+        tracing::warn!(
+            sender = %sender,
+            %device,
+            claimed = ?content.claimed_device_id(),
+            "ignoring a call media key whose claimed device is not the sender"
+        );
+        return;
+    }
+    let mut state = state.lock().await;
+    if state.own.wire != wire {
+        return;
+    }
+    if state.pending_keys.len() >= 256 {
+        let dropped = state.pending_keys.remove(0);
+        tracing::warn!(
+            sender = %dropped.sender,
+            device = %dropped.device,
+            "dropping a call media key whose member never resolved"
+        );
+    }
+    state.pending_keys.push(PendingKey {
+        sender,
+        device,
+        content,
+        received: keys::now_ms(),
+        reported: false,
+    });
+    emit_pending(&core, generation, session, &room_id, &mut state);
+}
+
 fn watch_keys(
     core: &Arc<Core>,
     client: &Client,
@@ -1368,78 +1717,47 @@ fn watch_keys(
     session: CallSessionId,
     room_id: OwnedRoomId,
     state: Arc<Mutex<State>>,
-) -> EventHandlerDropGuard {
-    let core = core.clone();
-    let handle = client.add_event_handler(
+) -> Vec<EventHandlerDropGuard> {
+    let core1 = core.clone();
+    let room1 = room_id.clone();
+    let state1 = state.clone();
+    let legacy = client.add_event_handler(
         move |event: keys::ToDeviceCallEncryptionKeysEvent,
               encryption: Option<matrix_sdk::deserialized_responses::EncryptionInfo>| {
-            let core = core.clone();
-            let room_id = room_id.clone();
-            let state = state.clone();
-            async move {
-                if event.content.room_id != room_id {
-                    return;
-                }
-                if !event.content.session.is_legacy_room_call() {
-                    tracing::warn!(sender = %event.sender, "ignoring a call media key for another session");
-                    return;
-                }
-                let Some(payload) = event.content.key() else {
-                    tracing::warn!(sender = %event.sender, "ignoring a call media key event without a key");
-                    return;
-                };
-                if keys::decode_key(&payload.key).is_none() {
-                    tracing::warn!(sender = %event.sender, "ignoring a call media key shorter than 16 bytes");
-                    return;
-                }
-                tracing::debug!(
-                    sender = %event.sender,
-                    index = payload.index,
-                    "received a call media key"
-                );
-                let Some(encryption) = encryption else {
-                    tracing::warn!(sender = %event.sender, "ignoring a call media key sent in clear");
-                    return;
-                };
-                let Some(device) = encryption.sender_device else {
-                    tracing::warn!(sender = %event.sender, "ignoring a call media key from an unknown device");
-                    return;
-                };
-                if encryption.sender != event.sender
-                    || event
-                        .content
-                        .claimed_device_id()
-                        .is_some_and(|claimed| claimed != device.as_str())
-                {
-                    tracing::warn!(
-                        sender = %event.sender,
-                        %device,
-                        claimed = ?event.content.claimed_device_id(),
-                        "ignoring a call media key whose claimed device is not the sender"
-                    );
-                    return;
-                }
-                let mut state = state.lock().await;
-                if state.pending_keys.len() >= 256 {
-                    let dropped = state.pending_keys.remove(0);
-                    tracing::warn!(
-                        sender = %dropped.sender,
-                        device = %dropped.device,
-                        "dropping a call media key whose member never resolved"
-                    );
-                }
-                state.pending_keys.push(PendingKey {
-                    sender: event.sender,
-                    device,
-                    content: event.content,
-                    received: keys::now_ms(),
-                    reported: false,
-                });
-                emit_pending(&core, generation, session, &room_id, &mut state);
-            }
+            receive_call_key(
+                core1.clone(),
+                generation,
+                session,
+                room1.clone(),
+                state1.clone(),
+                event.sender,
+                event.content,
+                encryption,
+                membership::RtcWire::Deployed,
+            )
         },
     );
-    client.event_handler_drop_guard(handle)
+    let core2 = core.clone();
+    let stable = client.add_event_handler(
+        move |event: keys::StableEncryptionKeyEvent,
+              encryption: Option<matrix_sdk::deserialized_responses::EncryptionInfo>| {
+            receive_call_key(
+                core2.clone(),
+                generation,
+                session,
+                room_id.clone(),
+                state.clone(),
+                event.sender,
+                event.content.content,
+                encryption,
+                membership::RtcWire::Stable,
+            )
+        },
+    );
+    vec![
+        client.event_handler_drop_guard(legacy),
+        client.event_handler_drop_guard(stable),
+    ]
 }
 
 fn watch_members(
@@ -1459,6 +1777,88 @@ fn watch_members(
     client.event_handler_drop_guard(handle)
 }
 
+fn watch_redactions(
+    client: &Client,
+    room_id: &OwnedRoomId,
+    state: Arc<Mutex<State>>,
+    wake: Arc<Notify>,
+) -> EventHandlerDropGuard {
+    let handle = client.add_room_event_handler(
+        room_id,
+        move |event: matrix_sdk::ruma::events::room::redaction::SyncRoomRedactionEvent,
+              room: Room| {
+            let state = state.clone();
+            let wake = wake.clone();
+            async move {
+                if let Some(event_id) =
+                    event.redacts(&room.clone_info().room_version_rules_or_default().redaction)
+                {
+                    state
+                        .lock()
+                        .await
+                        .sticky
+                        .redact(event_id.as_str(), keys::now_ms());
+                    wake.notify_one();
+                }
+            }
+        },
+    );
+    client.event_handler_drop_guard(handle)
+}
+
+async fn refresh_encrypted_hangup(
+    core: Arc<Core>,
+    room: Room,
+    own: CallMember,
+    delay: Arc<Mutex<super::DelayState>>,
+) {
+    let Ok(support) = core.delayed_events_support().await else {
+        return;
+    };
+    if !support.any() {
+        return;
+    }
+    let mut delay = delay.lock().await;
+    if !delay.active {
+        return;
+    }
+    if let Some(id) = delay.id.as_ref() {
+        let result =
+            crate::delayed_events::update(&room.client(), id.clone(), UpdateAction::Cancel).await;
+        if result.is_err() {
+            return;
+        }
+        delay.id = None;
+    }
+    match sticky::send_delayed_event(
+        &room.client(),
+        support,
+        &room,
+        if own.wire == membership::RtcWire::Stable {
+            "m.rtc.member"
+        } else {
+            membership::RTC_MEMBER_EVENT_TYPE
+        },
+        sticky::LeaveOut::for_wire(
+            own.member_id.clone(),
+            sticky::LeaveCode::DelayedLeave,
+            own.wire,
+        ),
+        HANGUP_DELAY,
+        120_000,
+    )
+    .await
+    {
+        Ok(id) => delay.id = Some(id),
+        Err(error) => tracing::warn!(?error, "could not refresh the delayed call leave"),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "The session loop coordinates sync, membership and delayed leaves"
+)]
 fn updates(
     core: Arc<Core>,
     generation: u64,
@@ -1467,9 +1867,12 @@ fn updates(
     state: Arc<Mutex<State>>,
     mut sync: Option<sticky::StickySync>,
     wake: Arc<Notify>,
+    delay: Arc<Mutex<super::DelayState>>,
+    encrypted: bool,
 ) -> crate::Task {
     spawn(async move {
         let mut renewed = keys::now_ms();
+        let mut delay_roster = HashSet::new();
         let mut sdk_sticky = room.sticky_events().subscribe();
         let mut sdk_sticky_open = true;
         loop {
@@ -1492,9 +1895,10 @@ fn updates(
                 };
                 match synced {
                     Some(Ok(events)) => {
+                        let encrypted = core.room_is_encrypted(&room).await.unwrap_or(true);
                         let mut state = state.lock().await;
                         for event in events {
-                            state.sticky.apply(&event, keys::now_ms());
+                            event.apply(&mut state.sticky, encrypted, keys::now_ms());
                         }
                     }
                     Some(Err(_)) => {
@@ -1520,12 +1924,24 @@ fn updates(
                 }
             }
             {
+                let encrypted = core.room_is_encrypted(&room).await.unwrap_or(true);
                 let mut state = state.lock().await;
                 for event in sticky::live_events(&room) {
-                    state.sticky.apply(&event, keys::now_ms());
+                    event.apply(&mut state.sticky, encrypted, keys::now_ms());
                 }
             }
             if core.session_generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            if let Ok(encrypted) = core.room_is_encrypted(&room).await
+                && encrypted != state.lock().await.distributor.is_some()
+            {
+                terminate(
+                    &core,
+                    generation,
+                    session,
+                    crate::protocol::CallSignalingStage::Membership,
+                );
                 return;
             }
             if !refresh(&core, generation, session, &room, &state).await {
@@ -1537,18 +1953,37 @@ fn updates(
                 );
                 return;
             }
-            let (own, intent) = {
+            let (own, intent, roster_changed) = {
                 let state = state.lock().await;
-                (state.own.clone(), state.intent)
+                let roster: HashSet<_> = state
+                    .members
+                    .iter()
+                    .map(|member| {
+                        (
+                            member.user_id.clone(),
+                            member.device_id.clone(),
+                            member.member_id.clone(),
+                        )
+                    })
+                    .collect();
+                let changed = roster != delay_roster;
+                delay_roster = roster;
+                (state.own.clone(), state.intent, changed)
             };
+            let mut refresh_delay = encrypted && own.mode == CallMode::Matrix2 && roster_changed;
             let renew_interval = if own.mode == CallMode::Matrix2 {
-                STICKY_RENEW_INTERVAL_MS
+                if core.room_is_encrypted(&room).await.unwrap_or(true) {
+                    ENCRYPTED_STICKY_RENEW_INTERVAL_MS
+                } else {
+                    STICKY_RENEW_INTERVAL_MS
+                }
             } else {
                 RENEW_INTERVAL_MS
             };
             if keys::now_ms().saturating_sub(renewed) >= renew_interval {
                 if publish_membership(&room, &own, intent).await.is_ok() {
                     renewed = keys::now_ms();
+                    refresh_delay |= encrypted && own.mode == CallMode::Matrix2;
                 } else {
                     terminate(
                         &core,
@@ -1558,6 +1993,14 @@ fn updates(
                     );
                     return;
                 }
+            }
+            if refresh_delay {
+                drop(spawn(refresh_encrypted_hangup(
+                    core.clone(),
+                    room.clone(),
+                    own,
+                    delay.clone(),
+                )));
             }
         }
     })

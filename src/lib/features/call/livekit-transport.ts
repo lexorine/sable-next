@@ -22,6 +22,7 @@ import {
   unmuteScreenAudio,
 } from '#lib/platform/screen-audio.js';
 import type { ScreenAudioChoice } from '#lib/platform/screen-audio-stream.js';
+import { electronBridge } from '#lib/platform/electron.js';
 import { startHdrShare, stopHdrShare } from '#lib/platform/hdr-share.js';
 import { preferences } from '#lib/settings/preferences.svelte.js';
 
@@ -379,8 +380,11 @@ export function createLivekitTransport(options: LivekitTransportOptions): Liveki
       event('call.connection.state', { 'call.connection_state': connectionState });
     })
     .on(RoomEvent.EncryptionError, (error) => {
-      if (error instanceof CryptorError && error.reason === CryptorErrorReason.MissingKey) {
-        event('call.encryption.missing_key');
+      if (
+        (error instanceof CryptorError && error.reason === CryptorErrorReason.MissingKey) ||
+        (error instanceof Error && error.message.startsWith('MissingKey: '))
+      ) {
+        fail('call.encryption.missing_key', error);
         return;
       }
       fail('call.encryption.error', error);
@@ -424,10 +428,14 @@ export function createLivekitTransport(options: LivekitTransportOptions): Liveki
     publish({ connection: 'connecting', error: undefined });
 
     connected = (async () => {
-      for (const key of connectOptions.encryptionKeys) {
-        void keyProvider?.setKey(key, key.identity === options.ownIdentity);
+      if (keyProvider) {
+        await Promise.all(
+          connectOptions.encryptionKeys.map((key) =>
+            keyProvider.setKey(key, key.identity === options.ownIdentity)
+          )
+        );
+        await keyProvider.flush();
       }
-      await keyProvider?.flush();
 
       const ownIdentity = options.ownIdentity;
       if (keyProvider && ownIdentity) {
@@ -646,6 +654,19 @@ export function createLivekitTransport(options: LivekitTransportOptions): Liveki
             enabled && room.localParticipant.isScreenShareEnabled ? await shareAudio(audio) : true;
           if (!enabled) await stopSharingAudio();
           syncLocal();
+          if (
+            enabled &&
+            room.localParticipant.isScreenShareEnabled &&
+            electronBridge()?.platform === 'darwin'
+          ) {
+            const track = room.localParticipant.getTrackPublication(Track.Source.ScreenShareAudio)
+              ?.track?.mediaStreamTrack;
+            if (!track || track.readyState === 'ended') {
+              const error = new ScreenAudioError();
+              fail('call.screen_share.audio', error);
+              throw error;
+            }
+          }
           if (!audioShared) throw new ScreenAudioError();
         },
       },

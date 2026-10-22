@@ -44,6 +44,10 @@
 </div>
 
 <style>
+  .composer-field {
+    padding-inline-end: calc(var(--space-050) + (var(--size-x500) + var(--target-hit)) / 2);
+  }
+
   .composer-field :global(.icon-button-small.composer-expand) {
     --button-height: var(--size-x500);
     --button-icon-size: var(--size-x50);

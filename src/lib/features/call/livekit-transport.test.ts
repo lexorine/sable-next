@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
-import { ConnectionState, RoomEvent, type Room } from 'livekit-client';
+import {
+  ConnectionState,
+  CryptorError,
+  CryptorErrorReason,
+  RoomEvent,
+  type Room,
+} from 'livekit-client';
 
 import { createLivekitTransport } from './livekit-transport';
 import { ScreenAudioError } from './call-transport';
@@ -102,6 +108,25 @@ const connectOptions = {
   cameraEnabled: false,
   encryptionKeys: [],
 };
+
+test('classifies missing keys from the LiveKit worker without hiding other encryption errors', () => {
+  const { room } = roomFixture();
+  const failure = vi.fn();
+  createLivekitTransport({
+    encryptMedia: false,
+    createRoom: () => room,
+    telemetry: { step: (_stage, action) => action(), event: vi.fn(), failure },
+  });
+
+  const workerError = structuredClone(new Error('MissingKey: missing key at index 0'));
+  room.emit(RoomEvent.EncryptionError, workerError);
+  room.emit(RoomEvent.EncryptionError, new CryptorError('missing', CryptorErrorReason.MissingKey));
+  room.emit(RoomEvent.EncryptionError, new Error('InternalError: encryption failed'));
+
+  expect(failure).toHaveBeenNthCalledWith(1, 'call.encryption.missing_key', workerError, {});
+  expect(failure).toHaveBeenNthCalledWith(2, 'call.encryption.missing_key', expect.any(Error), {});
+  expect(failure).toHaveBeenNthCalledWith(3, 'call.encryption.error', expect.any(Error), {});
+});
 
 beforeEach(() => {
   vi.stubGlobal('screen', { width: 1920, height: 1080 });
@@ -353,12 +378,85 @@ test('an existing key import failure rejects immediately without leaving a timer
   vi.useFakeTimers();
   vi.spyOn(crypto.subtle, 'importKey').mockRejectedValue(new Error('import failed'));
   const provider = new MatrixKeyProvider();
-  void provider.setKey({ identity: 'publisher', keyIndex: 0, key: new Uint8Array(16) }, true);
+  const failed = provider.setKey(
+    { identity: 'publisher', keyIndex: 0, key: new Uint8Array(16) },
+    true
+  );
+  await expect(failed).rejects.toThrow('import-failed');
   await vi.waitFor(() => {
     expect(provider.state.lastFailure).toBe('import-failed');
   });
   await expect(provider.waitForOwnKey('publisher')).rejects.toThrow('own-key-failed');
   expect(vi.getTimerCount()).toBe(0);
+});
+
+test('a failed key import does not prevent a later key from being installed', async () => {
+  const importKey = vi.spyOn(crypto.subtle, 'importKey');
+  importKey.mockRejectedValueOnce(new Error('import failed'));
+  const provider = new MatrixKeyProvider();
+  const key = { identity: 'publisher', keyIndex: 0, key: new Uint8Array(16) };
+
+  await expect(provider.setKey(key, true)).rejects.toThrow('import-failed');
+  await expect(provider.setKey(key, true)).resolves.toBeUndefined();
+  expect(provider.state.ready).toBe(true);
+  expect(provider.state.lastFailure).toBeNull();
+});
+
+test('32-byte media key material can be installed', async () => {
+  const provider = new MatrixKeyProvider();
+  await expect(
+    provider.setKey({ identity: 'publisher', keyIndex: 0, key: new Uint8Array(32) }, true)
+  ).resolves.toBeUndefined();
+  expect(provider.state.ready).toBe(true);
+});
+
+test('key import failures only clear readiness for the publisher key', async () => {
+  const provider = new MatrixKeyProvider();
+  const own = { identity: 'publisher', keyIndex: 0, key: new Uint8Array(16) };
+  await provider.setKey(own, true);
+  const importKey = vi.spyOn(crypto.subtle, 'importKey');
+
+  importKey.mockRejectedValueOnce(new Error('import failed'));
+  await expect(provider.setKey({ ...own, identity: 'remote' }, false)).rejects.toThrow();
+  await expect(provider.waitForOwnKey('publisher')).resolves.toBeUndefined();
+
+  importKey.mockRejectedValueOnce(new Error('import failed'));
+  await expect(provider.setKey({ ...own, keyIndex: 1 }, true)).rejects.toThrow();
+  await expect(provider.waitForOwnKey('publisher')).rejects.toThrow('own-key-failed');
+});
+
+test('remote keys do not change the publisher key index restored on reconnect', async () => {
+  const provider = new MatrixKeyProvider();
+  const key = new Uint8Array(16);
+  await provider.setKey({ identity: 'publisher', keyIndex: 3, key }, true);
+  await provider.setKey({ identity: 'remote', keyIndex: 7, key }, false);
+  expect(provider.getLatestManuallySetKeyIndex()).toBe(3);
+  await provider.setKey({ identity: 'publisher', keyIndex: 4, key }, true);
+  expect(provider.getLatestManuallySetKeyIndex()).toBe(4);
+  await provider.setKey({ identity: 'publisher', keyIndex: 255, key }, true);
+  await provider.setKey({ identity: 'publisher', keyIndex: 0, key }, true);
+  await provider.setKey({ identity: 'remote', keyIndex: 255, key }, false);
+  expect(provider.getLatestManuallySetKeyIndex()).toBe(0);
+});
+
+test('does not connect when an initial encryption key cannot be imported', async () => {
+  const fixture = roomFixture();
+  vi.spyOn(crypto.subtle, 'importKey').mockRejectedValueOnce(new Error('import failed'));
+  const transport = createLivekitTransport({
+    encryptMedia: true,
+    ownIdentity: 'publisher',
+    createRoom: () => fixture.room,
+    createWorker: () => ({ terminate: vi.fn() }) as unknown as Worker,
+  });
+
+  await expect(
+    transport.connect({
+      ...connectOptions,
+      encryptionKeys: [{ identity: 'publisher', keyIndex: 0, key: new Uint8Array(16) }],
+    })
+  ).rejects.toThrow('import-failed');
+  expect(fixture.room.connect).not.toHaveBeenCalled();
+  await transport.disconnect();
 });
 
 test('imports every initial encryption key before connecting', async () => {
@@ -490,6 +588,56 @@ test('a share without our own audio capture asks the browser for stereo system a
 
   await transport.capabilities.screenShare?.setEnabled(false);
   expect(fixture.localParticipant.setScreenShareEnabled).toHaveBeenLastCalledWith(false);
+});
+
+test.each(['missing', 'ended'])(
+  'reports %s macOS display audio without stopping the video share',
+  async (state) => {
+    vi.stubGlobal('sableElectron', { platform: 'darwin' });
+    const fixture = roomFixture();
+    if (state === 'ended') {
+      fixture.localParticipant.getTrackPublication.mockImplementation(
+        (source?: string) =>
+          (source === 'screen_share_audio'
+            ? { track: { mediaStreamTrack: { readyState: 'ended' } } }
+            : undefined) as never
+      );
+    }
+    const failure = vi.fn();
+    const transport = createLivekitTransport({
+      encryptMedia: false,
+      createRoom: () => fixture.room,
+      telemetry: { step: (_stage, action) => action(), event: vi.fn(), failure },
+    });
+
+    await transport.connect(connectOptions);
+    await expect(transport.capabilities.screenShare?.setEnabled(true)).rejects.toBeInstanceOf(
+      ScreenAudioError
+    );
+    expect(fixture.localParticipant.isScreenShareEnabled).toBe(true);
+    expect(failure).toHaveBeenCalledWith(
+      'call.screen_share.audio',
+      expect.any(ScreenAudioError),
+      {}
+    );
+    await transport.capabilities.screenShare?.setEnabled(false);
+    await transport.disconnect();
+  }
+);
+
+test('accepts live macOS display audio', async () => {
+  vi.stubGlobal('sableElectron', { platform: 'darwin' });
+  const fixture = roomFixture();
+  fixture.localParticipant.getTrackPublication.mockImplementation(
+    (source?: string) =>
+      (source === 'screen_share_audio'
+        ? { track: { mediaStreamTrack: { readyState: 'live' } } }
+        : undefined) as never
+  );
+  const transport = createLivekitTransport({ encryptMedia: false, createRoom: () => fixture.room });
+  await transport.connect(connectOptions);
+  await expect(transport.capabilities.screenShare?.setEnabled(true)).resolves.toBeUndefined();
+  await transport.disconnect();
 });
 
 test('an HDR monitor is published as the screen share and stopped with it', async () => {
