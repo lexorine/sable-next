@@ -117,16 +117,14 @@ test('a reveal shows the original under the trash-icon tombstone', async () => {
   expect(screen.getByText(/spam/)).toBeInTheDocument();
 });
 
-test('auto mode fetches once when visible, and only for moderators', async () => {
+test('auto mode fetches once per event while visible, even without moderator power', async () => {
   setPreference('autoRevealRedacted', true);
   visibleImmediately();
   redactedContent.mockResolvedValue(secret);
 
-  const hidden = await renderTombstone(false);
-  expect(redactedContent).not.toHaveBeenCalled();
-  hidden.unmount();
-
-  await renderTombstone();
+  // No canRedactOthers gate any more: the UI mounts for everyone and lets the
+  // homeserver decide. Two mounts of the same event still share one fetch.
+  await renderTombstone(false);
   await renderTombstone();
   await vi.waitFor(() => expect(screen.getAllByText('the secret')).toHaveLength(2));
   expect(redactedContent).toHaveBeenCalledTimes(1);

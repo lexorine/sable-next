@@ -2112,7 +2112,7 @@
     "doubleTapReact": "Double tap to react",
     "showRoleTooltip": "Show role name on hover",
     "autoRevealRedacted": "Show deleted messages’ content automatically",
-    "autoRevealRedactedHint": "For moderators, on homeservers that support MSC2815.",
+    "autoRevealRedactedHint": "Reads each deleted message from the homeserver (MSC2815) when it becomes visible. Who may read is decided by the server: room moderators, and admin users on the homeserver itself.",
     "doubleTapReaction": "Double tap reaction",
     "hideTypingIndicators": "Hide typing indicators",
     "groupMembersByPresence": "Group members by presence",

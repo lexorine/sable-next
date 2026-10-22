@@ -118,7 +118,7 @@
     <TrashIcon size={14} aria-hidden="true" />
     {redactedLabel(redactedBy ? memberName(members, redactedBy) : null, reason ?? null)}
   </p>
-  {#if canRedactOthers && roomId && item.event_id}
+  {#if roomId && item.event_id}
     <RedactedContent {roomId} eventId={item.event_id} {item} {senderTimezone} {onMatrixLink} />
   {/if}
 {:else if item.content.kind === 'sticker'}

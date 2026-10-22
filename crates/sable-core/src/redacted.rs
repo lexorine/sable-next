@@ -1,16 +1,18 @@
-//! MSC2815: room moderators read the original content of redacted events.
+//! MSC2815: read the original content of redacted events. The homeserver
+//! decides who may: room moderators (users at or above the room's `redact`
+//! level), and — on Tuwunel-family servers — admins of the homeserver itself.
 
 use std::sync::Arc;
 
 use http::Method;
 use matrix_sdk::ruma::{
-    OwnedEventId, OwnedRoomId, UserId,
+    OwnedEventId, OwnedRoomId,
     api::{
         EmptyBody, IncomingResponse, MatrixVersion, Metadata, OutgoingRequest, auth_scheme,
         error::{DeserializationError, IntoHttpError},
         path_builder::{PathBuilder, StablePathSelector, VersionHistory},
     },
-    events::{AnySyncTimelineEvent, room::power_levels::RoomPowerLevels},
+    events::AnySyncTimelineEvent,
     serde::Raw,
 };
 use serde::{Deserialize, Serialize};
@@ -45,10 +47,6 @@ impl Handler for RedactedContentParams {
     async fn run(self, core: &Arc<Core>) -> Result<RedactedContentView, RpcError> {
         let room = core.room(&self.room_id).await?;
         let client = room.client();
-        let user_id = client.user_id().ok_or(RpcError::NotLoggedIn)?.to_owned();
-        if !may_view_redacted(&room.power_levels_or_default().await, &user_id) {
-            return Err(RpcError::Denied);
-        }
 
         let advertised = client
             .unstable_features()
@@ -65,11 +63,6 @@ impl Handler for RedactedContentParams {
             Err(error) => failure(&error, advertised),
         }
     }
-}
-
-#[must_use]
-pub fn may_view_redacted(power_levels: &RoomPowerLevels, user_id: &UserId) -> bool {
-    power_levels.for_user(user_id) >= power_levels.redact
 }
 
 /// A server without the feature also answers 403/404, so those only mean "refused"/"gone" when it advertises MSC2815.
@@ -336,8 +329,9 @@ mod sdk_tests {
     }
 
     #[tokio::test]
-    async fn a_user_below_the_redact_level_is_denied_locally() {
+    async fn a_user_below_the_redact_level_gets_the_servers_denial() {
         let fixture = fixture(0, true).await;
+        answer(&fixture, 403, json!({ "errcode": "M_FORBIDDEN", "error": "refused" })).await;
         assert!(matches!(read(&fixture).await, Err(RpcError::Denied)));
     }
 

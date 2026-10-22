@@ -320,7 +320,6 @@ export class MessageActionExecutor {
       onViewSource: policy.viewSource ? () => void openSource(policy.eventId) : undefined,
       onViewRedacted:
         item.content.kind === 'redacted' &&
-        canRedactOthers &&
         policy.viewSource &&
         redactedReveal(roomId, policy.eventId)?.kind !== 'shown'
           ? () => void revealRedacted(core.rpc, roomId, policy.eventId)
