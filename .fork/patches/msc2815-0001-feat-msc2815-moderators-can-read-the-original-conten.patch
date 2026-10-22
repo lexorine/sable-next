@@ -13,7 +13,7 @@ setting to show it automatically when the message scrolls into view.
  crates/sable-core/src/view/mod.rs             |   2 +
  crates/sable-core/src/view/redacted.rs        |  34 ++
  .../features/room/messages/MessageBody.svelte |   6 +
- .../room/messages/RedactedContent.svelte      |  87 ++++
+ .../room/messages/RedactedContent.svelte      |  93 +++++
  .../room/messages/RedactedContent.test.ts     | 160 ++++++++
  .../message-action-controller.svelte.ts       |   8 +
  .../room/messages/message-menu-items.ts       |   9 +
@@ -23,7 +23,7 @@ setting to show it automatically when the message scrolls into view.
  src/lib/settings/registry/timeline.ts         |   8 +
  src/locales/en.json                           |  10 +
  tests/e2e/fake-core.ts                        |   1 +
- 16 files changed, 768 insertions(+)
+ 16 files changed, 774 insertions(+)
  create mode 100644 crates/sable-core/src/redacted.rs
  create mode 100644 crates/sable-core/src/view/redacted.rs
  create mode 100644 src/lib/features/room/messages/RedactedContent.svelte
@@ -548,10 +548,10 @@ index 273ca25d3..52ece6958 100644
    <div
 diff --git a/src/lib/features/room/messages/RedactedContent.svelte b/src/lib/features/room/messages/RedactedContent.svelte
 new file mode 100644
-index 000000000..adeab2e32
+index 000000000..b3ba9ba88
 --- /dev/null
 +++ b/src/lib/features/room/messages/RedactedContent.svelte
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,93 @@
 +<!-- MSC2815: the original content of a redacted message, revealed from the menu or automatically. -->
 +<script lang="ts">
 +  import type { Attachment } from 'svelte/attachments';
@@ -562,6 +562,7 @@ index 000000000..adeab2e32
 +  import { i18n } from '#lib/i18n.js';
 +  import { preferences } from '#lib/settings/preferences.svelte.js';
 +
++  import FormattedBody from './FormattedBody.svelte';
 +  import MessageBody from './MessageBody.svelte';
 +  import { redactedReveal, revealRedacted, type RevealFailure } from './redacted-reveals.svelte.js';
 +
@@ -602,19 +603,24 @@ index 000000000..adeab2e32
 +  {#if reveal?.kind === 'shown'}
 +    <div class="unredacted">
 +      <span class="note">{i18n.t('timeline.redactedShown')}</span>
-+      <MessageBody
-+        item={{
-+          ...item,
-+          id: `${item.id}:unredacted`,
-+          content: reveal.content,
-+          reactions: [],
-+          read_by: [],
-+          thread_summary: null,
-+        }}
-+        canRedactOthers={false}
-+        {senderTimezone}
-+        {onMatrixLink}
-+      />
++      <!-- MessageBody has no text branch; TimelineItem renders text itself. -->
++      {#if reveal.content.kind === 'message'}
++        <FormattedBody html={reveal.content.html} {senderTimezone} {onMatrixLink} />
++      {:else}
++        <MessageBody
++          item={{
++            ...item,
++            id: `${item.id}:unredacted`,
++            content: reveal.content,
++            reactions: [],
++            read_by: [],
++            thread_summary: null,
++          }}
++          canRedactOthers={false}
++          {senderTimezone}
++          {onMatrixLink}
++        />
++      {/if}
 +    </div>
 +  {:else if reveal?.kind === 'loading'}
 +    <span class="note">{i18n.t('timeline.redactedLoading')}</span>
